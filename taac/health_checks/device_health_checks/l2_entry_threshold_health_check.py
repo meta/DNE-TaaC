@@ -12,6 +12,7 @@ from taac.constants import (
     NDP_SOFT_LIMIT,
     TestDevice,
 )
+from taac.driver.driver_constants import DEFAULT_THRIFT_TIMEOUT
 from taac.health_checks.abstract_health_check import (
     AbstractDeviceHealthCheck,
 )
@@ -182,10 +183,19 @@ class L2EntryThresholdHealthCheck(
             ("ndp_entry_observe_only", self.async_observe_ndp_entries),
         )
         return [
-            method()
+            self._with_deadline(method(), parameter)
             for parameter, method in observation_methods
             if check_params.get(parameter)
         ]
+
+    async def _with_deadline(self, rpc: t.Awaitable[str], parameter: str) -> str:
+        # The thrift timeout does not bound a table dump in a flood.
+        try:
+            return await asyncio.wait_for(rpc, DEFAULT_THRIFT_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"{parameter} RPC timed out after {DEFAULT_THRIFT_TIMEOUT}s"
+            ) from None
 
     async def async_observe_mac_entries(self) -> str:
         # pyrefly: ignore [missing-attribute]

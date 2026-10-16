@@ -1551,6 +1551,15 @@ class FbossSwitch(AbstractSwitch):
             )
         return transceiver_id
 
+    @staticmethod
+    def _map_admin_states(
+        all_ports_info: Mapping[int, PortInfoThrift],
+    ) -> Dict[str, bool]:
+        return {
+            port_info.name: port_info.adminState == PortAdminState.ENABLED
+            for port_info in all_ports_info.values()
+        }
+
     async def async_get_all_interfaces_admin_status(self) -> DefaultDict[str, bool]:
         """
         Used to fetch a snapshot of the admin status of all the
@@ -1558,17 +1567,8 @@ class FbossSwitch(AbstractSwitch):
         will be marked as True, while it will be marked as False if
         it is DISABLED.
         """
-        all_interfaces_status_map: DefaultDict[str, bool] = defaultdict(bool)
-
         all_ports_info: Dict[int, PortInfoThrift] = await self.async_get_all_port_info()
-
-        for port_info in all_ports_info.values():
-            if port_info.adminState == PortAdminState.ENABLED:
-                all_interfaces_status_map[port_info.name] = True
-            else:
-                all_interfaces_status_map[port_info.name] = False
-
-        return all_interfaces_status_map
+        return defaultdict(bool, self._map_admin_states(all_ports_info))
 
     async def async_get_all_interfaces_operational_status(
         self,
@@ -5922,18 +5922,138 @@ class FbossSwitch(AbstractSwitch):
 
         return []
 
+    # The shell helper returns stdout only, so the command echoes its exit
+    # status after this marker.
+    _RC_MARKER = "__fboss2_rc="
+    # The shell helper retries ConnectionResetError twice, so one command can
+    # take 3x this cap.
+    _SET_PORT_STATE_TIMEOUT_S = 30
+    _SET_PORT_STATE_ATTEMPTS = 6
+    _SET_PORT_STATE_RETRY_SLEEP_S = 5
+    # The client default timeout is 120s. A silent agent must not stall a round.
+    _SET_PORT_STATE_READ_TIMEOUT_S = 15
+
+    @staticmethod
+    def _split_rc_marker(raw: str) -> t.Tuple[int, str]:
+        head, sep, tail = (raw or "").rpartition(FbossSwitch._RC_MARKER)
+        if not sep:
+            # No marker: the command did not finish (timeout or dropped session).
+            return -1, (raw or "").strip()
+        try:
+            return int(tail.strip().split()[0]), head.strip()
+        except (IndexError, ValueError):
+            return -1, head.strip()
+
+    async def _async_admin_status_once(self) -> Dict[str, bool]:
+        """One getAllPortInfo read with no retry; the verify loop retries."""
+        async with self.async_agent_client as client:
+            all_ports_info = await client.getAllPortInfo()
+        if not all_ports_info:
+            raise EmptyOutputReturnError(
+                f"getAllPortInfo returned no ports on {self.hostname}"
+            )
+        return self._map_admin_states(all_ports_info)
+
+    async def _async_fboss2_set_port_state(
+        self, interface: str, subcmd: str
+    ) -> t.Tuple[int, str, str]:
+        # -y is required: fboss2 refuses a port-state change when stdin/stderr
+        # is not a TTY, which is always the case over the driver's shell.
+        # 2>&1 keeps the errors that the shell helper drops.
+        cmd = f"fboss2 set port {interface} state {subcmd} -y </dev/null 2>&1"
+        raw = await self.async_run_cmd_on_shell(
+            f"{cmd}; echo {self._RC_MARKER}$?",
+            timeout=self._SET_PORT_STATE_TIMEOUT_S,
+        )
+        rc, output = self._split_rc_marker(raw)
+        return rc, output, cmd
+
     # pyrefly: ignore [bad-override]
     async def async_enable_ports_via_ssh(
         self, interfaces: List[str], enable: bool
     ) -> None:
+        """Set admin state over SSH and verify it; the command can exit 0 unchanged."""
+        if not interfaces:
+            return
         subcmd = "enable" if enable else "disable"
-        tasks = []
-        for interface in interfaces:
-            # -y is required: fboss2 refuses a port-state change when stdin/stderr
-            # is not a TTY, which is always the case over the driver's shell.
-            cmd = f"fboss2 set port {interface} state {subcmd} -y"
-            tasks.append(self.async_run_cmd_on_shell(cmd))
-        await asyncio.gather(*tasks)
+        max_attempts = self._SET_PORT_STATE_ATTEMPTS
+        pending: List[str] = list(interfaces)
+        last_result: Dict[str, t.Tuple[int, str, str]] = {}
+        last_good_status: Dict[str, bool] = {}
+        read_ever_succeeded = False
+
+        async def _issue(interface: str) -> None:
+            # An SSH failure is a failed attempt. The device state decides.
+            try:
+                rc, output, cmd = await self._async_fboss2_set_port_state(
+                    interface, subcmd
+                )
+            except Exception as ssh_error:
+                self.logger.warning(
+                    f"{interface}: set-port-state over SSH failed on "
+                    f"{self.hostname}: {ssh_error!r}"
+                )
+                last_result[interface] = (
+                    -1,
+                    f"{type(ssh_error).__name__}: {ssh_error}",
+                    "<not issued>",
+                )
+                return
+            if rc != 0:
+                self.logger.warning(
+                    f"{interface}: '{cmd}' on {self.hostname} exited {rc}: "
+                    f"{output[-500:]!r}"
+                )
+            last_result[interface] = (rc, output, cmd)
+
+        for attempt in range(1, max_attempts + 1):
+            # Serial on purpose: concurrent `fboss2 set port` calls can drop writes.
+            for iface in pending:
+                await _issue(iface)
+            try:
+                status = await asyncio.wait_for(
+                    self._async_admin_status_once(),
+                    timeout=self._SET_PORT_STATE_READ_TIMEOUT_S,
+                )
+                read_ever_succeeded = True
+                last_good_status = status
+            except Exception as read_error:  # the agent may still be starting
+                self.logger.warning(
+                    f"admin state read failed on {self.hostname} "
+                    f"(attempt {attempt}/{max_attempts}): {read_error!r}"
+                )
+                status = {}
+            # A missing interface is not a match, even when disabling.
+            pending = [
+                iface
+                for iface in pending
+                if iface not in status or status[iface] != enable
+            ]
+            if not pending:
+                return
+            if attempt < max_attempts:
+                self.logger.warning(
+                    f"{', '.join(pending)} admin state not yet {subcmd}d on "
+                    f"{self.hostname} (attempt {attempt}/{max_attempts}); "
+                    f"retrying in {self._SET_PORT_STATE_RETRY_SLEEP_S}s"
+                )
+                await asyncio.sleep(self._SET_PORT_STATE_RETRY_SLEEP_S)
+
+        details = "; ".join(
+            f"{iface}: last observed enabled={last_good_status.get(iface)}, "
+            f"'{last_result[iface][2]}' exited {last_result[iface][0]} with "
+            f"{last_result[iface][1][-500:]!r}"
+            for iface in pending
+        )
+        why = (
+            "did not reach admin state"
+            if read_ever_succeeded
+            else "could not be confirmed (no admin state read succeeded) as"
+        )
+        raise RuntimeError(
+            f"{', '.join(pending)} on {self.hostname} {why} "
+            f"{subcmd}d after {max_attempts} attempts -- {details}"
+        )
 
     async def async_get_memory_total(
         self,

@@ -59,7 +59,7 @@ _UG_GATES: dict[str, _GateExpectation] = {
     "bgp_ebb_longevity_playbook": ({"80": 150.0, "95": 180.0}, 35.0),
     "bgp_ebb_ebgp_session_oscillation_playbook": (
         {"80": 150.0, "95": 180.0},
-        25.0,
+        35.0,
     ),
     "bgp_ebb_ebgp_route_oscillation_playbook": (
         {"80": 60.0, "95": 160.0},

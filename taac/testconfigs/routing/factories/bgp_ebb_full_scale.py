@@ -502,8 +502,10 @@ _UG_CHARACTERIZATION_GATES: t.Mapping[str, CharacterizationGates] = {
     "bgp_ebb_longevity_playbook": CharacterizationGates(
         cpu_thresholds_pct=((80, 150.0), (95, 180.0)), rss_max_growth_pct=35.0
     ),
+    # The UG baseline settles anywhere from ~1.26 to ~1.57 GiB while the end
+    # state stays ~1.55-1.78 GiB, so a low baseline alone reads as 23-28%.
     "bgp_ebb_ebgp_session_oscillation_playbook": CharacterizationGates(
-        cpu_thresholds_pct=((80, 150.0), (95, 180.0)), rss_max_growth_pct=25.0
+        cpu_thresholds_pct=((80, 150.0), (95, 180.0)), rss_max_growth_pct=35.0
     ),
     "bgp_ebb_ebgp_route_oscillation_playbook": CharacterizationGates(
         cpu_thresholds_pct=((80, 60.0), (95, 160.0)), rss_max_growth_pct=10.0

@@ -24,9 +24,7 @@ TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
 # Only import Meta-internal modules when not in OSS mode
 if not TAAC_OSS:
-    import pyjk as justknobs
     from neteng.netcastle.utils.skynet_utils import (
-        async_get_device_info_from_fbnet,
         async_get_fbnet_device_vendor,
         get_skynet_thrift_client,
     )
@@ -197,13 +195,6 @@ async def async_get_vendor_info_from_fbnet(device_name: str) -> t.Optional[str]:
     """
     Given the device_name, queries FBNet to return the vendor name
     """
-    if not justknobs.check("dne_pit/taac:enable_fbnet_device_vendor_resolution"):
-        device_info = await async_get_device_info_from_fbnet(
-            device_name, "desired_platform.os_type_name"
-        )
-        if device_info and device_info.desired_platform:
-            return device_info.desired_platform.os_type_name
-        return None
     return await async_get_fbnet_device_vendor(device_name)
 
 

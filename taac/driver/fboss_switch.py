@@ -4362,8 +4362,15 @@ class FbossSwitch(AbstractSwitch):
         end_time: Optional[int] = None,
         grep_pattern: Optional[str] = None,
         tail_lines: Optional[int] = None,
+        utc_offset_seconds: Optional[int] = None,
     ) -> str:
-        """Read a Classic/NSPAWN FBOSS log with optional remote filtering."""
+        """Read a Classic/NSPAWN FBOSS log with optional remote filtering.
+
+        The time window is matched against the device's wall-clock stamps.
+        Pass the device's UTC offset (seconds east of UTC) as
+        utc_offset_seconds; without it the host's local zone is assumed,
+        which only works when the host and device share a zone.
+        """
         if start_time is None and grep_pattern is None and tail_lines is None:
             return await self.async_read_file(log_file_path)
 
@@ -4374,7 +4381,11 @@ class FbossSwitch(AbstractSwitch):
             first_minute = start_time - (start_time % 60)
             last_minute = stop_time - (stop_time % 60)
             for timestamp in range(first_minute, last_minute + 1, 60):
-                local_time = time.localtime(timestamp)
+                local_time = (
+                    time.localtime(timestamp)
+                    if utc_offset_seconds is None
+                    else time.gmtime(timestamp + utc_offset_seconds)
+                )
                 # FBOSS files contain both syslog-style timestamps
                 # ("Sep 23 19:03") and glog prefixes ("I0923 19:03").
                 formatted_times.extend(

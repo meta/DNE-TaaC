@@ -73,38 +73,61 @@ def format_time_range(start_time: t.Optional[int], end_time: t.Optional[int]) ->
     return ""
 
 
-def filter_agent_logs_by_time(content: str, start_time: int, end_time: int) -> str:
+def filter_agent_logs_by_time(
+    content: str, start_time: int, end_time: int, utc_offset_seconds: int = 0
+) -> str:
     """
     Filter agent logs by timestamp range.
 
     Agent logs use format: E0930 10:07:24.282159 (Level+MMDD HH:MM:SS.microseconds)
-    This format is used by BGP, FIB, and other agent logs. Device log timestamps
-    are UTC; start_time and end_time are Unix epochs.
+    This format is used by BGP, FIB, and other agent logs. start_time and
+    end_time are Unix epochs; see is_agent_log_line_in_time_range for
+    utc_offset_seconds.
     """
     current_year = time.gmtime().tm_year
     filtered_lines = []
 
     for line in content.splitlines():
-        if is_agent_log_line_in_time_range(line, start_time, end_time, current_year):
+        if is_agent_log_line_in_time_range(
+            line, start_time, end_time, current_year, utc_offset_seconds
+        ):
             filtered_lines.append(line)
 
     return "\n".join(filtered_lines)
 
 
+def parse_utc_offset_seconds(offset: str) -> int:
+    """Convert `date +%z` output such as "-0800" or "+0530" to seconds east of UTC."""
+    lines = offset.strip().splitlines()
+    match = re.fullmatch(r"([+-])(\d{2})(\d{2})", lines[-1].strip() if lines else "")
+    if match is None:
+        raise ValueError(f"Unrecognized UTC offset {offset!r}")
+    sign, hours, minutes = match.groups()
+    seconds = int(hours) * 3600 + int(minutes) * 60
+    return -seconds if sign == "-" else seconds
+
+
 def is_agent_log_line_in_time_range(
-    line: str, start_time: int, end_time: int, current_year: int
+    line: str,
+    start_time: int,
+    end_time: int,
+    current_year: int,
+    utc_offset_seconds: int = 0,
 ) -> bool:
     """
-    Check if an Arista daemon log line timestamp falls within the given time range.
+    Check if an agent log line timestamp falls within the given time range.
 
-    Arista daemon log format: E0930 10:07:24.282159 (Level+MMDD HH:MM:SS.microseconds)
-    This format is used by BGP, FIB, and other Arista daemons.
-    Returns True for non-timestamp lines (safer to include than exclude).
+    Agent log format: E0930 10:07:24.282159 (Level+MMDD HH:MM:SS.microseconds)
+    This format is used by BGP, FIB, and other Arista daemons, and by FBOSS
+    glog. Returns True for non-timestamp lines (safer to include than exclude).
 
-    The line timestamp is interpreted as UTC because devices log in UTC. Using
-    the host's local time instead shifts every line by the host's UTC offset,
-    which on a non-UTC devserver pushes all lines outside the test window and
-    makes callers silently check nothing.
+    The line timestamp is the device's wall clock, so it is converted with
+    the device's UTC offset (seconds east of UTC), never the host's. Arista
+    devices log in UTC, which is the default. FBOSS glog stamps in the
+    device's local zone (US/Pacific on lab switches), so FBOSS callers must
+    pass the device offset. A wrong offset shifts every line by the
+    difference, pushing all of them outside the test window so callers
+    silently check nothing.
     """
     try:
         # log format: E0930 10:07:24.282159
@@ -135,6 +158,7 @@ def is_agent_log_line_in_time_range(
         return any(
             start_time
             <= calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
+            - utc_offset_seconds
             <= end_time
             for year in candidate_years
         )

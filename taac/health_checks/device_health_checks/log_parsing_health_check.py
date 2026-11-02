@@ -71,8 +71,13 @@ def find_resource_accountant_rejections(
     log_content: str,
     start_time: int | None = None,
     end_time: int | None = None,
+    utc_offset_seconds: int = 0,
 ) -> list[str]:
-    """Return canonical ResourceAccountant rejection lines in the time window."""
+    """Return canonical ResourceAccountant rejection lines in the time window.
+
+    utc_offset_seconds is the device's offset (seconds east of UTC); FBOSS
+    agent logs are stamped in device-local time.
+    """
     current_year = time.gmtime().tm_year
     matching_lines = []
     for line in log_content.splitlines():
@@ -91,6 +96,7 @@ def find_resource_accountant_rejections(
                 start_time,
                 end_time if end_time is not None else int(time.time()),
                 current_year,
+                utc_offset_seconds,
             ):
                 continue
         matching_lines.append(line)
@@ -115,6 +121,14 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
         end_time = int(check_params.get("end_time") or time.time())
         log_file_path = check_params["log_file_path"]
         if check_params.get("resource_accountant_activation"):
+            # FBOSS agent logs carry the device's wall clock, not UTC, so
+            # both the remote grep and the exact window need its offset.
+            utc_offset_seconds = log_parsing_utils.parse_utc_offset_seconds(
+                await self.driver.async_run_cmd_on_shell("date +%z")
+            )
+            self.logger.debug(
+                f"[LOG_PARSING] {obj.name} UTC offset: {utc_offset_seconds}s"
+            )
             # The driver reads Classic/NSPAWN files and native NetOS journald,
             # while bounding remote output before applying exact timestamps.
             # pyrefly: ignore [missing-attribute]
@@ -124,11 +138,13 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
                 end_time=end_time,
                 grep_pattern=_RESOURCE_ACCOUNTANT_GREP_PATTERN,
                 tail_lines=200,
+                utc_offset_seconds=utc_offset_seconds,
             )
             matching_lines = find_resource_accountant_rejections(
                 log_content,
                 int(start_time) if start_time is not None else None,
                 end_time,
+                utc_offset_seconds,
             )
             if not matching_lines:
                 return hc_types.HealthCheckResult(

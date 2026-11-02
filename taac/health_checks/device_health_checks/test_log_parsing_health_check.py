@@ -46,6 +46,11 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
         self.health_check.driver.async_read_log_file = AsyncMock(
             return_value=_SAMPLE_COOP_CONFIG
         )
+        # `date +%z` on the device; the UTC default keeps windows built with
+        # calendar.timegm aligned with the log stamps.
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            return_value="+0000\n"
+        )
         self.device = MagicMock(spec=TestDevice)
         self.device.name = "test-host"
         self.input = hc_types.BaseHealthCheckIn()
@@ -143,8 +148,55 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
             end_time=start_time + 120,
             grep_pattern=log_parsing_health_check_module._RESOURCE_ACCOUNTANT_GREP_PATTERN,
             tail_lines=200,
+            utc_offset_seconds=0,
         )
         self.health_check.driver.async_read_file.assert_not_awaited()
+
+    async def test_resource_accountant_mode_reads_window_in_device_local_time(
+        self,
+    ):
+        # Regression: Overcommit_ECMP_ONLY_Groups on ssw002.s002.f01.qzd1
+        # (America/Los_Angeles). The device rejected the overcommit at 05:21:46
+        # PST, inside the 05:16:53-05:28:46 PST window, but reading the glog
+        # stamp as UTC put it eight hours early and the check failed.
+        start_time = 1793539013
+        end_time = 1793539726
+        content = (
+            "Nov  1 05:21:46 ssw002.s002.f01.qzd1.tfbnw.net "
+            "fboss_sw_agent[573954]: E1101 05:21:46.686595 574442 "
+            "ValidateStateUpdate.cpp:356] State updated rejected by resource "
+            "accountant.\n"
+        )
+        self.health_check.driver.async_run_cmd_on_shell.return_value = "-0800\n"
+        self.health_check.driver.async_read_log_file.return_value = content
+
+        result = await self.health_check._run(
+            self.device,
+            self.input,
+            {
+                "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+                "resource_accountant_activation": True,
+                "start_time": start_time,
+                "end_time": end_time,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.health_check.driver.async_run_cmd_on_shell.assert_awaited_once_with(
+            "date +%z"
+        )
+        self.health_check.driver.async_read_log_file.assert_awaited_once_with(
+            "/var/facebook/logs/fboss/wedge_agent.log",
+            start_time=start_time,
+            end_time=end_time,
+            grep_pattern=log_parsing_health_check_module._RESOURCE_ACCOUNTANT_GREP_PATTERN,
+            tail_lines=200,
+            utc_offset_seconds=-8 * 3600,
+        )
+        self.assertEqual(
+            [],
+            find_resource_accountant_rejections(content, start_time, end_time),
+        )
 
     def test_resource_accountant_accepts_netos_syslog_prefixed_event(self) -> None:
         start_time = calendar.timegm((2026, 9, 20, 23, 20, 0, 0, 0, 0))

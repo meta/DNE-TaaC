@@ -210,6 +210,8 @@ def gen_snake_test_config(
     rapid_a_end_flap_neighbor_hostnames: t.Optional[t.List[str]] = None,
     flap_recovery_check_retry_count: t.Optional[int] = None,
     flap_recovery_check_retry_delay_seconds: float = 10.0,
+    half_toggle_check_retry_count: t.Optional[int] = None,
+    half_toggle_check_retry_delay_seconds: float = 2.0,
     include_ptp: bool = True,
     skip_ixia_protocol_verification: bool = False,
     ixia_protocol_verification_timeout: int = 90,
@@ -271,6 +273,11 @@ def gen_snake_test_config(
                 state retries. Prechecks remain single-shot.
             postcheck_port_state_retry_delay_seconds: Fixed delay between
                 post-test port-state retries.
+            half_toggle_check_retry_count: Optional number of retries for the
+                half-interface-toggle LLDP and port-state checks that run
+                after interfaces are re-enabled. None keeps them single-shot.
+            half_toggle_check_retry_delay_seconds: Fixed delay between those
+                retries.
             qsfp_service_restart_use_recovery_window: Clear IXIA counters after
                 QSFP service recovery so its postcheck measures a fresh
                 ``packet_loss_sleep_time`` recovery window instead of the
@@ -478,6 +485,8 @@ def gen_snake_test_config(
         flap_recovery_check_retry_delay_seconds=(
             flap_recovery_check_retry_delay_seconds
         ),
+        half_toggle_check_retry_count=half_toggle_check_retry_count,
+        half_toggle_check_retry_delay_seconds=half_toggle_check_retry_delay_seconds,
         skip_lldp_check=skip_lldp_check,
         include_split_agent_warmboot=include_split_agent_warmboot,
     )

@@ -93,6 +93,12 @@ _W800_NPI_CORE_PLAYBOOKS = [
 # matching what the shipped Icepack FR4 snake configs use.
 _W800_RECOVERY_RETRY_COUNT = 6
 
+# Half-interface-toggle checks run 10s after re-enable; ports and LLDP neighbors
+# came back 13-18s after re-enable on the CACT 100G bed. 10 retries at 2s polls
+# until ~30s after re-enable before failing.
+_W800_HALF_TOGGLE_CHECK_RETRY_COUNT = 10
+_W800_HALF_TOGGLE_CHECK_RETRY_DELAY_S = 2.0
+
 # Same rate as the base traffic. MP3 800G snakes showed TC0 congestion discards
 # at 100% line rate and none at 99% (T227297634).
 _W800_BENCHMARK_LINE_RATE = 99
@@ -273,6 +279,8 @@ def _gen_w800_snake_test_config(
         frame_size_settings=frame_size_settings,
         postcheck_port_state_retry_count=_W800_RECOVERY_RETRY_COUNT,
         flap_recovery_check_retry_count=_W800_RECOVERY_RETRY_COUNT,
+        half_toggle_check_retry_count=_W800_HALF_TOGGLE_CHECK_RETRY_COUNT,
+        half_toggle_check_retry_delay_seconds=_W800_HALF_TOGGLE_CHECK_RETRY_DELAY_S,
         include_link_flap_longevity=playbooks_to_include is None,
         include_rapid_a_end_flap_stress=playbooks_to_include is None,
         include_split_agent_warmboot=True,

@@ -2055,6 +2055,9 @@ def create_lldp_check(
     disabled_interfaces_jq_var: t.Optional[str] = None,
     disabled_interfaces_jq: t.Optional[str] = None,
     disabled_interfaces_transforms: t.Optional[t.List[TransformFunction]] = None,
+    retry_count: t.Optional[int] = None,
+    retry_delay_seconds: t.Optional[float] = None,
+    retry_delay_multiplier: t.Optional[float] = None,
 ) -> PointInTimeHealthCheck:
     """LLDP_CHECK — LLDP neighbor verification.
 
@@ -2068,11 +2071,24 @@ def create_lldp_check(
             expected-down set deterministically (no prior cache step needed).
         disabled_interfaces_transforms: transforms applied to the jq result to
             select the expected-down set (e.g. ``SELECT_SNAKE_CIRCUIT_A_ENDS``).
+        retry_count: Number of retries after an initial failed LLDP check.
+        retry_delay_seconds: Delay before the first retry.
+        retry_delay_multiplier: Multiplier applied to each successive delay.
     """
+    payload: t.Dict[str, t.Any] = {}
+    if retry_count is not None:
+        payload["retry_count"] = retry_count
+    if retry_delay_seconds is not None:
+        payload["retry_delay_seconds"] = retry_delay_seconds
+    if retry_delay_multiplier is not None:
+        payload["retry_delay_multiplier"] = retry_delay_multiplier
+    json_params = json.dumps(payload) if payload else None
+
     if disabled_interfaces_jq is not None:
         return PointInTimeHealthCheck(
             name=hc_types.CheckName.LLDP_CHECK,
             check_params=Params(
+                json_params=json_params,
                 jq_params={"disabled_interfaces": disabled_interfaces_jq},
                 transform_params=(
                     {"disabled_interfaces": disabled_interfaces_transforms}
@@ -2082,10 +2098,16 @@ def create_lldp_check(
             ),
         )
     if disabled_interfaces_jq_var is None:
-        return PointInTimeHealthCheck(name=hc_types.CheckName.LLDP_CHECK)
+        if json_params is None:
+            return PointInTimeHealthCheck(name=hc_types.CheckName.LLDP_CHECK)
+        return PointInTimeHealthCheck(
+            name=hc_types.CheckName.LLDP_CHECK,
+            check_params=Params(json_params=json_params),
+        )
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.LLDP_CHECK,
         check_params=Params(
+            json_params=json_params,
             jq_params={"disabled_interfaces": f".{disabled_interfaces_jq_var}"},
         ),
     )

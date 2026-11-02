@@ -17168,6 +17168,8 @@ def gen_snake_playbooks(
     rapid_a_end_flap_neighbor_hostnames: t.Optional[t.List[str]] = None,
     flap_recovery_check_retry_count: t.Optional[int] = None,
     flap_recovery_check_retry_delay_seconds: float = 10.0,
+    half_toggle_check_retry_count: t.Optional[int] = None,
+    half_toggle_check_retry_delay_seconds: float = 2.0,
     skip_lldp_check: bool = False,
     include_split_agent_warmboot: bool = False,
 ) -> t.List[taac_types.Playbook]:
@@ -17187,6 +17189,20 @@ def gen_snake_playbooks(
         if not skip_lldp_check:
             checks.append(create_lldp_check())
         return checks
+
+    # Opt-in retries for the half-interface-toggle checks that run right after
+    # interfaces are re-enabled (ports and LLDP neighbors can take longer than
+    # the enable delay to come back). Empty when half_toggle_check_retry_count
+    # is None, so those checks stay single-shot for configs that don't set it.
+    half_toggle_retry_kwargs: t.Dict[str, t.Any] = (
+        {}
+        if half_toggle_check_retry_count is None
+        else {
+            "retry_count": half_toggle_check_retry_count,
+            "retry_delay_seconds": half_toggle_check_retry_delay_seconds,
+            "retry_delay_multiplier": 1.0,
+        }
+    )
 
     _prechecks = common_prechecks or []
     _postchecks = common_postchecks or []
@@ -17300,6 +17316,11 @@ def gen_snake_playbooks(
                 iteration=iteration,
                 prechecks=_prechecks,
                 postchecks=_postchecks
+                + (
+                    [create_lldp_check(**half_toggle_retry_kwargs)]
+                    if half_toggle_retry_kwargs and not skip_lldp_check
+                    else []
+                )
                 + [
                     create_ixia_packet_loss_check(clear_traffic_stats=True),
                 ]
@@ -17400,6 +17421,7 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
+                                        **half_toggle_retry_kwargs,
                                     ),
                                     create_port_state_check(
                                         disabled_interfaces_jq=f'."{hostname}".interfaces',
@@ -17414,6 +17436,7 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
+                                        **half_toggle_retry_kwargs,
                                     ),
                                 ],
                                 stage=taac_types.ValidationStage.MID_TEST,

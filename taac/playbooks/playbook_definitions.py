@@ -16625,8 +16625,11 @@ def create_rbb_3x200g_zr_playbooks(
     ixia_peer_addresses: t.List[str],
     traffic_item_name: str,
     iteration: int = 10,
+    qsfp_reset_error_monitoring_iteration: int = 50,
+    qsfp_reset_error_monitoring_targets: t.Optional[t.Dict[str, str]] = None,
     recovery_wait_s: int = 300,
     control_plane_settle_s: int = 120,
+    error_monitoring_observation_s: int = 180,
     longevity_duration_s: int = 12 * 60 * 60,
     max_packet_loss_duration_ms: str = "25",
 ) -> t.List[Playbook]:
@@ -16634,7 +16637,9 @@ def create_rbb_3x200g_zr_playbooks(
 
     ``devices`` contains one entry per RBB with ``hostname``,
     ``zr_port_channel``, ``zr_members`` and ``non_zr_interface``. Every
-    disruptive case is generated once per device. Device health checks remain
+    disruptive case is generated once per device. Dedicated QSFP-reset error
+    monitoring playbooks are additionally generated for entries in
+    ``qsfp_reset_error_monitoring_targets``. Device health checks remain
     topology-scoped and therefore validate both ends after each disruption.
 
     TAAC testbed isolation removes links to devices outside the declared
@@ -16761,6 +16766,21 @@ def create_rbb_3x200g_zr_playbooks(
             clear_traffic_stats=clear_traffic_stats,
         )
 
+    def _zr_input_error_check() -> PointInTimeHealthCheck:
+        return create_port_counters_check(
+            thresholds=[
+                hc_types.PortCountersThreshold(
+                    interfaces=[
+                        f"{device['hostname']}:{member}"
+                        for device in devices
+                        for member in device["zr_members"]
+                    ],
+                    in_error=0,
+                    comparison=hc_types.ComparisonType.EQUAL_TO,
+                )
+            ]
+        )
+
     def _prechecks() -> t.List[PointInTimeHealthCheck]:
         return _recovery_checks() + [
             _packet_loss_check(clear_traffic_stats=False)
@@ -16845,6 +16865,83 @@ def create_rbb_3x200g_zr_playbooks(
                 _routing_recovery_stage(),
             ],
             postchecks=_postchecks(),
+            traffic_items_to_start=[traffic_item_name],
+        )
+
+    def _qsfp_reset_error_monitoring_playbook(
+        device: t.Dict[str, t.Any], reset_member: str
+    ) -> Playbook:
+        return Playbook(
+            name=(
+                "test_rbb_zr_qsfp_reset_error_monitoring_"
+                f"{_device_tag(device)}"
+            ),
+            iteration=qsfp_reset_error_monitoring_iteration,
+            prechecks=_prechecks(),
+            stages=[
+                create_steps_stage(
+                    steps=[
+                        create_interface_flap_step(
+                            enable=False,
+                            interfaces=[reset_member],
+                            interface_flap_method=(
+                                taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_RESET
+                            ),
+                            device_name=device["hostname"],
+                            delay=recovery_wait_s,
+                            description=(
+                                "Reset the shared physical transceiver for "
+                                f"{device['hostname']}:{reset_member}"
+                            ),
+                        )
+                    ]
+                ),
+                create_steps_stage(
+                    steps=[
+                        create_validation_step(
+                            point_in_time_checks=_recovery_checks(),
+                            stage=taac_types.ValidationStage.MID_TEST,
+                            fail_on_failure=True,
+                            description=(
+                                "Verify ZR links, Open/R, and BGP recovered after "
+                                "the qsfp reset"
+                            ),
+                        ),
+                        create_longevity_step(
+                            duration=control_plane_settle_s,
+                            description=(
+                                "Let BGP routes and IXIA traffic settle after recovery"
+                            ),
+                        ),
+                    ]
+                ),
+                create_steps_stage(
+                    steps=[
+                        create_clear_traffic_stats_step(),
+                        create_clear_port_stats_step(
+                            device_regexes=[
+                                topology_device["hostname"]
+                                for topology_device in devices
+                            ],
+                            description=(
+                                "Clear interface counters on both RBB endpoints "
+                                "before the clean error window"
+                            ),
+                        ),
+                        create_longevity_step(
+                            duration=error_monitoring_observation_s,
+                            description=(
+                                "Run ZR traffic and observe for new input/PCS/CRC errors"
+                            ),
+                        ),
+                    ]
+                ),
+            ],
+            postchecks=_recovery_checks()
+            + [
+                _zr_input_error_check(),
+                _packet_loss_check(clear_traffic_stats=False),
+            ],
             traffic_items_to_start=[traffic_item_name],
         )
 
@@ -16949,24 +17046,36 @@ def create_rbb_3x200g_zr_playbooks(
 
     playbooks: t.List[Playbook] = []
     for device in devices:
-        playbooks.extend(
+        device_playbooks = [
+            _member_flap_playbook(
+                "test_rbb_zr_member_flap",
+                device,
+                taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+            ),
+            _member_flap_playbook(
+                "test_rbb_zr_qsfp_low_power",
+                device,
+                taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_UTIL_POWER,
+            ),
+            _member_flap_playbook(
+                "test_rbb_zr_qsfp_util_disable",
+                device,
+                taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_UTIL_TX,
+            ),
+            _qsfp_reset_playbook(device),
+        ]
+        if (
+            qsfp_reset_error_monitoring_targets is not None
+            and device["hostname"] in qsfp_reset_error_monitoring_targets
+        ):
+            device_playbooks.append(
+                _qsfp_reset_error_monitoring_playbook(
+                    device,
+                    qsfp_reset_error_monitoring_targets[device["hostname"]],
+                )
+            )
+        device_playbooks.extend(
             [
-                _member_flap_playbook(
-                    "test_rbb_zr_member_flap",
-                    device,
-                    taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
-                ),
-                _member_flap_playbook(
-                    "test_rbb_zr_qsfp_low_power",
-                    device,
-                    taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_UTIL_POWER,
-                ),
-                _member_flap_playbook(
-                    "test_rbb_zr_qsfp_util_disable",
-                    device,
-                    taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_UTIL_TX,
-                ),
-                _qsfp_reset_playbook(device),
                 _service_playbook(
                     "test_rbb_zr_agent_warmboot",
                     device,
@@ -17003,6 +17112,7 @@ def create_rbb_3x200g_zr_playbooks(
                 _port_channel_flap_playbook(device),
             ]
         )
+        playbooks.extend(device_playbooks)
 
     playbooks.append(
         Playbook(

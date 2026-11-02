@@ -150,7 +150,7 @@ class PortCountersHealthCheck(
             raise ValueError(f"Unsupported comparison type: {comparison}")
 
     async def skip_check(self, obj: TestDevice) -> t.Tuple[bool, t.Optional[str]]:
-        supported_roles = ["BAG", "GTSW"]
+        supported_roles = ["BAG", "GTSW", "RB"]
         if obj.attributes.role not in supported_roles:
             return True, f"{obj.name}'s device role is not in {supported_roles}"
         return False, None

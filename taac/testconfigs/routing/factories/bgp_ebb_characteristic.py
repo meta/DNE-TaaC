@@ -170,6 +170,9 @@ from taac.testconfigs.routing.util.bgp_ebb_constants import (
     PEERGROUP_IBGP_V4,
     PEERGROUP_IBGP_V6,
 )
+from taac.testconfigs.routing.util.bgp_ebb_ixia_config import (
+    enforce_ebb_ixia_bgp_timers,
+)
 from taac.testconfigs.routing.util.bgp_ebb_periodic_tasks import (
     create_standard_periodic_tasks,
 )
@@ -1109,6 +1112,7 @@ def test_config_sc3_transient_memory_route_scale_on_eos(
     )
 
 
+@enforce_ebb_ixia_bgp_timers
 def create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
     testbed: PhysicalInventory,
     enable_update_group: bool = False,
@@ -2244,6 +2248,7 @@ def create_bgp_ebb_update_packing_test_config(
     )
 
 
+@enforce_ebb_ixia_bgp_timers
 def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
     testbed: PhysicalInventory,
     enable_update_group: bool = False,
@@ -2410,6 +2415,7 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
     )
 
 
+@enforce_ebb_ixia_bgp_timers
 def create_bgp_ebb_queue_memory_monitor_test_config(
     physical_inventory: PhysicalInventory,
     enable_update_group: bool = False,
@@ -2605,6 +2611,7 @@ def create_bgp_ebb_characteristic_performance_scaling_test_config(
     )
 
 
+@enforce_ebb_ixia_bgp_timers
 def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
     testbed: PhysicalInventory,
     enable_update_group: bool = False,
@@ -2777,6 +2784,7 @@ def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
     )
 
 
+@enforce_ebb_ixia_bgp_timers
 def create_bgp_ebb_characteristic_route_churn_processing_test_config(
     testbed: PhysicalInventory,
     enable_update_group: bool = False,

@@ -9,6 +9,8 @@ from taac.abstractions.compatibility.legacy_ebb_binding import (
     IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
 )
 from taac.abstractions.compatibility.legacy_ebb_topology import (
+    EBB_IXIA_BGP_HOLD_TIMER_S,
+    EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
     EBGP_REMOTE_AS,
     IBGP_REMOTE_AS,
 )
@@ -54,7 +56,11 @@ UG_NEW_PEER_JOIN_AS_NUMBERS = {
     "ibgp": IBGP_REMOTE_AS,
 }
 
-_UG_IXIA_BGP_SESSION = IxiaBgpSessionIntent(address_prefix_length=127)
+_UG_IXIA_BGP_SESSION = IxiaBgpSessionIntent(
+    address_prefix_length=127,
+    hold_timer_s=EBB_IXIA_BGP_HOLD_TIMER_S,
+    keepalive_timer_s=EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
+)
 
 UG_EBGP_PEER_GROUP = BgpPeerGroup(
     name="EB-FA-V6",

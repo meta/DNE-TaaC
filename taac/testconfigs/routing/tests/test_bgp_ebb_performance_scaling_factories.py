@@ -858,6 +858,54 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
         self.assertEqual(8, len(device_groups))
         self.assertTrue(all(not group.enable for group in device_groups))
 
+    def test_scheduled_characteristic_configs_match_bgpcpp_timers_on_ixia(
+        self,
+    ) -> None:
+        configs = [
+            cicd_ebb_int_tc.NRQEB006_SC2_CONSTANT_ATTRIBUTE_STORAGE_INGRESS_TEST_CONFIG_UG,
+            cicd_ebb_int_tc.NRQEB007_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST_CONFIG_UG,
+            cicd_ebb_int_tc.NRQEB008_SC1_EGRESS_PEER_SCALE_TEST_CONFIG_UG,
+            cicd_ebb_int_tc.NRQEB009_SC9_BOUNDED_ECMP_SETS_TEST_CONFIG_UG,
+            cicd_ebb_int_tc.NRQEB008_SC5_UPDATE_PACKING_TEST_CONFIG_UG,
+            cicd_ebb_int_tc.NRQEB006_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_CONFIG_UG,
+            cicd_ebb_int_tc.NRQEB007_SC6_CHURN_PROCESSING_TEST_CONFIG_UG,
+            cicd_ebb_int_tc.NRQEB009_SC8_POLICY_EVALUATION_TEST_CONFIG_UG,
+        ]
+
+        for config in configs:
+            with self.subTest(config=config.name):
+                bgp_configs = [
+                    bgp
+                    for port in config.basic_port_configs or []
+                    for group in port.device_group_configs or []
+                    for bgp in (group.v4_bgp_config, group.v6_bgp_config)
+                    if bgp is not None
+                ]
+
+                self.assertTrue(bgp_configs)
+                self.assertEqual(
+                    {(15, 5)},
+                    {(bgp.hold_timer, bgp.keepalive_timer) for bgp in bgp_configs},
+                )
+
+    def test_retained_bounded_ecmp_matches_bgpcpp_timers_on_ixia(self) -> None:
+        config = characteristic_factory.create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
+            NRQEB009_ASH6,
+        )
+        bgp_configs = [
+            bgp
+            for port in config.basic_port_configs or []
+            for group in port.device_group_configs or []
+            for bgp in (group.v4_bgp_config, group.v6_bgp_config)
+            if bgp is not None
+        ]
+
+        self.assertEqual(8, len(bgp_configs))
+        self.assertEqual(
+            {(15, 5)},
+            {(bgp.hold_timer, bgp.keepalive_timer) for bgp in bgp_configs},
+        )
+
     def test_update_packing_conveyor_config_is_ug_and_non_vacuous(self) -> None:
         config = create_bgp_ebb_update_packing_test_config(
             NRQEB008_ASH6,

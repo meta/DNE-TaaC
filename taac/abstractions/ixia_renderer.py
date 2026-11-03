@@ -914,8 +914,6 @@ def _validate_partitioned_session(
             and not requires_route_mutation
         )
         or not session.enable_four_byte_local_as
-        or session.hold_timer_s != 30
-        or session.keepalive_timer_s != 10
         or session.enable_graceful_restart
         is not (relationship is PeerRelationship.EXTERNAL)
         or len(session.local_addresses) != group.peer_count
@@ -1420,8 +1418,6 @@ def _validate_initial_ipv6_session(
         or session.address_step != 2
         or session.address_start_index != 0
         or not session.enable_four_byte_local_as
-        or session.hold_timer_s != 30
-        or session.keepalive_timer_s != 10
         or not session.enable_graceful_restart
     ):
         _unsupported(
@@ -1452,8 +1448,6 @@ def _validate_compact_named_ipv6_session(
         or session.address_step != 2
         or session.address_start_index != 0
         or not session.enable_four_byte_local_as
-        or session.hold_timer_s != 30
-        or session.keepalive_timer_s != 10
         or not session.enable_graceful_restart
     ):
         _unsupported(
@@ -1997,6 +1991,8 @@ def _partitioned_bgp_config(
             _BGP_CAPABILITIES[capability] for capability in session.capabilities
         ],
         "bgp_peer_type": _BGP_PEER_TYPES[session.relationship],
+        "hold_timer": session.hold_timer_s,
+        "keepalive_timer": session.keepalive_timer_s,
         "tcp_window_size_bytes": session.tcp_window_size_bytes,
     }
     if advertisements:

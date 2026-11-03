@@ -11,6 +11,8 @@ from taac.abstractions.compatibility.legacy_ebb_binding import (
     IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
 )
 from taac.abstractions.compatibility.legacy_ebb_topology import (
+    EBB_IXIA_BGP_HOLD_TIMER_S,
+    EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
     EBGP_REMOTE_AS,
     IBGP_REMOTE_AS,
 )
@@ -56,6 +58,8 @@ _IPV6_UPDATE_PACKING_IXIA_BGP_SESSION = IxiaBgpSessionIntent(
         IxiaBgpCapability.IPV4_UNICAST,
         IxiaBgpCapability.IPV6_UNICAST,
     ),
+    hold_timer_s=EBB_IXIA_BGP_HOLD_TIMER_S,
+    keepalive_timer_s=EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
 )
 
 IPV6_UPDATE_PACKING_EBGP_PEER_GROUP = BgpPeerGroup(

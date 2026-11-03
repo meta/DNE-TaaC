@@ -198,6 +198,9 @@ from taac.tasks.setup_base_configs_task import (
 from taac.tasks.verify_best_path_changes_task import (
     VerifyBestPathChangesTask,
 )
+from taac.tasks.rbb_state_audit_task import (
+    RbbStateAuditTask,
+)
 
 TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     AristaDaemonControlTask,
@@ -261,6 +264,7 @@ TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     RbbSrv6CounterDeltaTask,
     RbbSrv6DirectRouteTask,
     RbbSrv6VerifyTask,
+    RbbStateAuditTask,
 ]
 
 # Add internal tasks only when not in OSS mode

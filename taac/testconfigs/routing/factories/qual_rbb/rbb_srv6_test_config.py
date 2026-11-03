@@ -12,7 +12,8 @@ topology-compiler path, keeping the OSS slice self-contained.
 Physical wiring (DUT hostnames, core port-channels, IXIA edges/ports) is derived
 from the run's ``circuit_info.csv`` via ``bgp_rbb_topology.load_rbb_topology``.
 Read-only factory inspection has a documentation-only fallback; live traffic
-requires explicit wiring so a user can safely declare any valid port layout.
+and DUT bootstrap require explicit wiring so a user can safely declare any
+valid port layout.
 
 Control-plane/data-plane confirmation runs as registered tasks (§5.4). The IXIA
 generator side is provisioned by the lab's IXIA session and asserted via the
@@ -77,7 +78,9 @@ def _resolve_topology(
         )
     if topology is None:
         topology = load_rbb_topology(
-            allow_placeholder=not include_traffic,
+            # Documentation wiring is safe only for non-mutating inspection.
+            # Both live IXIA and --setup-duts act on physical interfaces.
+            allow_placeholder=not (include_traffic or C.SETUP_DUTS_ENABLED),
             require_ixia=include_traffic,
         )
     else:

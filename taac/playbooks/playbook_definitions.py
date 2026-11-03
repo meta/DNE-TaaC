@@ -31234,51 +31234,9 @@ _SC9_EBGP_PREFIX_POOLS: t.List[str] = [
 ]
 
 
-# Ceiling on REAL ECMP sets (>= _SC9_MIN_ECMP_WIDTH wide) at any sample.
-#
-# Two observations bound this, and neither is a guess. The first fully clean
-# single-drain run peaked at 12 multi-way groups (and zero width-1 groups) for a
-# 75.6s plateau, against a steady state of exactly 2 -- corroborated by the
-# device's own ECMP high watermark moving 7 -> 12 across the same window, an
-# independent max-over-time counter that cannot miss a sub-sample peak. The
-# worst peak ever recorded on this topology is 27, from the ten-cycle run whose
-# cycles re-withdrew mid-recovery; that is a pathological shape this playbook no
-# longer produces, but 32 clears even it.
-#
-# So: 2.7x the clean observation, above the worst contaminated one, 8x under the
-# topology's structural maximum of 128*2+2 = 258, and 256x under the device's
-# 8,192-entry EcmpLevel2 table. Stated plainly because an earlier version of
-# this comment claimed "~5x" against a peak of 6 that a later, cleaner run
-# superseded -- the margin is real but it is 2.7x, not 5x.
-#
-# ★ NOW DERIVED FROM A COMPLETE FIVE-CYCLE RUN, which is the first one there has
-# ever been. Five clean draws peaked at ELEVEN multi-way sets (plus a single
-# width-1), against twelve total nexthop groups; the one earlier clean draw, at
-# one cycle, peaked at 12. So the distribution is tight and -- the part that
-# matters -- the peak does NOT grow with cycle count.
-#
-# That falsified the reasoning behind an interim raise to 64. The argument was
-# that N cycles is N draws so the expected maximum climbs with N, anchored on a
-# reading of 20 from a two-and-a-bit-cycle run. But that 20 was not a clean
-# draw: it was taken while the drain was dying mid-transition with the restore
-# ALSO failing, so the device was in a non-recovered state when the maximum
-# landed. Discard it and the observations are 11 and 12.
-#
-# 32 is ~2.9x the five-cycle peak, still 8x under the topology's structural
-# maximum of 258 and 256x under the device's 8,192-entry table. 64 would need
-# fragmentation to go six-fold worse than anything observed before it said a
-# word, which is not a gate.
-#
-# Being honest about what this number is: it is FITTED to observation, not
-# derived from hardware, and it exists to catch an order-of-magnitude explosion.
-# The claim itself rests on the calibration-free assertions -- settled at exactly
-# 2 per AFI, no groups left unprogrammed, and RIB-level recovery to the
-# discovered baseline.
-_SC9_MAX_MULTIWAY_GROUPS = 32
-
 # The number of distinct ECMP sets this topology can structurally produce: one
-# per eBGP peer per AFI, plus the two converged sets. Used as the bound on how
-# far the device-maintained ECMP high watermark may climb ACROSS the drain.
+# per eBGP peer per AFI, plus the two converged sets. This bounds both sampled
+# multi-way groups and the device-maintained high-watermark delta.
 #
 # A structural bound, not a calibrated one, and labelled as such: the clean
 # single-drain run moved that watermark by 5, so 258 is ~50x that observation
@@ -31596,8 +31554,8 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
                 # uncontaminated run, and the coverage-bearing bound is the
                 # hardware-capacity postcheck.
                 min_ecmp_width=_SC9_MIN_ECMP_WIDTH,
-                # Bound the transient on REAL ECMP sets -- see the constant.
-                max_multiway_groups=_SC9_MAX_MULTIWAY_GROUPS,
+                # Use the topology-derived bound for real ECMP sets.
+                max_multiway_groups=_SC9_STRUCTURAL_MAX_ECMP_SETS,
                 # SC9's FIRST claim, and until now the only one untested: 5,000
                 # routes from 128 peers install as ONE ECMP set per AFI. Every
                 # other verdict on this task is a maximum over the run, so a

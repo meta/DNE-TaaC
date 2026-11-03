@@ -127,10 +127,10 @@ from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.thrift_types import Params, PointInTimeHealthCheck
 
 # Services SERVICE_RESTART_CHECK monitors on agent-restart playbooks.
-# Modeled on Meta's ``SERVICES_TO_MONITOR_DURING_AGENT_RESTART = [coop,
-# fsdb, qsfp_service]`` (taac/health_checks/constants.py) — the "stable
-# through an agent bounce" set — minus ``coop``, which ships with the
-# Meta-internal FBOSS image but may not be active on OSS FBOSS DUT
+# Modeled on Meta's ``SERVICES_TO_MONITOR_DURING_AGENT_RESTART = [fsdb,
+# qsfp_service]`` (taac/health_checks/constants.py) — the "stable
+# through an agent bounce" set. ``coop`` is not monitored: it ships with
+# the Meta-internal FBOSS image but may not be active on OSS FBOSS DUT
 # images (unit exists but ``ActiveState=inactive``). Plus the two
 # services these playbooks intentionally restart (``fboss_sw_agent``,
 # ``fboss_hw_agent@0``) so the check also verifies they came back up.

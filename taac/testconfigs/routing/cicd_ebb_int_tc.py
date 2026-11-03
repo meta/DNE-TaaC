@@ -12,9 +12,6 @@ Playbook list. Catalog governance lives in
 """
 
 from taac.abstractions.physical_inventory import (
-    BAG011_ASH6,
-    BAG012_ASH6,
-    BAG013_ASH6,
     NRQEB006_ASH6,
     NRQEB007_ASH6,
     NRQEB008_ASH6,
@@ -39,13 +36,11 @@ from taac.constants import (
 )
 from taac.testconfigs.routing.factories.bgp_ebb_characteristic import (
     create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config,
-    create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config,
     create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config,
     create_bgp_ebb_characteristic_performance_scaling_test_config,
     create_bgp_ebb_characteristic_route_churn_processing_test_config,
     create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config,
     create_bgp_ebb_characteristic_transient_memory_route_scale_test_config,
-    create_bgp_ebb_queue_memory_monitor_test_config,
     create_bgp_ebb_separable_policy_evaluation_test_config,
     create_bgp_ebb_update_packing_test_config,
 )
@@ -300,36 +295,7 @@ NRQEB009_SC8_POLICY_EVALUATION_TEST_CONFIG_UG = _with_testbed_isolation_bypass(
 )
 
 
-# Legacy retained scale-and-characteristic selectors. They stay registered for
-# compatibility but are not the first-wave Conveyor bindings above.
-BAG011_QUEUE_MEMORY_MONITOR_TEST_CONFIG_UG = (
-    create_bgp_ebb_queue_memory_monitor_test_config(
-        BAG011_ASH6,
-        enable_update_group=True,
-        name_override="BAG011_QUEUE_MEMORY_MONITOR_TEST_CONFIG_UG",
-        profile=_OPENR_STANDALONE,
-    )
-)
-
-BAG012_UPDATE_PACKING_TEST_CONFIG_UG = create_bgp_ebb_update_packing_test_config(
-    BAG012_ASH6,
-    enable_update_group=True,
-    name_override="BAG012_UPDATE_PACKING_TEST_CONFIG_UG",
-    profile=_OPENR_STANDALONE,
-)
-
-BAG013_BOUNDED_ECMP_SETS_TEST_CONFIG_UG = (
-    create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
-        BAG013_ASH6,
-        enable_update_group=True,
-        name_override="BAG013_BOUNDED_ECMP_SETS_TEST_CONFIG_UG",
-        profile=_OPENR_STANDALONE,
-    )
-)
-
-
 __all__ = [
-    "BAG011_QUEUE_MEMORY_MONITOR_TEST_CONFIG_UG",
     "NRQEB007_SC6_CHURN_PROCESSING_TEST_CONFIG_UG",
     "NRQEB007_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST_CONFIG_UG",
     "NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
@@ -338,8 +304,6 @@ __all__ = [
     "NRQEB008_SC5_UPDATE_PACKING_TEST_CONFIG_UG",
     "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
     "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG",
-    "BAG012_UPDATE_PACKING_TEST_CONFIG_UG",
-    "BAG013_BOUNDED_ECMP_SETS_TEST_CONFIG_UG",
     "NRQEB009_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
     "NRQEB009_SC9_BOUNDED_ECMP_SETS_TEST_CONFIG_UG",
     "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",

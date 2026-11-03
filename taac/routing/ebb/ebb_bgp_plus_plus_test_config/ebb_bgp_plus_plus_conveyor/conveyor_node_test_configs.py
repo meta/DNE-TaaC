@@ -1,45 +1,7 @@
 # pyre-unsafe
-"""Aggregated EBB BGP++ conveyor node TestConfig list.
+"""Aggregated BGP++ EBB TestConfigs owned by the NRQEB Conveyor fleet."""
 
-Exposes ``EBB_BGP_PLUS_PLUS_CONVEYOR_NODE_TEST_CONFIGS`` with the scheduled
-NRQEB006/NRQEB007/NRQEB008/NRQEB009 entries first. Retained BAG010 selectors and
-other ad-hoc qualification configs are appended to the same registry list for
-CLI resolution, but are not Conveyor-scheduled.
-
-Previously this aggregation lived in the package ``__init__.py``,
-which meant the eager TestConfig imports ran on *any* attribute
-access under ``ebb_bgp_plus_plus_conveyor`` (e.g. importing one
-constant from ``.conveyor_constants``). On strict Python that
-pulled in every bag-conveyor file and closed a circular import
-via ``playbook_definitions`` ↔ ``testconfigs.routing.ebb``. Moving
-the aggregation here keeps the package ``__init__`` side-effect
-free; consumers that need the aggregated list import it from this
-module directly.
-"""
-
-# Durable ad-hoc scale-and-characteristic selectors. The BAG variants remain
-# registered for manual comparison after the scheduled waves moved to NRQEB;
-# their runtime names are distinct from the Conveyor selectors.
-from taac.testconfigs.routing.adhoc_bgp_ebb_characteristic import (
-    BAG010_ASH6_SC1_EGRESS_PEER_SCALE_TEST_UPDATE_GROUP_CONFIG,
-    BAG010_ASH6_SC2_CONSTANT_ATTRIBUTE_STORAGE_INGRESS_TEST_UPDATE_GROUP_CONFIG,
-    BAG010_ASH6_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST_UPDATE_GROUP_CONFIG,
-    BAG010_ASH6_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_UPDATE_GROUP_CONFIG,
-    BAG010_ASH6_SC5_UPDATE_PACKING_TEST_UPDATE_GROUP_CONFIG,
-    BAG010_ASH6_SC6_CHURN_PROCESSING_TEST_UPDATE_GROUP_CONFIG,
-    BAG012_ASH6_EBB20_SC4_QUALIFICATION_TEST_CONFIG_UG,
-    BAG012_ASH6_EBB22_SC6_QUALIFICATION_TEST_CONFIG_UG,
-    BAG012_ASH6_EBB23_SC8_POLICY_EVALUATION_TEST_CONFIG_UG,
-    BAG013_ASH6_SC9_BOUNDED_ECMP_SETS_TEST_UPDATE_GROUP_CONFIG,
-)
-
-# The Conveyor bindings and retained Stage 1 UG and scale counterparts live in
-# ``cicd_ebb_int_tc.py``. Every scheduled entry has an inline
-# ``CONVEYOR: dne_routing / <node>`` marker at its definition site.
 from taac.testconfigs.routing.cicd_ebb_int_tc import (
-    BAG011_QUEUE_MEMORY_MONITOR_TEST_CONFIG_UG,
-    BAG012_UPDATE_PACKING_TEST_CONFIG_UG,
-    BAG013_BOUNDED_ECMP_SETS_TEST_CONFIG_UG,
     NRQEB006_SC2_CONSTANT_ATTRIBUTE_STORAGE_INGRESS_TEST_CONFIG_UG,
     NRQEB006_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_CONFIG_UG,
     NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
@@ -58,240 +20,22 @@ from taac.testconfigs.routing.cicd_ebb_int_tc import (
     NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
 )
 
-# Migrated to the routing framework in Diffs 2 + 3 (Wave 1 Struct-Init):
-# BGP_UG_NEW_PEER_JOIN_TEST_CONFIG (bag012 UG) + the two BAG013 conveyor
-# TestConfigs (spec 2.1.1 initial-dump + 2.7.2 sustained-link-flap; renamed to
-# BAG013_ASH6_BGP_UG_INITIAL_DUMP_IDENTICAL_ROUTES_TEST_CONFIG +
-# BAG013_ASH6_BGP_UG_SUSTAINED_LINK_FLAP_TEST_CONFIG at the Python level, but
-# the internal TestConfig ``name`` field is preserved verbatim as
-# ``BAG013_ASH6_BGP_CONVEYOR_TEST`` / ``..._UPDATE_GROUP`` so the golden
-# manifest is byte-wise identical) now live in
-# testconfigs/routing/qual_bgp_update_group.py; import via that path.
-from taac.testconfigs.routing.qual_bgp_update_group import (
-    BAG011_ASH6_BGP_UG_PEER_LIFECYCLE_TEST_CONFIG,
-    BAG012_ASH6_BGP_UG_DISRUPTION_RECOVERY_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_ADD_PEER_DYNAMIC_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_BACKPRESSURE_TOPOLOGY_SMOKE_CONFIG,
-    BAG013_ASH6_BGP_UG_BEST_PATH_CHANGE_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_CPU_QUANT_UG_OFF_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_CPU_QUANT_UG_ON_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_DUAL_STACK_ISOLATION_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_EDGE_CASES_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_INITIAL_DUMP_IDENTICAL_ROUTES_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_MULTIPLE_GROUPS_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_NOTIFICATION_ISOLATION_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_REPEATED_PEER_FLAPS_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_SCALE_WITHDRAW_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_SIMULTANEOUS_DISRUPTIONS_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_STAGGERED_STARTUP_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_SUSTAINED_LINK_FLAP_TEST_CONFIG,
-    BGP_UG_BACKPRESSURE_TEST_CONFIG,
-    BGP_UG_NEW_PEER_JOIN_TEST_CONFIG,
-)
 
-
-# Aggregated list of every TestConfig registered with the routing framework's
-# Netcastle registry. Three groups:
-#   1. CONVEYOR configs — the 8 Stage 1 configs (UG and non-UG), 4 first-wave
-#      scale-and-characteristic configs, and the EBB-21 second-wave config from
-#      ``cicd_ebb_int_tc.py`` that are scheduled by
-#      ``dne_routing.conveyor_config.cconf`` (see the ``CONVEYOR:`` markers in
-#      that file for the per-node mapping).
-#   2. RETAINED configs — 4 scale-and-characteristic configs held for later
-#      onboarding.
-#   3. AD-HOC configs — BGP++ UG qualification testconfigs that are runnable
-#      via Netcastle CLI but not (yet) wired into a conveyor node.
 EBB_BGP_PLUS_PLUS_CONVEYOR_NODE_TEST_CONFIGS = [
-    # Stage 1 — runtime-balanced full-scale playbooks on each scheduled device.
     NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
     NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
     NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
     NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
-    # Stage 1 UG counterparts for promotion gating and A/B comparison.
     NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
     NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
     NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
     NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
-    # First promotion-gating scale-and-characteristic wave — one node per device.
     NRQEB006_SC2_CONSTANT_ATTRIBUTE_STORAGE_INGRESS_TEST_CONFIG_UG,
     NRQEB007_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST_CONFIG_UG,
     NRQEB008_SC1_EGRESS_PEER_SCALE_TEST_CONFIG_UG,
     NRQEB009_SC9_BOUNDED_ECMP_SETS_TEST_CONFIG_UG,
-    # Second promotion-gating wave; serialized after EBB-17 on NRQEB008.
     NRQEB008_SC5_UPDATE_PACKING_TEST_CONFIG_UG,
-    # Second promotion-gating wave on NRQEB006 and NRQEB007. Each node is
-    # serialized only after the first-wave node on the same physical device.
     NRQEB006_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_CONFIG_UG,
     NRQEB007_SC6_CHURN_PROCESSING_TEST_CONFIG_UG,
-    # NRQEB009 EBB-23 onboarding target. CLI-resolvable for E2E, not scheduled.
     NRQEB009_SC8_POLICY_EVALUATION_TEST_CONFIG_UG,
-    # Legacy retained scale-and-characteristic selectors; these are not the
-    # first-wave Conveyor bindings above.
-    BAG011_QUEUE_MEMORY_MONITOR_TEST_CONFIG_UG,
-    BAG012_UPDATE_PACKING_TEST_CONFIG_UG,
-    BAG013_ASH6_SC9_BOUNDED_ECMP_SETS_TEST_UPDATE_GROUP_CONFIG,
-    BAG013_BOUNDED_ECMP_SETS_TEST_CONFIG_UG,
-    # BAG012 qualification-only EBB23 paired policy sweep. Not scheduled.
-    BAG012_ASH6_EBB23_SC8_POLICY_EVALUATION_TEST_CONFIG_UG,
-    # BGP++ Update Group "new peer join" qualification (specs 2.4.1 + 2.4.2
-    # + 2.4.3 combined into one TestConfig with 3 playbooks sharing the
-    # 21-eBGP + 4-iBGP testbed). Ad-hoc; not yet wired into a conveyor stage
-    # (do NOT schedule until manually verified on the device).
-    BGP_UG_NEW_PEER_JOIN_TEST_CONFIG,
-    # BGP++ UG Backpressure & Blocking Behavior qualification (specs 2.3.1 +
-    # 2.3.2 + 2.3.3 + 2.3.4 combined into one TestConfig with 4 playbooks
-    # sharing the EBB full-scale topology on bag013). Ad-hoc; not in conveyor.
-    BGP_UG_BACKPRESSURE_TEST_CONFIG,
-    # Topology-smoke sibling -- 30-min longevity hold on the same testbed,
-    # paired with --skip-teardown --skip-ixia-cleanup so the DUT + IXIA
-    # session stay live for hands-on inspection. Ad-hoc; not in conveyor.
-    BAG013_ASH6_BGP_UG_BACKPRESSURE_TOPOLOGY_SMOKE_CONFIG,
-    # BGP++ UG peer-lifecycle qualification (specs 2.2.1 peer-down, 2.2.2
-    # reconnect shadow-RIB, 2.2.3 sustained-churn) on bag011.ash6; select one
-    # with --regex 'bgp_ug_<usecase>'. Ad-hoc; not scheduled on a conveyor
-    # stage (do NOT schedule until 2.2.1/2.2.2 are unblocked).
-    BAG011_ASH6_BGP_UG_PEER_LIFECYCLE_TEST_CONFIG,
-    # Canonical BAG012 EBB full-scale Update Group 2.7 suite. Ad-hoc; not in
-    # conveyor stages.
-    BAG012_ASH6_BGP_UG_DISRUPTION_RECOVERY_TEST_CONFIG,
-    # bag013.ash6 (ad-hoc, not in conveyor stages).
-    # ``_UPDATE_GROUP`` variant adds the Update Group qualification 2.7.2
-    # sustained-link-flap playbook (rotates flapping the 3 IXIA ports on
-    # independent cadences, asserts no cross-group BGP session disruption)
-    # plus the 2.1.1 initial-dump-identical-routes playbook (full parity
-    # with eb03.lab.ash6).
-    BAG013_ASH6_BGP_UG_INITIAL_DUMP_IDENTICAL_ROUTES_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_SUSTAINED_LINK_FLAP_TEST_CONFIG,
-    # bag010.ash6 SC1 egress peer-scale sweep. Ad-hoc: resolvable via
-    # --test-config, not wired into a conveyor node. UG-only (all SC run UG).
-    BAG010_ASH6_SC1_EGRESS_PEER_SCALE_TEST_UPDATE_GROUP_CONFIG,
-    # bag010.ash6 SC2 constant attribute storage (char-2, INGRESS-ONLY) — the
-    # BAG012 varying-combinations engine made ingress-only + non-vacuous: 8 eBGP
-    # advertise 800K paths accepted into RIB (route_registry cleared) with no
-    # egress peers; sweeps unique attribute combinations (100K→800K)
-    # and gates memory constancy + a received-count acceptance gate. Ad-hoc;
-    # runnable via --test-config, not yet wired into a conveyor node.
-    BAG010_ASH6_SC2_CONSTANT_ATTRIBUTE_STORAGE_INGRESS_TEST_UPDATE_GROUP_CONFIG,
-    # bag010.ash6 SC3 transient memory (char-3) — the former SC2 route-scale
-    # sweep WITH egress (eBGP=2 ingress + iBGP=500 egress, resolvable/advertised),
-    # sweeps the ingress route count (10K→50K) and gates on the transient
-    # (peak-minus-stable) memory (dedup rides along), update-group enabled.
-    # Ad-hoc; runnable via --test-config, not yet wired into a conveyor node.
-    BAG010_ASH6_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST_UPDATE_GROUP_CONFIG,
-    # bag010.ash6 SC4 transient memory (char-4) — the INGRESS complement of SC1:
-    # sweeps the eBGP ingress sender count (per AF, each n → 2*n eBGP peers) at a
-    # fixed iBGP egress fan-out + fixed route count, routes resolvable/advertised,
-    # and gates on the transient (peak-minus-stable) memory staying ~flat as the
-    # sender count grows. Update-group enabled. Ad-hoc; runnable via --test-config,
-    # not yet wired into a conveyor node.
-    BAG010_ASH6_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_UPDATE_GROUP_CONFIG,
-    # bag010.ash6 SC5 maximally-packed UPDATEs (char-5) — bag010 mirror of the
-    # BAG012 update-packing test: 10 eBGP senders inject a route set with
-    # identical attributes, 1 iBGP peer captures what the DUT re-advertises, and
-    # every UPDATE is grouped by normalized attributes and checked for maximal
-    # fill. Both gates (packing floor, capture/parse integrity) are BLOCKING --
-    # they were already enforced as bare raises before being registered.
-    # Update-group enabled. Ad-hoc; runnable via --test-config, not wired into a
-    # conveyor node.
-    BAG010_ASH6_SC5_UPDATE_PACKING_TEST_UPDATE_GROUP_CONFIG,
-    # bag010.ash6 SC6 churn processing P(N) (char-6) — convergence time vs route
-    # scale. Reuses the EB02 churn P(N) engine (iBGP-injection IPv6-only, exact
-    # 100-route churn, sweep total route scale 5K→50K) with bag010 device setup
-    # (nexthop gflag + CRF cleared). The targeted ingress and complete egress fan-out
-    # produce one cross-port latency with a 30s per-phase ceiling; queue-backpressure
-    # is monitored separately. Update-group is enabled in the managed base config.
-    # Ad-hoc; runnable via --test-config, not yet wired into a conveyor node.
-    BAG010_ASH6_SC6_CHURN_PROCESSING_TEST_UPDATE_GROUP_CONFIG,
-    # Temporary BAG012 qualification selectors for the corrected EBB20/SC4
-    # and EBB22/SC6 implementations. They are CLI-resolvable but not scheduled.
-    BAG012_ASH6_EBB20_SC4_QUALIFICATION_TEST_CONFIG_UG,
-    BAG012_ASH6_EBB22_SC6_QUALIFICATION_TEST_CONFIG_UG,
-    # BGP++ UG "edge cases" qualification (spec 2.9) on bag013.ash6. Bundles
-    # the section-2.9 adversarial scenarios on the shared EBB full-scale
-    # topology (2.9.7 empty-group live today; 2.9.1/2.9.2/2.9.3/2.9.4/2.9.6
-    # land incrementally). Ad-hoc; not wired into a conveyor stage (do NOT
-    # schedule until manually verified on the device). Select a scenario with
-    # ``--regex 'bgp_ug_<usecase>'``.
-    BAG013_ASH6_BGP_UG_EDGE_CASES_TEST_CONFIG,
-    # BGP++ UG 2.9.2 Simultaneous Disruptions on bag013.ash6 -- its own WITH_OPEN_R
-    # TestConfig (the IGP-instability track needs a running Open/R daemon). 30-min
-    # run. Ad-hoc; NOT wired into a conveyor stage (do NOT schedule until manually
-    # verified on the device).
-    BAG013_ASH6_BGP_UG_SIMULTANEOUS_DISRUPTIONS_TEST_CONFIG,
-    # BGP++ UG 2.9.4 Dual-Stack Isolation on bag013.ash6 -- its own WITH_OPEN_R
-    # TestConfig (per-AFI PS-gauge distribution needs Open/R-resolved next-hops so
-    # the DUT advertises). The IPv6 distribution checks failed on the old bag011
-    # binary (bgpcpp IPv6 next-hop defect); bag013's fixed binary should clear them.
-    # Ad-hoc; NOT wired into a conveyor stage (do NOT schedule until manually
-    # verified on the device).
-    BAG013_ASH6_BGP_UG_DUAL_STACK_ISOLATION_TEST_CONFIG,
-    # BGP++ UG 2.9.6 Staggered Peer Startup on bag013.ash6 -- its own WITHOUT_OPEN_R
-    # TestConfig using the next-hop-self resolution infra (D113330327) so the iBGP
-    # next-hops resolve and the DUT advertises with no Open/R daemon. Distribution is
-    # STRICT per-peer (criteria 1-2 uniform on both AFIs + criterion-3 v4 delta;
-    # HW-validated on bag013). Ad-hoc; NOT wired into a conveyor stage (do NOT
-    # schedule until manually verified on the device). Select with
-    # ``--regex 'bgp_ug_staggered_startup'``.
-    BAG013_ASH6_BGP_UG_STAGGERED_STARTUP_TEST_CONFIG,
-    # BGP++ UG 2.9.1 Best-Path Change During Active Distribution on bag013.ash6 --
-    # its own WITHOUT_OPEN_R TestConfig using the next-hop-self resolution infra
-    # (D113330327). Two eBGP competing sets advertise the same 500 v4 prefixes with
-    # different AS-PATH lengths (the DNE-approved discriminator); converge-to-Set-B
-    # is measure-first, the adversarial no-crash/stability substance lands. Ad-hoc;
-    # NOT wired into a conveyor stage (do NOT schedule until manually verified on the
-    # device). Select with ``--regex 'bgp_ug_best_path_change'``.
-    BAG013_ASH6_BGP_UG_BEST_PATH_CHANGE_TEST_CONFIG,
-    # BGP++ UG 2.9.8 Quantifying CPU reduction on bag013.ash6 -- TWO WITHOUT_OPEN_R
-    # + next-hop-self TestConfigs (UG off vs on) running the identical 1-hr dual-AFI
-    # (v4 + v6) eBGP churn workload and comparing CPU. Run UG_OFF first (baseline),
-    # then UG_ON (its comparison step reads the UG-off metrics file). Ad-hoc; NOT
-    # wired into a conveyor stage (do NOT schedule until manually verified on the
-    # device).
-    BAG013_ASH6_BGP_UG_CPU_QUANT_UG_OFF_TEST_CONFIG,
-    BAG013_ASH6_BGP_UG_CPU_QUANT_UG_ON_TEST_CONFIG,
-    # BGP++ UG 2.9.3 NOTIFICATION Sent to One Peer -> Group Isolation on
-    # bag013.ash6 -- its own WITHOUT_OPEN_R + next-hop-self TestConfig.
-    # StopKeepAlive on ONE eBGP session/AFI drives a DUT-originated
-    # Hold-Timer-Expired NOTIFICATION; the playbook verifies the drop is isolated
-    # to that peer, distribution to everyone else keeps working, and the peer
-    # re-syncs on ResumeKeepAlive. Dual-AFI. Ad-hoc; NOT wired into a conveyor
-    # stage (do NOT schedule until manually verified on the device). Select with
-    # ``--regex 'bgp_ug_notification_isolation'``.
-    BAG013_ASH6_BGP_UG_NOTIFICATION_ISOLATION_TEST_CONFIG,
-    # BGP++ UG 2.5.1 Multiple Groups Formed for Different Outbound Policies on
-    # bag013.ash6 -- its own WITHOUT_OPEN_R + next-hop-self TestConfig on the
-    # standard EBB_FULL_SCALE topology (BGP-MON not tested). Verifies each
-    # peer-group x AFI is its own update group, no cross-AFI leak, and 4 groups
-    # total; all checks STRICT (the +N distribution is convergence-polled). Ad-hoc;
-    # NOT wired into a conveyor stage (do NOT schedule until manually verified on
-    # the device). Select with ``--regex 'bgp_ug_multiple_groups_outbound_policies'``.
-    BAG013_ASH6_BGP_UG_MULTIPLE_GROUPS_TEST_CONFIG,
-    # BGP++ UG 2.5.2 Scale Withdraw: 10+ Peers in Same Group, Withdraw Routes on
-    # bag013.ash6 -- its own WITHOUT_OPEN_R + next-hop-self TestConfig on the
-    # standard EBB_FULL_SCALE topology (BGP-MON not tested). Advertises 1000 v6 eBGP
-    # routes to the large iBGP-v6 update group, then withdraws all 1000 at scale and
-    # asserts zero remain (no stale entries), no session flaps, and no crash; all
-    # checks STRICT (the received/removed PS deltas are convergence-polled). Ad-hoc;
-    # NOT wired into a conveyor stage (do NOT schedule until manually verified on the
-    # device). Select with ``--regex 'bgp_ug_scale_withdraw_10plus_peers'``.
-    BAG013_ASH6_BGP_UG_SCALE_WITHDRAW_TEST_CONFIG,
-    # BGP++ UG 2.6.1 Repeated Peer Flaps -- Group Remains Stable on bag013.ash6 --
-    # its own WITHOUT_OPEN_R + next-hop-self TestConfig. Rapidly flaps the SAME 32
-    # eBGP sessions/AFI x50 while churning routes from the remaining peers, then
-    # verifies the update group re-forms with all 140 members/AFI, distribution
-    # reaches every peer (incl the flapped 32) via a 200-route iBGP-side inject, no
-    # crash / no bit-allocation corruption (composite proxy), bounded VmHWM growth +
-    # load. Ad-hoc; NOT wired into a conveyor stage (do NOT schedule until manually
-    # verified on the device). Select with ``--regex 'bgp_ug_repeated_peer_flaps'``.
-    BAG013_ASH6_BGP_UG_REPEATED_PEER_FLAPS_TEST_CONFIG,
-    # BGP++ UG 2.4.4 New Peer Added Dynamically via addPeer API on bag013.ash6 --
-    # its own TestConfig on the shared UG_NEW_PEER_JOIN topology (which now carries a
-    # spare eBGP group whose DUT neighbor is absent from the static bgpcpp config; its
-    # /127 interface IP + IXIA session are still provisioned). Brings the spare IXIA
-    # session UP + asserts NOT Established (no DUT neighbor -- proving addPeers is
-    # causal), calls addPeers, asserts it establishes + joins the EB-FA-V6 update
-    # group + gets the full dump, injects 50 more prefixes, then delPeers cleanup.
-    # Ad-hoc; NOT wired into a conveyor stage (do NOT schedule until manually verified
-    # on the device). Select with ``--regex 'bgp_ug_add_peer_dynamic'``.
-    BAG013_ASH6_BGP_UG_ADD_PEER_DYNAMIC_TEST_CONFIG,
 ]

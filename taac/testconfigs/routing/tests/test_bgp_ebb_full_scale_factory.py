@@ -20,10 +20,7 @@ from taac.constants import (
     BgpPlusPlusProfile,
     TESTBED_ISOLATION_BYPASS_TAG,
 )
-from taac.testconfigs.routing import (
-    cicd_ebb_int_tc,
-    qual_bgp_update_group,
-)
+from taac.testconfigs.routing import cicd_ebb_int_tc
 from taac.testconfigs.routing.factories import (
     bgp_ebb_full_scale as factory,
 )
@@ -686,15 +683,3 @@ class StuckIxiaSessionRecoveryTest(unittest.TestCase):
         self.assertNotEqual(
             "bgp_ixia_session_recovery", self._last_custom_step_name(cold_start)
         )
-
-    def test_cases_without_device_group_toggle_skip_session_recovery(self) -> None:
-        """UG suite cases never enable the IXIA device groups in setup, so their
-        peers are not guaranteed up when setup ends."""
-        config = (
-            qual_bgp_update_group.BAG012_ASH6_BGP_UG_DISRUPTION_RECOVERY_TEST_CONFIG
-        )
-        for playbook in config.playbooks or []:
-            with self.subTest(playbook=playbook.name):
-                self.assertNotEqual(
-                    "bgp_ixia_session_recovery", self._last_custom_step_name(playbook)
-                )

@@ -17187,7 +17187,17 @@ def gen_snake_playbooks(
         )
         checks = [port_state_check]
         if not skip_lldp_check:
-            checks.append(create_lldp_check())
+            # LLDP neighbors can only reappear after the port is up, so give the
+            # LLDP check the same opt-in retries as the port-state check.
+            checks.append(
+                create_lldp_check()
+                if flap_recovery_check_retry_count is None
+                else create_lldp_check(
+                    retry_count=flap_recovery_check_retry_count,
+                    retry_delay_seconds=flap_recovery_check_retry_delay_seconds,
+                    retry_delay_multiplier=1.0,
+                )
+            )
         return checks
 
     # Opt-in retries for the half-interface-toggle checks that run right after

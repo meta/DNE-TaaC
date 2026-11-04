@@ -1431,23 +1431,6 @@ def _graceful_restart_kwargs(
     }
 
 
-class _IxiaBgpTimerKwargs(t.TypedDict, total=False):
-    hold_timer: int
-    keepalive_timer: int
-
-
-def _ixia_bgp_timer_kwargs(
-    device_group: BoundDeviceGroup,
-) -> _IxiaBgpTimerKwargs:
-    peer_group = device_group.peer_group
-    if not isinstance(peer_group, BgpPeerGroup):
-        return {}
-    return {
-        "hold_timer": peer_group.ixia_session.hold_timer_s,
-        "keepalive_timer": peer_group.ixia_session.keepalive_timer_s,
-    }
-
-
 def _resolved_peer_prefix_length(
     bound: BoundTopology,
     device_group: BoundDeviceGroup,
@@ -2000,7 +1983,6 @@ def _ebb_full_scale_ibgp_plane_device_groups(
                 local_as_4_bytes=args.ibgp_remote_asn,
                 enable_4_byte_local_as=True,
                 tcp_window_size_bytes=v6_dc.slow_peer_tcp_window_size_bytes,
-                **_ixia_bgp_timer_kwargs(v6_dc),
                 **_graceful_restart_kwargs(v6_dc, established_default=False),
                 bgp_capabilities=[ixia_types.BgpCapability.IpV6Unicast],
                 bgp_peer_type=ixia_types.BgpPeerType.IBGP,
@@ -2028,7 +2010,6 @@ def _ebb_full_scale_ibgp_plane_device_groups(
                 local_as_4_bytes=args.ibgp_remote_asn,
                 enable_4_byte_local_as=True,
                 tcp_window_size_bytes=v6_mp.slow_peer_tcp_window_size_bytes,
-                **_ixia_bgp_timer_kwargs(v6_mp),
                 **_graceful_restart_kwargs(v6_mp, established_default=False),
                 bgp_capabilities=[ixia_types.BgpCapability.IpV6Unicast],
                 bgp_peer_type=ixia_types.BgpPeerType.IBGP,
@@ -2051,7 +2032,6 @@ def _ebb_full_scale_ibgp_plane_device_groups(
                 local_as_4_bytes=args.ibgp_remote_asn,
                 enable_4_byte_local_as=True,
                 tcp_window_size_bytes=v4_dc.slow_peer_tcp_window_size_bytes,
-                **_ixia_bgp_timer_kwargs(v4_dc),
                 **_graceful_restart_kwargs(v4_dc, established_default=False),
                 bgp_capabilities=[ixia_types.BgpCapability.IpV4Unicast],
                 bgp_peer_type=ixia_types.BgpPeerType.IBGP,
@@ -2080,7 +2060,6 @@ def _ebb_full_scale_ibgp_plane_device_groups(
                 local_as_4_bytes=args.ibgp_remote_asn,
                 enable_4_byte_local_as=True,
                 tcp_window_size_bytes=v4_mp.slow_peer_tcp_window_size_bytes,
-                **_ixia_bgp_timer_kwargs(v4_mp),
                 **_graceful_restart_kwargs(v4_mp, established_default=False),
                 bgp_capabilities=[ixia_types.BgpCapability.IpV4Unicast],
                 bgp_peer_type=ixia_types.BgpPeerType.IBGP,
@@ -2173,7 +2152,6 @@ def _ebb_authored_leaf_bgp_config(
         "bgp_capabilities": capabilities,
         "bgp_peer_type": peer_type,
         "tcp_window_size_bytes": device_group.slow_peer_tcp_window_size_bytes,
-        **_ixia_bgp_timer_kwargs(device_group),
     }
     route_scales = _route_scales(bound, device_group)
     if route_scales:
@@ -2257,7 +2235,6 @@ def _ebb_full_scale_basic_port_configs(
                         local_as_4_bytes=args.ebgp_remote_asn,
                         enable_4_byte_local_as=True,
                         tcp_window_size_bytes=(ebgp_v6.slow_peer_tcp_window_size_bytes),
-                        **_ixia_bgp_timer_kwargs(ebgp_v6),
                         bgp_capabilities=[ixia_types.BgpCapability.IpV6Unicast],
                         bgp_peer_type=ixia_types.BgpPeerType.EBGP,
                         **_graceful_restart_kwargs(ebgp_v6, established_default=True),
@@ -2291,7 +2268,6 @@ def _ebb_full_scale_basic_port_configs(
                         local_as_4_bytes=args.ebgp_remote_asn,
                         enable_4_byte_local_as=True,
                         tcp_window_size_bytes=(ebgp_v4.slow_peer_tcp_window_size_bytes),
-                        **_ixia_bgp_timer_kwargs(ebgp_v4),
                         bgp_capabilities=[ixia_types.BgpCapability.IpV4Unicast],
                         bgp_peer_type=ixia_types.BgpPeerType.EBGP,
                         **_graceful_restart_kwargs(ebgp_v4, established_default=True),
@@ -2368,7 +2344,6 @@ def _ebb_full_scale_basic_port_configs(
                             tcp_window_size_bytes=(
                                 bgpmon.slow_peer_tcp_window_size_bytes
                             ),
-                            **_ixia_bgp_timer_kwargs(bgpmon),
                             **_graceful_restart_kwargs(
                                 bgpmon, established_default=False
                             ),
@@ -2726,7 +2701,8 @@ def _ug_new_peer_join_device_group_config(
                 ixia_types.BgpPeerType.EBGP if is_ebgp else ixia_types.BgpPeerType.IBGP
             ),
             bgp_capabilities=[ixia_types.BgpCapability.IpV6Unicast],
-            **_ixia_bgp_timer_kwargs(device_group),
+            hold_timer=peer_group.hold_timer_s,
+            keepalive_timer=peer_group.keepalive_timer_s,
             route_scales=_ug_new_peer_join_route_scales(bound, device_group),
             **_graceful_restart_kwargs(device_group, established_default=True),
         ),
@@ -3216,7 +3192,6 @@ def _ipv6_update_packing_device_group_config(
                 if device_group.role == "ebgp"
                 else ixia_types.BgpPeerType.IBGP
             ),
-            **_ixia_bgp_timer_kwargs(device_group),
             route_scales=_ipv6_update_packing_route_scales(bound, device_group),
         ),
     )
@@ -3490,7 +3465,6 @@ def _egress_peer_scale_device_group_config(
             else ixia_types.BgpPeerType.IBGP
         ),
         "tcp_window_size_bytes": device_group.slow_peer_tcp_window_size_bytes,
-        **_ixia_bgp_timer_kwargs(device_group),
     }
     if device_group.role == "ebgp":
         bgp_params["route_scales"] = _route_scales(
@@ -3986,7 +3960,6 @@ def _bounded_ecmp_child_device_group_config(
             else ixia_types.BgpPeerType.IBGP
         ),
         "tcp_window_size_bytes": parent.slow_peer_tcp_window_size_bytes,
-        **_ixia_bgp_timer_kwargs(parent),
     }
     if parent.role == "ebgp":
         advertisement = child.prefix_advertisements[0]

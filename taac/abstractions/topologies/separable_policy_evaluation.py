@@ -20,8 +20,6 @@ from taac.abstractions.compatibility.legacy_ebb_binding import (
     IXIA_EBGP_IC_PARENT_NETWORK_V6,
 )
 from taac.abstractions.compatibility.legacy_ebb_topology import (
-    EBB_IXIA_BGP_HOLD_TIMER_S,
-    EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
     EBGP_REMOTE_AS,
 )
 from taac.abstractions.routing_semantics import PeerRelationship
@@ -31,7 +29,6 @@ from taac.abstractions.topology import (
     DeviceGroupSpec,
     EndpointSpec,
     FormulaicPrefixSource,
-    IxiaBgpSessionIntent,
     IxiaPortAssignment,
     LogicalTopology,
     NextHopIntent,
@@ -65,20 +62,13 @@ SEPARABLE_POLICY_EVALUATION_PARENT_NETWORKS_IXIA03 = {
 }
 SEPARABLE_POLICY_EVALUATION_AS_NUMBERS = {"ebgp": EBGP_REMOTE_AS}
 
-_SEPARABLE_POLICY_EVALUATION_IXIA_BGP_SESSION = IxiaBgpSessionIntent(
-    hold_timer_s=EBB_IXIA_BGP_HOLD_TIMER_S,
-    keepalive_timer_s=EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
-)
-
 SEPARABLE_POLICY_EVALUATION_EBGP_V6_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_EBGP_V6,
     remote_asn="ebgp",
-    ixia_session=_SEPARABLE_POLICY_EVALUATION_IXIA_BGP_SESSION,
 )
 SEPARABLE_POLICY_EVALUATION_EBGP_V4_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_EBGP_V4,
     remote_asn="ebgp",
-    ixia_session=_SEPARABLE_POLICY_EVALUATION_IXIA_BGP_SESSION,
 )
 SEPARABLE_POLICY_EVALUATION_PEER_GROUPS = {
     peer_group.name: peer_group

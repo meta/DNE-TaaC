@@ -2,15 +2,8 @@
 
 import ipaddress
 from collections import defaultdict
-from collections.abc import Callable
-from functools import wraps
-from typing import ParamSpec
 
 from ixia.ixia import types as ixia_types
-from taac.abstractions.compatibility.legacy_ebb_topology import (
-    EBB_IXIA_BGP_HOLD_TIMER_S,
-    EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
-)
 from taac.constants import BgpPlusPlusProfile
 from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.types import (
@@ -18,53 +11,7 @@ from taac.test_as_a_config.types import (
     BgpConfig,
     DeviceGroupConfig,
     IpAddressesConfig,
-    TestConfig,
 )
-
-
-_P = ParamSpec("_P")
-
-
-def enforce_ebb_ixia_bgp_timers(
-    factory: Callable[_P, TestConfig],
-) -> Callable[_P, TestConfig]:
-    @wraps(factory)
-    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> TestConfig:
-        config = factory(*args, **kwargs)
-        if config.basic_port_configs is None:
-            return config
-        return config(
-            basic_port_configs=[
-                port_config(
-                    device_group_configs=[
-                        device_group(
-                            v4_bgp_config=(
-                                device_group.v4_bgp_config(
-                                    hold_timer=EBB_IXIA_BGP_HOLD_TIMER_S,
-                                    keepalive_timer=EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
-                                )
-                                if device_group.v4_bgp_config is not None
-                                else None
-                            ),
-                            v6_bgp_config=(
-                                device_group.v6_bgp_config(
-                                    hold_timer=EBB_IXIA_BGP_HOLD_TIMER_S,
-                                    keepalive_timer=EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
-                                )
-                                if device_group.v6_bgp_config is not None
-                                else None
-                            ),
-                        )
-                        for device_group in port_config.device_group_configs or []
-                    ]
-                )
-                if port_config.device_group_configs is not None
-                else port_config
-                for port_config in config.basic_port_configs
-            ]
-        )
-
-    return wrapped
 
 
 def _create_ibgp_plane_device_groups(

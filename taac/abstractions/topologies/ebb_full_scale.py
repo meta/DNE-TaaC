@@ -64,8 +64,6 @@ from taac.abstractions.compatibility.legacy_ebb_topology import (
     EBB_DEVICE_PER_PEER_MAX_ROUTE_LIMIT,
     EBB_DEVICE_PREFIX_LIMIT,
     EBB_DEVICE_ROUTE_LIMIT,
-    EBB_IXIA_BGP_HOLD_TIMER_S,
-    EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
     EBGP_PEER_COUNT_V4,
     EBGP_PEER_COUNT_V6,
     EBGP_REMOTE_AS,
@@ -87,7 +85,6 @@ from taac.abstractions.topology import (
     ExplicitNextHopSource,
     FormulaicNextHopSource,
     FormulaicPrefixSource,
-    IxiaBgpSessionIntent,
     IxiaDeviceGroupChild,
     IxiaPortAssignment,
     LogicalTopology,
@@ -212,40 +209,30 @@ _EBB_DIVERSE_NHG_REQUIRED_PEER_COUNT = (
     + EBB_DIVERSE_NHG_GROUP_COUNT * EBB_DIVERSE_NHG_EXCLUDED_PEERS_PER_GROUP
 )
 
-_EBB_IXIA_BGP_SESSION = IxiaBgpSessionIntent(
-    hold_timer_s=EBB_IXIA_BGP_HOLD_TIMER_S,
-    keepalive_timer_s=EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
-)
-
 EBGP_V6_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_EBGP_V6,
     remote_asn="ebgp",
     enable_graceful_restart=True,
-    ixia_session=_EBB_IXIA_BGP_SESSION,
 )
 EBGP_V4_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_EBGP_V4,
     remote_asn="ebgp",
     enable_graceful_restart=True,
-    ixia_session=_EBB_IXIA_BGP_SESSION,
 )
 IBGP_V6_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_IBGP_V6,
     remote_asn="ibgp",
     enable_graceful_restart=False,
-    ixia_session=_EBB_IXIA_BGP_SESSION,
 )
 IBGP_V4_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_IBGP_V4,
     remote_asn="ibgp",
     enable_graceful_restart=False,
-    ixia_session=_EBB_IXIA_BGP_SESSION,
 )
 BGP_MON_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_BGP_MON,
     remote_asn="bgpmon",
     enable_graceful_restart=False,
-    ixia_session=_EBB_IXIA_BGP_SESSION,
 )
 
 EBB_PEER_GROUPS: dict[str, BgpPeerGroup] = {

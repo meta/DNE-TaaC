@@ -124,22 +124,6 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
         },
     )
 
-    def test_conveyor_ixia_bgp_timers_match_ebb_profile(self) -> None:
-        config = cicd_ebb_int_tc.NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG
-        bgp_configs = [
-            bgp
-            for port in config.basic_port_configs or []
-            for group in port.device_group_configs or []
-            for bgp in (group.v4_bgp_config, group.v6_bgp_config)
-            if bgp is not None
-        ]
-
-        self.assertTrue(bgp_configs)
-        self.assertEqual(
-            {(15, 5)},
-            {(bgp.hold_timer, bgp.keepalive_timer) for bgp in bgp_configs},
-        )
-
     def test_openr_mode_owns_testbed_isolation_policy(self) -> None:
         for profile, expected_bypass in (
             (BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R, True),

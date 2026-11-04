@@ -19,8 +19,6 @@ from taac.abstractions.compatibility.legacy_ebb_binding import (
     IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
 )
 from taac.abstractions.compatibility.legacy_ebb_topology import (
-    EBB_IXIA_BGP_HOLD_TIMER_S,
-    EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
     EBGP_REMOTE_AS,
     EGRESS_PEER_SCALE_SWEEP_PEER_COUNTS,
     IBGP_REMOTE_AS,
@@ -32,7 +30,6 @@ from taac.abstractions.topology import (
     DeviceGroupSpec,
     EndpointSpec,
     FormulaicPrefixSource,
-    IxiaBgpSessionIntent,
     IxiaPortAssignment,
     LogicalTopology,
     NextHopIntent,
@@ -73,34 +70,25 @@ EGRESS_PEER_SCALE_AS_NUMBERS = {
     "ibgp": IBGP_REMOTE_AS,
 }
 
-_EGRESS_PEER_SCALE_IXIA_BGP_SESSION = IxiaBgpSessionIntent(
-    hold_timer_s=EBB_IXIA_BGP_HOLD_TIMER_S,
-    keepalive_timer_s=EBB_IXIA_BGP_KEEPALIVE_TIMER_S,
-)
-
 EGRESS_PEER_SCALE_EBGP_V6_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_EBGP_V6,
     remote_asn="ebgp",
-    ixia_session=_EGRESS_PEER_SCALE_IXIA_BGP_SESSION,
 )
 EGRESS_PEER_SCALE_EBGP_V4_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_EBGP_V4,
     remote_asn="ebgp",
-    ixia_session=_EGRESS_PEER_SCALE_IXIA_BGP_SESSION,
 )
 EGRESS_PEER_SCALE_IBGP_V6_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_IBGP_V6,
     local_asn="ibgp",
     remote_asn="ibgp",
     enable_graceful_restart=False,
-    ixia_session=_EGRESS_PEER_SCALE_IXIA_BGP_SESSION,
 )
 EGRESS_PEER_SCALE_IBGP_V4_PEER_GROUP = BgpPeerGroup(
     name=PEERGROUP_IBGP_V4,
     local_asn="ibgp",
     remote_asn="ibgp",
     enable_graceful_restart=False,
-    ixia_session=_EGRESS_PEER_SCALE_IXIA_BGP_SESSION,
 )
 EGRESS_PEER_SCALE_PEER_GROUPS = {
     peer_group.name: peer_group

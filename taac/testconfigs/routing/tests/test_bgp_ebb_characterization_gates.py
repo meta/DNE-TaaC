@@ -6,7 +6,7 @@ import unittest
 from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
     build_fibagent_bgp_config_deploy_cmd,
 )
-from taac.abstractions.physical_inventory import BAG011_ASH6
+from taac.abstractions.physical_inventory import NRQEB007_ASH6
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_FIBAGENT_BGP_NHG_WATERMARK_HIGH,
     EBB_FIBAGENT_BGP_NHG_WATERMARK_LOW,
@@ -124,7 +124,7 @@ def _params(check: PointInTimeHealthCheck) -> dict[str, object]:
 class BgpEbbCharacterizationGatesTest(unittest.TestCase):
     def _config(self, enable_update_group: bool) -> TestConfig:
         return create_bgp_ebb_full_scale_test_config(
-            BAG011_ASH6,
+            NRQEB007_ASH6,
             name=(
                 "BAG011_CHARACTERIZATION_UG_TEST"
                 if enable_update_group
@@ -200,7 +200,7 @@ class BgpEbbCharacterizationGatesTest(unittest.TestCase):
         for enable_update_group in (False, True):
             with self.subTest(enable_update_group=enable_update_group):
                 config = create_bgp_ebb_full_scale_test_config(
-                    BAG011_ASH6,
+                    NRQEB007_ASH6,
                     name="BAG011_CANONICAL_EBGP_BASELINE_TEST",
                     playbooks_selected=["bgp_ebb_daemon_restart_playbook"],
                     enable_update_group=enable_update_group,
@@ -218,7 +218,7 @@ class BgpEbbCharacterizationGatesTest(unittest.TestCase):
         for enable_update_group in (False, True):
             with self.subTest(enable_update_group=enable_update_group):
                 config = create_bgp_ebb_full_scale_test_config(
-                    BAG011_ASH6,
+                    NRQEB007_ASH6,
                     name="BAG011_CANONICAL_EBGP_BASELINE_TEST",
                     playbooks_selected=["bgp_ebb_daemon_restart_playbook"],
                     enable_update_group=enable_update_group,

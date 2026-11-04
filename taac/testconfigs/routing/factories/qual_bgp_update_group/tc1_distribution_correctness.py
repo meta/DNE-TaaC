@@ -169,17 +169,13 @@ def build_bag_conveyor_test_config(
     builder wires only the eBGP + iBGP topology (``include_bgp_mon=False``)
     and defaults ``profile`` to ``WITHOUT_OPEN_R``.
 
-    DUT-agnostic across the bag010/011/012/013 EBB conveyor nodes: every
+    DUT-agnostic across compatible EBB inventories: every
     value is read from ``physical_inventory`` (device_name, dut_bgp_as, ixia_ports,
     bgpcpp_configerator_path), so cloning to a new bag node is a one-line
     lifecycle-binding change. Renamed from ``build_bag013_conveyor_test_config``
     (formerly bag013-hardcoded) during the tc9 edge-cases work;
     behavior-preserving, so existing bag013 goldens stay byte-identical.
     """
-    assert physical_inventory.device_name.startswith("bag"), (
-        f"bag conveyor topology builder targets bag* EBB conveyor nodes; "
-        f"got physical_inventory.device_name={physical_inventory.device_name!r}."
-    )
     assert physical_inventory.dut_bgp_as is not None, (
         "PhysicalInventory must have dut_bgp_as set"
     )

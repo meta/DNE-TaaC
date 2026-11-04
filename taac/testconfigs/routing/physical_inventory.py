@@ -7,10 +7,6 @@ New code imports from ``neteng.test_infra.dne.taac.abstractions.physical_invento
 
 from taac.abstractions.physical_inventory import (
     BAG002_SNC1,
-    BAG010_ASH6,
-    BAG011_ASH6,
-    BAG012_ASH6,
-    BAG013_ASH6,
     CTE_UCMP_QZD_PHYSICAL_INVENTORY,
     CTE_UCMP_STAND_ALONE_PHYSICAL_INVENTORY,
     EB01_LAB_ASH6,
@@ -38,10 +34,6 @@ from taac.abstractions.physical_inventory import (
 
 __all__ = (
     "BAG002_SNC1",
-    "BAG010_ASH6",
-    "BAG011_ASH6",
-    "BAG012_ASH6",
-    "BAG013_ASH6",
     "CTE_UCMP_QZD_PHYSICAL_INVENTORY",
     "CTE_UCMP_STAND_ALONE_PHYSICAL_INVENTORY",
     "EB_TEST_DEVICE",

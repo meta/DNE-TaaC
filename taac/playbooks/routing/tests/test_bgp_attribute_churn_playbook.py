@@ -29,10 +29,6 @@ from taac.abstractions.churn.specs import (
     ChurnWorkload,
 )
 from taac.abstractions.physical_inventory import (
-    BAG010_ASH6,
-    BAG011_ASH6,
-    BAG012_ASH6,
-    BAG013_ASH6,
     NRQEB006_ASH6,
     NRQEB007_ASH6,
     NRQEB008_ASH6,
@@ -1678,19 +1674,10 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             321, playbook_factory.call_args.kwargs["expected_established_sessions"]
         )
 
-    def test_ebb12_matches_bag010_and_nrqeb006_bound_artifacts(self) -> None:
+    def test_ebb12_matches_nrqeb006_bound_artifacts(self) -> None:
         profiles = (
             (
-                BAG010_ASH6,
                 NRQEB006_ASH6,
-                EBB_PARENT_NETWORKS,
-                EBB_NEXT_HOPS,
-                EBB_PARENT_NETWORKS["bgpmon_v6"],
-                EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
-            ),
-            (
-                NRQEB006_ASH6,
-                BAG010_ASH6,
                 EBB_PARENT_NETWORKS_IXIA03,
                 EBB_NEXT_HOPS_IXIA03,
                 EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
@@ -1700,7 +1687,6 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
 
         for (
             inventory,
-            counterpart,
             parent_networks,
             next_hops,
             expected_bgp_mon,
@@ -1722,7 +1708,6 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                 playbook = config.playbooks[0]
                 serialized = thrift_to_json(playbook)
                 self.assertIn(inventory.device_name, serialized)
-                self.assertNotIn(counterpart.device_name, serialized)
                 self.assertIn(f"{expected_bgp_mon}::/80", serialized)
                 self.assertNotIn(f"{forbidden_bgp_mon}::/80", serialized)
 
@@ -1803,53 +1788,31 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         self.assertEqual(750, items["ipv4"]["target_prefix_count"])
         self.assertEqual(750, items["ipv6"]["target_prefix_count"])
 
-    def test_automation_contract_matches_every_bag_nrq_inventory_pair(self) -> None:
-        inventory_pairs = (
-            (BAG010_ASH6, NRQEB006_ASH6),
-            (BAG011_ASH6, NRQEB007_ASH6),
-            (BAG012_ASH6, NRQEB008_ASH6),
-            (BAG013_ASH6, NRQEB009_ASH6),
-        )
-        profiles = (
-            (
-                EBB_PARENT_NETWORKS,
-                EBB_NEXT_HOPS,
-                EBB_PARENT_NETWORKS["bgpmon_v6"],
-                EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
-            ),
-            (
-                EBB_PARENT_NETWORKS_IXIA03,
-                EBB_NEXT_HOPS_IXIA03,
-                EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
-                EBB_PARENT_NETWORKS["bgpmon_v6"],
-            ),
-        )
-
-        for bag_inventory, nrq_inventory in inventory_pairs:
-            for inventory, (
-                parent_networks,
-                next_hops,
-                expected_bgp_mon,
-                forbidden_bgp_mon,
-            ) in zip((bag_inventory, nrq_inventory), profiles, strict=True):
-                with self.subTest(inventory=inventory.device_name):
-                    bound = _bound_full_scale_automation_artifact(
-                        inventory,
-                        parent_networks=parent_networks,
-                        next_hops=next_hops,
-                    )
-                    self.assertEqual(
-                        _CANONICAL_AUTOMATION_CONTRACT,
-                        _ebb_automation_contract(bound),
-                    )
-                    self.assertEqual(
-                        expected_bgp_mon,
-                        bound.parent_networks["bgpmon_v6"],
-                    )
-                    self.assertNotEqual(
-                        forbidden_bgp_mon,
-                        bound.parent_networks["bgpmon_v6"],
-                    )
+    def test_automation_contract_matches_every_nrq_inventory(self) -> None:
+        for inventory in (
+            NRQEB006_ASH6,
+            NRQEB007_ASH6,
+            NRQEB008_ASH6,
+            NRQEB009_ASH6,
+        ):
+            with self.subTest(inventory=inventory.device_name):
+                bound = _bound_full_scale_automation_artifact(
+                    inventory,
+                    parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+                    next_hops=EBB_NEXT_HOPS_IXIA03,
+                )
+                self.assertEqual(
+                    _CANONICAL_AUTOMATION_CONTRACT,
+                    _ebb_automation_contract(bound),
+                )
+                self.assertEqual(
+                    EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
+                    bound.parent_networks["bgpmon_v6"],
+                )
+                self.assertNotEqual(
+                    EBB_PARENT_NETWORKS["bgpmon_v6"],
+                    bound.parent_networks["bgpmon_v6"],
+                )
 
     def test_automation_contract_anchors_and_escapes_exact_ixia_names(self) -> None:
         contract = _CANONICAL_AUTOMATION_CONTRACT._replace(
@@ -1872,19 +1835,10 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             contract.exact_ebgp_route_regex(),
         )
 
-    def test_ebb05_uses_exact_route_handles_on_bag013_and_nrqeb009(self) -> None:
+    def test_ebb05_uses_exact_route_handles_on_nrqeb009(self) -> None:
         profiles = (
             (
-                BAG013_ASH6,
                 NRQEB009_ASH6,
-                EBB_PARENT_NETWORKS,
-                EBB_NEXT_HOPS,
-                EBB_PARENT_NETWORKS["bgpmon_v6"],
-                EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
-            ),
-            (
-                NRQEB009_ASH6,
-                BAG013_ASH6,
                 EBB_PARENT_NETWORKS_IXIA03,
                 EBB_NEXT_HOPS_IXIA03,
                 EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
@@ -1894,7 +1848,6 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
 
         for (
             inventory,
-            counterpart,
             parent_networks,
             next_hops,
             expected_bgp_mon,
@@ -1914,7 +1867,6 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                 playbook = config.playbooks[0]
                 serialized = thrift_to_json(playbook)
                 self.assertIn(inventory.device_name, serialized)
-                self.assertNotIn(counterpart.device_name, serialized)
 
                 workload = next(
                     _step_payload(step)
@@ -1949,26 +1901,18 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                     workload["parent_prefixes_to_ignore"],
                 )
 
-    def test_ebb09_and_ebb16_use_exact_handles_on_bag_and_nrq(self) -> None:
+    def test_ebb09_and_ebb16_use_exact_handles_on_nrq(self) -> None:
         cases = (
             (
                 "bgp_ebb_multipath_group_oscillation_playbook",
-                BAG012_ASH6,
                 NRQEB008_ASH6,
             ),
             (
                 "bgp_ebb_nexthop_group_count_threshold_playbook",
-                BAG013_ASH6,
                 NRQEB009_ASH6,
             ),
         )
         profiles = (
-            (
-                EBB_PARENT_NETWORKS,
-                EBB_NEXT_HOPS,
-                EBB_PARENT_NETWORKS["bgpmon_v6"],
-                EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
-            ),
             (
                 EBB_PARENT_NETWORKS_IXIA03,
                 EBB_NEXT_HOPS_IXIA03,
@@ -1977,18 +1921,13 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             ),
         )
 
-        for playbook_name, bag_inventory, nrq_inventory in cases:
-            for inventory, counterpart, (
+        for playbook_name, inventory in cases:
+            for (
                 parent_networks,
                 next_hops,
                 expected_bgp_mon,
                 forbidden_bgp_mon,
-            ) in zip(
-                (bag_inventory, nrq_inventory),
-                (nrq_inventory, bag_inventory),
-                profiles,
-                strict=True,
-            ):
+            ) in profiles:
                 with self.subTest(
                     playbook=playbook_name,
                     inventory=inventory.device_name,
@@ -2005,7 +1944,6 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                     playbook = config.playbooks[0]
                     serialized = thrift_to_json(playbook)
                     self.assertIn(inventory.device_name, serialized)
-                    self.assertNotIn(counterpart.device_name, serialized)
                     self.assertIn(f"{expected_bgp_mon}::/80", serialized)
                     self.assertNotIn(f"{forbidden_bgp_mon}::/80", serialized)
 

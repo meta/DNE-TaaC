@@ -5,7 +5,7 @@ import unittest
 from taac.abstractions.eos_bgpcpp_setup_tasks import (
     create_bgpcpp_logging_setup_task,
 )
-from taac.abstractions.physical_inventory import BAG010_ASH6
+from taac.abstractions.physical_inventory import NRQEB006_ASH6
 from taac.testconfigs.routing.factories.bgp_ebb_characteristic import (
     _validate_sc6_startup_order,
     create_bgp_ebb_characteristic_route_churn_processing_test_config,
@@ -22,7 +22,7 @@ from taac.testconfigs.routing.util.bgp_ebb_constants import (
 from taac.test_as_a_config import types as taac_types
 
 _SC6 = create_bgp_ebb_characteristic_route_churn_processing_test_config(
-    BAG010_ASH6,
+    NRQEB006_ASH6,
     enable_update_group=True,
 )
 _NEXTHOP_IFACE_STATE_FLAG = "bgp_resolve_nexthops_from_interface_state"
@@ -97,10 +97,10 @@ class Sc6TestbedDrivenNameTest(unittest.TestCase):
 
     def test_name_derives_from_device_with_ug(self) -> None:
         config = create_bgp_ebb_characteristic_route_churn_processing_test_config(
-            BAG010_ASH6, enable_update_group=True
+            NRQEB006_ASH6, enable_update_group=True
         )
         self.assertEqual(
-            config.name, "BAG010_ASH6_SC6_CHURN_PROCESSING_TEST_UPDATE_GROUP"
+            config.name, "NRQEB006_ASH6_SC6_CHURN_PROCESSING_TEST_UPDATE_GROUP"
         )
 
 
@@ -193,19 +193,19 @@ class Sc6ChurnSweepTest(unittest.TestCase):
         params = _custom_step_params(_SC6)
         self.assertEqual(
             params.get("ibgp_receiver_source_pairs"),
-            {"2401:db00:e50d:11:9::10": "2401:db00:e50d:11:9::11"},
+            {"2401:db00:e50d:33:9::10": "2401:db00:e50d:33:9::11"},
         )
         egress_pairs = params.get("ebgp_receiver_source_pairs")
         self.assertIsInstance(egress_pairs, dict)
         assert isinstance(egress_pairs, dict)
         self.assertEqual(len(egress_pairs), 100)
         self.assertEqual(
-            egress_pairs.get("2401:db00:e50d:11:8::11"),
-            "2401:db00:e50d:11:8::10",
+            egress_pairs.get("2401:db00:e50d:33:8::11"),
+            "2401:db00:e50d:33:8::10",
         )
         self.assertEqual(
-            egress_pairs.get("2401:db00:e50d:11:8::d7"),
-            "2401:db00:e50d:11:8::d6",
+            egress_pairs.get("2401:db00:e50d:33:8::d7"),
+            "2401:db00:e50d:33:8::d6",
         )
 
     def test_capture_window_bounded_but_above_fail_ceiling(self) -> None:
@@ -224,7 +224,7 @@ class Sc6ChurnSweepTest(unittest.TestCase):
     def test_every_sweep_scale_must_leave_an_unchurned_control_slice(self) -> None:
         with self.assertRaisesRegex(ValueError, "larger than churn_count"):
             create_bgp_ebb_scaling_route_churn_prefix_test_config(
-                BAG010_ASH6,
+                NRQEB006_ASH6,
                 name="INVALID_SC6_GEOMETRY",
                 ebgp_peer_count=2,
                 ibgp_peer_count=2,

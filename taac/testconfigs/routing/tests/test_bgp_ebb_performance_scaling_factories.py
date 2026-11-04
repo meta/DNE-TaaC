@@ -19,8 +19,6 @@ from taac.abstractions.eos_bgpcpp_setup_tasks import (
     POLICY_EVALUATION_SOURCE_CONFIG_PATH,
 )
 from taac.abstractions.physical_inventory import (
-    BAG010_ASH6,
-    BAG012_ASH6,
     NRQEB006_ASH6,
     NRQEB007_ASH6,
     NRQEB008_ASH6,
@@ -71,7 +69,7 @@ _ROUTER_ID_ASSIGN = "c['router_id']="
 class IngressPeerScaleIxiaGeometryTest(unittest.TestCase):
     def test_disjoint_compact_geometry_is_forwarded_to_ixia_builder(self) -> None:
         config = create_bgp_ebb_scaling_ingress_peer_scale_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             name="SC4_GEOMETRY_TEST",
             ingress_peer_counts=[1, 2, 4, 8, 16],
             ibgp_peer_count=500,
@@ -140,32 +138,31 @@ def _custom_step_params(config) -> list:
 class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
     """The perf-scaling factory is physical-inventory-driven: the TestConfig name derives
     from ``physical_inventory.device_name`` and ``router_id`` is optional so physical inventories that
-    rely on the device-default router-id (bag010) work without pinning one."""
+    rely on the device-default router-id work without pinning one."""
 
     def test_name_derives_from_device(self) -> None:
         # The name is device-derived: {DEVICE}_SC1_EGRESS_PEER_SCALE_TEST. A
-        # non-bag010 device (bag012) exercises the derivation independently of
-        # the bag010 default.
+        # second NRQ inventory exercises the derivation independently.
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG012_ASH6
+            NRQEB008_ASH6
         )
-        self.assertEqual(config.name, "BAG012_ASH6_SC1_EGRESS_PEER_SCALE_TEST")
+        self.assertEqual(config.name, "NRQEB008_ASH6_SC1_EGRESS_PEER_SCALE_TEST")
 
-    def test_bag010_builds_without_router_id(self) -> None:
-        # bag010 has no router_id — the factory must not require one, and the
+    def test_nrqeb006_builds_without_router_id(self) -> None:
+        # NRQEB006 has no router_id — the factory must not require one, and the
         # name must derive from the physical_inventory device_name.
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6
+            NRQEB006_ASH6
         )
-        self.assertEqual(config.name, "BAG010_ASH6_SC1_EGRESS_PEER_SCALE_TEST")
+        self.assertEqual(config.name, "NRQEB006_ASH6_SC1_EGRESS_PEER_SCALE_TEST")
 
     def test_update_group_appends_suffix(self) -> None:
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6, enable_update_group=True
+            NRQEB006_ASH6, enable_update_group=True
         )
         self.assertEqual(
             config.name,
-            "BAG010_ASH6_SC1_EGRESS_PEER_SCALE_TEST_UPDATE_GROUP",
+            "NRQEB006_ASH6_SC1_EGRESS_PEER_SCALE_TEST_UPDATE_GROUP",
         )
 
     def test_nrqeb006_sc2_uses_primary_ixia03_addresses_and_port(self) -> None:
@@ -268,13 +265,13 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
     def test_sc2_empty_parent_networks_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing required keys"):
             create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-                BAG010_ASH6,
+                NRQEB006_ASH6,
                 parent_networks={},
             )
 
     def test_sc2_explicit_parent_networks_support_unknown_ixia_chassis(self) -> None:
         unknown_chassis = replace(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             primary_ixia_chassis_ip="2401:db00:2066:3036::ffff",
         )
 
@@ -292,7 +289,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
 
     def test_sc2_required_keys_are_derived_from_canonical_maps(self) -> None:
         unknown_chassis = replace(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             primary_ixia_chassis_ip="2401:db00:2066:3036::ffff",
         )
         first_canonical_map = {
@@ -335,7 +332,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
             )
 
     def test_sc2_known_chassis_uses_only_its_canonical_keys(self) -> None:
-        legacy_chassis = BAG010_ASH6.primary_ixia_chassis_ip
+        legacy_chassis = NRQEB006_ASH6.primary_ixia_chassis_ip
         extended_other_chassis_map = {
             **EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
             "future_required": "2001:db8:ffff::",
@@ -399,13 +396,13 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
                     ixia_chassis_ip=unknown_chassis_ip,
                 )
 
-    def test_sc2_explicit_legacy_parent_networks_do_not_imply_direct_binding(
+    def test_sc2_explicit_parent_networks_do_not_imply_direct_binding(
         self,
     ) -> None:
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             parent_networks={
-                **EGRESS_PEER_SCALE_PARENT_NETWORKS,
+                **EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
                 "metadata": "ignored",
             },
         )
@@ -414,7 +411,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
         self.assertEqual(1, len(dut_endpoints))
         self.assertFalse(dut_endpoints[0].direct_ixia_connections)
         self.assertIn(
-            EGRESS_PEER_SCALE_PARENT_NETWORKS["ebgp_v6"],
+            EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03["ebgp_v6"],
             "\n".join(
                 task.params.json_params or "" for task in config.setup_tasks or []
             ),
@@ -711,8 +708,8 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
     def test_sc3_rejects_parent_networks_for_different_ixia_chassis(self) -> None:
         with self.assertRaisesRegex(ValueError, "do not match IXIA chassis"):
             create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
-                BAG010_ASH6,
-                parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
+                NRQEB006_ASH6,
+                parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS,
             )
 
     def test_nrqeb008_sc1_uses_primary_ixia03_addresses_and_ports(self) -> None:
@@ -759,7 +756,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
 
     def test_sc1_requires_complete_dual_stack_parent_network_map(self) -> None:
         cases = (
-            (BAG012_ASH6, EGRESS_PEER_SCALE_PARENT_NETWORKS),
+            (NRQEB008_ASH6, EGRESS_PEER_SCALE_PARENT_NETWORKS),
             (NRQEB008_ASH6, EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03),
         )
         required_keys = ("ebgp_v4", "ebgp_v6", "ibgp_v4", "ibgp_v6")
@@ -993,15 +990,15 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
         self.assertEqual(1, len(packing_steps))
         self.assertEqual(50000, packing_steps[0].get("min_advertised_nlri"))
 
-    def test_ebb23_bag012_is_ug_paired_and_non_vacuous(self) -> None:
+    def test_ebb23_nrqeb008_is_ug_paired_and_non_vacuous(self) -> None:
         config = create_bgp_ebb_separable_policy_evaluation_test_config(
-            BAG012_ASH6,
+            NRQEB008_ASH6,
             enable_update_group=True,
-            name_override="BAG012_ASH6_EBB23_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
+            name_override="NRQEB008_ASH6_EBB23_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
         )
 
         self.assertEqual(
-            "BAG012_ASH6_EBB23_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
+            "NRQEB008_ASH6_EBB23_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
             config.name,
         )
         self.assertEqual(
@@ -1009,7 +1006,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
             [playbook.name for playbook in config.playbooks or []],
         )
         self.assertEqual(
-            [("Ethernet3/36/1", "2401:db00:2066:303b::3001", "8/1")],
+            [("Ethernet3/35/1", "2401:db00:2066:3036::3003", "1/89")],
             [
                 (
                     connection.interface,
@@ -1025,7 +1022,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
             if task.task_name == "validate_bgpcpp_update_group_state"
         ]
         self.assertEqual(
-            [{"hostname": "bag012.ash6", "expect_enabled": True}],
+            [{"hostname": "nrqeb008.ash6", "expect_enabled": True}],
             update_group_validators,
         )
         self.assertEqual(
@@ -1137,7 +1134,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
         self.assertTrue(
             any(
                 task.task_name == "interface_ip_cleanup"
-                and _task_json_params(task)["interfaces"] == ["Ethernet3/36/1"]
+                and _task_json_params(task)["interfaces"] == ["Ethernet3/35/1"]
                 for task in config.teardown_tasks or []
             )
         )
@@ -1438,7 +1435,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
 
     def test_explicit_empty_ixia_overrides_are_preserved(self) -> None:
         config = create_bgp_ebb_scaling_performance_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             name="EMPTY_IXIA_OVERRIDES",
             egress_peer_counts=[1],
             endpoints=[],
@@ -1474,7 +1471,7 @@ class PerformanceScalingInterfaceIpCoverageTest(unittest.TestCase):
     """
 
     def _ibgp_interface_ip_peer_counts(self, config) -> list:
-        ibgp_iface = BAG010_ASH6.ixia_ports[1][0]
+        ibgp_iface = NRQEB006_ASH6.ixia_ports[1][0]
         counts = []
         for task in config.setup_tasks or []:
             if task.task_name != "interface_ip_configuration":
@@ -1486,7 +1483,7 @@ class PerformanceScalingInterfaceIpCoverageTest(unittest.TestCase):
 
     def test_ibgp_interface_covers_full_sweep(self) -> None:
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6
+            NRQEB006_ASH6
         )
         counts = self._ibgp_interface_ip_peer_counts(config)
         self.assertEqual(
@@ -1515,7 +1512,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
 
     def test_nexthop_resolution_gflag_enabled_via_managed_shell(self) -> None:
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6
+            NRQEB006_ASH6
         )
         matching = [
             p
@@ -1537,7 +1534,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
 
     def test_no_openr_ingress_only_config_uses_same_mode_invariant(self) -> None:
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         matching = [
@@ -1584,7 +1581,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
         test below pins.
         """
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         enabling = [
@@ -1602,7 +1599,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
 
     def test_update_group_state_uses_thrift_after_final_bgp_restart(self) -> None:
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         tasks = config.setup_tasks or []
@@ -1628,7 +1625,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
         self.assertEqual(1, len(validators))
         self.assertEqual(
             {
-                "hostname": BAG010_ASH6.device_name,
+                "hostname": NRQEB006_ASH6.device_name,
                 "expect_enabled": True,
             },
             validators[0][1],
@@ -1648,7 +1645,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
         iBGP peer count reaching zero is what keeps the DUT silent.
         """
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         sweep_steps = [
@@ -1686,7 +1683,7 @@ class ConstantAttributeStorageIngressAttributeDumpTest(unittest.TestCase):
 
     def test_attribute_dump_disabled(self) -> None:
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         sweep_steps = [
@@ -1716,7 +1713,7 @@ class PerformanceScalingRouteFilterClearTest(unittest.TestCase):
 
     def test_route_filter_cleared(self) -> None:
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6
+            NRQEB006_ASH6
         )
         clear_tasks = [
             task

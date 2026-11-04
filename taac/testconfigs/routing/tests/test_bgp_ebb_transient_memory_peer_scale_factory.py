@@ -13,14 +13,14 @@ from taac.testconfigs.routing.factories.bgp_ebb_characteristic import (
     create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config,
 )
 from taac.testconfigs.routing.physical_inventory import (
-    BAG010_ASH6,
-    BAG012_ASH6,
+    NRQEB006_ASH6,
+    NRQEB008_ASH6,
 )
 
 _GFLAG = "bgp_resolve_nexthops_from_interface_state"
 _INGRESS_PLAYBOOK_NAME = "Transient_Memory_Ingress_Peer_Scale"
 _SC4_UG = create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
-    BAG010_ASH6,
+    NRQEB006_ASH6,
     enable_update_group=True,
 )
 
@@ -66,18 +66,18 @@ class Sc4TestbedDrivenNameTest(unittest.TestCase):
     ``testbed.device_name`` and update-group appends the suffix."""
 
     def test_name_derives_from_device(self) -> None:
-        # A non-bag010 device (bag012) exercises the derivation independently.
+        # A second NRQ inventory exercises the derivation independently.
         config = create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
-            BAG012_ASH6
+            NRQEB008_ASH6
         )
         self.assertEqual(
-            config.name, "BAG012_ASH6_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST"
+            config.name, "NRQEB008_ASH6_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST"
         )
 
-    def test_bag010_update_group_appends_suffix(self) -> None:
+    def test_nrqeb006_update_group_appends_suffix(self) -> None:
         self.assertEqual(
             _SC4_UG.name,
-            "BAG010_ASH6_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_UPDATE_GROUP",
+            "NRQEB006_ASH6_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_UPDATE_GROUP",
         )
 
 
@@ -159,7 +159,7 @@ class Sc4InterfaceIpCoverageTest(unittest.TestCase):
         ]
 
     def test_ebgp_interface_covers_sweep_max(self) -> None:
-        counts = self._iface_peer_counts(_SC4_UG, BAG010_ASH6.ixia_ports[0][0])
+        counts = self._iface_peer_counts(_SC4_UG, NRQEB006_ASH6.ixia_ports[0][0])
         self.assertIn(max(_SC4_INGRESS_EBGP_PEER_COUNTS), counts)
 
     def test_ibgp_interface_is_v6_only(self) -> None:
@@ -167,7 +167,7 @@ class Sc4InterfaceIpCoverageTest(unittest.TestCase):
         # v6-only. Dual-stack lays 500 v6 + 500 v4 = 1000 secondaries on one
         # interface, overflowing Arista's ~500-secondary-per-interface ceiling,
         # so v6 iBGP peers past ~250 get no local source IP and stay IDLE.
-        ibgp_iface = BAG010_ASH6.ixia_ports[1][0]
+        ibgp_iface = NRQEB006_ASH6.ixia_ports[1][0]
         tasks = [
             p
             for p in _params_for(_SC4_UG, "interface_ip_configuration")
@@ -266,7 +266,7 @@ class Sc4DevicePeerSupersetTest(unittest.TestCase):
         # The peer list is spliced into bgpcpp_config by shell tasks; the highest
         # eBGP peer address index must reach the sweep max, not the first entry.
         cmds = self._all_setup_params(_SC4_UG)
-        ebgp_v6_base = "2401:db00:e50d:11:8"
+        ebgp_v6_base = "2401:db00:e50d:33:8"
         self.assertIn(ebgp_v6_base, cmds, "eBGP peers must be written to the device")
         max_n = max(_SC4_INGRESS_EBGP_PEER_COUNTS)
         # v6 peers step by 2 from ::11, so sender k lives at ::(11 + 2*(k-1)).

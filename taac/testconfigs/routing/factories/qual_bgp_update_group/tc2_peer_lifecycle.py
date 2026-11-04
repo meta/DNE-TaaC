@@ -166,10 +166,10 @@ def create_bgp_ug_peer_lifecycle_test_config(
     are best-effort and 2.2.3's 1-min flap cadence is infra-gated.
 
     Args:
-        physical_inventory: Device physical inventory (BAG011_ASH6 expected)
+        physical_inventory: Compatible EBB physical inventory
 
     Returns:
-        TestConfig wiring the 2.2.1/2.2.2/2.2.3 playbooks on the bag conveyor
+        TestConfig wiring the 2.2.1/2.2.2/2.2.3 playbooks on the EBB
         topology
     """
     bgp_mon_ignore_prefixes = [f"{IXIA_BGP_MON_IC_PARENT_NETWORK}::/80"]
@@ -275,11 +275,10 @@ def create_bgp_ug_peer_lifecycle_test_config(
 
     return build_bag_conveyor_test_config(
         physical_inventory,
-        # Explicit name matching the sibling UG qualification TestConfigs
-        # (e.g. BAG011_ASH6_BGP_UG_EDGE_CASES_TEST) and the golden-manifest
-        # convention -- NOT _derive_test_config_name (which drops _ASH6 and
-        # appends _CONFIG_UG). --test-config resolves against this .name.
-        name="BAG011_ASH6_BGP_UG_PEER_LIFECYCLE_TEST",
+        name=(
+            f"{physical_inventory.device_name.upper().replace('.', '_')}"
+            "_BGP_UG_PEER_LIFECYCLE_TEST"
+        ),
         playbooks=[
             peer_down_playbook,
             peer_reconnect_playbook,

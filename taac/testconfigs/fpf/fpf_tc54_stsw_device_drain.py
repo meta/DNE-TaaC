@@ -178,6 +178,14 @@ def create_fpf_tc54_test_config() -> TestConfig:
         prod_prefix_recovery=True,
         local_prod_prefixes=PROD_PREFIXES,
         impacted_planes_by_host=IMPACTED_PLANES_BY_HOST,
+        # Prechecks plus the STSW drain/reinjection sequence occupy the first
+        # ~240s.  Start strict steady-drain assertions after that intentional
+        # transition; otherwise transient remote-failure samples and the
+        # expected lane-0 prefix removal are misclassified as regressions even
+        # though every remote-failure tuple has recovered to zero.
+        convergence_settle_sec=300,
+        convergence_blip_mode="last_sample",
+        prod_prefix_settle_sec=300,
         # Lane 0 (stsw001.s001 = plane 0 = beth0) STAYS drained for the whole
         # longevity. Host-spray asserts beth0~0, and rib/fsdb/bulk/remote-failure
         # exempt lane 0; every other lane, the all-UP HRT plane-status check, and

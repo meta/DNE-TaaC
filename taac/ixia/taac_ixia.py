@@ -2185,6 +2185,30 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             return []
         return list(self.ixia_config.traffic_items or [])
 
+    def is_traffic_running(self) -> bool:
+        """Treat Keysight's statistics-start transition as running traffic.
+
+        On high-scale traffic, IxNetwork can report the global
+        ``IsTrafficRunning`` flag as false for several minutes while every
+        enabled item is already in ``startedWaitingForStats``. Retrying the
+        whole start path in that state re-applies and restarts the items,
+        preventing the statistics view from ever becoming ready.
+        """
+        if super().is_traffic_running():
+            return True
+        enabled_items = [item for item in self.get_traffic_items() if item.Enabled]
+        if enabled_items and all(
+            item.State in {"started", "startedWaitingForStats"}
+            for item in enabled_items
+        ):
+            self.logger.debug(
+                "Treating enabled IXIA traffic items in %s as running while "
+                "statistics initialize",
+                [item.State for item in enabled_items],
+            )
+            return True
+        return False
+
     def apply_traffic(self) -> None:
         """Serialize `Traffic.Apply()` against chassis CSV snapshots.
 

@@ -438,7 +438,15 @@ class ConfigureParallelBgpPeers(BaseTask):
                 gateway_starting_ip = config["gateway_starting_ip"]
                 gateway_increment_ip = config["gateway_increment_ip"]
                 interface_port_info = interface_to_port_info[interface]
-                vlan_id = config.get("vlan_id", interface_port_info.vlans[0])
+                if "vlan_id" in config:
+                    vlan_id = config["vlan_id"]
+                elif interface_port_info.vlans:
+                    vlan_id = interface_port_info.vlans[0]
+                else:
+                    raise ValueError(
+                        f"vlan_id is required for {interface} because the live "
+                        "port has no VLAN membership"
+                    )
                 retain_existing_vlan_addresses = config.get(
                     "retain_existing_vlan_addresses", True
                 )
@@ -763,10 +771,30 @@ class CoopRegisterPatcherTask(BaseTask):
         hostname = params["hostname"]
         config_names = params.get("config_names") or [params["config_name"]]
         patcher_name = params["patcher_name"]
+        patcher_desc = params.get("patcher_desc", "")
+        jq_program = params.get("jq_program")
+        driver = await async_get_device_driver(hostname)
+        if jq_program is not None:
+            if TAAC_OSS:
+                raise NotImplementedError(
+                    "generic jq COOP patchers are available only in Meta-internal TAAC"
+                )
+            coop_utils = importlib.import_module(
+                "neteng.test_infra.dne.taac.internal.coop_utils"
+            )
+            for config_name in config_names:
+                await coop_utils.async_register_jq_patcher(
+                    hostname=hostname,
+                    config_name=config_name,
+                    patcher_name=patcher_name,
+                    jq_program=jq_program,
+                    description=patcher_desc,
+                    persistent=True,
+                )
+            return
+
         py_func_name = params["py_func_name"]
         patcher_args = json.loads(params["patcher_args"])
-        patcher_desc = params.get("patcher_desc", "")
-        driver = await async_get_device_driver(hostname)
         for config_name in config_names:
             # pyre-fixme[16]: `AbstractSwitch` has no attribute
             #  `async_register_python_patcher`.

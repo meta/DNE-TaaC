@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, call, MagicMock, patch, PropertyMock
 
 from later.unittest import TestCase
 from neteng.fboss.ctrl.types import SwitchRunState
+from taac.driver import drivers_common
 from taac.driver.driver_constants import FbossSystemctlServiceName
 from taac.driver.fboss_switch import FbossSwitch
 from taac.health_checks.device_health_checks.wedge_agent_configured_health_check import (
@@ -30,6 +31,27 @@ class FbossSwitchTest(TestCase):
         self.switch = FbossSwitch(
             "test-switch.example.com", logging.getLogger(__name__)
         )
+
+    async def test_dsf_lab_smc_tier_authorizes_disruptive_method(self) -> None:
+        hostname = "rdsw004.u001.c086.ash6.tfbnw.net"
+        queried_tiers: list[str] = []
+
+        class TestSwitch:
+            def __init__(self) -> None:
+                self.hostname = hostname
+
+            @drivers_common.is_dne_test_device
+            async def disruptive_method(self) -> bool:
+                return True
+
+        def smc_hosts(tier: str) -> list[str]:
+            queried_tiers.append(tier)
+            return [hostname] if tier == "netcastle.lab.fboss.dsf" else []
+
+        with patch.object(drivers_common, "get_smc_hosts", side_effect=smc_hosts):
+            self.assertTrue(await TestSwitch().disruptive_method())
+
+        self.assertIn("netcastle.lab.fboss.dsf", queried_tiers)
 
     async def test_agent_config_reload_uses_async_client(self) -> None:
         client = AsyncMock()

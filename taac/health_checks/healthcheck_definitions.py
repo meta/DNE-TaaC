@@ -1579,6 +1579,32 @@ def create_dsf_fabric_reachability_check() -> PointInTimeHealthCheck:
     return PointInTimeHealthCheck(name=hc_types.CheckName.DSF_FABRIC_REACHABILITY_CHECK)
 
 
+def create_dsf_fsdb_session_check(
+    check_id: t.Optional[str] = None,
+) -> PointInTimeHealthCheck:
+    """Create the topology-wide DSF FSDB-session health check."""
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.DSF_FSDB_SESSION_CHECK,
+        check_id=check_id,
+    )
+
+
+def create_dsf_traffic_rebalance_check(
+    deviation_threshold_pct: int = 20,
+    check_id: t.Optional[str] = None,
+) -> PointInTimeHealthCheck:
+    """Verify fabric-port traffic remains within the allowed deviation."""
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.DSF_TRAFFIC_REBALANCE_CHECK,
+        input_json=thrift_to_json(
+            hc_types.DsfTrafficRebalanceHealthCheckIn(
+                deviation_threshold_pct=deviation_threshold_pct
+            )
+        ),
+        check_id=check_id,
+    )
+
+
 def create_dsf_pfc_check(
     json_params: t.Optional[t.Dict[str, t.Any]] = None,
     thresholds: t.Optional[t.List["hc_types.DsfPfcThreshold"]] = None,
@@ -2944,8 +2970,10 @@ def create_bgp_route_count_verification_check(
     """BGP_ROUTE_COUNT_VERIFICATION_CHECK — opaque pass-through with optional check_id.
 
     The check schema (descriptions_to_check / descriptions_to_ignore /
-    direction / expected_count / policy_type / etc.) varies enough across
-    callers that an opaque dict is the simplest factory shape.
+    direction / expected_count / policy_type, or absolute bgpcpp Loc-RIB
+    ``rib_prefix_ranges`` / ``expected_rib_prefix_count`` /
+    ``expected_rib_path_count``) varies enough across callers that an opaque
+    dict is the simplest factory shape.
 
     When called with no arguments (``json_params=None``), produces a bare
     PointInTime check (no ``check_params``), matching the previously-separate

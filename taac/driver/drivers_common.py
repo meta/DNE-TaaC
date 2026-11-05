@@ -18,6 +18,7 @@ from taac.driver.driver_constants import (
     DNE_LAB_SMC_TIER,
     DNE_REGRESSION_BASSET_POOL_NAME,
     DNE_STANDALONE_SMC_TIER,
+    FBOSS_DSF_LAB_SMC_TIER,
     FBOSS_LAB_SMC_TIER,
     IpAddress,
     NET_AI_DSF,
@@ -339,6 +340,7 @@ def is_dne_test_device(func: Callable) -> Callable:
             NET_AI_LAB_SMC_TIER,
             NET_AI_LAB_REGRESSION_SMC_TIER,
             FBOSS_LAB_SMC_TIER,
+            FBOSS_DSF_LAB_SMC_TIER,
         ]
         dne_test_devices: List[str] = []
         for smc_tier in smc_tiers:

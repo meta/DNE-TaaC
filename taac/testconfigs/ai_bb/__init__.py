@@ -60,6 +60,13 @@ from taac.testconfigs.ai_bb.mp3n_prefix_profiling_ixia_config import (
     HYBRID_PREFIX_ALL,
     NON_CONTIGUOUS_PREFIX_ALL,
 )
+from taac.testconfigs.ai_bb.rdsw004_c086_u001_ash6_fsdb_path_scale_test_config import (
+    RDSW004_C086_U001_ASH6_FSDB_PATH_SCALE,
+    RDSW004_C086_U001_ASH6_FSDB_PATH_SCALE_CONTROL_PLANE,
+)
+from taac.testconfigs.ai_bb.rdsw004_c086_u001_ash6_fsdb_stable_state_test_config import (
+    RDSW004_C086_U001_ASH6_FSDB_STABLE_STATE,
+)
 from taac.testconfigs.ai_bb.wedge400_ecmp_resource_testing_config import (
     RTSW001_L1003_C084_ECMP_RESOURCE_TESTING,
     RTSW001_U001_C081_ECMP_RESOURCE_TESTING,
@@ -92,6 +99,9 @@ __all__ = [
     "HYBRID_PREFIX_ALL",
     "NON_CONTIGUOUS_PREFIX_ALL",
     "RDSW004_C085_N001_SNC1_HARDENING_NODE",
+    "RDSW004_C086_U001_ASH6_FSDB_PATH_SCALE",
+    "RDSW004_C086_U001_ASH6_FSDB_PATH_SCALE_CONTROL_PLANE",
+    "RDSW004_C086_U001_ASH6_FSDB_STABLE_STATE",
     "RTSW001_L1003_C084_ECMP_RESOURCE_TESTING",
     "RTSW001_U001_C081_ECMP_RESOURCE_TESTING",
     "TEST_SNC1_C084_DSF_FR4_LITE_OPTICS",

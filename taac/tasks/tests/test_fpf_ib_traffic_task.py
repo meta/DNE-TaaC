@@ -12,6 +12,8 @@ from taac.tasks.fpf_ib_traffic_task import (
     build_ib_process_snapshot_cmd,
     build_ib_write_bw_cmd,
     DEFAULT_KEY_DESC,
+    FpfStartIbTrafficTask,
+    IbWriteBwProcess,
     launch_validated_ib_process,
     parse_background_pid,
     parse_ib_process_snapshot,
@@ -276,6 +278,34 @@ class FpfIbTrafficProcessValidationTest(unittest.IsolatedAsyncioTestCase):
                 ssh_run=ssh_run,
             )
 
+    async def test_binary_probe_stdout_is_not_masked_by_sush_banner(self) -> None:
+        ssh_run = AsyncMock(
+            return_value=(
+                4,
+                "NOT_EXECUTABLE\n",
+                "Meta authorized users only. Usage is subject to monitoring.",
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "NOT_EXECUTABLE"):
+            await validate_remote_ib_binary(
+                host="server.mwg2",
+                binary_path="/root/ib_write_bw",
+                ssh_run=ssh_run,
+            )
+
+    async def test_process_inventory_uses_transport_specific_exception(self) -> None:
+        ssh_run = AsyncMock(return_value=(255, "", "connection timed out"))
+
+        with self.assertRaises(task_module.IbProcessInventoryTransportError):
+            await validate_remote_ib_process(
+                host="server.mwg2",
+                role="server",
+                expected_cmd=self.expected_cmd,
+                ssh_run=ssh_run,
+                attempts=1,
+            )
+
     async def test_non_regular_remote_binary_fails(self) -> None:
         ssh_run = AsyncMock(return_value=(3, "NOT_REGULAR\n", ""))
 
@@ -410,6 +440,61 @@ class FpfIbTrafficProcessValidationTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(url, "https://fburl.com/traffic")
         register.assert_called_once_with("ods", "recovery", "https://fburl.com/traffic")
+
+    async def test_skip_ods_validation_returns_after_process_validation(self) -> None:
+        task = FpfStartIbTrafficTask()
+        task._ssh_run = AsyncMock(return_value=(0, "", ""))
+        process = IbWriteBwProcess(
+            pid=12345,
+            cmdline="/usr/bin/ib_write_bw --run_infinitely",
+            cgroup="0::/test;",
+        )
+        with (
+            patch.object(
+                task_module,
+                "validate_remote_ib_binary",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                task_module,
+                "launch_validated_ib_process",
+                new=AsyncMock(
+                    side_effect=[
+                        (0, "12345\n", ""),
+                        (0, "12346\n", ""),
+                    ]
+                ),
+            ),
+            patch.object(
+                task_module,
+                "validate_remote_ib_process",
+                new=AsyncMock(return_value=[process]),
+            ),
+            patch.object(
+                task_module,
+                "validate_ib_ods_egress",
+                new=AsyncMock(return_value=(["healthy"], "https://ods.example")),
+            ) as validate_ods,
+            patch.object(task_module.asyncio, "sleep", new=AsyncMock()) as sleep,
+        ):
+            await task.run(
+                {
+                    "server": "server.mwg2",
+                    "clients": ["client.mwg2"],
+                    "binary_path": "/usr/bin/ib_write_bw",
+                    "device": "mlx5_bveth0",
+                    "gid_index": 3,
+                    "settle_sec": 120,
+                    "process_validation_attempts": 1,
+                    "skip_ods_validation": True,
+                }
+            )
+
+        validate_ods.assert_not_awaited()
+        self.assertNotIn(
+            unittest.mock.call(120),
+            sleep.await_args_list,
+        )
 
 
 if __name__ == "__main__":

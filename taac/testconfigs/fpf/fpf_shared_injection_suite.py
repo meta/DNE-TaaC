@@ -35,6 +35,8 @@ Usage:
     --debug --continue-on-precheck-failure --skip-fboss-rsyslog
 """
 
+import ipaddress
+import json
 import os
 
 from taac.health_checks.healthcheck_definitions import (
@@ -100,6 +102,7 @@ from taac.testconfigs.fpf.fpf_hardening_common import (
     OBSERVER_GTSWS,
     skip_ib_traffic,
     skip_ssh_dependencies,
+    skip_twshared_ssh,
     SPRAY_HOSTS,
     TRIGGER_STSWS,
     VF_COLLECTOR_SUBNET,
@@ -145,6 +148,97 @@ RF_VF_GROUPS = fpf_rf_vf_groups(
     device_ids_by_vf=(HRT_VF_DEVICE_IDS if HRT_DEVICE_IDS != [0] else None),
 )
 
+_TWSHARED_SSH_CUSTOM_STEPS = frozenset(
+    {
+        "fpf_ensure_traffic",
+        "fpf_restart_ib_traffic",
+        "fpf_restart_hrt",
+        "fpf_nic_mstreg_paos",
+        "fpf_nic_mstreg_verify_link",
+        "fpf_nic_mstreg_flap",
+    }
+)
+
+
+def _custom_step_name(step) -> str | None:
+    params = step.step_params
+    if params is None or params.json_params is None:
+        return None
+    try:
+        return json.loads(params.json_params).get("custom_step_name")
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _strip_twshared_ssh_steps(playbooks: list) -> list[str]:
+    """Remove known GPU-host shell steps from every generated playbook."""
+    removed: list[str] = []
+    filtered_playbooks = []
+    for playbook in playbooks:
+        filtered_stages = []
+        for stage in playbook.stages:
+            retained = []
+            for step in stage.steps:
+                custom_name = _custom_step_name(step)
+                if custom_name in _TWSHARED_SSH_CUSTOM_STEPS:
+                    removed.append(f"{playbook.name}:{custom_name}")
+                else:
+                    retained.append(step)
+            filtered_stages.append(stage(steps=retained))
+        replacements = {"stages": filtered_stages}
+        for field_name in ("setup_steps", "cleanup_steps"):
+            steps = getattr(playbook, field_name, None)
+            if steps is None:
+                continue
+            retained = []
+            for step in steps:
+                custom_name = _custom_step_name(step)
+                if custom_name in _TWSHARED_SSH_CUSTOM_STEPS:
+                    removed.append(f"{playbook.name}:{custom_name}")
+                else:
+                    retained.append(step)
+            replacements[field_name] = retained
+        filtered_playbooks.append(playbook(**replacements))
+    playbooks[:] = filtered_playbooks
+    return removed
+
+
+def _use_recent_baseline_for_prod_prefix_prechecks(playbooks: list) -> None:
+    """Evaluate prechecks over recent collector history, not a sub-poll race.
+
+    The collectors run for 120 seconds before a playbook starts. A precheck can
+    begin less than one collector interval after the runner resets the test-case
+    timestamp; anchoring there intermittently yields zero samples despite a
+    healthy current state. Use the latest 120 seconds rather than the full setup
+    history: the shared suite intentionally runs disruptive playbooks back to
+    back, so a longer window carries a previous playbook's expected transition
+    into the next playbook and produces a false precheck failure. Postchecks
+    remain test-case-window scoped.
+    """
+    rewritten = []
+    for playbook in playbooks:
+        prechecks = []
+        for check in playbook.prechecks or []:
+            if (
+                check.check_id == "fpf_prod_hrt_prefix_stability_precheck"
+                and check.check_params is not None
+                and check.check_params.json_params is not None
+            ):
+                params = json.loads(check.check_params.json_params)
+                params["lookback_sec"] = 120
+                params["use_test_case_start_time"] = False
+                prechecks.append(
+                    check(
+                        check_params=check.check_params(
+                            json_params=json.dumps(params, sort_keys=True)
+                        )
+                    )
+                )
+            else:
+                prechecks.append(check)
+        rewritten.append(playbook(prechecks=prechecks))
+    playbooks[:] = rewritten
+
 
 def _ib_readiness_config(
     spray: list[str] | None,
@@ -167,7 +261,20 @@ PROD_PREFIX_HOST = GPU_HOSTS[0]
 # Production-prefix recovery remains a deliberately narrow dev0 canary, queried
 # from every GPU host. Bulk and remote-failure checks cover every HRT device.
 PROD_PREFIX_DEVICE_ID = 0
-PROD_TARGET_PREFIX = get_prefix(PROD_PREFIX_HOST, PROD_PREFIX_DEVICE_ID)
+
+
+def _prod_target_prefix() -> str:
+    configured = os.environ.get("TAAC_FPF_PROD_PREFIX", "").strip()
+    prefix = configured or get_prefix(PROD_PREFIX_HOST, PROD_PREFIX_DEVICE_ID)
+    network = ipaddress.ip_network(prefix, strict=True)
+    if network.version != 6 or network.prefixlen != 64:
+        raise ValueError(
+            f"TAAC_FPF_PROD_PREFIX must be a canonical IPv6 /64; got {prefix!r}"
+        )
+    return str(network)
+
+
+PROD_TARGET_PREFIX = _prod_target_prefix()
 PROD_PREFIXES = [PROD_TARGET_PREFIX]
 PROD_PREFIXES_BY_HOST = {host: PROD_PREFIXES for host in GPU_HOSTS}
 
@@ -1372,8 +1479,18 @@ def _drain_playbooks(
 ) -> list:
     """tc17 (link drain) / tc19 (device drain): disrupt + restore."""
     impacted_lanes = sorted({c.lane for c in circuits})
+    impacted_planes = _impacted_planes_by_host(circuits)
+    affected_prod_prefixes_by_host = {
+        host: PROD_PREFIXES_BY_HOST[host]
+        for host in impacted_planes
+        if host in PROD_PREFIXES_BY_HOST
+    }
     stabilization_delay_sec = 300
-    longevity_sec = 120
+    # Host-spray samples use a one-minute ODS average.  Two minutes can still
+    # return a lagging bucket that straddles the drain transition (observed as
+    # 15.84 Gbps before the lane reached 0.03 Gbps).  Three minutes guarantees
+    # a fully post-drain sample while preserving a bounded test duration.
+    longevity_sec = 180
     drain_interfaces = (
         [] if device_drain else sorted({c.a_end_interface for c in circuits})
     )
@@ -1431,9 +1548,13 @@ def _drain_playbooks(
         impacted_lanes=impacted_lanes,
         impacted_lanes_by_host_gpu=impacted_lanes_by_host_gpu(circuits),
         impacted_beths_by_host=_impacted_beths_by_host(circuits),
-        impacted_planes_by_host=_impacted_planes_by_host(circuits),
+        impacted_planes_by_host=impacted_planes,
         prod_prefixes=PROD_PREFIXES,
-        prod_prefixes_by_host=PROD_PREFIXES_BY_HOST,
+        # Transition mode requires an affected-plane scope for each asserted
+        # host.  The shared collector still observes both GPU hosts, but a
+        # single GTSW link/device drain is modeled only on the host(s) carried
+        # by ``circuits``; do not manufacture a failure on an untouched host.
+        prod_prefixes_by_host=affected_prod_prefixes_by_host,
         hrt_memory_hosts=HRT_MEMORY_HOSTS,
         hrt_driver_hosts=HRT_MEMORY_HOSTS,
         spray_hosts=spray,
@@ -1487,11 +1608,16 @@ def _drain_playbooks(
         rf_vf_groups=RF_VF_GROUPS,
         playbook_name=restore_name,
         prod_prefixes=PROD_PREFIXES,
-        prod_prefixes_by_host=PROD_PREFIXES_BY_HOST,
+        prod_prefixes_by_host=affected_prod_prefixes_by_host,
         skip_ssh_dependent_checks=skip_ssh,
         use_bgp_snapshot=True,
         prod_prefix_settle_sec=120,
-        convergence_settle_sec=120,
+        # Prechecks consume roughly 120s before the undrain is issued.  The
+        # all-UP plane-status check anchors settle_sec at test-case start, so a
+        # 120s settle still included the intentional pre-undrain DRAINED sample.
+        # Advance past both prechecks and the restore transient while retaining
+        # about two minutes of strict UP samples from the 180s recovery soak.
+        convergence_settle_sec=180,
         fsdb_expected_total=EXPECTED_FSDB_SESSION_COUNT,
         skip_fsdb_session_precheck=True,
         hrt_memory_hosts=HRT_MEMORY_HOSTS,
@@ -1501,7 +1627,7 @@ def _drain_playbooks(
         plane_status_check=True,
         prod_prefix_recovery=True,
         local_prod_prefixes=PROD_PREFIXES,
-        impacted_planes_by_host=_impacted_planes_by_host(circuits),
+        impacted_planes_by_host=impacted_planes,
         cleanup_steps=[cleanup_step],
     )
     return [disrupt_playbook, restore_playbook]
@@ -1698,9 +1824,10 @@ def _tc54_tc35_stsw_drain_undrain_pair() -> list:
 def create_fpf_shared_injection_suite_test_config() -> TestConfig:
     skip_ssh = skip_ssh_dependencies()
     skip_ib = skip_ib_traffic()
+    skip_gpu_ssh = skip_twshared_ssh()
     ib_setup, ib_teardown = fpf_ib_traffic_tasks(
         skip_ssh,
-        skip_ib,
+        skip_ib or skip_gpu_ssh,
         traffic_config=IB_TRAFFIC_CONFIG,
     )
     spray = None if skip_ssh or skip_ib else SPRAY_HOSTS
@@ -1729,8 +1856,11 @@ def create_fpf_shared_injection_suite_test_config() -> TestConfig:
     playbooks += _tc50(spray=spray, skip_ssh=skip_ssh)
     playbooks += _tc51(spray=spray, skip_ssh=skip_ssh)
     playbooks += _tc58(spray=spray, skip_ssh=skip_ssh)
-    # HRT restart.
-    playbooks += _tc52(spray=spray, skip_ssh=skip_ssh)
+    # HRT restart requires shell access to the GPU host. External-traffic mode
+    # omits it; an explicit TC52 regex then fails closed through Netcastle's
+    # existing no-matching-tests guard.
+    if not skip_gpu_ssh:
+        playbooks += _tc52(spray=spray, skip_ssh=skip_ssh)
     # NDP clear.
     playbooks += _tc38(spray=spray, skip_ssh=skip_ssh)
     # Interface admin events.
@@ -1765,6 +1895,11 @@ def create_fpf_shared_injection_suite_test_config() -> TestConfig:
     playbooks += _tc27(spray=spray, skip_ssh=skip_ssh)
     # Full device reboot (most destructive) — last.
     playbooks += _tc55(spray=spray, skip_ssh=skip_ssh)
+
+    _use_recent_baseline_for_prod_prefix_prechecks(playbooks)
+
+    if skip_gpu_ssh:
+        _strip_twshared_ssh_steps(playbooks)
 
     return TestConfig(
         name="fpf_shared_injection_suite",
@@ -1809,7 +1944,10 @@ def create_fpf_shared_injection_suite_test_config() -> TestConfig:
             *ib_teardown,
         ],
         playbooks=playbooks,
-        tags=["fpf"],
+        tags=[
+            "fpf",
+            *(["external_twshared_traffic"] if skip_gpu_ssh else []),
+        ],
     )
 
 

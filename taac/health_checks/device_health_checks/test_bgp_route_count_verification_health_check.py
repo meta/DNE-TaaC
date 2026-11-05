@@ -2,10 +2,13 @@
 
 # pyre-unsafe
 
+import ipaddress
 import unittest
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, call, MagicMock, patch
 
+from neteng.fboss.bgp_attr.types import TBgpAfi, TIpPrefix
+from neteng.fboss.bgp_route_types.types import TBgpPath, TRibEntry
 from neteng.netcastle.logger import ConsoleFileLogger
 from taac.constants import TestDevice
 from taac.health_checks.device_health_checks.bgp_route_count_verification_health_check import (
@@ -30,6 +33,152 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
         driver = AsyncMock()
         health_check.driver = driver
         return health_check, driver
+
+    @staticmethod
+    def _rib_entry(prefix: str, path_counts: list[int]) -> SimpleNamespace:
+        network = ipaddress.ip_network(prefix)
+        return SimpleNamespace(
+            prefix=SimpleNamespace(
+                prefix_bin=network.network_address.packed,
+                num_bits=network.prefixlen,
+            ),
+            paths={
+                f"group-{index}": [object()] * count
+                for index, count in enumerate(path_counts)
+            },
+        )
+
+    async def test_rib_path_scale_counts_every_addpath_entry_in_ranges(self) -> None:
+        health_check, driver = self._health_check()
+        driver.async_get_bgp_rib_entries.return_value = [
+            self._rib_entry("5000:dd::/64", [2, 1]),
+            self._rib_entry("5000:dd:0:1::/64", [4]),
+            self._rib_entry("5000:ee::/64", [5]),
+            self._rib_entry("6000::/64", [999]),
+        ]
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["5000:dd::/32", "5000:ee::/32"],
+                "expected_rib_prefix_count": 3,
+                "expected_rib_path_count": 12,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn("3 prefixes, 12 paths", result.message or "")
+        driver.async_get_bgp_rib_entries.assert_awaited_once()
+        driver.async_get_bgp_sessions.assert_not_awaited()
+
+    async def test_rib_path_scale_selects_only_matching_address_family_ranges(
+        self,
+    ) -> None:
+        health_check, driver = self._health_check()
+        entries = []
+        for cidr in (
+            "192.0.2.0/25",
+            "198.51.100.0/24",
+            "2001:db8::/64",
+            "2001:db9::/64",
+        ):
+            network = ipaddress.ip_network(cidr)
+            prefix = TIpPrefix(
+                afi=(
+                    TBgpAfi.AFI_IPV4
+                    if isinstance(network, ipaddress.IPv4Network)
+                    else TBgpAfi.AFI_IPV6
+                ),
+                prefix_bin=network.network_address.packed,
+                num_bits=network.prefixlen,
+            )
+            entries.append(
+                TRibEntry(prefix=prefix, paths={"group": [TBgpPath(next_hop=prefix)]})
+            )
+        driver.async_get_bgp_rib_entries.return_value = entries
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["192.0.2.0/24", "2001:db8::/32"],
+                "expected_rib_prefix_count": 2,
+                "expected_rib_path_count": 2,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn("2 prefixes, 2 paths", result.message or "")
+        driver.async_get_bgp_rib_entries.assert_awaited_once()
+        driver.async_get_bgp_sessions.assert_not_awaited()
+
+    async def test_rib_path_scale_accepts_immutable_thrift_style_mapping(
+        self,
+    ) -> None:
+        health_check, driver = self._health_check()
+        entry = self._rib_entry("5000:dd::/64", [2, 3])
+        entry.paths = MappingProxyType(entry.paths)
+        driver.async_get_bgp_rib_entries.return_value = [entry]
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["5000:dd::/32"],
+                "expected_rib_prefix_count": 1,
+                "expected_rib_path_count": 5,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+
+    async def test_rib_path_scale_reports_both_absolute_mismatches(self) -> None:
+        health_check, driver = self._health_check()
+        driver.async_get_bgp_rib_entries.return_value = [
+            self._rib_entry("5000:dd::/64", [3]),
+        ]
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["5000::/16"],
+                "expected_rib_prefix_count": 26,
+                "expected_rib_path_count": 79872,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("expected_prefixes=26, actual_prefixes=1", result.message or "")
+        self.assertIn("expected_paths=79872, actual_paths=3", result.message or "")
+
+    async def test_rib_path_scale_query_failure_is_error(self) -> None:
+        health_check, driver = self._health_check()
+        driver.async_get_bgp_rib_entries.side_effect = RuntimeError("RIB unavailable")
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["5000::/16"],
+                "expected_rib_prefix_count": 26,
+                "expected_rib_path_count": 79872,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.ERROR, result.status)
+        self.assertIn("authoritative bgpcpp RIB path counts", result.message or "")
 
     async def test_arista_declared_bgpcpp_reads_thrift_not_eos_cli(self) -> None:
         """Native EOS BGP can run with an empty table beside BGP++; a device the

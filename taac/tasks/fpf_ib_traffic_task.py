@@ -163,7 +163,7 @@ async def validate_remote_ib_binary(
     path = _validate_binary_path(binary_path)
     rc, out, err = await ssh_run(host, build_ib_binary_probe_cmd(path))
     if rc != 0 or out.strip() != "OK":
-        detail = err.strip() or out.strip() or "no output"
+        detail = out.strip() or err.strip() or "no output"
         raise RuntimeError(
             f"{host}: ib_write_bw binary validation failed for {path!r} "
             f"(rc={rc}): {detail}"
@@ -272,6 +272,14 @@ def parse_background_pid(output: str, *, host: str, role: str) -> int:
     return int(lines[0])
 
 
+class IbTrafficObservabilityError(RuntimeError):
+    """Remote traffic state could not be observed over SSH."""
+
+
+class IbProcessInventoryTransportError(IbTrafficObservabilityError):
+    """The remote process state could not be observed over SSH."""
+
+
 async def validate_remote_ib_process(
     *,
     host: str,
@@ -292,7 +300,7 @@ async def validate_remote_ib_process(
     for attempt in range(attempts):
         rc, out, err = await ssh_run(host, command)
         if rc != 0:
-            raise RuntimeError(
+            raise IbProcessInventoryTransportError(
                 f"{host} {role}: process inventory SSH failed (rc={rc}): "
                 f"{err.strip() or out.strip() or 'no output'}"
             )
@@ -600,6 +608,7 @@ class FpfStartIbTrafficTask(BaseTask):
                 DEFAULT_PROCESS_VALIDATION_INTERVAL_SEC,
             )
         )
+        skip_ods_validation = bool(params.get("skip_ods_validation", False))
 
         all_hosts = [server, *clients]
         gid_note = (
@@ -734,6 +743,13 @@ class FpfStartIbTrafficTask(BaseTask):
                 f"[FpfStartIbTraffic] {host} {role}: validated pid={process.pid} "
                 f"cmd={process.cmdline!r} cgroup={process.cgroup!r} log={log_path}"
             )
+
+        if skip_ods_validation:
+            logger.info(
+                "[FpfStartIbTraffic] PROCESS READY — exact server/client "
+                "processes validated; ODS validation skipped by caller"
+            )
+            return
 
         # Let traffic ramp, then validate egress via ODS.
         logger.info(

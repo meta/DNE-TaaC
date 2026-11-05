@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from taac.health_checks.device_health_checks.fpf_prod_hrt_prefix_stability_health_check import (
+    _evaluate_host,
     _evaluate_host_restart_recovery,
 )
 from taac.libs.fpf.fpf_prod_hrt_prefix import PrefixReachability
@@ -56,8 +57,31 @@ class _Collector:
     def get_rows_in_window(self, window_start, window_end):
         return self.rows
 
+    def timeout_count_in_window(self, window_start, window_end):
+        return 0
+
 
 class TestFpfProdHrtPrefixRestartRecovery(unittest.TestCase):
+    def test_recovery_last_n_reports_evaluated_sample_count(self):
+        result = _evaluate_host(
+            host=HOST,
+            collector=_Collector(
+                [
+                    _row(1, {PREFIX_A: GOOD_A}),
+                    _row(2, {PREFIX_A: GOOD_A}),
+                    _row(3, {PREFIX_A: GOOD_A}),
+                ]
+            ),
+            window_start=RESTART_TS,
+            window_end=RESTART_TS + 10,
+            target_norms={PREFIX_A},
+            fixed_expected=None,
+            recovery_last_n=2,
+        )
+
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.n_samples, 2)
+
     def _evaluate(self, rows, prefixes=None, sla=30.0, completion_offset=None):
         return _evaluate_host_restart_recovery(
             host=HOST,

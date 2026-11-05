@@ -486,6 +486,9 @@ def _evaluate_prefix_series(
         tail = (
             samples[-recovery_last_n:] if len(samples) >= recovery_last_n else samples
         )
+        res.n_samples += sum(
+            1 for _ts, _ts_str, rb in tail if not _sample_null_fields(rb)
+        )
         expected_tuple = _baseline_tuple(baseline)
         all_compliant = all(
             not _sample_null_fields(rb) and _rb_tuple(rb) == expected_tuple

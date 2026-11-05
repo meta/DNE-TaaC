@@ -67,6 +67,17 @@ def _all_steps(config):
             yield from stage.steps or []
 
 
+def _custom_step_names(config) -> set[str]:
+    names = set()
+    for step in _all_steps(config):
+        if step.step_params is None or step.step_params.json_params is None:
+            continue
+        params = json.loads(step.step_params.json_params)
+        if "custom_step_name" in params:
+            names.add(params["custom_step_name"])
+    return names
+
+
 def _reload_shared_suite_modules():
     """Reload environment-derived standalone factories before their umbrella."""
     importlib.reload(fpf_hardening_common)
@@ -618,6 +629,60 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
                 self.assertEqual(ensure_steps, [])
         finally:
             _reload_shared_suite_modules()
+
+    def test_shared_suite_skip_twshared_ssh_preserves_non_ssh_coverage(self):
+        hosts = ["twshared1352.03.mwg2", "twshared1388.03.mwg2"]
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "FPF_GPU_HOSTS": ",".join(hosts),
+                    "FPF_HRT_DEVICE_IDS": "0,1,2,3,4,5,6,7",
+                    "FPF_HRT_LANES": "0,1,2,3",
+                    "FPF_HRT_VF1_DEVICE_IDS": "0,2,4,6",
+                    "FPF_HRT_VF2_DEVICE_IDS": "1,3,5,7",
+                    "TAAC_FPF_LINK_DRAIN_INTERFACE": "eth1/41/5",
+                    "TAAC_FPF_DEVICE_DRAIN_GTSW": "gtsw002.l1002.c087.mwg2",
+                    "TAAC_FPF_SKIP_TWSHARED_SSH": "1",
+                },
+            ):
+                _reload_shared_suite_modules()
+                config = fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
+
+                self.assertTrue(fpf_hardening_common.skip_twshared_ssh())
+                task_names = {
+                    task.task_name
+                    for task in [*config.setup_tasks, *config.teardown_tasks]
+                }
+                self.assertNotIn("fpf_start_ib_traffic", task_names)
+                self.assertNotIn("fpf_stop_ib_traffic", task_names)
+                self.assertIn("fpf_start_collectors", task_names)
+                self.assertNotIn("fpf_restart_hrt", _custom_step_names(config))
+                baseline = _playbook(config, "fpf_tc41_longevity_pristine")
+                self.assertIn(
+                    "fpf_host_spray",
+                    {check.check_id for check in baseline.postchecks or []},
+                )
+        finally:
+            os.environ.pop("TAAC_FPF_SKIP_TWSHARED_SSH", None)
+            _reload_shared_suite_modules()
+
+    def test_shared_suite_prod_prefix_prechecks_use_recent_history(self):
+        config = (
+            fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
+        )
+        checks = [
+            (playbook.name, _optional_check_params(check))
+            for playbook in config.playbooks
+            for check in playbook.prechecks or []
+            if check.check_id == "fpf_prod_hrt_prefix_stability_precheck"
+        ]
+        self.assertTrue(checks)
+        for playbook_name, params in checks:
+            self.assertFalse(
+                params.get("use_test_case_start_time", True), playbook_name
+            )
+            self.assertEqual(params.get("lookback_sec"), 120, playbook_name)
 
     def test_shared_suite_wires_explicit_twshared_device_identity(self):
         device_ids = list(range(8))

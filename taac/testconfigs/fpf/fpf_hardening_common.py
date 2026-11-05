@@ -43,6 +43,20 @@ def skip_ib_traffic() -> bool:
     )
 
 
+def skip_twshared_ssh() -> bool:
+    """Whether external orchestration owns all twshared host shell operations.
+
+    This narrow mode keeps GTSW/STSW SSH, HRT Thrift collectors, and ODS checks
+    enabled while preventing TAAC from starting, stopping, or probing
+    ib_write_bw over SSH on the GPU hosts.
+    """
+    return os.environ.get("TAAC_FPF_SKIP_TWSHARED_SSH", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 DEFAULT_IB_DEVICE: str = "mlx5_34"
 DEFAULT_IB_BINARY: str = "/usr/bin/ib_write_bw"
 DEFAULT_IB_GID_IFACE: str = "bveth0"
@@ -498,7 +512,7 @@ def fpf_ib_traffic_tasks(
     while omitting only ib_write_bw. Imported lazily to avoid an import cycle
     with task_definitions.
     """
-    if skip_ssh or skip_ib:
+    if skip_ssh or skip_ib or skip_twshared_ssh():
         return [], []
     from taac.task_definitions import (
         create_fpf_start_ib_traffic_task,

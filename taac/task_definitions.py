@@ -426,6 +426,7 @@ def create_coop_register_patcher_task(
     task_name: t.Optional[str] = None,
     patcher_args: t.Optional[t.Dict[str, t.Any]] = None,
     py_func_name: t.Optional[str] = None,
+    jq_program: t.Optional[str] = None,
 ) -> Task:
     """
     Create a task to register a coop patcher on a device.
@@ -439,10 +440,17 @@ def create_coop_register_patcher_task(
             and rely on py_func_name as the dispatch key).
         patcher_args: Optional arguments for the patcher (serialized via inner json.dumps)
         py_func_name: Optional Python function name for the patcher
+        jq_program: Optional jq expression for a generic COOP patcher. Mutually
+            exclusive with py_func_name and patcher_args.
 
     Returns:
         Task object to register the patcher
     """
+    if jq_program is not None and (
+        py_func_name is not None or patcher_args is not None
+    ):
+        raise ValueError("jq_program is mutually exclusive with Python patcher fields")
+
     # Preserve original key insertion order (hostname, config_name, patcher_name,
     # task_name) for byte-equivalence with pre-Phase-8 callers' JSON serialization.
     params: t.Dict[str, t.Any] = {"hostname": hostname}
@@ -457,6 +465,8 @@ def create_coop_register_patcher_task(
         params["patcher_args"] = json.dumps(patcher_args)
     if py_func_name is not None:
         params["py_func_name"] = py_func_name
+    if jq_program is not None:
+        params["jq_program"] = jq_program
 
     return Task(
         task_name="coop_register_patcher",
@@ -1907,6 +1917,7 @@ def create_bgp_peer_group_patcher_task(
             "name": peer_group_name,
             "attributes_to_update_json": json.dumps(attributes_to_update),
         },
+        py_func_name="configure_bgp_peer_group",
     )
 
 
@@ -1958,6 +1969,7 @@ def create_remove_bgp_peers_patcher_task(
         patcher_name=patcher_name,
         task_name="remove_bgp_peers",
         patcher_args={"delete_all": str(delete_all)},
+        py_func_name="remove_bgp_peers",
     )
 
 

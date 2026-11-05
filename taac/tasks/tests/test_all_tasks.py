@@ -547,6 +547,40 @@ class CoopPatcherTaskGateTest(later.unittest.TestCase):
         driver.async_apply_patchers.assert_not_awaited()
 
 
+class CoopRegisterPatcherTaskTest(later.unittest.TestCase):
+    async def test_internal_registers_generic_jq_patcher_to_current(self) -> None:
+        driver = MagicMock()
+        register_jq = AsyncMock()
+        coop_utils = SimpleNamespace(async_register_jq_patcher=register_jq)
+        with (
+            patch.object(tasks_all, "TAAC_OSS", False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+            patch(f"{ALL_PATH}.importlib.import_module", return_value=coop_utils),
+        ):
+            await CoopRegisterPatcherTask(logger=MagicMock()).run(
+                {
+                    "hostname": "rdsw.example",
+                    "config_name": "bgpcpp",
+                    "patcher_name": "path_limit_10m",
+                    "jq_program": ".switch_limit_config.total_path_limit = 10000000",
+                }
+            )
+
+        register_jq.assert_awaited_once_with(
+            hostname="rdsw.example",
+            config_name="bgpcpp",
+            patcher_name="path_limit_10m",
+            jq_program=".switch_limit_config.total_path_limit = 10000000",
+            description="",
+            persistent=True,
+        )
+        driver.async_register_python_patcher.assert_not_called()
+
+
 class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
     async def test_interface_only_config_does_not_register_bgp_patcher(self) -> None:
         driver = MagicMock()

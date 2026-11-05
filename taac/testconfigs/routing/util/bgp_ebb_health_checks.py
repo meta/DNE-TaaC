@@ -24,10 +24,12 @@ from taac.health_checks.healthcheck_definitions import (
     create_system_cpu_load_average_check,
     create_unclean_exit_check,
 )
+from taac.health_checks.retry_policy import get_retry_kwargs
 from taac.utils.hardware_capacity_utils import (
     get_postcheck_thresholds,
     get_precheck_thresholds,
 )
+from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config.types import PointInTimeHealthCheck, SnapshotHealthCheck
 
 _MEMORY_THRESHOLD_BY_SERVICE_PRECHECK = {
@@ -322,6 +324,7 @@ def create_standard_prechecks(
                 watermark_delta_threshold=precheck_thresholds.watermark_delta_threshold,
                 check_watermarks=precheck_thresholds.check_watermarks,
                 check_id="startup_hardware_capacity_baseline",
+                **get_retry_kwargs(hc_types.CheckName.HARDWARE_CAPACITY_CHECK),
             )
         )
 

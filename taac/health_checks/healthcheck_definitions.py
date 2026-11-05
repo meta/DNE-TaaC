@@ -1369,6 +1369,9 @@ def create_hardware_capacity_check(
     watermark_delta_threshold: t.Optional[t.Any] = None,
     check_watermarks: t.Optional[bool] = None,
     check_id: t.Optional[str] = None,
+    retry_count: t.Optional[int] = None,
+    retry_delay_seconds: t.Optional[float] = None,
+    retry_delay_multiplier: t.Optional[float] = None,
 ) -> PointInTimeHealthCheck:
     """Create a point-in-time check of hardware capacity (FEC + ECMP) utilization.
 
@@ -1390,6 +1393,10 @@ def create_hardware_capacity_check(
         check_watermarks: If True, also asserts watermark values stayed within
             tolerance.
         check_id: Optional unique identifier for the check.
+        retry_count: Retries after the initial attempt when the check FAILs.
+            0 (default) = single-shot.
+        retry_delay_seconds: Base delay before the first retry (default 5.0).
+        retry_delay_multiplier: Backoff multiplier per retry (default 1.5).
 
     Returns:
         A `PointInTimeHealthCheck` with `name=HARDWARE_CAPACITY_CHECK`.
@@ -1407,6 +1414,12 @@ def create_hardware_capacity_check(
         payload["fec_high_watermark_threshold"] = fec_high_watermark_threshold
     if ecmp_high_watermark_threshold is not None:
         payload["ecmp_high_watermark_threshold"] = ecmp_high_watermark_threshold
+    if retry_count is not None:
+        payload["retry_count"] = retry_count
+    if retry_delay_seconds is not None:
+        payload["retry_delay_seconds"] = retry_delay_seconds
+    if retry_delay_multiplier is not None:
+        payload["retry_delay_multiplier"] = retry_delay_multiplier
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.HARDWARE_CAPACITY_CHECK,
         check_params=Params(json_params=json.dumps(payload)),

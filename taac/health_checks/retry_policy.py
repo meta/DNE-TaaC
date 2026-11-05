@@ -58,10 +58,18 @@ DEFAULT_RETRY_SPEC: RetrySpec = RetrySpec(
 )
 
 # Per-check overrides, used only where a check genuinely needs different numbers
-# than the fleet default. Empty today (session / convergence / RIB-FIB all use
-# the default); kept as the extension point so future tuning stays in one place
-# rather than scattered across call sites.
-_PER_CHECK_RETRY: t.Dict[hc_types.CheckName, RetrySpec] = {}
+# than the fleet default; kept here so future tuning stays in one place rather
+# than scattered across call sites.
+_PER_CHECK_RETRY: t.Dict[hc_types.CheckName, RetrySpec] = {
+    # FibAgent deletes unused nexthop groups lazily, every 3-5 minutes. A
+    # capacity read just after BGP convergence can still count those groups'
+    # FECs, so wait for at least one sweep (30s, 45s, 67.5s, 101s; ~4 min).
+    hc_types.CheckName.HARDWARE_CAPACITY_CHECK: RetrySpec(
+        retry_count=4,
+        retry_delay_seconds=30.0,
+        retry_delay_multiplier=1.5,
+    ),
+}
 
 
 def get_retry_spec(check_name: hc_types.CheckName) -> RetrySpec:

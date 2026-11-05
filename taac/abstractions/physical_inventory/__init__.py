@@ -37,6 +37,7 @@ from taac.abstractions.physical_inventory.routing_ebb_testbed import (
     NRQEB007_ASH6,
     NRQEB008_ASH6,
     NRQEB009_ASH6,
+    NRQEB010_ASH6,
 )
 
 __all__ = (
@@ -59,6 +60,7 @@ __all__ = (
     "NRQEB007_ASH6",
     "NRQEB008_ASH6",
     "NRQEB009_ASH6",
+    "NRQEB010_ASH6",
     "PhysicalInventory",
     "PhysicalInterfaceProfile",
     "PhysicalLinkRate",

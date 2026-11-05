@@ -4,9 +4,10 @@
 
 §1 Purpose
 ==========
-Framework-owned inventories for the ASH6 NRQ EBB Conveyor fleet, ancillary
-EB0x lab devices, the historical SNC1 BAG, the per-developer EBB box, and the
-SNC1 Arista device.
+Framework-owned inventories for the ASH6 NRQ EBB Conveyor fleet, including
+the single-DUT IxANVL conformance rig (``nrqeb010``), ancillary EB0x lab
+devices, the historical SNC1 BAG, the per-developer EBB box, and the SNC1
+Arista device.
 
 §2 IXIA chassis inventory
 ========================
@@ -24,6 +25,10 @@ secondary wiring profile and remains primary for the EB0x lab devices.
     1/{85..88} -- Eth3/35/{1..4} nrqeb007  9/{5..8}  -- Eth3/36/{1..4}
     1/{89..92} -- Eth3/35/{1..4} nrqeb008  10/{1..4} -- Eth3/36/{1..4}
     1/{93..96} -- Eth3/35/{1..4} nrqeb009  10/{5..8} -- Eth3/36/{1..4}
+
+    Conformance-only single DUT (no OpenR pair, no secondary chassis):
+    7/{2..4} -- Eth3/36/{2..4} nrqeb010  (IXIA11; DIface-0/1/2 in that order;
+    lane 1 carries no light, per LLDP)
 
     nrqeb006 Eth3/1/1 -- Eth3/1/1 nrqeb007   po100306 owner link
     nrqeb006 Eth3/2/1 -- Eth3/2/1 nrqeb007   po100307 owner link
@@ -320,6 +325,30 @@ NRQEB009_ASH6 = PhysicalInventory(
     bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
     openr_configerator_path="taac/ebb_ci_cd_configs/nrqeb009_ash6_openr_config",
     openr_standalone_link=_NRQEB009_OPENR_LINK,
+    peer_groups=_ebb_peer_groups(),
+)
+
+
+# ─── NRQEB010 — IxANVL conformance single DUT ────────────────────────────
+# Conformance-only: three IXIA11 links in DIface order, no OpenR pair and
+# no secondary chassis. The DUT and IxANVL configs both resolve from this
+# record, as they do from EB03_LAB_ASH6. The BGP AS is the one the
+# conformance configs apply; NRQ devices are reached through FCR, so no
+# lab login fields are set. Lane 1 (7/1) carries no light, so the rig
+# uses lanes 2-4; lane order, not the lane numbers, decides DIface-N.
+NRQEB010_ASH6 = PhysicalInventory(
+    device_name="nrqeb010.ash6",
+    network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
+    usage=frozenset({"qual"}),
+    primary_ixia_chassis_ip=IXIA11_ASH6,
+    ixia_ports=[
+        ("Ethernet3/36/2", "7/2"),
+        ("Ethernet3/36/3", "7/3"),
+        ("Ethernet3/36/4", "7/4"),
+    ],
+    dut_bgp_as=64981,
+    bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
     peer_groups=_ebb_peer_groups(),
 )
 

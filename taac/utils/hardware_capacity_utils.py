@@ -54,6 +54,7 @@ class HardwareCapacityThresholds:
         max_ecmp_level3: int = ARISTA_DEFAULT_MAX_ECMP_LEVEL3,
         watermark_delta_threshold: int = ARISTA_DEFAULT_WATERMARK_DELTA_THRESHOLD,
         check_watermarks: bool = ARISTA_DEFAULT_CHECK_WATERMARKS,
+        check_instantaneous_usage: bool = True,
         fec_high_watermark_threshold: int | None = None,
         ecmp_high_watermark_threshold: int | None = None,
     ):
@@ -64,6 +65,7 @@ class HardwareCapacityThresholds:
         self.max_ecmp_level3 = max_ecmp_level3
         self.watermark_delta_threshold = watermark_delta_threshold
         self.check_watermarks = check_watermarks
+        self.check_instantaneous_usage = check_instantaneous_usage
         self.fec_high_watermark_threshold = fec_high_watermark_threshold
         self.ecmp_high_watermark_threshold = ecmp_high_watermark_threshold
 
@@ -96,6 +98,9 @@ class HardwareCapacityThresholds:
             ),
             check_watermarks=value_or_default(
                 "check_watermarks", ARISTA_DEFAULT_CHECK_WATERMARKS
+            ),
+            check_instantaneous_usage=value_or_default(
+                "check_instantaneous_usage", True
             ),
             fec_high_watermark_threshold=params.get("fec_high_watermark_threshold"),
             ecmp_high_watermark_threshold=params.get("ecmp_high_watermark_threshold"),
@@ -223,17 +228,16 @@ def validate_hardware_capacity(
     errors = []
     warnings = []
 
-    # Check FEC usage
-    if capacity_data.fec_used > thresholds.fec_threshold:
-        errors.append(
-            f"FEC usage ({capacity_data.fec_used}) exceeds threshold ({thresholds.fec_threshold})"
-        )
+    if thresholds.check_instantaneous_usage:
+        if capacity_data.fec_used > thresholds.fec_threshold:
+            errors.append(
+                f"FEC usage ({capacity_data.fec_used}) exceeds threshold ({thresholds.fec_threshold})"
+            )
 
-    # Check ECMP usage
-    if capacity_data.ecmp_used > thresholds.ecmp_threshold:
-        errors.append(
-            f"ECMP usage ({capacity_data.ecmp_used}) exceeds threshold ({thresholds.ecmp_threshold})"
-        )
+        if capacity_data.ecmp_used > thresholds.ecmp_threshold:
+            errors.append(
+                f"ECMP usage ({capacity_data.ecmp_used}) exceeds threshold ({thresholds.ecmp_threshold})"
+            )
 
     if (
         thresholds.fec_high_watermark_threshold is not None
@@ -255,21 +259,21 @@ def validate_hardware_capacity(
             f"({thresholds.ecmp_high_watermark_threshold})"
         )
 
-    # Check ECMP level constraints
-    if capacity_data.ecmp_level3_used > thresholds.max_ecmp_level3:
-        errors.append(
-            f"EcmpLevel3 objects ({capacity_data.ecmp_level3_used}) exceeds maximum allowed ({thresholds.max_ecmp_level3})"
-        )
+    if thresholds.check_instantaneous_usage:
+        if capacity_data.ecmp_level3_used > thresholds.max_ecmp_level3:
+            errors.append(
+                f"EcmpLevel3 objects ({capacity_data.ecmp_level3_used}) exceeds maximum allowed ({thresholds.max_ecmp_level3})"
+            )
 
-    if capacity_data.ecmp_level1_used > thresholds.max_ecmp_level1:
-        errors.append(
-            f"EcmpLevel1 objects ({capacity_data.ecmp_level1_used}) exceeds maximum allowed ({thresholds.max_ecmp_level1})"
-        )
+        if capacity_data.ecmp_level1_used > thresholds.max_ecmp_level1:
+            errors.append(
+                f"EcmpLevel1 objects ({capacity_data.ecmp_level1_used}) exceeds maximum allowed ({thresholds.max_ecmp_level1})"
+            )
 
-    if capacity_data.ecmp_level2_used > thresholds.max_ecmp_level2:
-        errors.append(
-            f"EcmpLevel2 objects ({capacity_data.ecmp_level2_used}) exceeds maximum allowed ({thresholds.max_ecmp_level2})"
-        )
+        if capacity_data.ecmp_level2_used > thresholds.max_ecmp_level2:
+            errors.append(
+                f"EcmpLevel2 objects ({capacity_data.ecmp_level2_used}) exceeds maximum allowed ({thresholds.max_ecmp_level2})"
+            )
 
     # Check high watermarks if enabled
     if thresholds.check_watermarks:

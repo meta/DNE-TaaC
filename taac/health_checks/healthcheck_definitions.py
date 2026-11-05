@@ -1368,6 +1368,7 @@ def create_hardware_capacity_check(
     max_ecmp_level3: t.Optional[t.Any] = None,
     watermark_delta_threshold: t.Optional[t.Any] = None,
     check_watermarks: t.Optional[bool] = None,
+    check_instantaneous_usage: t.Optional[bool] = None,
     check_id: t.Optional[str] = None,
     retry_count: t.Optional[int] = None,
     retry_delay_seconds: t.Optional[float] = None,
@@ -1392,6 +1393,9 @@ def create_hardware_capacity_check(
             high-water-mark utilization.
         check_watermarks: If True, also asserts watermark values stayed within
             tolerance.
+        check_instantaneous_usage: If False, skips the current FEC, ECMP, and
+            ECMP-level thresholds. Explicit absolute watermark thresholds are
+            still enforced.
         check_id: Optional unique identifier for the check.
         retry_count: Retries after the initial attempt when the check FAILs.
             0 (default) = single-shot.
@@ -1414,6 +1418,8 @@ def create_hardware_capacity_check(
         payload["fec_high_watermark_threshold"] = fec_high_watermark_threshold
     if ecmp_high_watermark_threshold is not None:
         payload["ecmp_high_watermark_threshold"] = ecmp_high_watermark_threshold
+    if check_instantaneous_usage is not None:
+        payload["check_instantaneous_usage"] = check_instantaneous_usage
     if retry_count is not None:
         payload["retry_count"] = retry_count
     if retry_delay_seconds is not None:

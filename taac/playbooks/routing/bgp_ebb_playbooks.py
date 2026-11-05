@@ -68,7 +68,6 @@ from taac.constants import (
 )
 from taac.health_checks.healthcheck_definitions import (
     create_bgp_session_snapshot_check,
-    create_hardware_capacity_check,
 )
 from taac.playbooks.playbook_definitions import (
     build_case2_playbook,
@@ -2661,13 +2660,7 @@ def get_bgp_ebb_nexthop_group_count_threshold_playbook(
         setup_steps=create_bgp_instability_setup_steps(
             device_name=device_name,
         ),
-        prechecks=soak_checks.prechecks
-        + [
-            create_hardware_capacity_check(
-                ecmp_high_watermark_threshold=fibagent_nhg_watermark_high,
-                check_watermarks=False,
-            ),
-        ],
+        prechecks=soak_checks.prechecks,
         snapshot_checks=soak_checks.snapshot_checks,
         periodic_tasks=create_standard_periodic_tasks(
             device_name=device_name,
@@ -2691,13 +2684,7 @@ def get_bgp_ebb_nexthop_group_count_threshold_playbook(
                 min_samples=nexthop_group_min_samples,
             ),
         ],
-        postchecks=soak_checks.postchecks
-        + [
-            create_hardware_capacity_check(
-                ecmp_high_watermark_threshold=fibagent_nhg_watermark_high,
-                check_watermarks=False,
-            ),
-        ],
+        postchecks=soak_checks.postchecks,
         stages=_characterized(
             [
                 create_bgp_nhg_random_storm_stage(

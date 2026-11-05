@@ -94,9 +94,9 @@ _W800_NPI_CORE_PLAYBOOKS = [
 # matching what the shipped Icepack FR4 snake configs use.
 _W800_RECOVERY_RETRY_COUNT = 6
 
-# Half-interface-toggle checks run 10s after re-enable; ports and LLDP neighbors
+# Half-interface-toggle checks run 20s after re-enable; ports and LLDP neighbors
 # came back 13-18s after re-enable on the CACT 100G bed. 10 retries at 2s polls
-# until ~30s after re-enable before failing.
+# until ~40s after re-enable before failing.
 _W800_HALF_TOGGLE_CHECK_RETRY_COUNT = 10
 _W800_HALF_TOGGLE_CHECK_RETRY_DELAY_S = 2.0
 

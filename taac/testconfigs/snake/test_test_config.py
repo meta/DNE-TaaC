@@ -181,7 +181,7 @@ def gen_snake_test_config(
     include_link_flap_longevity: bool = False,
     link_flap_longevity_iterations: int = 33,
     link_flap_longevity_disable_delay_s: int = 30,
-    link_flap_longevity_enable_delay_s: int = 10,
+    link_flap_longevity_enable_delay_s: int = 20,
     link_flap_longevity_soak_s: int = 3600,
     link_flap_longevity_interface_slice: t.Optional[str] = None,
     include_rapid_a_end_flap_stress: bool = False,

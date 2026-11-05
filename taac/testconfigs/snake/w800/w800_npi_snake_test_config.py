@@ -60,6 +60,7 @@ from ixia.ixia import types as ixia_types
 from taac.testconfigs.snake.test_test_config import (
     gen_snake_test_config,
 )
+from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
 
 
@@ -98,6 +99,18 @@ _W800_RECOVERY_RETRY_COUNT = 6
 # until ~30s after re-enable before failing.
 _W800_HALF_TOGGLE_CHECK_RETRY_COUNT = 10
 _W800_HALF_TOGGLE_CHECK_RETRY_DELAY_S = 2.0
+
+# Postcheck that the forwarding services recovered after each playbook. On
+# NetOS-native beds these resolve to netos.service.fboss_sw_agent,
+# netos.service.fboss_wedge_agent_<vendor>_0 and
+# netos.service.fboss_qsfp_service. The stability window turns a crash-looping
+# unit, which is briefly active between restarts, into a FAIL.
+_W800_POSTCHECK_SYSTEMCTL_SERVICES = [
+    hc_types.Service.FBOSS_SW_AGENT,
+    hc_types.Service.FBOSS_HW_AGENT_0,
+    hc_types.Service.QSFP_SERVICE,
+]
+_W800_POSTCHECK_SYSTEMCTL_MIN_ACTIVE_SECONDS = 30
 
 # Same rate as the base traffic. MP3 800G snakes showed TC0 congestion discards
 # at 100% line rate and none at 99% (T227297634).
@@ -281,6 +294,8 @@ def _gen_w800_snake_test_config(
         flap_recovery_check_retry_count=_W800_RECOVERY_RETRY_COUNT,
         half_toggle_check_retry_count=_W800_HALF_TOGGLE_CHECK_RETRY_COUNT,
         half_toggle_check_retry_delay_seconds=_W800_HALF_TOGGLE_CHECK_RETRY_DELAY_S,
+        postcheck_systemctl_services=_W800_POSTCHECK_SYSTEMCTL_SERVICES,
+        postcheck_systemctl_min_active_seconds=_W800_POSTCHECK_SYSTEMCTL_MIN_ACTIVE_SECONDS,
         include_link_flap_longevity=playbooks_to_include is None,
         include_rapid_a_end_flap_stress=playbooks_to_include is None,
         include_split_agent_warmboot=True,

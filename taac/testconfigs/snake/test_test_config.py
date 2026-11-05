@@ -28,6 +28,7 @@ from taac.health_checks.healthcheck_definitions import (
     create_device_core_dumps_check,
     create_ixia_packet_loss_check,
     create_port_state_check,
+    create_systemctl_active_state_check,
 )
 from taac.playbooks.playbook_definitions import (
     gen_common_hcs,
@@ -216,6 +217,8 @@ def gen_snake_test_config(
     skip_ixia_protocol_verification: bool = False,
     ixia_protocol_verification_timeout: int = 90,
     default_ixia_l1_config: t.Optional[ixia_types.L1Config] = None,
+    postcheck_systemctl_services: t.Optional[t.List[hc_types.Service]] = None,
+    postcheck_systemctl_min_active_seconds: t.Optional[int] = None,
 ) -> taac_types.TestConfig:
     """Build a snake/loopback ``TestConfig``.
 
@@ -328,6 +331,10 @@ def gen_snake_test_config(
                 The traffic precheck still verifies end-to-end forwarding.
             ixia_protocol_verification_timeout: Settle time used when protocol
                 verification is skipped.
+            postcheck_systemctl_services: When set, every playbook postchecks
+                that these units are active, retried like the port-state check.
+            postcheck_systemctl_min_active_seconds: Minimum time each of those
+                units must have been active, so a crash loop FAILs.
 
     Returns:
         A ``TestConfig`` ready to slot into ``SNAKE_TEST_CONFIGS``.
@@ -425,6 +432,16 @@ def gen_snake_test_config(
     if packet_loss_sleep_time != 10:
         # post-check: keep clear_traffic_stats=False, only adjust the drain window
         common_postchecks = _override_packet_loss(common_hcs, clear_traffic_stats=False)
+    if postcheck_systemctl_services:
+        common_postchecks = common_postchecks + [
+            create_systemctl_active_state_check(
+                services=postcheck_systemctl_services,
+                retry_count=postcheck_port_state_retry_count or 6,
+                retry_delay_seconds=postcheck_port_state_retry_delay_seconds,
+                retry_delay_multiplier=1.0,
+                min_active_seconds=postcheck_systemctl_min_active_seconds,
+            )
+        ]
 
     common_postchecks = [*common_postchecks, create_device_core_dumps_check()]
 

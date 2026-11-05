@@ -2601,6 +2601,7 @@ def create_systemctl_active_state_check(
     retry_delay_seconds: t.Optional[float] = None,
     retry_delay_multiplier: t.Optional[float] = None,
     expected_restarted_services: t.Optional[t.List[str]] = None,
+    min_active_seconds: t.Optional[int] = None,
 ) -> PointInTimeHealthCheck:
     """SYSTEMCTL_ACTIVE_STATE_CHECK — systemctl active-state verification.
 
@@ -2617,6 +2618,10 @@ def create_systemctl_active_state_check(
     `services`). Passing it WITHOUT `services_json` is valid: the check's
     consumer falls back to DEFAULT_SERVICE_NAMES when no `services` key is
     present in check_params — the allowlist still applies to that set.
+
+    `min_active_seconds` (internal path): each unit must also have been active
+    for at least this long, so a crash-looping unit that is briefly active
+    between restarts FAILs.
     """
     if services is not None and services_json is not None:
         raise ValueError(
@@ -2634,6 +2639,8 @@ def create_systemctl_active_state_check(
         retry_params["retry_delay_seconds"] = retry_delay_seconds
     if retry_delay_multiplier is not None:
         retry_params["retry_delay_multiplier"] = retry_delay_multiplier
+    if min_active_seconds is not None:
+        retry_params["min_active_seconds"] = min_active_seconds
     if (
         services is None
         and services_json is None

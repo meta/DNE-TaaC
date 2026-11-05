@@ -124,16 +124,6 @@ IBGP_MIMIC_PARENTS: t.List[str] = [
 # asserts and the count the postcheck asserts cannot drift apart.
 SC9_EBGP_SESSION_COUNT = 256
 
-# Absolute bound on the device-maintained ECMP peak. DNE's already-sanctioned
-# bar (health_checks/constants.py) rather than a number invented here, and it
-# has to be ABSOLUTE: the watermark cannot be reset in-test, so bag013 carried a
-# pre-existing peak of 416 into the first SC9 run and will carry one into every
-# run until it is reloaded. A bound below that would fail on lab history rather
-# than on anything SC9 did.
-# Applied at BOTH the precheck and the postcheck, at the same value, so a peak
-# the box arrived with is attributed to the testbed instead of to SC9's drain.
-_SC9_MAX_ECMP_HIGH_WATERMARK = 1000
-
 _LIFECYCLE_CONVERGENCE_HARD_TIMEOUT_SECONDS = 1200
 _SOAK_READINESS_STABILITY_WINDOW_SECONDS = 30.0
 RUNTIME_UPDATE_EXACT_PEER_GROUP_NAMES = ("EB-FA-V6", "EB-FA-V4")
@@ -788,31 +778,14 @@ def _sc9_bounded_ecmp(ctx: ProfileContext) -> ProfileChecks:
     """
     return ProfileChecks(
         prechecks=[
-            # Hardware headroom BEFORE the drain, recorded so a postcheck
-            # breach can be read against where the device started.
-            #
-            # Nothing in the framework compares the two readings -- each
-            # hardware-capacity check is independent and stateless -- so this is
-            # documentation of the starting point, not half of a delta. An
-            # earlier revision of this profile claimed it "establishes the floor
-            # the post reading is compared against"; that mechanism does not
-            # exist. check_watermarks=False keeps the within-reading delta check
-            # off, because bag013 carries a large stale FEC peak that no SC9 run
-            # can reset or influence.
-            #
-            # The ECMP high-watermark bound is applied HERE TOO, at the same
-            # value as the postcheck. That watermark is monotonic within a boot
-            # and no SC9 step resets it, so a box arriving with a peak left by a
-            # previous full-scale run would fail the postcheck and read as
-            # "SC9's drain exhausted the ECMP table" when SC9 never touched it.
-            # Asserting it before the run attributes that state to the testbed,
-            # where it belongs. The delta step in the playbook covers the same
-            # counter immune to staleness, by comparing against SC9's own
-            # capture rather than against an absolute.
+            # Check instantaneous hardware headroom before the drain. Do not
+            # gate the boot-lifetime ECMP high watermark here: Conveyor runs
+            # SC9 after the full-scale workloads on the same boot, so that
+            # counter legitimately includes predecessor activity. Stage A
+            # captures SC9's own baseline for the Stage C delta comparison.
             create_hardware_capacity_check(
                 check_id="sc9_precheck_hw_capacity_baseline",
                 check_watermarks=False,
-                ecmp_high_watermark_threshold=_SC9_MAX_ECMP_HIGH_WATERMARK,
             ),
         ],
         postchecks=[
@@ -854,36 +827,13 @@ def _sc9_bounded_ecmp(ctx: ProfileContext) -> ProfileChecks:
                 use_discovered_width=True,
                 peers_stopped_delta=0,
             ),
-            # Hardware headroom AFTER the drain.
-            #
-            # This deliberately does NOT use watermark_delta_threshold, which an
-            # earlier revision set to the topology's structural max. That knob
-            # does not mean what the name suggests: validate_hardware_capacity
-            # computes abs(high_watermark - used) WITHIN A SINGLE READING, so it
-            # never compares the precheck to the postcheck, and the same knob
-            # gates FEC as well as ECMP. The first bag013 run failed on exactly
-            # that -- "FEC high watermark delta (19398) exceeds threshold (258)"
-            # -- where 19398 is a stale FEC peak (hwm 24271 vs 4873 used) that
-            # was identical at precheck and postcheck and has nothing to do with
-            # SC9. check_watermarks=False turns the delta checks off.
-            #
-            # `ecmp_high_watermark_threshold` IS load-bearing and stays: unlike
-            # every neighbouring threshold, HardwareCapacityThresholds.from_dict
-            # reads it with a bare params.get() and applies NO default, so
-            # passing it is the only thing that enables the bound at all. Its
-            # value coinciding with ARISTA_DEFAULT_ECMP_THRESHOLD is a red
-            # herring -- that default belongs to `ecmp_threshold`, a different
-            # counter. It is evaluated outside the check_watermarks block.
-            #
-            # `max_ecmp_level2` was dropped: it was set to 500, which is exactly
-            # ARISTA_DEFAULT_MAX_ECMP_LEVEL2 and IS applied by from_dict on
-            # None, so it was a no-op dressed as a deliberate SC9 bound -- and
-            # sitting beside a genuinely load-bearing parameter it implied both
-            # were chosen. The framework default still applies.
+            # Check instantaneous hardware headroom after the drain. The
+            # boot-lifetime watermark remains excluded for the same reason as
+            # the precheck; the Stage C delta comparison owns SC9-attributable
+            # watermark growth.
             create_hardware_capacity_check(
                 check_id="sc9_postcheck_hw_capacity",
                 check_watermarks=False,
-                ecmp_high_watermark_threshold=_SC9_MAX_ECMP_HIGH_WATERMARK,
             ),
         ],
         snapshot_checks=[

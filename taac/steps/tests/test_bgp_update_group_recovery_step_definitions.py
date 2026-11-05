@@ -328,6 +328,35 @@ class BgpUpdateGroupRecoveryStepDefinitionsTest(TestCase):
         self.assertEqual(state_key, params["state_key"])
         self.assertEqual(100, params["max_current_delta"])
         self.assertEqual(100, params["max_high_watermark_increase"])
+        self.assertNotIn("high_watermark_resources", params)
+
+    def test_hardware_capacity_delta_serializes_hwm_resource_scope(self) -> None:
+        step = create_hardware_capacity_delta_step(
+            "bag012.ash6",
+            "compare",
+            str(uuid.uuid4()),
+            high_watermark_resources=("ecmp",),
+        )
+        params = json.loads(none_throws(none_throws(step.step_params).json_params))
+
+        self.assertEqual(["ecmp"], params["high_watermark_resources"])
+
+    def test_hardware_capacity_delta_default_hwm_scope_is_order_independent(
+        self,
+    ) -> None:
+        for action in ("capture", "compare", "clear"):
+            with self.subTest(action=action):
+                step = create_hardware_capacity_delta_step(
+                    "bag012.ash6",
+                    action,
+                    str(uuid.uuid4()),
+                    high_watermark_resources=("ecmp", "fec"),
+                )
+                params = json.loads(
+                    none_throws(none_throws(step.step_params).json_params)
+                )
+
+                self.assertNotIn("high_watermark_resources", params)
 
     def test_hardware_capacity_delta_rejects_bad_key_and_threshold(self) -> None:
         with self.assertRaisesRegex(ValueError, "UUID"):
@@ -340,6 +369,21 @@ class BgpUpdateGroupRecoveryStepDefinitionsTest(TestCase):
                         "compare",
                         str(uuid.uuid4()),
                         max_current_delta=value,
+                    )
+        for resources in (
+            (),
+            ("route",),
+            (["ecmp"],),
+            ("ecmp", "ecmp"),
+            ["ecmp"],
+        ):
+            with self.subTest(resources=resources):
+                with self.assertRaisesRegex(ValueError, "high_watermark_resources"):
+                    create_hardware_capacity_delta_step(
+                        "bag012.ash6",
+                        "compare",
+                        str(uuid.uuid4()),
+                        high_watermark_resources=t.cast(t.Any, resources),
                     )
 
     def test_hardware_capacity_delta_rejects_noncompare_thresholds(self) -> None:
@@ -358,6 +402,13 @@ class BgpUpdateGroupRecoveryStepDefinitionsTest(TestCase):
                         action,
                         str(uuid.uuid4()),
                         max_high_watermark_increase=True,
+                    )
+                with self.assertRaisesRegex(ValueError, "only for compare"):
+                    create_hardware_capacity_delta_step(
+                        "bag012.ash6",
+                        action,
+                        str(uuid.uuid4()),
+                        high_watermark_resources=("ecmp",),
                     )
 
     def test_device_group_toggle_serializes_exact_match_count(self) -> None:

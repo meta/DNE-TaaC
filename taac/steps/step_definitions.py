@@ -492,6 +492,7 @@ def create_bgp_update_group_state_step(
 
 _DEFAULT_MAX_HARDWARE_CURRENT_DELTA = 100
 _DEFAULT_MAX_HARDWARE_HIGH_WATERMARK_INCREASE = 100
+_DEFAULT_HARDWARE_HIGH_WATERMARK_RESOURCES = ("fec", "ecmp")
 
 # Settle time after admin-enabling ports, before their state is asserted.
 # Testbeds on coherent ZR optics must raise this: ZR takes 120-180s to acquire
@@ -515,6 +516,9 @@ def create_hardware_capacity_delta_step(
     *,
     max_current_delta: int = _DEFAULT_MAX_HARDWARE_CURRENT_DELTA,
     max_high_watermark_increase: int = (_DEFAULT_MAX_HARDWARE_HIGH_WATERMARK_INCREASE),
+    high_watermark_resources: tuple[str, ...] = (
+        _DEFAULT_HARDWARE_HIGH_WATERMARK_RESOURCES
+    ),
     description: t.Optional[str] = None,
 ) -> Step:
     """Create a keyed capture, compare, or clear capacity-delta action."""
@@ -538,19 +542,39 @@ def create_hardware_capacity_delta_step(
     for name, value in thresholds:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
+    supported_resources = set(_DEFAULT_HARDWARE_HIGH_WATERMARK_RESOURCES)
+    if (
+        not isinstance(high_watermark_resources, tuple)
+        or not high_watermark_resources
+        or any(
+            not isinstance(resource, str) or resource not in supported_resources
+            for resource in high_watermark_resources
+        )
+        or len(set(high_watermark_resources)) != len(high_watermark_resources)
+    ):
+        raise ValueError(
+            "high_watermark_resources must be a non-empty tuple containing "
+            "only 'fec' and/or 'ecmp', without duplicates"
+        )
+    is_default_high_watermark_scope = (
+        set(high_watermark_resources) == supported_resources
+    )
     default_thresholds = {
         "max_current_delta": _DEFAULT_MAX_HARDWARE_CURRENT_DELTA,
         "max_high_watermark_increase": (_DEFAULT_MAX_HARDWARE_HIGH_WATERMARK_INCREASE),
     }
-    if action != "compare" and any(
-        value != default_thresholds[name] for name, value in thresholds
+    if action != "compare" and (
+        any(value != default_thresholds[name] for name, value in thresholds)
+        or not is_default_high_watermark_scope
     ):
         raise ValueError(
-            "hardware-capacity thresholds are supported only for compare actions"
+            "hardware-capacity comparison options are supported only for compare actions"
         )
     if action == "compare":
         for name, value in thresholds:
             payload[name] = value
+        if not is_default_high_watermark_scope:
+            payload["high_watermark_resources"] = high_watermark_resources
     return create_custom_step(
         params_dict=payload,
         description=description or f"Hardware-capacity delta: {action}",

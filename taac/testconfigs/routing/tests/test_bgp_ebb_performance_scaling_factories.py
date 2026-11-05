@@ -46,6 +46,7 @@ from taac.testconfigs.routing.factories import (
 )
 from taac.testconfigs.routing.factories.bgp_ebb_characteristic import (
     create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config,
+    create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config,
     create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config,
     create_bgp_ebb_characteristic_performance_scaling_test_config,
     create_bgp_ebb_characteristic_transient_memory_route_scale_test_config,
@@ -854,6 +855,42 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
 
         self.assertEqual(8, len(device_groups))
         self.assertTrue(all(not group.enable for group in device_groups))
+
+    def test_sc9_uses_bgpcpp_bgp_timers(self) -> None:
+        config = create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config(
+            NRQEB009_ASH6,
+            parent_networks=BOUNDED_ECMP_PARENT_NETWORKS_IXIA03,
+        )
+        bgp_configs = [
+            bgp_config
+            for port in config.basic_port_configs or []
+            for group in port.device_group_configs or []
+            for bgp_config in (group.v4_bgp_config, group.v6_bgp_config)
+            if bgp_config is not None
+        ]
+
+        self.assertEqual(8, len(bgp_configs))
+        self.assertEqual(
+            {(15, 5)},
+            {
+                (bgp_config.hold_timer, bgp_config.keepalive_timer)
+                for bgp_config in bgp_configs
+            },
+        )
+
+    def test_retained_bounded_ecmp_keeps_default_ixia_bgp_timers(self) -> None:
+        config = create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
+            NRQEB009_ASH6
+        )
+        timers = {
+            (bgp_config.hold_timer, bgp_config.keepalive_timer)
+            for port in config.basic_port_configs or []
+            for group in port.device_group_configs or []
+            for bgp_config in (group.v4_bgp_config, group.v6_bgp_config)
+            if bgp_config is not None
+        }
+
+        self.assertEqual({(30, 10)}, timers)
 
     def test_update_packing_conveyor_config_is_ug_and_non_vacuous(self) -> None:
         config = create_bgp_ebb_update_packing_test_config(

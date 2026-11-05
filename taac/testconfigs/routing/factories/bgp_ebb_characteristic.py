@@ -2954,13 +2954,35 @@ def create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
     )
 
 
-def _with_ixia_device_groups_disabled(
+_SC9_IXIA_BGP_HOLD_TIMER_S = 15
+_SC9_IXIA_BGP_KEEPALIVE_TIMER_S = 5
+
+
+def _with_sc9_ixia_settings(
     basic_port_configs: Sequence[taac_types.BasicPortConfig],
 ) -> list[taac_types.BasicPortConfig]:
     return [
         port_config(
             device_group_configs=[
-                device_group(enable=False)
+                device_group(
+                    enable=False,
+                    v4_bgp_config=(
+                        device_group.v4_bgp_config(
+                            hold_timer=_SC9_IXIA_BGP_HOLD_TIMER_S,
+                            keepalive_timer=_SC9_IXIA_BGP_KEEPALIVE_TIMER_S,
+                        )
+                        if device_group.v4_bgp_config is not None
+                        else None
+                    ),
+                    v6_bgp_config=(
+                        device_group.v6_bgp_config(
+                            hold_timer=_SC9_IXIA_BGP_HOLD_TIMER_S,
+                            keepalive_timer=_SC9_IXIA_BGP_KEEPALIVE_TIMER_S,
+                        )
+                        if device_group.v6_bgp_config is not None
+                        else None
+                    ),
+                )
                 for device_group in port_config.device_group_configs or []
             ]
         )
@@ -3043,8 +3065,8 @@ def create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config(
         startup_checks=[],
         setup_tasks=compiled.setup_tasks,
         teardown_tasks=compiled.teardown_tasks,
-        basic_port_configs=_with_ixia_device_groups_disabled(
-            compiled.basic_port_configs
+        basic_port_configs=_with_sc9_ixia_settings(
+            compiled.basic_port_configs,
         ),
         playbooks=[
             get_bgp_ebb_bounded_ecmp_sc9_playbook(

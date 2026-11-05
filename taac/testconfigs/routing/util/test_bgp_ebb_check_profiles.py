@@ -96,6 +96,30 @@ class CheckProfileRegistryTest(unittest.TestCase):
             checks.snapshot_checks[0].name, hc_types.CheckName.CORE_DUMPS_CHECK
         )
 
+    def test_sc9_does_not_gate_on_boot_lifetime_ecmp_watermark(self):
+        checks = get_profile_checks(CheckProfile.SC9_BOUNDED_ECMP, ProfileContext())
+        hardware_checks = [
+            check
+            for check in [*checks.prechecks, *checks.postchecks]
+            if check.check_id
+            in {
+                "sc9_precheck_hw_capacity_baseline",
+                "sc9_postcheck_hw_capacity",
+            }
+        ]
+
+        self.assertEqual(
+            [
+                "sc9_precheck_hw_capacity_baseline",
+                "sc9_postcheck_hw_capacity",
+            ],
+            [check.check_id for check in hardware_checks],
+        )
+        for check in hardware_checks:
+            payload = json.loads(check.check_params.json_params)
+            self.assertFalse(payload["check_watermarks"])
+            self.assertIsNone(payload.get("ecmp_high_watermark_threshold"))
+
     def test_retry_is_baked_from_ssot(self):
         # Every postcheck must carry the uniform SSOT retry spec (P1/P3): the
         # profile never hand-passes retry numbers.

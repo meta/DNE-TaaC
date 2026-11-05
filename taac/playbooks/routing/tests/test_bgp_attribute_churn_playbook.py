@@ -1413,7 +1413,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             "observer_peer_parent_prefix", playbook_factory.call_args.kwargs
         )
 
-    def test_scheduled_full_scale_playbooks_use_canonical_fec_baseline(
+    def test_scheduled_full_scale_playbooks_use_canonical_hardware_guards(
         self,
     ) -> None:
         playbooks_by_name = {
@@ -1428,7 +1428,6 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         }
         expected_without_hardware_precheck = {
             "bgp_ebb_longevity_playbook",
-            "bgp_ebb_nexthop_group_count_threshold_playbook",
         }
         without_hardware_precheck = set()
 
@@ -1445,11 +1444,12 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             check_params = hardware_prechecks[0].check_params
             if check_params is None or check_params.json_params is None:
                 self.fail(f"{name} hardware precheck must carry JSON parameters")
-            self.assertEqual(
-                15_000,
-                json.loads(check_params.json_params)["fec_threshold"],
-                name,
-            )
+            payload = json.loads(check_params.json_params)
+            if name == "bgp_ebb_nexthop_group_count_threshold_playbook":
+                self.assertEqual(1000, payload["ecmp_high_watermark_threshold"])
+                self.assertFalse(payload["check_watermarks"])
+            else:
+                self.assertEqual(15_000, payload["fec_threshold"], name)
 
         self.assertEqual(16, len(playbooks_by_name))
         self.assertEqual(
@@ -2247,6 +2247,33 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             },
         )
         self.assertIn(300, [payload.get("duration") for payload in payloads])
+
+    def test_ebb16_factory_gates_absolute_ecmp_high_watermark(self) -> None:
+        playbook = get_bgp_ebb_nexthop_group_count_threshold_playbook(
+            device_name="dut.example.com",
+            expected_established_sessions=1272,
+            route_count_expected=105_000,
+            ixia_items_by_afi=_EBB16_IXIA_ITEMS,
+        )
+
+        for phase, checks in (
+            ("pre", playbook.prechecks or []),
+            ("post", playbook.postchecks or []),
+        ):
+            hardware_checks = [
+                check
+                for check in checks
+                if check.name == hc_types.CheckName.HARDWARE_CAPACITY_CHECK
+            ]
+            self.assertEqual(1, len(hardware_checks), phase)
+            check_params = hardware_checks[0].check_params
+            if check_params is None or check_params.json_params is None:
+                self.fail(f"EBB16 {phase} hardware check must carry parameters")
+            payload = json.loads(check_params.json_params)
+            self.assertEqual(1000, payload["ecmp_high_watermark_threshold"])
+            self.assertFalse(payload["check_watermarks"])
+            self.assertIsNone(payload["ecmp_threshold"])
+            self.assertNotIn("fec_high_watermark_threshold", payload)
 
     def test_full_scale_factory_wires_optional_bgp_monitor_port(self) -> None:
         fauu_target = (

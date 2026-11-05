@@ -3757,6 +3757,7 @@ def create_nexthop_group_poll_periodic_task(
     min_bgp_multiway_consecutive_samples: t.Optional[int] = None,
     min_programmed_groups: t.Optional[int] = None,
     max_programmed_groups: t.Optional[int] = None,
+    max_converged_unprogrammed: t.Optional[int] = None,
 ) -> PeriodicTask:
     """Periodic task to poll nexthop-group count against a threshold.
 
@@ -3834,6 +3835,10 @@ def create_nexthop_group_poll_periodic_task(
             median of an even window is the AVERAGE of its two middle samples,
             so a window straddling two values yields a half-integer that can
             never equal the integer expectation and a healthy device breaches.
+        max_converged_unprogrammed: Optional ceiling for the maximum
+            `num_unprogrammed_groups` value in the closing window. This permits
+            expected transition-time rebuilds while requiring the device to be
+            fully programmed after the final soak. Omitted = not asserted.
         min_samples: Optional floor on how many samples the run collected. The
             poll swallows every collection failure and only an ENTIRELY empty
             series fails, so without this a run that lost most of its reads
@@ -3907,6 +3912,7 @@ def create_nexthop_group_poll_periodic_task(
         ("min_bgp_groups", min_bgp_groups),
         ("min_programmed_groups", min_programmed_groups),
         ("max_programmed_groups", max_programmed_groups),
+        ("max_converged_unprogrammed", max_converged_unprogrammed),
         (
             "min_bgp_groups_consecutive_samples",
             min_bgp_groups_consecutive_samples,

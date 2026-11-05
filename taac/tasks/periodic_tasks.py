@@ -546,6 +546,26 @@ def _unprogrammed_verdict(
     )
 
 
+def _converged_unprogrammed_verdict(
+    series: t.Dict[float, int], maximum: int, window: int
+) -> t.Tuple[bool, str]:
+    ordered = sorted(series)
+    if len(ordered) < window:
+        return True, (
+            f"converged unprogrammed NOT EVALUATED: {len(ordered)} samples is "
+            f"fewer than the {window} needed for a closing window"
+        )
+    values = _series_window(series, window, last=True)
+    peak = max(values)
+    detail = f"closing-window peak {peak} across {window} samples"
+    if peak <= maximum:
+        return False, (f"converged unprogrammed OK: {detail}, within maximum {maximum}")
+    return True, (
+        f"converged unprogrammed BREACH: {detail}, above maximum {maximum} -- "
+        f"the device was left with an unprogrammed nexthop group after the soak"
+    )
+
+
 def _count_multiway_groups(sizes: t.Dict[int, int], min_width: int) -> int:
     """Number of nexthop groups at least ``min_width`` next-hops wide.
 
@@ -846,6 +866,7 @@ def _misconfigured_params(params: t.Dict[str, t.Any]) -> t.List[str]:  # noqa: C
             "so there is no unprogrammed ceiling for it to soften"
         )
     _checked_int(params, "expected_converged_multiway_groups", problems, minimum=0)
+    _checked_int(params, "max_converged_unprogrammed", problems, minimum=0)
     # The closing window must be ODD. statistics.median AVERAGES the two middle
     # values of an even-length window, so a window straddling 2 and 3 medians to
     # 2.5 -- and 2.5 never equals an integer expectation, so a HEALTHY device
@@ -1339,20 +1360,22 @@ class NexthopGroupPoll(PeriodicTask):
         2. ``max(num_unprogrammed_groups) <= max_unprogrammed`` -- the device's
            own "I could not program this group" signal, i.e. the closest thing
            the box reports to "the hardware table is full".
-        3. ``len(samples) >= min_samples`` -- the poll stayed alive.
-        4. multi-way ECMP-set count and ceiling (``min_ecmp_width`` /
+        3. ``max_converged_unprogrammed`` -- the closing post-soak window has
+           no persistent unprogrammed groups.
+        4. ``len(samples) >= min_samples`` -- the poll stayed alive.
+        5. multi-way ECMP-set count and ceiling (``min_ecmp_width`` /
            ``max_multiway_groups``).
-        5. the settled multi-way count (``expected_converged_multiway_groups``).
-        6. a floor on what was observed at all (``min_observed_groups``).
-        7. an optional same-sample aggregate count and multipath floor.
-        8. recovery to the opening baseline (``recovery_tolerance``).
-        9. BGP-only named-NHG creation across every width
+        6. the settled multi-way count (``expected_converged_multiway_groups``).
+        7. a floor on what was observed at all (``min_observed_groups``).
+        8. an optional same-sample aggregate count and multipath floor.
+        9. recovery to the opening baseline (``recovery_tolerance``).
+        10. BGP-only named-NHG creation across every width
            (``min_bgp_groups``).
-        10. sustained BGP-only multipath-NHG creation
+        11. sustained BGP-only multipath-NHG creation
            (``min_bgp_multiway_groups``).
-        11. a floor on the peak sampled EOS programmed-group count
+        12. a floor on the peak sampled EOS programmed-group count
             (``min_programmed_groups``).
-        12. an inclusive ceiling on every sampled EOS nexthop group whose
+        13. an inclusive ceiling on every sampled EOS nexthop group whose
             group-level programmed state is true (``max_programmed_groups``).
 
         Collecting no data is a FAILURE, not a SKIP. ``run`` swallows every
@@ -1482,6 +1505,20 @@ class NexthopGroupPoll(PeriodicTask):
                 num_unprogrammed_groups_data,
                 int(max_unprogrammed),
                 None if tolerance is None else int(tolerance),
+            )
+            (failures if failed else verdicts).append(text)
+
+        max_converged_unprogrammed = self._params.get("max_converged_unprogrammed")
+        if max_converged_unprogrammed is not None:
+            failed, text = _converged_unprogrammed_verdict(
+                num_unprogrammed_groups_data,
+                int(max_converged_unprogrammed),
+                int(
+                    self._params.get(
+                        "converged_window_samples",
+                        _DEFAULT_CONVERGED_WINDOW_SAMPLES,
+                    )
+                ),
             )
             (failures if failed else verdicts).append(text)
 

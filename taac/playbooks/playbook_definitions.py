@@ -31457,16 +31457,13 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
       as Requirement Coverage (the catalog admits only precheck / workload /
       postcheck / snapshot phases), and the task's own baseline window would
       land during setup_steps, before convergence.
-    * Hardware headroom -- two things, which an earlier revision conflated. The
-      profile's pre/post hardware-capacity checks bound the device-maintained
-      ``ecmp_high_watermark`` in ABSOLUTE terms at both ends, so a peak the box
-      arrived carrying is attributed to the testbed rather than to this drain.
-      Separately, the capture/compare pair in Stages A and C is the only thing
-      that COMPARES those two readings: each hardware-capacity check is
-      independent and stateless, so before this the watermark was measured twice
-      and differenced never. That delta is the one gate here immune to sampling
-      -- a max-over-time counter maintained by the device cannot miss a peak
-      that falls between two 5s polls.
+    * Hardware headroom -- the profile's pre/post hardware-capacity checks gate
+      instantaneous usage and table limits. They deliberately ignore the
+      boot-lifetime ECMP high watermark because Conveyor runs SC9 after
+      full-scale workloads on the same boot. The capture/compare pair in Stages
+      A and C instead bounds watermark growth relative to SC9's converged
+      baseline. That delta records any new max-over-time peak above the captured
+      baseline, including one that falls between two 5s polls.
     * Instrument liveness -- the periodic task's ``min_observed_groups``, which
       fails a run that reported only zeroes. That is not hypothetical: the
       predecessor suite on bag012 read 0 for all 884 samples and passed eleven
@@ -31532,33 +31529,9 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
                 threshold=_SC9_ECMP_LEVEL2_CAPACITY,
                 # Blocking: a run that only ever reported zero measured nothing.
                 min_observed_groups=1,
-                # The device's own report that it could not program a group --
-                # the most direct hardware-exhaustion signal available, and the
-                # one number that does not need calibrating. Measured 0 on all
-                # 728 readings of the first bag013 run, against a peak of 27
-                # groups in an 8,192-entry table, so this is a real gate rather
-                # than a threshold picked to pass.
-                max_unprogrammed=0,
-                # Tolerate groups momentarily IN FLIGHT; gate on groups that
-                # stay unprogrammed. The first complete five-cycle run read 0
-                # in 390 of 391 samples and 4 in exactly one, caught mid-rebuild
-                # with widths climbing 1,2,3,12,...,26 and back to 0 five
-                # seconds later. `max_unprogrammed=0` alone asserted that
-                # creation and hardware programming are atomic, which they are
-                # not, so it failed a run whose every other gate passed.
-                #
-                # 3 samples is ~18s at the measured 5.8s cadence, against an
-                # unprogrammed condition that lasted ONE sample (~5s): the poll
-                # read 0 groups for five samples, then 3 groups at widths 1/2/3,
-                # then 12 groups with 4 unprogrammed, then 9 groups with 0. Note
-                # this is the duration of the UNPROGRAMMED state, not of the
-                # rebuild -- the rebuild itself runs ~70s to {128: 2} (76/71/68/
-                # 70s across the four sampled cycles), so a tolerance sized to
-                # the rebuild would be four times too wide and would blind the
-                # gate. Anything genuinely unprogrammed persists far longer than
-                # 18s -- rel-191 sat at 8 while the ECMP structure was
-                # collapsing. Caveat: n=1, one non-zero reading in five cycles.
-                unprogrammed_tolerance_samples=3,
+                # Intentional drain/readvertise phases can leave groups in
+                # flight for minutes. The post-soak window must be clean.
+                max_converged_unprogrammed=0,
                 # Report real ECMP sets separately from width-1 singletons. No
                 # ceiling yet -- the peak has never been measured on an
                 # uncontaminated run, and the coverage-bearing bound is the
@@ -31620,7 +31593,7 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
                             "next-hops, then record it"
                         ),
                     ),
-                    # Capture the device's own FEC/ECMP peak counters, AFTER the
+                    # Capture the device's own FEC/ECMP counters, AFTER the
                     # baseline has converged so the reading is a steady state
                     # rather than a mid-convergence one.
                     #
@@ -31706,15 +31679,18 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
                     # recovery is already asserted twice over -- at RIB level by
                     # the multipath-width postcheck and on the sampled series by
                     # the converged verdict -- so it is corroboration here, not
-                    # the gate. The watermark INCREASE is the gate.
+                    # the gate. The ECMP watermark INCREASE is the gate. FEC
+                    # current recovery remains checked, but the topology-derived
+                    # ECMP group bound must not be applied to the FEC peak.
                     create_hardware_capacity_delta_step(
                         device_name,
                         "compare",
                         _sc9_capacity_state_key(device_name),
                         max_high_watermark_increase=_SC9_STRUCTURAL_MAX_ECMP_SETS,
+                        high_watermark_resources=("ecmp",),
                         description=(
-                            "SC9 Stage C: compare FEC/ECMP capacity against the "
-                            "pre-drain capture"
+                            "SC9 Stage C: compare current capacity and the ECMP "
+                            "high watermark against the pre-drain capture"
                         ),
                     ),
                 ],

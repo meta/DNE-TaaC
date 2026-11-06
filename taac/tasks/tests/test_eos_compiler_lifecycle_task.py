@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import shlex
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, call, MagicMock, patch
 
 from later.unittest import TestCase
@@ -539,7 +541,7 @@ class EosCompilerLifecycleTaskTest(TestCase):
         )
         encoded_expected = base64.b64encode(expected.encode()).decode("ascii")
         self.assertTrue(any(encoded_expected in command for command in commands))
-        self.assertTrue(any("chown 42:43" in command for command in commands))
+        self.assertTrue(any("chown +42:+43" in command for command in commands))
         self.assertTrue(any("chmod '640'" in command for command in commands))
         self.assertTrue(any("mv -f" in command for command in commands))
         logger.info.assert_called_once()
@@ -669,7 +671,7 @@ class EosCompilerLifecycleTaskTest(TestCase):
         )
         self.assertTrue(any("base64 -d" in command for command in commands))
         self.assertTrue(any("sha256sum" in command for command in commands))
-        self.assertTrue(any("chown 42:43" in command for command in commands))
+        self.assertTrue(any("chown +42:+43" in command for command in commands))
         self.assertTrue(any("chmod '640'" in command for command in commands))
         self.assertTrue(any("mv -f" in command for command in commands))
         encoded_prior_bytes = base64.b64encode(prior_bytes).decode("ascii")
@@ -677,7 +679,13 @@ class EosCompilerLifecycleTaskTest(TestCase):
         self.assertTrue(
             all("/mnt/flash/bgpcpp_config" in command for command in commands)
         )
-        logger.info.assert_called_once()
+        logger.info.assert_any_call(
+            "Verified exact Configerator routing artifact bytes"
+        )
+        logger.info.assert_any_call(
+            "EOS routing-config snapshot /mnt/flash/bgpcpp_config: "
+            "mode=640, uid=42, gid=43"
+        )
 
     async def test_routing_config_rejects_exact_readback_drift(self) -> None:
         driver = MagicMock()
@@ -723,6 +731,54 @@ class EosCompilerLifecycleTaskTest(TestCase):
                 "installed file missing at /mnt/flash/bgpcpp_config",
             ):
                 await task.run(_routing_config_params("routing_config_verify"))
+
+    async def test_routing_config_restore_rejects_metadata_drift(self) -> None:
+        expected = ("644", 11420360, 88)
+        for label, actual in (
+            ("mode", ("600", 11420360, 88)),
+            ("uid", ("644", 80556623, 88)),
+            ("gid", ("644", 11420360, 88088)),
+        ):
+            with self.subTest(field=label):
+                metadata_reads = iter((expected, actual))
+                driver = MagicMock()
+                driver.async_read_file = AsyncMock(return_value="prior bytes")
+
+                async def execute(
+                    command: str,
+                    *,
+                    configure: bool = False,
+                    metadata_values: Iterator[tuple[str, int, int]] = metadata_reads,
+                ) -> str:
+                    if "stat -c" in command:
+                        mode, uid, gid = next(metadata_values)
+                        return f"taac-file-metadata:{mode}:{uid}:{gid}"
+                    if "sha256sum" in command:
+                        return hashlib.sha256(b"prior bytes").hexdigest()
+                    return ""
+
+                driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
+                    side_effect=execute
+                )
+                logger = MagicMock()
+                task = EosCompilerLifecycleTask(
+                    hostname="dut.example.com", logger=logger, shared_data={}
+                )
+                with patch(
+                    f"{_MODULE}.async_get_device_driver", AsyncMock(return_value=driver)
+                ):
+                    await task.run(_routing_config_params("routing_config_snapshot"))
+                    with self.assertRaisesRegex(
+                        RuntimeError, "restored file metadata mismatch"
+                    ) as context:
+                        await task.run(_routing_config_params("routing_config_restore"))
+
+                self.assertIn(f"expected={expected}", str(context.exception))
+                self.assertIn(f"actual={actual}", str(context.exception))
+                logger.info.assert_any_call(
+                    "EOS restored file /mnt/flash/bgpcpp_config: "
+                    f"expected_metadata={expected}, actual_metadata={actual}"
+                )
 
     async def test_routing_config_restore_rejects_malformed_checksum_output(
         self,
@@ -959,7 +1015,7 @@ class EosCompilerLifecycleTaskTest(TestCase):
         self.assertTrue(
             any("b3JpZ2luYWwgc3RhcnR1cA==" in command for command in commands)
         )
-        self.assertTrue(any("chown 0:0" in command for command in commands))
+        self.assertTrue(any("chown +0:+0" in command for command in commands))
         self.assertTrue(any("chmod '755'" in command for command in commands))
         restore.assert_awaited_once_with(
             driver,
@@ -1239,9 +1295,11 @@ class EosCompilerLifecycleTaskTest(TestCase):
         }
         metadata: dict[str, tuple[str, int, int]] = {
             "/usr/sbin/run_bgpcpp.sh": ("755", 0, 0),
-            "/mnt/flash/bgpcpp_config": ("640", 42, 43),
+            "/mnt/flash/bgpcpp_config": ("644", 11420360, 88),
             _RIB_POLICY_STATE_PATH: ("600", 44, 45),
         }
+        staged_metadata: dict[str, tuple[str, int, int]] = {}
+        expected_metadata = dict(metadata)
         daemon_states: dict[str, bool] = {
             "FibGrpc": True,
             "FibAgent": False,
@@ -1282,8 +1340,28 @@ class EosCompilerLifecycleTaskTest(TestCase):
             if "sha256sum" in command:
                 path = next(path for path in files if path in command)
                 return hashlib.sha256(files[path]).hexdigest()
+            if "chown" in command:
+                parts = shlex.split(command)
+                owner, group = parts[3].split(":")
+                uid = (
+                    int(owner)
+                    if owner.startswith("+")
+                    else {"11420360": 80556623, "0": 11420360}.get(owner, int(owner))
+                )
+                gid = (
+                    int(group)
+                    if group.startswith("+")
+                    else {"88": 88088}.get(group, int(group))
+                )
+                staged_metadata[parts[4]] = ("664", uid, gid)
+            if "chmod" in command:
+                parts = shlex.split(command)
+                _, uid, gid = staged_metadata[parts[4]]
+                staged_metadata[parts[4]] = (parts[3], uid, gid)
             if "mv -f" in command:
-                path = next(path for path in files if path in command)
+                parts = shlex.split(command)
+                path = parts[-1]
+                metadata[path] = staged_metadata.pop(parts[-2])
                 events.append(f"file:{path}")
             return ""
 
@@ -1339,6 +1417,8 @@ class EosCompilerLifecycleTaskTest(TestCase):
             )
             await task.run(_state_guard_component_params("routing_component_restore"))
 
+        self.assertEqual(expected_metadata, metadata)
+        self.assertEqual({}, staged_metadata)
         self.assertEqual(
             [
                 ("Bgpcpp", False),
@@ -1391,7 +1471,7 @@ class EosCompilerLifecycleTaskTest(TestCase):
             mode, owner_uid, owner_gid = metadata[path]
             self.assertTrue(
                 any(
-                    f"chown {owner_uid}:{owner_gid}" in command and path in command
+                    f"chown +{owner_uid}:+{owner_gid}" in command and path in command
                     for command in commands
                 )
             )

@@ -211,10 +211,21 @@ else:
 
 
 if not TAAC_OSS:
+    from taac.internal.driver.lab_ssh_transport import (
+        async_exec as lab_ssh_async_exec,
+        lab_ssh_transport_enabled,
+    )
     from service_automation.fboss.remediations.utils.bmc_helper import (
         run_bmc_cmd_hwcontrol,
     )
 else:
+
+    def lab_ssh_transport_enabled() -> bool:  # type: ignore
+        """OSS has no lab-ssh daemon; BMC commands use run_bmc_cmd_hwcontrol."""
+        return False
+
+    async def lab_ssh_async_exec(*args, **kwargs):  # type: ignore
+        raise NotImplementedError("The lab-ssh transport is Meta-internal")
 
     def run_bmc_cmd_hwcontrol(hostname: str, cmd: str) -> str:  # type: ignore
         """OSS replacement - run a BMC command on the device's BMC via SSH.
@@ -12993,6 +13004,15 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
 # =============================================================================
 
 _WEDGE_POWER_CMD: str = "/usr/local/bin/wedge_power.sh"
+_BOOT_ID_CMD: str = "cat /proc/sys/kernel/random/boot_id"
+_REBOOT_VERIFY_TIMEOUT_S: int = 900
+_REBOOT_VERIFY_INTERVAL_S: int = 10
+
+
+def _bmc_hostname(hostname: str) -> str:
+    """``<short>-oob.<domain>``, the BMC naming the OSS BMC helper also uses."""
+    short, _, domain = hostname.partition(".")
+    return f"{short}-oob.{domain}" if domain else f"{short}-oob"
 
 
 class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
@@ -13005,6 +13025,7 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
     ) -> None:
         start_time = time.time()
         sleep_time_after_reboot = params.get("sleep_time_after_reboot", 0)
+        boot_id_before = await self._async_read_boot_id() if self.is_fboss else None
         if input.trigger == taac_types.SystemRebootTrigger.FULL_SYSTEM_REBOOT:
             await self.driver.async_full_system_reboot()
             self.logger.info(
@@ -13016,42 +13037,12 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
             and self.is_fboss
         ):
             # `reset -s` power-cycles the whole chassis; bare `reset` is microserver-only.
-            wedge_power_system_reset = f"{_WEDGE_POWER_CMD} reset -s"
-            try:
-                run_bmc_cmd_hwcontrol(self.device.name, wedge_power_system_reset)
-                self.logger.info(
-                    f"Successfully initiated the system reboot via the BMC command: {wedge_power_system_reset}"
-                )
-            except (
-                EOFError,
-                OSError,
-                paramiko.SSHException,
-                RuntimeError,
-            ) as e:
-                self.logger.info(
-                    f"BMC command {wedge_power_system_reset!r} raised {type(e).__name__} "
-                    f"(expected post-reboot disconnect): {e}"
-                )
+            await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset -s")
         elif (
             input.trigger == taac_types.SystemRebootTrigger.BMC_MICROSERVER_ONLY_RESET
             and self.is_fboss
         ):
-            wedge_power_microserver_reset = f"{_WEDGE_POWER_CMD} reset"
-            try:
-                run_bmc_cmd_hwcontrol(self.device.name, wedge_power_microserver_reset)
-                self.logger.info(
-                    f"Successfully initiated the system reboot via the BMC command: {wedge_power_microserver_reset}"
-                )
-            except (
-                EOFError,
-                OSError,
-                paramiko.SSHException,
-                RuntimeError,
-            ) as e:
-                self.logger.info(
-                    f"BMC command {wedge_power_microserver_reset!r} raised {type(e).__name__} "
-                    f"(expected post-reboot disconnect): {e}"
-                )
+            await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset")
         if sleep_time_after_reboot > 0:
             self.logger.info(
                 f"Waiting for {sleep_time_after_reboot} seconds after reboot"
@@ -13078,6 +13069,93 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
         await self.driver.wait_for_ssh_reachable()
         self.logger.debug(
             f"{self.device.name} is ssh-able {time.time() - start_time} seconds after {input.trigger.name}"
+        )
+        if boot_id_before is not None:
+            await self._async_wait_for_new_boot_id(
+                boot_id_before,
+                start_time,
+                input.trigger,
+                params.get("reboot_verify_timeout", _REBOOT_VERIFY_TIMEOUT_S),
+            )
+
+    async def _async_read_boot_id(self) -> str:
+        boot_id = (await self.driver.async_run_cmd_on_shell(_BOOT_ID_CMD)).strip()
+        if not boot_id:
+            raise RuntimeError(f"{self.device.name} returned an empty boot_id")
+        return boot_id
+
+    async def _async_run_bmc_reset(self, cmd: str) -> None:
+        if lab_ssh_transport_enabled():
+            # The lab-ssh daemon authenticates to the BMC with the caller's
+            # certificate; the hwcontrol path needs a Rotor password instead.
+            bmc = _bmc_hostname(self.device.name)
+            result = await lab_ssh_async_exec(
+                host=bmc, command=cmd, timeout_sec=60, username="root"
+            )
+            # The daemon encodes remote BMC SSH disconnects as exit -1;
+            # local daemon/RPC errors still propagate from lab_ssh_async_exec.
+            # A real non-zero command exit status is a failure.
+            if result.exit_code > 0:
+                raise RuntimeError(
+                    f"BMC command {cmd!r} failed on {bmc} (exit {result.exit_code}): "
+                    f"{result.stderr or result.stdout}"
+                )
+            self.logger.info(
+                f"BMC command {cmd!r} on {bmc}: exit {result.exit_code}, "
+                f"output {result.stdout.strip()!r}"
+            )
+            return
+        try:
+            output = run_bmc_cmd_hwcontrol(self.device.name, cmd)
+            self.logger.info(f"BMC command {cmd!r} returned {output!r}")
+        except (
+            EOFError,
+            OSError,
+            paramiko.SSHException,
+            RuntimeError,
+        ) as e:
+            self.logger.info(
+                f"BMC command {cmd!r} raised {type(e).__name__} "
+                f"(expected post-reboot disconnect): {e}"
+            )
+
+    async def _async_wait_for_new_boot_id(
+        self,
+        boot_id_before: str,
+        start_time: float,
+        trigger: taac_types.SystemRebootTrigger,
+        timeout: int,
+    ) -> None:
+        """Fail unless the device came back with a new kernel boot ID.
+
+        Ping and SSH cannot tell a reboot from a reset that never happened: a
+        host that stayed up answers both at once. The BMC helper also returns
+        an empty result instead of raising when it cannot run the command.
+        """
+        deadline = start_time + timeout
+        last_error = None
+        while True:
+            try:
+                boot_id = await self._async_read_boot_id()
+            except Exception as e:
+                # Down, or not serving SSH yet, partway through the reboot.
+                last_error = e
+            else:
+                if boot_id and boot_id != boot_id_before:
+                    self.logger.info(
+                        f"{self.device.name} rebooted: boot_id {boot_id_before} -> "
+                        f"{boot_id} ({time.time() - start_time:.0f}s after "
+                        f"{trigger.name})"
+                    )
+                    return
+                last_error = None
+            if time.time() >= deadline:
+                break
+            await asyncio.sleep(_REBOOT_VERIFY_INTERVAL_S)
+        raise RuntimeError(
+            f"{self.device.name} did not reboot after {trigger.name}: no new "
+            f"boot_id within {timeout}s (before: {boot_id_before})"
+            + (f"; last error: {last_error}" if last_error else "")
         )
 
 

@@ -4460,16 +4460,76 @@ class Ixia:
             or not bgp_peer_config.bgp_peer_name.endswith(self._DRAIN_PEER_NAME_SUFFIX)
         ):
             return
-        bgp_peer_obj.LocalRouterID.Increment(
-            start_value=self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE,
-            step_value=self._DRAIN_PEER_LOCAL_ROUTER_ID_STEP,
-        )
-        self.logger.info(
-            f"[{port_identifier}] Set explicit LocalRouterID base "
-            f"{self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE} on drain peer "
-            f"{desired_bgp_name} to avoid IXIA default-allocator "
-            f"collision with main pool"
-        )
+        local_router_id = bgp_peer_obj.LocalRouterID
+        increment = getattr(local_router_id, "Increment", None)
+        applied = False
+        if increment is not None:
+            increment(
+                start_value=self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE,
+                step_value=self._DRAIN_PEER_LOCAL_ROUTER_ID_STEP,
+            )
+            applied = True
+        else:
+            # BgpIpv4Peer/BgpIpv6Peer expose LocalRouterID as a plain value
+            # list, not a Multivalue pattern: set one stepped value per
+            # current entry, which is the Increment pattern spelled out
+            # for a value list. The generated update() setter does not
+            # accept this field in the loaded restpy version, so write
+            # through _set_attribute, the primitive the generated setters
+            # use; if neither write works, continue with IXIA defaults
+            # rather than failing all of setup for one drain peer. The
+            # stepped values are built inside the guarded block, so a
+            # base/step the address parser rejects soft-fails the same
+            # way; ip_address covers both address families.
+            current = local_router_id if isinstance(local_router_id, list) else []
+            values: list[str] = []
+
+            def _read_values() -> list[str] | None:
+                read = bgp_peer_obj.LocalRouterID
+                if isinstance(read, (list, tuple)):
+                    return [str(v) for v in read]
+                if isinstance(read, str):
+                    return [read]
+                return None
+
+            try:
+                base = ipaddress.ip_address(self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE)
+                step = int(ipaddress.ip_address(self._DRAIN_PEER_LOCAL_ROUTER_ID_STEP))
+                values = [
+                    str(base + index * step)
+                    for index in range(max(len(current), 1))
+                ]
+                wrote = False
+                try:
+                    t.cast(t.Any, bgp_peer_obj).update(LocalRouterID=values)
+                    # update() may ignore an unaccepted field without
+                    # raising: only a read-back proving the values landed
+                    # counts as applied.
+                    wrote = _read_values() == values
+                except TypeError:
+                    wrote = False
+                if not wrote:
+                    getattr(bgp_peer_obj, "_set_attribute")(
+                        "localRouterID", values
+                    )
+                    wrote = _read_values() == values
+                applied = wrote
+            except Exception as e:  # noqa: BLE001 - defaults are the fallback
+                self.logger.warning(
+                    f"[{port_identifier}] Could not set explicit "
+                    f"LocalRouterID {values} on drain peer "
+                    f"{desired_bgp_name}: {e!r}; continuing with IXIA "
+                    "defaults (drain router-id collision risk remains)"
+                )
+        # Only when a write applied: logging success after the soft-fail
+        # warning above would contradict it.
+        if applied:
+            self.logger.info(
+                f"[{port_identifier}] Set explicit LocalRouterID base "
+                f"{self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE} on drain peer "
+                f"{desired_bgp_name} to avoid IXIA default-allocator "
+                f"collision with main pool"
+            )
 
     def _verify_bgp_tcp_window_readback(
         self,
@@ -12684,17 +12744,99 @@ class Ixia:
                 as_numbers, last_two_octets = self._split_community_values(
                     community_list
                 )
-                community_obj.Type.Single(
-                    ixia_types.BGP_COMMUNITY_TYPE_MAP[
-                        config.bgp_community_type or ixia_types.BgpCommunityType.MANUAL
-                    ]
-                )
                 if config.attribute == ixia_types.BgpAttribute.COMMUNITIES:
+                    community_obj.Type.Single(
+                        ixia_types.BGP_COMMUNITY_TYPE_MAP[
+                            config.bgp_community_type
+                            or ixia_types.BgpCommunityType.MANUAL
+                        ]
+                    )
                     community_obj.AsNumber.ValueList(as_numbers)
                     community_obj.LastTwoOctets.ValueList(last_two_octets)
                 else:
-                    community_obj.AsNumber4Bytes.ValueList(as_numbers)
-                    community_obj.AssignedNumber4Bytes.ValueList(last_two_octets)
+                    type_value, as_field, assigned_field = (
+                        self._extended_community_fields(
+                            community_list, as_numbers, last_two_octets
+                        )
+                    )
+                    community_obj.Type.Single(type_value)
+                    getattr(community_obj, as_field).ValueList(as_numbers)
+                    getattr(community_obj, assigned_field).ValueList(
+                        last_two_octets
+                    )
+
+    def _extended_community_fields(
+        self,
+        community_list: list[str],
+        as_numbers: list[str],
+        last_two_octets: list[str],
+    ) -> tuple[str, str, str]:
+        """(Type, AS field, assigned field) for an extended-community row list.
+
+        The standard-community map does not apply here: the extended
+        object's ``Type`` only accepts administrator forms. A 2-octet
+        administrator takes ``AsNumber2Bytes``/``AssignedNumber4Bytes``;
+        a 4-octet administrator takes ``AsNumber4Bytes``/
+        ``AssignedNumber2Bytes``. Only the route-target prefix is
+        recognised; anything else fails loudly.
+
+        One row list maps to one community object, and one object
+        carries one ``Type``, so the choice is per list, not per
+        value: a list whose AS numbers are all 2-octet takes the
+        2-octet form, and any list containing a 4-octet AS takes
+        the 4-octet form, whose 4-byte AS field holds every value
+        in the list. Splitting a mixed list across two objects
+        would change the community count the caller stated. The
+        assigned numbers must fit the assigned field of the chosen
+        form: a list with a 4-octet AS and an assigned number over
+        65535 has no single form that holds both, so it fails
+        loudly here instead of overflowing the 2-byte field.
+        """
+        for community in community_list:
+            parts = community.split(":")
+            if len(parts) == 3 and parts[0] != "rt":
+                raise ValueError(
+                    f"extended community {community!r} has unsupported "
+                    "prefix (only 'rt:' is recognised)"
+                )
+        widths: list[int] = []
+        for asn in as_numbers:
+            try:
+                widths.append(int(asn))
+            except ValueError:
+                raise ValueError(
+                    f"extended community AS {asn!r} is not a decimal number"
+                ) from None
+        assigned: list[int] = []
+        for value in last_two_octets:
+            try:
+                assigned.append(int(value))
+            except ValueError:
+                raise ValueError(
+                    f"extended community assigned number {value!r} "
+                    "is not a decimal number"
+                ) from None
+        if all(width <= 65535 for width in widths):
+            if any(value > 0xFFFFFFFF for value in assigned):
+                raise ValueError(
+                    "extended community assigned number does not fit in "
+                    "AssignedNumber4Bytes (4-byte field)"
+                )
+            return (
+                "administratoras2octet",
+                "AsNumber2Bytes",
+                "AssignedNumber4Bytes",
+            )
+        if any(value > 65535 for value in assigned):
+            raise ValueError(
+                "extended community assigned number does not fit in "
+                "AssignedNumber2Bytes (2-byte field)"
+            )
+        return (
+            "administratoras4octet",
+            "AsNumber4Bytes",
+            "AssignedNumber2Bytes",
+        )
 
     def _parse_communities_file(self, file_content: str) -> list[list[str]]:
         """Parse a communities file into a list of community lists."""
@@ -12714,11 +12856,26 @@ class Ixia:
     def _split_community_values(
         self, community_list: list[str]
     ) -> tuple[list[str], list[str]]:
-        """Split community values into AS numbers and last two octets."""
+        """Split community values into AS numbers and last two octets.
+
+        Standard form is ``<as>:<number>``. Extended route-target form
+        is ``rt:<as>:<number>``; the type prefix is dropped and the
+        remaining two parts are used as-is. Anything else fails loudly
+        here rather than silently mis-assigning an AS number.
+        """
         as_numbers = []
         last_two_octets = []
         for community in community_list:
-            as_number, last_two_octet = community.split(":")
+            parts = community.split(":")
+            if len(parts) == 2:
+                as_number, last_two_octet = parts
+            elif len(parts) == 3 and parts[0] == "rt":
+                _prefix, as_number, last_two_octet = parts
+            else:
+                raise ValueError(
+                    f"community {community!r} is not '<as>:<number>' "
+                    "or 'rt:<as>:<number>'"
+                )
             as_numbers.append(as_number)
             last_two_octets.append(last_two_octet)
         return as_numbers, last_two_octets

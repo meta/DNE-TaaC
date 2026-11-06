@@ -990,6 +990,13 @@ def build_rescale_bgpcpp_config_steps(
 # Upper bound used when stopping IXIA IBGP peers between iterations. Matches
 # the long-standing lab convention.
 PER_ITERATION_MAX_IBGP_SESSIONS_TO_STOP: int = 500
+# Stopping hundreds of IXIA sessions completes asynchronously; a Start issued
+# while it is still settling left 65 of 100 IPv6 sessions resetting every DUT
+# OPEN on NRQEB008 SC1 (2026-11-06).
+PER_ITERATION_IXIA_STOP_SETTLE_SECONDS: int = 30
+# The DUT already has this iteration's peers configured, so a started session
+# that is not up within a minute is stuck and gets restarted.
+PER_ITERATION_IXIA_UP_TIMEOUT_SECONDS: int = 60
 _REGEX_IBGP_V6: str = "BGP_PEER_IPV6_IBGP"
 _REGEX_IBGP_V4: str = "BGP_PEER_IPV4_IBGP"
 
@@ -1049,16 +1056,22 @@ def build_ixia_ibgp_subset_activation_steps(n_v6: int, n_v4: int) -> list:
 
     Skips the start step for an AF whose count is 0.
     """
-    from taac.steps.step_definitions import create_ixia_api_step
+    from taac.steps.step_definitions import (
+        create_ixia_api_step,
+        create_longevity_step,
+    )
 
     def _args(start: bool, regex: str, end_idx: int) -> t.Dict[str, t.Any]:
-        return {
+        args: t.Dict[str, t.Any] = {
             "start": start,
             "regex": regex,
             "session_start_idx": 1,
             "session_end_idx": end_idx,
             "verify_started": start,
         }
+        if start:
+            args["verify_up_timeout_seconds"] = PER_ITERATION_IXIA_UP_TIMEOUT_SECONDS
+        return args
 
     steps = [
         create_ixia_api_step(
@@ -1071,6 +1084,13 @@ def build_ixia_ibgp_subset_activation_steps(n_v6: int, n_v4: int) -> list:
             (_REGEX_IBGP_V4, "IPv4"),
         )
     ]
+    steps.append(
+        create_longevity_step(
+            duration=PER_ITERATION_IXIA_STOP_SETTLE_SECONDS,
+            description="Let IXIA finish stopping IBGP peers before restarting them",
+            start_traffic=False,
+        )
+    )
     for regex, label, n in (
         (_REGEX_IBGP_V6, "IPv6", n_v6),
         (_REGEX_IBGP_V4, "IPv4", n_v4),
@@ -1176,16 +1196,22 @@ def build_ixia_ebgp_subset_activation_steps(n_v6: int, n_v4: int) -> list:
     ``build_ixia_ibgp_subset_activation_steps``. Skips the start step for an AF
     whose count is 0.
     """
-    from taac.steps.step_definitions import create_ixia_api_step
+    from taac.steps.step_definitions import (
+        create_ixia_api_step,
+        create_longevity_step,
+    )
 
     def _args(start: bool, regex: str, end_idx: int) -> t.Dict[str, t.Any]:
-        return {
+        args: t.Dict[str, t.Any] = {
             "start": start,
             "regex": regex,
             "session_start_idx": 1,
             "session_end_idx": end_idx,
             "verify_started": start,
         }
+        if start:
+            args["verify_up_timeout_seconds"] = PER_ITERATION_IXIA_UP_TIMEOUT_SECONDS
+        return args
 
     steps = [
         create_ixia_api_step(
@@ -1198,6 +1224,13 @@ def build_ixia_ebgp_subset_activation_steps(n_v6: int, n_v4: int) -> list:
             (_REGEX_EBGP_V4, "IPv4"),
         )
     ]
+    steps.append(
+        create_longevity_step(
+            duration=PER_ITERATION_IXIA_STOP_SETTLE_SECONDS,
+            description="Let IXIA finish stopping EBGP peers before restarting them",
+            start_traffic=False,
+        )
+    )
     for regex, label, n in (
         (_REGEX_EBGP_V6, "IPv6", n_v6),
         (_REGEX_EBGP_V4, "IPv4", n_v4),

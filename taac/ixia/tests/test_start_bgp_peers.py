@@ -313,7 +313,7 @@ class _FakeClock:
         self.now += seconds
 
 
-class StartBgpPeersVerifyStartedTest(unittest.TestCase):
+class _BgpSessionStatusTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self.ixia = _ixia()
         self.peer = _peer("BGP_PEER_IPV6_IBGP", 5)
@@ -338,6 +338,8 @@ class StartBgpPeersVerifyStartedTest(unittest.TestCase):
 
         self.peer.refresh.side_effect = refresh
 
+
+class StartBgpPeersVerifyStartedTest(_BgpSessionStatusTestBase):
     def _start(self, end: int = 5) -> None:
         self.ixia.start_bgp_peers(
             start=True,
@@ -450,3 +452,67 @@ class StartBgpPeersVerifyStartedTest(unittest.TestCase):
             r"Ixia server errors: \['unavailable \(RuntimeError: gateway timeout\)'\]",
         ):
             self._start()
+
+
+class StartBgpPeersVerifyUpTest(_BgpSessionStatusTestBase):
+    def _start_up(self, timeout: float = 10.0) -> None:
+        self.ixia.start_bgp_peers(
+            start=True,
+            regex="BGP_PEER_IPV6_IBGP",
+            session_start_idx=1,
+            session_end_idx=3,
+            verify_started=True,
+            verify_up_timeout_seconds=timeout,
+        )
+
+    def test_sessions_already_up_need_no_restart(self) -> None:
+        self._set_statuses(["up", "up", "up", "down", "down"])
+
+        self._start_up()
+
+        self.peer.Start.assert_called_once_with(SessionIndices="1-3")
+        self.peer.Stop.assert_not_called()
+
+    def test_restarts_only_sessions_not_up_after_timeout(self) -> None:
+        stuck = ["up", "down", "up"]
+        self._set_statuses(*([stuck] * 6), ["up"] * 3)
+
+        self._start_up(timeout=10.0)
+
+        self.peer.Stop.assert_called_once_with(SessionIndices="2")
+        self.assertEqual(
+            [call(SessionIndices="1-3"), call(SessionIndices="2")],
+            self.peer.Start.call_args_list,
+        )
+
+    def test_raises_naming_sessions_never_up(self) -> None:
+        self._set_statuses(["up", "down", "down"])
+        self.peer.SessionInfo = ["none", "none", "none"]
+
+        with self.assertRaises(IxiaOperationStateError) as raised:
+            self._start_up()
+
+        self.assertIn("BGP_PEER_IPV6_IBGP: 2 not up [2-3]", str(raised.exception))
+        self.assertEqual(2, self.peer.Stop.call_count)
+        self.assertEqual(3, self.peer.Start.call_count)
+
+    def test_requires_verify_started(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires verify_started"):
+            self.ixia.start_bgp_peers(
+                start=True,
+                regex="BGP_PEER_IPV6_IBGP",
+                session_end_idx=3,
+                verify_up_timeout_seconds=10.0,
+            )
+        self.peer.Start.assert_not_called()
+
+    def test_stop_ignores_up_timeout(self) -> None:
+        self.ixia.start_bgp_peers(
+            start=False,
+            regex="BGP_PEER_IPV6_IBGP",
+            session_end_idx=3,
+            verify_started=True,
+            verify_up_timeout_seconds=10.0,
+        )
+
+        self.peer.refresh.assert_not_called()

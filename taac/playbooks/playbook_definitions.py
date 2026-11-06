@@ -22406,7 +22406,10 @@ OPENR_RESTART_SERVICE_CHECK = create_service_restart_health_check(
 # ---------------------------------------------------------------------------
 
 
-def create_agent_warmboot_playbook(iteration: int = 5) -> Playbook:
+def create_agent_warmboot_playbook(
+    iteration: int = 5,
+    post_restart_settle_seconds: int | None = None,
+) -> Playbook:
     """Build the `test_agent_warmboot` Playbook for FBOSS hardening conveyors.
 
     Repeats `iteration` cycles of FBOSS AGENT service restart (warmboot
@@ -22417,16 +22420,23 @@ def create_agent_warmboot_playbook(iteration: int = 5) -> Playbook:
 
     Args:
         iteration: Number of warmboot cycles. Default 5.
+        post_restart_settle_seconds: When set, each cycle ends with a longevity
+            step of this many seconds. On native NetOS, bgpd and openr restart
+            after the SW agent, which can be after the convergence step
+            returns.
 
     Returns:
         A `Playbook` named `test_agent_warmboot` with one repeated stage.
     """
+    steps = create_service_restart_steps(Service.AGENT)
+    if post_restart_settle_seconds:
+        steps.append(create_longevity_step(duration=post_restart_settle_seconds))
     return Playbook(
         name="test_agent_warmboot",
         stages=[
             create_steps_stage(
                 iteration=iteration,
-                steps=create_service_restart_steps(Service.AGENT),
+                steps=steps,
             ),
         ],
         postchecks=[

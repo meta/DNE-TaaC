@@ -70,6 +70,7 @@ _PNH_START_LIST_BUILDERS = ("get_bgp_ebb_igp_pnh_metric_oscillation_playbook",)
 def _inventory() -> mock.MagicMock:
     inventory = mock.MagicMock()
     inventory.device_name = "bag012.ash6"
+    inventory.basset_pool = "dne.test"
     inventory.ixia_ports = []
     return inventory
 
@@ -123,6 +124,18 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
             "ipv6": "ROUTE+POOL(V6)",
         },
     )
+
+    def test_nrq_lifecycle_configs_inherit_routing_qual_pool(self) -> None:
+        nrq_configs = [
+            getattr(cicd_ebb_int_tc, name)
+            for name in cicd_ebb_int_tc.__all__
+            if name.startswith("NRQEB")
+        ]
+
+        self.assertTrue(nrq_configs)
+        for config in nrq_configs:
+            with self.subTest(config=config.name):
+                self.assertEqual("routing.qual", config.basset_pool)
 
     def test_openr_mode_owns_testbed_isolation_policy(self) -> None:
         for profile, expected_bypass in (

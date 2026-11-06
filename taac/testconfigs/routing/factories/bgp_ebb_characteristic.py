@@ -1160,7 +1160,7 @@ def create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
         ixia_chassis_ip=testbed.ixia_chassis_ip,
     )
 
-    return test_config_sc3_transient_memory_route_scale_on_eos(
+    config = test_config_sc3_transient_memory_route_scale_on_eos(
         test_config_name=name,
         device_name=testbed.device_name,
         # Bind the DUT to the BGP++-aware AristaFbossSwitch driver (thrift), so
@@ -1201,6 +1201,7 @@ def create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
             else None
         ),
     )
+    return config(basset_pool=testbed.basset_pool)
 
 
 def test_config_constant_attribute_storage_varying_combinations_on_eos(
@@ -2207,7 +2208,7 @@ def create_bgp_ebb_update_packing_test_config(
     )
     compiled = bound.compile()
 
-    return test_config_bgp_update_packing_validation(
+    config = test_config_bgp_update_packing_validation(
         test_config_name=name,
         device_name=device_name,
         # EBGP configuration (ingress - routes sent here from Fabric Aggregators)
@@ -2242,6 +2243,7 @@ def create_bgp_ebb_update_packing_test_config(
         basic_port_configs=compiled.basic_port_configs,
         log_collection_timeout=600,
     )
+    return config(basset_pool=physical_inventory.basset_pool)
 
 
 def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
@@ -2351,7 +2353,7 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
         )
     )
 
-    return test_config_constant_attribute_storage_varying_combinations_on_eos(
+    config = test_config_constant_attribute_storage_varying_combinations_on_eos(
         test_config_name=name,
         device_name=device_name,
         # Bind the DUT to the BGP++-aware AristaFbossSwitch driver (thrift), so
@@ -2408,6 +2410,7 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
         memory_growth_gate_mode="blocking",
         log_collection_timeout=600,
     )
+    return config(basset_pool=testbed.basset_pool)
 
 
 def create_bgp_ebb_queue_memory_monitor_test_config(
@@ -2581,7 +2584,7 @@ def create_bgp_ebb_characteristic_performance_scaling_test_config(
         # load-bearing path at convergence time.
         v4_peer_start_offset=IXIA_IPV4_START_OFFSET,
     )
-    return create_bgp_ebb_scaling_performance_test_config(
+    config = create_bgp_ebb_scaling_performance_test_config(
         physical_inventory,
         name=name,
         host_driver_args=None,
@@ -2603,6 +2606,7 @@ def create_bgp_ebb_characteristic_performance_scaling_test_config(
         teardown_tasks=compiled.teardown_tasks,
         per_iteration_setup_steps_factory=factory,
     )
+    return config(basset_pool=physical_inventory.basset_pool)
 
 
 def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
@@ -2725,7 +2729,7 @@ def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
             ixia_needed=True,
         )
     )
-    return create_bgp_ebb_scaling_ingress_peer_scale_test_config(
+    config = create_bgp_ebb_scaling_ingress_peer_scale_test_config(
         testbed,
         name=name,
         host_driver_args=None,
@@ -2775,6 +2779,7 @@ def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
             transient_gate_mode=GATE_MODE_BLOCKING,
         ),
     )
+    return config(basset_pool=testbed.basset_pool)
 
 
 def create_bgp_ebb_characteristic_route_churn_processing_test_config(
@@ -2890,7 +2895,7 @@ def create_bgp_ebb_characteristic_route_churn_processing_test_config(
         enable_update_group=enable_update_group,
     )
     _validate_sc6_startup_order(test_config.setup_tasks or [])
-    return test_config
+    return test_config(basset_pool=testbed.basset_pool)
 
 
 def create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
@@ -2937,7 +2942,7 @@ def create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
         ),
         skip_ixia_protocol_verification=True,
         log_collection_timeout=600,
-        basset_pool="dne.test",
+        basset_pool=physical_inventory.basset_pool,
         endpoints=compiled.endpoints,
         host_driver_args=physical_inventory.host_driver_args,
         oss_mock_device_data=physical_inventory.oss_mock_device_data,
@@ -3057,7 +3062,7 @@ def create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config(
         ),
         skip_ixia_protocol_verification=True,
         log_collection_timeout=600,
-        basset_pool="dne.test",
+        basset_pool=physical_inventory.basset_pool,
         endpoints=compiled.endpoints,
         host_driver_args=physical_inventory.host_driver_args,
         oss_mock_device_data=physical_inventory.oss_mock_device_data,
@@ -3132,7 +3137,7 @@ def create_bgp_ebb_separable_policy_evaluation_test_config(
         ),
         skip_ixia_protocol_verification=True,
         log_collection_timeout=600,
-        basset_pool="dne.test",
+        basset_pool=physical_inventory.basset_pool,
         endpoints=compiled.endpoints,
         host_driver_args=physical_inventory.host_driver_args,
         oss_mock_device_data=physical_inventory.oss_mock_device_data,

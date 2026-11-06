@@ -1782,7 +1782,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
         name=name,
         skip_ixia_protocol_verification=True,
         log_collection_timeout=600,
-        basset_pool="dne.test",
+        basset_pool=physical_inventory.basset_pool,
         tags=(
             [TESTBED_ISOLATION_BYPASS_TAG]
             if openr_mode is OpenRMode.STANDALONE

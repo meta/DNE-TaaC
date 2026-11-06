@@ -166,6 +166,7 @@ _NRQEB006_OPENR_LINK = OpenRStandaloneLink(
 
 NRQEB006_ASH6 = PhysicalInventory(
     device_name="nrqeb006.ash6",
+    basset_pool="routing.qual",
     network_role=NetworkRole.EB,
     default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     usage=frozenset({"cicd", "qual"}),
@@ -211,6 +212,7 @@ _NRQEB007_OPENR_LINK = OpenRStandaloneLink(
 
 NRQEB007_ASH6 = PhysicalInventory(
     device_name="nrqeb007.ash6",
+    basset_pool="routing.qual",
     network_role=NetworkRole.EB,
     default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     usage=frozenset({"cicd", "qual"}),
@@ -259,6 +261,7 @@ _NRQEB008_OPENR_LINK = OpenRStandaloneLink(
 
 NRQEB008_ASH6 = PhysicalInventory(
     device_name="nrqeb008.ash6",
+    basset_pool="routing.qual",
     network_role=NetworkRole.EB,
     default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     usage=frozenset({"cicd", "qual"}),
@@ -304,6 +307,7 @@ _NRQEB009_OPENR_LINK = OpenRStandaloneLink(
 
 NRQEB009_ASH6 = PhysicalInventory(
     device_name="nrqeb009.ash6",
+    basset_pool="routing.qual",
     network_role=NetworkRole.EB,
     default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     usage=frozenset({"cicd", "qual"}),

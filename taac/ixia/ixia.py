@@ -1070,6 +1070,14 @@ def split_list_into_chunks(list_to_split: list, chunk_size: int) -> t.List[list]
     ]
 
 
+def _same_host(left: str, right: str) -> bool:
+    """IxNetwork may store a chassis IPv6 address expanded or compressed."""
+    try:
+        return ipaddress.ip_address(left) == ipaddress.ip_address(right)
+    except ValueError:
+        return left.lower() == right.lower()
+
+
 def _ixia_value_equals(current: t.Any, desired: t.Any) -> bool:
     """Type-coerce-safe comparison of an IxNetwork Multivalue read vs a desired write.
 
@@ -2443,7 +2451,8 @@ class Ixia:
                     f"{_MAGENTA}[IXIA]{_RESET}   Failed to query vport states: {log_ex}"
                 )
             raise IxiaPortUnavailableError(
-                f"Unable to assign IXIA physical ports: {connect_ex}"
+                f"Unable to assign IXIA physical ports: {connect_ex}. "
+                f"Hardware port state: {self._hardware_port_states(port_configs)}"
             ) from connect_ex
         if fec_requested:
             self._push_rs_fec_and_verify_link(port_configs)
@@ -2501,7 +2510,68 @@ class Ixia:
                 "Ports never linked up after connect "
                 "(link-up gate was skipped for RS-FEC): "
                 + ", ".join(sorted(pending))
+                + f". Hardware port state: {self._hardware_port_states(port_configs)}"
             )
+
+    def _hardware_port_states(
+        self, port_configs: t.Sequence[ixia_types.PortConfig]
+    ) -> str:
+        """Best-effort owner, busy and link state of each physical port.
+
+        A restpy link-up timeout looks the same whether another IxNetwork
+        session holds the port or the physical link is down; the chassis-side
+        port state tells them apart. Called while building an error message,
+        so it never raises.
+        """
+        try:
+            return self._describe_hardware_ports(port_configs)
+        except Exception as ex:
+            return f"unavailable ({type(ex).__name__}: {ex})"
+
+    def _describe_hardware_ports(
+        self, port_configs: t.Sequence[ixia_types.PortConfig]
+    ) -> str:
+        # pyrefly: ignore [missing-attribute]
+        all_chassis = list(self.ixnetwork.AvailableHardware.Chassis.find())
+        states: t.List[str] = []
+        any_busy = any_down = False
+        for port_config in port_configs:
+            phy = port_config.phy_port_config
+            location = f"{phy.chassis_ip} {phy.slot_number}/{phy.port_number}"
+            chassis = next(
+                (c for c in all_chassis if _same_host(c.Hostname, phy.chassis_ip)),
+                None,
+            )
+            if chassis is None:
+                states.append(f"{location}: chassis not in session")
+                continue
+            try:
+                ports = chassis.Card.find(CardId=phy.slot_number).Port.find(
+                    PortId=phy.port_number
+                )
+                if len(ports) == 0:
+                    states.append(f"{location}: port not found")
+                    continue
+                port = ports[0]
+                busy, link_up = bool(port.IsBusy), bool(port.IsLinkUp)
+                states.append(
+                    f"{location}: owner={port.Owner or 'none'} busy={busy} "
+                    f"link_up={link_up}"
+                )
+            except Exception as ex:
+                states.append(f"{location}: unavailable ({type(ex).__name__}: {ex})")
+                continue
+            any_busy |= busy
+            any_down |= not link_up
+        summary = "; ".join(states)
+        if any_busy:
+            summary += (
+                ". A busy port is usually held by another IxNetwork session or "
+                "a concurrent run; compare its owner and free it before retrying"
+            )
+        elif any_down:
+            summary += ". Link is down; check the physical link and optics"
+        return summary
 
     def configure_nrz_100g_rs_fec(
         self, port_configs: t.Sequence[ixia_types.PortConfig]

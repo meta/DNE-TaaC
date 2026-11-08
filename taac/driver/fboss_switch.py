@@ -4406,7 +4406,8 @@ class FbossSwitch(AbstractSwitch):
         self, log_file_path: str, start_time: Optional[str] = None
     ) -> str:
         """Return a shell command that streams an FBOSS log to stdout."""
-        return f"zcat -f {shlex.quote(log_file_path)}"
+        decompressor = "zstdcat" if log_file_path.endswith(".zst") else "zcat -f"
+        return f"{decompressor} {shlex.quote(log_file_path)}"
 
     async def async_delete_file(self, file_location: str) -> None:
         """

@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# pyre-unsafe
 """
 Consolidated step definitions for TAAC test configurations.
 
@@ -308,6 +307,106 @@ def create_custom_step(
         name=StepName.CUSTOM_STEP,
         step_params=Params(json_params=json.dumps(params_dict)),
         description=description,
+    )
+
+
+def create_cbag_acacia_transceiver_reset_step(
+    reset_device: str = "cbag001.qzp1",
+    traffic_items: t.Optional[t.List[str]] = None,
+    measured_interfaces_by_device: t.Optional[t.Dict[str, t.List[str]]] = None,
+    expected_bgp_sessions_by_device: t.Optional[t.Dict[str, int]] = None,
+    bgp_sessions_blocking: bool = False,
+    removal_hold_seconds: int = 120,
+    recovery_timeout_seconds: int = 600,
+    recovery_poll_interval_seconds: int = 10,
+    stability_window_seconds: int = 30,
+    traffic_observation_seconds: int = 240,
+    loss_settle_seconds: int = 60,
+    iteration_count: int = 50,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Create a fail-fast CBAG Acacia reset and traffic-measurement loop."""
+    traffic_items = traffic_items or [
+        "RDMA_CBAG001_TO_BAG001",
+        "RDMA_CBAG001_TO_BAG002",
+    ]
+    measured_interfaces_by_device = measured_interfaces_by_device or {
+        hostname: [
+            "Ethernet4/32/1",
+            "Ethernet4/32/5",
+            "Ethernet4/36/1",
+            "Ethernet4/36/5",
+        ]
+        for hostname in ("cbag001.qzp1", "bag001.qzq1", "bag002.qzq1")
+    }
+    expected_bgp_sessions_by_device = expected_bgp_sessions_by_device or {
+        "cbag001.qzp1": 404,
+        "bag001.qzq1": 204,
+        "bag002.qzq1": 204,
+    }
+    if not reset_device:
+        raise ValueError("reset_device must be non-empty")
+    if not traffic_items or any(not item for item in traffic_items):
+        raise ValueError("traffic_items must contain at least one non-empty name")
+    if not measured_interfaces_by_device or any(
+        not hostname or not interfaces or any(not interface for interface in interfaces)
+        for hostname, interfaces in measured_interfaces_by_device.items()
+    ):
+        raise ValueError("measured_interfaces_by_device must be non-empty")
+    if not expected_bgp_sessions_by_device or any(
+        not hostname
+        or isinstance(expected, bool)
+        or not isinstance(expected, int)
+        or expected < 0
+        for hostname, expected in expected_bgp_sessions_by_device.items()
+    ):
+        raise ValueError("expected_bgp_sessions_by_device must be non-negative")
+    if (
+        isinstance(iteration_count, bool)
+        or not isinstance(iteration_count, int)
+        or not 1 <= iteration_count <= 50
+    ):
+        raise ValueError("iteration_count must be an integer in [1, 50]")
+    positive_values = {
+        "recovery_timeout_seconds": recovery_timeout_seconds,
+        "recovery_poll_interval_seconds": recovery_poll_interval_seconds,
+        "traffic_observation_seconds": traffic_observation_seconds,
+    }
+    nonnegative_values = {
+        "removal_hold_seconds": removal_hold_seconds,
+        "stability_window_seconds": stability_window_seconds,
+        "loss_settle_seconds": loss_settle_seconds,
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in positive_values.values()
+    ):
+        raise ValueError(f"Timing values must be positive integers: {positive_values}")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in nonnegative_values.values()
+    ):
+        raise ValueError(
+            f"Timing values must be non-negative integers: {nonnegative_values}"
+        )
+    return create_custom_step(
+        {
+            "custom_step_name": "cbag_acacia_transceiver_reset",
+            "hostname": reset_device,
+            "reset_device": reset_device,
+            "traffic_items": traffic_items,
+            "measured_interfaces_by_device": measured_interfaces_by_device,
+            "expected_bgp_sessions_by_device": expected_bgp_sessions_by_device,
+            "bgp_sessions_blocking": bgp_sessions_blocking,
+            "removal_hold_seconds": removal_hold_seconds,
+            "recovery_timeout_seconds": recovery_timeout_seconds,
+            "recovery_poll_interval_seconds": recovery_poll_interval_seconds,
+            "stability_window_seconds": stability_window_seconds,
+            "traffic_observation_seconds": traffic_observation_seconds,
+            "loss_settle_seconds": loss_settle_seconds,
+            "iteration_count": iteration_count,
+        },
+        description=description or "Reset all Acacia optics and validate PCS/IXIA loss",
     )
 
 

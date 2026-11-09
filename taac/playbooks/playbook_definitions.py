@@ -1,4 +1,3 @@
-# pyre-unsafe
 """
 Centralized Playbook factory definitions.
 
@@ -136,6 +135,7 @@ from taac.stages.stage_definitions import (
 )
 from taac.steps.step_definitions import (
     create_bgp_instability_setup_steps,
+    create_cbag_acacia_transceiver_reset_step,
     create_multipath_nexthop_count_health_check_step,
     create_allocate_cgroup_memory_step,
     create_clear_port_stats_step,
@@ -5082,6 +5082,128 @@ def get_cbag_agent_interruption_playbook(
         ],
         traffic_items_to_start=traffic_items_to_start,
         iteration=iteration,
+    )
+
+
+def create_cbag_acacia_transceiver_reset_playbook(
+    reset_device: str = "cbag001.qzp1",
+    traffic_items_to_start: t.Optional[t.List[str]] = None,
+    measured_interfaces_by_device: t.Optional[t.Dict[str, t.List[str]]] = None,
+    expected_bgp_sessions_by_device: t.Optional[t.Dict[str, int]] = None,
+    bgp_sessions_blocking: bool = False,
+    iteration: int = 50,
+    removal_hold_seconds: int = 120,
+    recovery_timeout_seconds: int = 600,
+    recovery_poll_interval_seconds: int = 10,
+    stability_window_seconds: int = 30,
+    traffic_observation_seconds: int = 240,
+    loss_settle_seconds: int = 60,
+) -> Playbook:
+    """Build the fail-fast CBAG Acacia simulated-removal endurance playbook."""
+    if not reset_device:
+        raise ValueError("reset_device must be non-empty")
+    if isinstance(iteration, bool) or not 1 <= iteration <= 50:
+        raise ValueError("iteration must be an integer in [1, 50]")
+    traffic_items = traffic_items_to_start or [
+        "RDMA_CBAG001_TO_BAG001",
+        "RDMA_CBAG001_TO_BAG002",
+    ]
+    measured_interfaces = measured_interfaces_by_device or {
+        hostname: [
+            "Ethernet4/32/1",
+            "Ethernet4/32/5",
+            "Ethernet4/36/1",
+            "Ethernet4/36/5",
+        ]
+        for hostname in ("cbag001.qzp1", "bag001.qzq1", "bag002.qzq1")
+    }
+    expected_bgp_sessions = expected_bgp_sessions_by_device or {
+        "cbag001.qzp1": 404,
+        "bag001.qzq1": 204,
+        "bag002.qzq1": 204,
+    }
+    if not traffic_items or any(not item for item in traffic_items):
+        raise ValueError("traffic_items_to_start must contain non-empty names")
+
+    return Playbook(
+        name="test_cbag_bag_acacia_transceiver_reset",
+        device_regexes=[reset_device],
+        prechecks=[
+            create_port_state_check(
+                retry_count=12,
+                retry_delay_seconds=10,
+                retry_delay_multiplier=1.0,
+            ),
+            create_port_speed_check(
+                json_params={
+                    hostname: {
+                        "interfaces": [
+                            {"interface_name": interface, "expected_speed": 400}
+                            for interface in interfaces
+                        ]
+                    }
+                    for hostname, interfaces in measured_interfaces.items()
+                }
+            ),
+        ],
+        stages=[
+            create_steps_stage(
+                steps=[
+                    create_cbag_acacia_transceiver_reset_step(
+                        reset_device=reset_device,
+                        traffic_items=traffic_items,
+                        measured_interfaces_by_device=measured_interfaces,
+                        expected_bgp_sessions_by_device=expected_bgp_sessions,
+                        bgp_sessions_blocking=bgp_sessions_blocking,
+                        removal_hold_seconds=removal_hold_seconds,
+                        recovery_timeout_seconds=recovery_timeout_seconds,
+                        recovery_poll_interval_seconds=recovery_poll_interval_seconds,
+                        stability_window_seconds=stability_window_seconds,
+                        traffic_observation_seconds=traffic_observation_seconds,
+                        loss_settle_seconds=loss_settle_seconds,
+                        iteration_count=iteration,
+                    )
+                ],
+                description="Reset CBAG Acacia optics and verify lossless recovery",
+            )
+        ],
+        postchecks=[
+            create_port_state_check(
+                retry_count=12,
+                retry_delay_seconds=10,
+                retry_delay_multiplier=1.0,
+            ),
+            create_port_speed_check(
+                json_params={
+                    hostname: {
+                        "interfaces": [
+                            {"interface_name": interface, "expected_speed": 400}
+                            for interface in interfaces
+                        ]
+                    }
+                    for hostname, interfaces in measured_interfaces.items()
+                }
+            ),
+            create_cpu_utilization_check(
+                threshold=40.0,
+                start_time_jq_var="test_case_start_time",
+            ),
+            create_memory_utilization_check(
+                threshold=Gigabyte.GIG_4_POINT_3.value,
+                start_time_jq_var="test_case_start_time",
+            ),
+        ],
+        snapshot_checks=[
+            create_bgp_session_snapshot_check(
+                skip_flap_check=True,
+                skip_uptime_check=True,
+            ),
+            create_core_dumps_snapshot_check(),
+        ],
+        traffic_items_to_start=traffic_items,
+        # Keep every reset in one test case so the first loss/PCS failure
+        # aborts the loop instead of allowing later parameterized cases to run.
+        iteration=1,
     )
 
 

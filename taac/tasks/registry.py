@@ -95,6 +95,7 @@ if t.TYPE_CHECKING or not TAAC_OSS:
         ConfigureEosParallelBgpPeers,
         CreateEosBgpPeerGroup,
         RestoreRunningConfigTask,
+        WaitForEosInterfacesTask,
     )
     from taac.tasks.fpf_collector_tasks import (
         FpfStartCollectorsTask,
@@ -281,6 +282,7 @@ if not TAAC_OSS:
             ConfigureEosParallelBgpPeers,
             CreateEosBgpPeerGroup,
             RestoreRunningConfigTask,
+            WaitForEosInterfacesTask,
             GenerateCommunityBgpPolicyTask,
             GenerateMultipleCommunityBgpPoliciesTask,
             GenerateCommunityBgpPolicyAndInjectTask,

@@ -3066,6 +3066,39 @@ def create_cleanup_exabgp_task(
     )
 
 
+def create_wait_for_eos_interfaces_task(
+    hostname: str,
+    interfaces: t.Sequence[str],
+    timeout_seconds: int = 120,
+    poll_interval_seconds: int = 5,
+) -> Task:
+    """Wait for a bounded set of EOS interfaces to appear after breakout."""
+    if not hostname:
+        raise ValueError("hostname must be non-empty")
+    if not interfaces or any(not interface for interface in interfaces):
+        raise ValueError("interfaces must contain non-empty interface names")
+    for name, value in (
+        ("timeout_seconds", timeout_seconds),
+        ("poll_interval_seconds", poll_interval_seconds),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    return Task(
+        task_name="wait_for_eos_interfaces",
+        hostname=hostname,
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "interfaces": list(interfaces),
+                    "timeout_seconds": timeout_seconds,
+                    "poll_interval_seconds": poll_interval_seconds,
+                }
+            )
+        ),
+    )
+
+
 def create_backup_running_config_task(
     hostname: str,
     backup_file: t.Optional[str] = None,

@@ -22922,6 +22922,7 @@ def create_qsfp_service_warmboot_and_reset_playbook(
     iteration: int = 5,
     post_warmboot_wait_seconds: int = 300,
     post_reset_settle_seconds: int = 300,
+    interfaces: t.Optional[t.List[str]] = None,
 ) -> Playbook:
     """Build the `test_qsfp_service_warmboot_and_reset` Playbook.
 
@@ -22943,10 +22944,23 @@ def create_qsfp_service_warmboot_and_reset_playbook(
         iteration: Number of warmboot + reset cycles. Default 5.
         post_warmboot_wait_seconds: Hold between the warmboot and the reset.
         post_reset_settle_seconds: Hold after the reset for optics to relink.
+        interfaces: Explicit interface list to reset. Default ``None`` resolves
+            the DUT's interfaces from the topology at runtime.
 
     Returns:
         A `Playbook` named `test_qsfp_service_warmboot_and_reset`.
     """
+    if interfaces is not None and not interfaces:
+        raise ValueError(
+            "create_qsfp_service_warmboot_and_reset_playbook: `interfaces` "
+            "was passed as an empty list; pass the interfaces to reset, or "
+            "omit the argument to resolve them from the topology."
+        )
+    reset_kwargs: t.Dict[str, t.Any] = (
+        {"interfaces": list(interfaces)}
+        if interfaces is not None
+        else {"jq_params": {"interfaces": '."{dut}".interfaces'}}
+    )
     return Playbook(
         name="test_qsfp_service_warmboot_and_reset",
         postchecks=[
@@ -22976,11 +22990,11 @@ def create_qsfp_service_warmboot_and_reset_playbook(
                         interface_flap_method=int(
                             taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_RESET
                         ),
-                        jq_params={"interfaces": '."{dut}".interfaces'},
                         description=(
                             "Reset all transceivers in one "
                             "`wedge_qsfp_util --qsfp-reset` invocation"
                         ),
+                        **reset_kwargs,
                     ),
                     create_longevity_step(
                         duration=post_reset_settle_seconds,
@@ -23326,10 +23340,15 @@ def get_critical_services_single_box_playbooks(
     iteration: int = 5,
     ixia_rogue_ic_parent_network_v6: str = "",
     ixia_rogue_ic_parent_network_v4: str = "",
+    agent_post_restart_settle_seconds: int | None = None,
+    interfaces: t.Optional[t.List[str]] = None,
 ) -> list[Playbook]:
     """Build the critical-services playbooks that require only one DUT."""
     playbooks = [
-        create_agent_warmboot_playbook(iteration=iteration),
+        create_agent_warmboot_playbook(
+            iteration=iteration,
+            post_restart_settle_seconds=agent_post_restart_settle_seconds,
+        ),
         _repeat_single_stage_playbook(
             TEST_FBOSS_SW_AGENT_WARMBOOT_PLAYBOOK(attribute_filters={}),
             iteration,
@@ -23367,9 +23386,11 @@ def get_critical_services_single_box_playbooks(
         ),
         create_qsfp_service_warmboot_and_tx_flap_playbook(
             iteration=iteration,
+            interfaces=interfaces,
         ),
         create_qsfp_service_warmboot_and_reset_playbook(
             iteration=iteration,
+            interfaces=interfaces,
         ),
         create_bgpd_and_fsdb_restart_playbook(iteration=iteration),
         create_agent_and_fsdb_restart_playbook(iteration=iteration),

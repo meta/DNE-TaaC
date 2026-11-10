@@ -459,6 +459,7 @@ def get_bgp_ebb_cold_start_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    gateway_resolution_device_group_names: t.Sequence[str] = (),
 ) -> Playbook:
     """
     Build CICD-EBB-02: BGP cold start.
@@ -499,6 +500,9 @@ def get_bgp_ebb_cold_start_playbook(
             characterization (RSS START/STOP bracket + RSS_DELTA_CHECK reader)
             around convergence (default: True). Observe-only: reports settled
             baseline/current/peak/growth into the results table, no threshold.
+        gateway_resolution_device_group_names: IXIA device groups whose
+            gateway MACs must resolve right after the cold-start enable and
+            before convergence is observed. Empty skips the gate.
 
     Returns:
         Playbook configured for BGP cold start testing
@@ -585,6 +589,7 @@ def get_bgp_ebb_cold_start_playbook(
             # The catalog audit pins that name to the factory name, so this is
             # the string to keep in step with, not the other way round.
             characterization_playbook_name="bgp_ebb_cold_start_playbook",
+            gateway_resolution_device_group_names=gateway_resolution_device_group_names,
         ),
     ]
     return Playbook(

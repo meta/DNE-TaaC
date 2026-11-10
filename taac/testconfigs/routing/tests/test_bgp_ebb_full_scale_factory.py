@@ -2,9 +2,10 @@
 """Focused coverage for EBB full-scale topology selection."""
 
 import json
+import runpy
 import typing as t
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 from taac.abstractions.topologies.ebb_full_scale import (
@@ -20,7 +21,10 @@ from taac.constants import (
     BgpPlusPlusProfile,
     TESTBED_ISOLATION_BYPASS_TAG,
 )
-from taac.testconfigs.routing import cicd_ebb_int_tc
+from taac.testconfigs.routing import (
+    adhoc_fibagent_qualification_traffic,
+    cicd_ebb_int_tc,
+)
 from taac.testconfigs.routing.factories import (
     bgp_ebb_full_scale as factory,
 )
@@ -80,9 +84,33 @@ def _compiled_topology() -> mock.MagicMock:
     topology.bind_to_inventory.return_value.compile.return_value = SimpleNamespace(
         endpoints=[],
         host_os_type_map={},
-        setup_tasks=[],
+        setup_tasks=[
+            taac_types.Task(
+                task_name="interface_ip_configuration",
+                ixia_needed=True,
+                params=taac_types.Params(json_params="{}"),
+            ),
+            taac_types.Task(
+                task_name="arista_daemon_control",
+                ixia_needed=True,
+                params=taac_types.Params(
+                    json_params=json.dumps(
+                        {"daemon_name": "Bgpcpp", "action": "enable"}
+                    )
+                ),
+            ),
+        ],
         teardown_tasks=[],
-        basic_port_configs=[],
+        basic_port_configs=[
+            taac_types.BasicPortConfig(
+                device_group_configs=[
+                    taac_types.DeviceGroupConfig(
+                        device_group_index=0,
+                        device_group_name="DEVICE_GROUP_IPV6_EBGP",
+                    )
+                ]
+            )
+        ],
         basic_traffic_item_configs=[],
     )
     return topology
@@ -680,3 +708,323 @@ class StuckIxiaSessionRecoveryTest(unittest.TestCase):
         self.assertNotEqual(
             "bgp_ixia_session_recovery", self._last_custom_step_name(cold_start)
         )
+
+
+def _json_params(params: taac_types.Params | None) -> dict[str, t.Any]:
+    return json.loads((params.json_params if params else None) or "{}")
+
+
+def _is_gateway_gate(params: taac_types.Params | None) -> bool:
+    return (
+        _json_params(params).get("api_name") == "refresh_and_verify_gateway_resolution"
+    )
+
+
+def _gate_device_group_names(params: taac_types.Params | None) -> list[str]:
+    return json.loads(_json_params(params)["args_json"])["device_group_names"]
+
+
+def _enabled_device_groups(
+    config: taac_types.TestConfig,
+) -> list[taac_types.DeviceGroupConfig]:
+    return [
+        device_group
+        for port_config in config.basic_port_configs or []
+        for device_group in port_config.device_group_configs or []
+        if device_group.enable
+    ]
+
+
+def _enabled_device_group_names(config: taac_types.TestConfig) -> list[str]:
+    return [
+        device_group.device_group_name or ""
+        for device_group in _enabled_device_groups(config)
+    ]
+
+
+def _bgp_peer_names(device_group: taac_types.DeviceGroupConfig) -> list[str]:
+    return [
+        bgp_config.bgp_peer_name or ""
+        for bgp_config in (device_group.v4_bgp_config, device_group.v6_bgp_config)
+        if bgp_config is not None
+    ]
+
+
+_COLD_START_PLAYBOOK = "bgp_ebb_cold_start_playbook"
+
+# Every registered TestConfig the gateway gates change. The golden manifest
+# skips NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG.
+_GATED_FULL_SCALE_CONFIGS: tuple[tuple[ModuleType, str], ...] = (
+    (cicd_ebb_int_tc, "NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG"),
+    (cicd_ebb_int_tc, "NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG"),
+    (cicd_ebb_int_tc, "NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG"),
+    (cicd_ebb_int_tc, "NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG"),
+    (cicd_ebb_int_tc, "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG"),
+    (cicd_ebb_int_tc, "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG"),
+    (cicd_ebb_int_tc, "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG"),
+    (cicd_ebb_int_tc, "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG"),
+    (
+        adhoc_fibagent_qualification_traffic,
+        "NRQEB009_EBB16_FIBAGENT_QUALIFICATION_TRAFFIC_UG_ADHOC",
+    ),
+)
+
+
+def _gated_full_scale_configs() -> dict[str, taac_types.TestConfig]:
+    return {name: getattr(module, name) for module, name in _GATED_FULL_SCALE_CONFIGS}
+
+
+def _gateless_namespace(module: ModuleType) -> dict[str, t.Any]:
+    """Re-run `module` with no device group named for either gateway gate.
+
+    `runpy` builds the configs in a fresh namespace and leaves `sys.modules`
+    untouched.
+    """
+    with mock.patch.object(
+        factory, "_enabled_ixia_device_group_names", return_value=[]
+    ):
+        return runpy.run_module(module.__name__)
+
+
+def _without_gateway_gates(config: taac_types.TestConfig) -> taac_types.TestConfig:
+    return config(
+        setup_tasks=[
+            task
+            for task in config.setup_tasks or []
+            if not _is_gateway_gate(task.params)
+        ],
+        playbooks=[
+            playbook
+            if playbook.stages is None
+            else playbook(
+                stages=[
+                    stage(
+                        steps=[
+                            step
+                            for step in stage.steps
+                            if not _is_gateway_gate(step.step_params)
+                        ]
+                    )
+                    for stage in playbook.stages
+                ]
+            )
+            for playbook in config.playbooks or []
+        ],
+    )
+
+
+class GatewayResolutionGateTest(unittest.TestCase):
+    """The setup NS precedes the DUT interface IP configuration, and cold start
+    re-enables every IXIA device group, so full-scale setup and the cold-start
+    enable must each re-resolve every IXIA gateway before BGP needs it."""
+
+    def test_setup_without_ixia_device_groups_adds_no_gate(self) -> None:
+        topology = _compiled_topology()
+        compiled = topology.bind_to_inventory.return_value.compile.return_value
+        compiled.basic_port_configs = []
+        with mock.patch.object(
+            factory, "ebb_full_scale_topology", return_value=topology
+        ):
+            config = factory.create_bgp_ebb_full_scale_test_config(
+                _inventory(), name="NO_IXIA_DEVICE_GROUPS", setup_only=True
+            )
+
+        self.assertEqual(
+            ["interface_ip_configuration", "arista_daemon_control"],
+            [task.task_name for task in config.setup_tasks or []],
+        )
+
+    def test_ixia_device_groups_without_gate_anchors_fail_construction(self) -> None:
+        topology = _compiled_topology()
+        compiled = topology.bind_to_inventory.return_value.compile.return_value
+        compiled.setup_tasks = []
+        with (
+            mock.patch.object(
+                factory, "ebb_full_scale_topology", return_value=topology
+            ),
+            self.assertRaisesRegex(ValueError, "interface_ip_configuration"),
+        ):
+            factory.create_bgp_ebb_full_scale_test_config(
+                _inventory(), name="MISSING_GATE_ANCHORS", setup_only=True
+            )
+
+    def test_gate_names_skip_disabled_device_groups(self) -> None:
+        port_config = taac_types.BasicPortConfig(
+            endpoint="bag012.ash6:Ethernet3/35/1",
+            device_group_configs=[
+                taac_types.DeviceGroupConfig(
+                    device_group_index=0, device_group_name="DEVICE_GROUP_IPV6_EBGP"
+                ),
+                taac_types.DeviceGroupConfig(
+                    device_group_index=1,
+                    device_group_name="DEVICE_GROUP_IPV4_EBGP",
+                    enable=False,
+                ),
+                taac_types.DeviceGroupConfig(device_group_index=2, enable=False),
+            ],
+        )
+
+        self.assertEqual(
+            ["DEVICE_GROUP_IPV6_EBGP"],
+            factory._enabled_ixia_device_group_names([port_config]),
+        )
+
+    def test_unnamed_enabled_device_group_fails_construction(self) -> None:
+        port_config = taac_types.BasicPortConfig(
+            endpoint="bag012.ash6:Ethernet3/35/1",
+            device_group_configs=[taac_types.DeviceGroupConfig(device_group_index=3)],
+        )
+
+        with self.assertRaisesRegex(ValueError, "device group 3 on .* has no name"):
+            factory._enabled_ixia_device_group_names([port_config])
+
+    def test_setup_gates_first_bgpcpp_enable_on_every_ixia_gateway(self) -> None:
+        for name, config in _gated_full_scale_configs().items():
+            with self.subTest(config=name):
+                tasks = list(config.setup_tasks or [])
+                gates = [
+                    index
+                    for index, task in enumerate(tasks)
+                    if task.task_name == "invoke_ixia_api"
+                    and _is_gateway_gate(task.params)
+                ]
+                self.assertEqual(1, len(gates))
+                last_interface_ip = max(
+                    index
+                    for index, task in enumerate(tasks)
+                    if task.task_name == "interface_ip_configuration"
+                    and task.ixia_needed
+                )
+                first_bgpcpp_enable = next(
+                    index
+                    for index in range(last_interface_ip + 1, len(tasks))
+                    if tasks[index].task_name == "arista_daemon_control"
+                    and _json_params(tasks[index].params).get("daemon_name") == "Bgpcpp"
+                    and _json_params(tasks[index].params).get("action") == "enable"
+                )
+                self.assertEqual(first_bgpcpp_enable - 1, gates[0])
+                self.assertLess(last_interface_ip, gates[0])
+                names = _gate_device_group_names(tasks[gates[0]].params)
+                self.assertEqual(_enabled_device_group_names(config), names)
+                self.assertTrue(
+                    {
+                        "DEVICE_GROUP_IPV6_EBGP",
+                        "DEVICE_GROUP_IPV4_EBGP",
+                        "DEVICE_GROUP_BGP_MON",
+                    }
+                    <= set(names)
+                )
+                self.assertEqual(len(names), len(set(names)))
+                for device_group in _enabled_device_groups(config):
+                    self.assertTrue(
+                        any(
+                            stack is not None and stack.gateway_starting_ip
+                            for stack in (
+                                device_group.v4_addresses_config,
+                                device_group.v6_addresses_config,
+                            )
+                        ),
+                        device_group.device_group_name,
+                    )
+
+    def test_session_recovery_already_requires_every_gated_device_group(
+        self,
+    ) -> None:
+        """Every case but cold start ends setup by requiring each `^BGP_PEER_`
+        IXIA session, so no gated device group is one a case leaves unused."""
+        for name, config in _gated_full_scale_configs().items():
+            with self.subTest(config=name):
+                for device_group in _enabled_device_groups(config):
+                    peer_names = _bgp_peer_names(device_group)
+                    self.assertTrue(peer_names, device_group.device_group_name)
+                    for peer_name in peer_names:
+                        self.assertRegex(peer_name, "^BGP_PEER_")
+                active_peer_cases = [
+                    playbook
+                    for playbook in config.playbooks or []
+                    if playbook.name != _COLD_START_PLAYBOOK
+                ]
+                self.assertTrue(active_peer_cases)
+                for playbook in active_peer_cases:
+                    params = _json_params((playbook.setup_steps or [])[-1].step_params)
+                    self.assertEqual(
+                        "bgp_ixia_session_recovery",
+                        params.get("custom_step_name"),
+                        playbook.name,
+                    )
+                    self.assertEqual(
+                        "^BGP_PEER_", params.get("ixia_bgp_peer_regex"), playbook.name
+                    )
+
+    def test_cold_start_gates_convergence_on_every_ixia_gateway(self) -> None:
+        cold_start_configs = set()
+        for name, config in _gated_full_scale_configs().items():
+            for playbook in config.playbooks or []:
+                steps = [
+                    step for stage in playbook.stages or [] for step in stage.steps
+                ]
+                gates = [
+                    index
+                    for index, step in enumerate(steps)
+                    if _is_gateway_gate(step.step_params)
+                ]
+                with self.subTest(config=name, playbook=playbook.name):
+                    if playbook.name != _COLD_START_PLAYBOOK:
+                        self.assertEqual([], gates)
+                        continue
+                    cold_start_configs.add(name)
+                    self.assertEqual(1, len(gates))
+                    self.assertEqual(
+                        "toggle_device_groups",
+                        _json_params(steps[gates[0] - 1].step_params).get("api_name"),
+                    )
+                    self.assertEqual(
+                        "test_bgp_thread_cpu_monitor_eos_bgp_plus_plus",
+                        _json_params(steps[gates[0] + 1].step_params).get(
+                            "custom_step_name"
+                        ),
+                    )
+                    # The cold-start verdict excludes auxiliary observation peers.
+                    self.assertEqual(
+                        [
+                            device_group_name
+                            for device_group_name in _enabled_device_group_names(config)
+                            if device_group_name != "DEVICE_GROUP_BGP_MON"
+                        ],
+                        _gate_device_group_names(steps[gates[0]].step_params),
+                    )
+        self.assertEqual(
+            {
+                "NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG",
+                "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
+            },
+            cold_start_configs,
+        )
+
+
+class GatewayGateScopeTest(unittest.TestCase):
+    """Each gated config must differ from its gate-free build only by the
+    gateway gates."""
+
+    gated: dict[str, taac_types.TestConfig]
+    gateless: dict[str, taac_types.TestConfig]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        modules = {module.__name__: module for module, _ in _GATED_FULL_SCALE_CONFIGS}
+        namespaces = {
+            module_name: _gateless_namespace(module)
+            for module_name, module in modules.items()
+        }
+        cls.gated = _gated_full_scale_configs()
+        cls.gateless = {
+            name: namespaces[module.__name__][name]
+            for module, name in _GATED_FULL_SCALE_CONFIGS
+        }
+
+    def test_gates_are_the_only_change(self) -> None:
+        for name, config in self.gated.items():
+            with self.subTest(config=name):
+                self.assertNotEqual(self.gateless[name], config)
+                self.assertEqual(self.gateless[name], _without_gateway_gates(config))

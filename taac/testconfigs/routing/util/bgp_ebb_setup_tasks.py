@@ -40,6 +40,7 @@ from taac.task_definitions import (
     create_eos_compiler_lifecycle_task,
     create_interface_ip_cleanup_task,
     create_interface_ip_configuration_task,
+    create_invoke_ixia_api_task,
     create_run_commands_on_shell_task,
     create_set_bgp_setting_config_task,
     create_validate_bgpcpp_update_group_state_task,
@@ -2094,6 +2095,74 @@ def get_teardown_tasks(
         )
         for interface in reversed(interfaces)
     ]
+
+
+def _is_bgpcpp_enable_task(task: Task) -> bool:
+    if task.task_name != "arista_daemon_control":
+        return False
+    try:
+        params = json.loads(task.params.json_params or "{}")
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(params, dict)
+        and params.get("daemon_name") == "Bgpcpp"
+        and params.get("action") == "enable"
+    )
+
+
+def insert_gateway_resolution_gate(
+    setup_tasks: t.Sequence[Task],
+    device_group_names: t.Sequence[str],
+) -> t.List[Task]:
+    """Gate the first post-IXIA Bgpcpp enable on every named IXIA gateway MAC.
+
+    StartAllProtocols sends its only ARP/NS before the DUT interface IP
+    configuration tasks give the DUT its gateway addresses. The gate re-sends
+    ARP/NS after the last of those tasks and fails setup while any gateway MAC
+    of the named device groups stays unresolved. Raises `ValueError` when no
+    device group is named or either anchor task is missing, so the gate cannot
+    be dropped silently.
+    """
+    if not device_group_names:
+        raise ValueError("Gateway gate requires at least one IXIA device group")
+    tasks = list(setup_tasks)
+    interface_ip_indices = [
+        index
+        for index, task in enumerate(tasks)
+        if task.task_name == "interface_ip_configuration"
+    ]
+    if not interface_ip_indices:
+        raise ValueError(
+            "Gateway gate requires an interface_ip_configuration setup task"
+        )
+    # Pre-IXIA tasks all run before post-IXIA tasks, so only post-IXIA interface
+    # configuration constrains the gate position.
+    last_post_ixia_interface_ip = max(
+        (index for index in interface_ip_indices if tasks[index].ixia_needed),
+        default=-1,
+    )
+    bgpcpp_enable_index = next(
+        (
+            index
+            for index in range(last_post_ixia_interface_ip + 1, len(tasks))
+            if tasks[index].ixia_needed and _is_bgpcpp_enable_task(tasks[index])
+        ),
+        None,
+    )
+    if bgpcpp_enable_index is None:
+        raise ValueError(
+            "Gateway gate requires a post-IXIA Bgpcpp enable after the DUT "
+            "interface IP configuration"
+        )
+    tasks.insert(
+        bgpcpp_enable_index,
+        create_invoke_ixia_api_task(
+            api_name="refresh_and_verify_gateway_resolution",
+            args_dict={"device_group_names": list(device_group_names)},
+        ),
+    )
+    return tasks
 
 
 # CPU stress constants and task factories are in task_definitions.py.

@@ -5471,6 +5471,35 @@ def create_ixia_device_group_toggle_step(
     )
 
 
+def create_ixia_gateway_resolution_step(
+    device_group_names: t.Sequence[str],
+    description: t.Optional[str] = None,
+) -> Step:
+    """
+    Create a step that re-resolves the gateway MAC of every named device group.
+
+    Place it right after the device groups are enabled and before a step that
+    needs their BGP sessions: IXIA does not re-resolve a gateway that stayed
+    unresolved, and BGP Stop/Start leaves the IP layer alone. The step fails
+    while any gateway MAC is unresolved.
+
+    Args:
+        device_group_names: Exact IXIA device group names to check
+        description: Custom description for the step
+
+    Returns:
+        Step object calling Ixia.refresh_and_verify_gateway_resolution
+    """
+    if not device_group_names:
+        raise ValueError("device_group_names must name at least one device group")
+    return create_ixia_api_step(
+        api_name="refresh_and_verify_gateway_resolution",
+        args_dict={"device_group_names": list(device_group_names)},
+        description=description
+        or f"Re-resolve gateway MACs of {len(device_group_names)} IXIA device group(s)",
+    )
+
+
 def create_daemon_control_step(
     device_name: str,
     daemon_name: str = "Bgpcpp",

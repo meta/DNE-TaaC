@@ -143,7 +143,6 @@ from taac.task_definitions import (
     create_coop_register_patcher_task,
     create_coop_unregister_patchers_task,
     create_interface_ip_configuration_task,
-    create_invoke_ixia_api_task,
     create_replace_bgp_peers_task,
     create_run_commands_on_shell_task,
     create_scp_file_template_task,
@@ -178,6 +177,7 @@ from taac.testconfigs.routing.util.bgp_ebb_setup_tasks import (
     build_per_iteration_factory_v4_capable,
     get_ebb_device_state_guard_tasks,
     get_update_packing_setup_tasks,
+    insert_gateway_resolution_gate,
 )
 from taac.utils.gate_catalog import (
     SC4_STABLE_SAMPLE_WINDOW_SECONDS,
@@ -2505,73 +2505,18 @@ def create_bgp_ebb_queue_memory_monitor_test_config(
     )
 
 
-def _is_bgpcpp_enable_task(task: taac_types.Task) -> bool:
-    if task.task_name != "arista_daemon_control":
-        return False
-    try:
-        params = json.loads(task.params.json_params or "{}")
-    except json.JSONDecodeError:
-        return False
-    return (
-        isinstance(params, dict)
-        and params.get("daemon_name") == "Bgpcpp"
-        and params.get("action") == "enable"
-    )
-
-
 def _insert_gateway_resolution_gate(
     setup_tasks: Sequence[taac_types.Task],
 ) -> list[taac_types.Task]:
-    """Gate the first post-IXIA Bgpcpp enable on every IXIA BGP gateway MAC.
-
-    StartAllProtocols sends its only ARP/NS before the DUT interface IP
-    configuration tasks give the DUT its gateway addresses. The gate re-sends
-    ARP/NS after the last of those tasks and fails setup while any gateway MAC
-    of an SC1 IXIA BGP device group stays unresolved. Raises `ValueError` when
-    either anchor task is missing, so the gate cannot be dropped silently.
-    """
-    tasks = list(setup_tasks)
-    interface_ip_indices = [
-        index
-        for index, task in enumerate(tasks)
-        if task.task_name == "interface_ip_configuration"
-    ]
-    if not interface_ip_indices:
-        raise ValueError(
-            "SC1 gateway gate requires an interface_ip_configuration setup task"
-        )
-    # Pre-IXIA tasks all run before post-IXIA tasks, so only post-IXIA interface
-    # configuration constrains the gate position.
-    last_post_ixia_interface_ip = max(
-        (index for index in interface_ip_indices if tasks[index].ixia_needed),
-        default=-1,
+    """Gate the first post-IXIA Bgpcpp enable on every SC1 IXIA BGP gateway MAC."""
+    return insert_gateway_resolution_gate(
+        setup_tasks,
+        device_group_names=[
+            device_group.legacy_ixia_device_group_name
+            for device_group in EGRESS_PEER_SCALE.device_groups
+            if device_group.legacy_ixia_device_group_name is not None
+        ],
     )
-    bgpcpp_enable_index = next(
-        (
-            index
-            for index in range(last_post_ixia_interface_ip + 1, len(tasks))
-            if tasks[index].ixia_needed and _is_bgpcpp_enable_task(tasks[index])
-        ),
-        None,
-    )
-    if bgpcpp_enable_index is None:
-        raise ValueError(
-            "SC1 gateway gate requires a post-IXIA Bgpcpp enable after the DUT "
-            "interface IP configuration"
-        )
-    device_group_names = [
-        device_group.legacy_ixia_device_group_name
-        for device_group in EGRESS_PEER_SCALE.device_groups
-        if device_group.legacy_ixia_device_group_name is not None
-    ]
-    tasks.insert(
-        bgpcpp_enable_index,
-        create_invoke_ixia_api_task(
-            api_name="refresh_and_verify_gateway_resolution",
-            args_dict={"device_group_names": device_group_names},
-        ),
-    )
-    return tasks
 
 
 def create_bgp_ebb_characteristic_performance_scaling_test_config(

@@ -8265,12 +8265,15 @@ class Ixia:
         `start_and_verify_protocols` sends ARP/NS once, right after
         StartAllProtocols, when some sessions may not have started yet and the
         DUT may not own the gateway addresses. Call this after the DUT owns
-        them. ARP/NS is sent once per stack and never re-sent. Raises
-        `IxiaOperationStateError` naming the unresolved sessions if any gateway
-        MAC is still unresolved after `timeout_seconds`.
+        them. IXIA refuses ARP/NS on a session that has not started, so this
+        first waits up to `timeout_seconds` for every IP session to leave
+        notStarted, as re-enabled device groups need. ARP/NS is then sent once
+        per stack and never re-sent. Raises `IxiaOperationStateError` naming
+        the sessions that never started, or whose gateway MAC is still
+        unresolved `timeout_seconds` after ARP/NS.
         """
         gateway_stacks = self._gateway_stacks(device_group_names)
-        stale = self._unresolved_gateways(gateway_stacks)
+        stale = self._wait_for_started_ip_sessions(gateway_stacks, timeout_seconds)
         if stale:
             self.logger.warning(
                 "Gateway MACs unresolved before ARP/NS refresh: "
@@ -8356,16 +8359,76 @@ class Ixia:
             stack = gateway_stack.stack
             # restpy serves attributes from the snapshot taken by find().
             stack.refresh()
-            macs = list(stack.ResolvedGatewayMac or [])
             count = int(stack.Count)
-            indices = [
-                index
-                for index in range(1, count + 1)
-                if index > len(macs) or not _is_resolved_gateway_mac(macs[index - 1])
-            ]
+            indices = Ixia._unresolved_gateway_indices(stack, count)
             if indices:
                 unresolved.append((gateway_stack, count, indices))
         return unresolved
+
+    @staticmethod
+    def _unresolved_gateway_indices(stack: t.Any, count: int) -> list[int]:
+        macs = list(stack.ResolvedGatewayMac or [])
+        return [
+            index
+            for index in range(1, count + 1)
+            if index > len(macs) or not _is_resolved_gateway_mac(macs[index - 1])
+        ]
+
+    def _wait_for_started_ip_sessions(
+        self,
+        gateway_stacks: t.Sequence[_GatewayStack],
+        timeout_seconds: float,
+    ) -> list[t.Tuple[_GatewayStack, int, list[int]]]:
+        """Wait until no IP session of the stacks is notStarted.
+
+        Returns the gateways that are unresolved once every session has
+        started. Raises `IxiaOperationStateError` naming the sessions still
+        notStarted after `timeout_seconds`.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        waiting_logged = False
+        while True:
+            not_started = []
+            unresolved = []
+            for gateway_stack in gateway_stacks:
+                stack = gateway_stack.stack
+                # restpy serves attributes from the snapshot taken by find().
+                stack.refresh()
+                count = int(stack.Count)
+                statuses = _sampled_session_values(
+                    list(stack.SessionStatus or []), range(1, count + 1)
+                )
+                pending = [
+                    index
+                    for index, status in enumerate(statuses, start=1)
+                    if status == "notStarted"
+                ]
+                if pending:
+                    not_started.append((gateway_stack, count, pending))
+                indices = self._unresolved_gateway_indices(stack, count)
+                if indices:
+                    unresolved.append((gateway_stack, count, indices))
+            if not not_started:
+                return unresolved
+            summary = "; ".join(
+                f"{waiting.device_group_name} {waiting.family} "
+                f"{len(waiting_indices)}/{total} notStarted "
+                f"[{_bgp_session_indices_spec(waiting_indices[:_GATEWAY_RESOLUTION_FAILURE_SAMPLE_SIZE])}"
+                f"{', ...' if len(waiting_indices) > _GATEWAY_RESOLUTION_FAILURE_SAMPLE_SIZE else ''}]"
+                for waiting, total, waiting_indices in not_started
+            )
+            if time.monotonic() >= deadline:
+                raise IxiaOperationStateError(
+                    f"IP sessions not started {timeout_seconds}s into the "
+                    f"gateway check: {summary}; Ixia server errors: "
+                    f"{self._recent_ixia_server_errors()}"
+                )
+            if not waiting_logged:
+                self.logger.info(
+                    f"Waiting for IP sessions to start before ARP/NS: {summary}"
+                )
+                waiting_logged = True
+            time.sleep(_GATEWAY_RESOLUTION_POLL_SECONDS)
 
     @staticmethod
     def _gateway_resolution_failure_detail(

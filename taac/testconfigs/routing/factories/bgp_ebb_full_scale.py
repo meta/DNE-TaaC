@@ -100,6 +100,7 @@ from taac.testconfigs.routing.util.bgp_ebb_health_checks import (
 )
 from taac.testconfigs.routing.util.bgp_ebb_setup_tasks import (
     build_expected_peer_identity,
+    insert_gateway_resolution_gate,
 )
 from taac.utils.characterization import (
     DISABLED,
@@ -109,6 +110,7 @@ from taac.utils.hardware_capacity_utils import (
     get_precheck_thresholds,
 )
 from taac.test_as_a_config.types import (
+    BasicPortConfig,
     Playbook,
     PointInTimeHealthCheck,
     SnapshotHealthCheck,
@@ -1068,6 +1070,7 @@ def _get_bgp_ebb_full_scale_playbooks(
     nhg_storm_min_confirmed_pause_fap_samples: int = 3,
     nhg_storm_control_plane_sample_interval_seconds: int = 5,
     nhg_storm_control_plane_read_timeout_seconds: int = 180,
+    gateway_device_group_names: t.Sequence[str] = (),
 ) -> list[Playbook]:
     device_config = bound.device_config
     if device_config is None:
@@ -1369,6 +1372,7 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            gateway_resolution_device_group_names=gateway_device_group_names,
         ),
         get_bgp_ebb_ebgp_session_oscillation_playbook(
             device_name=device_name,
@@ -1545,6 +1549,24 @@ def _setup_enables_all_ixia_device_groups(playbook: Playbook) -> bool:
     return enabled
 
 
+def _enabled_ixia_device_group_names(
+    port_configs: t.Sequence[BasicPortConfig],
+) -> list[str]:
+    """Name every IXIA device group the compiled setup creates enabled."""
+    names = []
+    for port_config in port_configs:
+        for device_group in port_config.device_group_configs or []:
+            if not device_group.enable:
+                continue
+            if not device_group.device_group_name:
+                raise ValueError(
+                    f"IXIA device group {device_group.device_group_index} on "
+                    f"{port_config.endpoint!r} has no name to gate its gateway on"
+                )
+            names.append(device_group.device_group_name)
+    return names
+
+
 def create_bgp_ebb_full_scale_test_config(  # noqa: C901
     physical_inventory: PhysicalInventory,
     *,
@@ -1695,6 +1717,21 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
     )
     if selected_tc7_playbooks:
         _validate_tc7_bound_topology(bound)
+    compiled = bound.compile()
+    gateway_device_group_names = _enabled_ixia_device_group_names(
+        compiled.basic_port_configs or []
+    )
+    # Auxiliary observation peers stay out of testcase triggers and verdicts.
+    monitor_device_group_names = {
+        group.legacy_ixia_device_group_name or group.name
+        for group in bound.device_groups
+        if group.peer_relationship is PeerRelationship.MONITOR
+    }
+    testcase_gateway_device_group_names = [
+        device_group_name
+        for device_group_name in gateway_device_group_names
+        if device_group_name not in monitor_device_group_names
+    ]
     playbooks = []
     if not setup_only:
         playbooks = _get_bgp_ebb_full_scale_playbooks(
@@ -1736,6 +1773,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
             nhg_storm_control_plane_read_timeout_seconds=(
                 nhg_storm_control_plane_read_timeout_seconds
             ),
+            gateway_device_group_names=testcase_gateway_device_group_names,
         )
     if playbooks_selected:
         playbooks_by_name = {playbook.name: playbook for playbook in playbooks}
@@ -1777,7 +1815,6 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
         for playbook in playbooks
     ]
 
-    compiled = bound.compile()
     return TestConfig(
         name=name,
         skip_ixia_protocol_verification=True,
@@ -1791,7 +1828,14 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
         endpoints=compiled.endpoints,
         host_os_type_map=compiled.host_os_type_map,
         startup_checks=[],
-        setup_tasks=compiled.setup_tasks,
+        # A compile without an enabled IXIA device group has no gateway to check.
+        setup_tasks=(
+            insert_gateway_resolution_gate(
+                compiled.setup_tasks, gateway_device_group_names
+            )
+            if gateway_device_group_names
+            else compiled.setup_tasks
+        ),
         teardown_tasks=compiled.teardown_tasks,
         basic_port_configs=compiled.basic_port_configs,
         basic_traffic_item_configs=(

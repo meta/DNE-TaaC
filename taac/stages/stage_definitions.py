@@ -80,6 +80,7 @@ from taac.steps.step_definitions import (
     create_interface_flap_step,
     create_interface_permanent_flap_step,
     create_ixia_device_group_toggle_step,
+    create_ixia_gateway_resolution_step,
     create_ixia_packet_capture_step,
     create_longevity_community_churn_step,
     create_longevity_step,
@@ -368,6 +369,7 @@ def create_cold_start_test_stage(
     enable_rss_delta_characterization: bool = False,
     rss_characterization_interval_seconds: float = 3.0,
     characterization_playbook_name: str | None = None,
+    gateway_resolution_device_group_names: Sequence[str] = (),
 ) -> Stage:
     """
     Create a BGP cold start test stage.
@@ -382,6 +384,7 @@ def create_cold_start_test_stage(
     3. Enable BGP daemon (initializes without sessions)
     4. Wait for BGP initial convergence to complete (no sessions active)
     5. Toggle all device groups to active (cold start - all sessions establish simultaneously)
+    5b. Require every named IXIA gateway MAC (optional)
     6. Monitor thread CPU during convergence (optional)
 
     Args:
@@ -432,6 +435,9 @@ def create_cold_start_test_stage(
             has no default: this stage has more than one caller, and a wrong name
             files the run's measurements under another playbook. Ignored when
             both flags are False.
+        gateway_resolution_device_group_names: IXIA device groups whose gateway
+            MACs must resolve right after the Step 5 toggle, before Step 6
+            observes convergence. Empty (default) adds no gate.
 
     Returns:
         Stage object for BGP cold start test.
@@ -526,6 +532,18 @@ def create_cold_start_test_stage(
         description="Toggle all device groups back to active",
         require_match=True,
         verify_readback=True,
+    )
+    # Step 5b: IXIA does not retry a gateway left unresolved when a re-enabled
+    # session starts, so require every gateway MAC before observing convergence.
+    gateway_steps = (
+        [
+            create_ixia_gateway_resolution_step(
+                gateway_resolution_device_group_names,
+                description="Re-resolve IXIA gateway MACs after re-enabling device groups",
+            )
+        ]
+        if gateway_resolution_device_group_names
+        else []
     )
     # Step 6: Monitor thread CPU OR wait for convergence.
     # If monitoring is enabled, it runs for the convergence duration and
@@ -681,6 +699,7 @@ def create_cold_start_test_stage(
             *rss_start_steps,
             *cpu_start_steps,
             toggle_step,
+            *gateway_steps,
             *tail_steps,
             *cpu_stop_steps,
             *rss_stop_steps,

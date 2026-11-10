@@ -183,16 +183,51 @@ class RefreshAndVerifyGatewayResolutionTest(unittest.TestCase):
         ipv4.SendArp.assert_called_once_with()
         self.assertGreaterEqual(self.clock.now, 9)
 
-    def test_not_started_sessions_fail_closed(self) -> None:
+    def test_sessions_that_never_start_fail_closed_before_sending(self) -> None:
         ipv6 = _stack("ipv6", [_UNRESOLVED, _MAC])
         ipv6.SessionStatus = ["notStarted", "up"]
         self._use_device_groups(_device_group("DEVICE_GROUP_IPV6_IBGP", ipv6=[ipv6]))
 
         with self.assertRaisesRegex(
             IxiaOperationStateError,
-            r"1/2 unresolved \[1\].*SessionStatus=\{'notStarted': 1\}",
+            r"IP sessions not started 9s into the gateway check: "
+            r"DEVICE_GROUP_IPV6_IBGP IPv6 1/2 notStarted \[1\]",
         ):
             self._verify("DEVICE_GROUP_IPV6_IBGP")
+
+        ipv6.SendNs.assert_not_called()
+        self.assertEqual([3, 3, 3], self.clock.sleeps)
+
+    def test_waits_for_ip_sessions_to_start_before_sending(self) -> None:
+        events: list[str] = []
+        ipv6 = _stack("ipv6", [_UNRESOLVED] * 2, [_UNRESOLVED] * 2, [_MAC] * 2)
+        statuses = itertools.chain(
+            [["notStarted", "notStarted"]], itertools.repeat(["up", "up"])
+        )
+        refresh = ipv6.refresh.side_effect
+
+        def starting_refresh() -> MagicMock:
+            events.append("refresh")
+            ipv6.SessionStatus = next(statuses)
+            return refresh()
+
+        ipv6.refresh.side_effect = starting_refresh
+        ipv6.SendNs.side_effect = lambda: events.append("send")
+        self._use_device_groups(_device_group("DEVICE_GROUP_IPV6_IBGP", ipv6=[ipv6]))
+
+        self._verify("DEVICE_GROUP_IPV6_IBGP")
+
+        self.assertEqual(["refresh", "refresh", "send", "refresh"], events)
+        self.assertEqual([3], self.clock.sleeps)
+        self.assertIn(
+            "Waiting for IP sessions to start before ARP/NS: "
+            "DEVICE_GROUP_IPV6_IBGP IPv6 2/2 notStarted [1-2]",
+            self.logger.info.call_args_list[0].args[0],
+        )
+        self.assertIn(
+            "DEVICE_GROUP_IPV6_IBGP IPv6 2/2 [1-2]",
+            self.logger.warning.call_args.args[0],
+        )
 
     def test_short_value_lists_degrade_per_session(self) -> None:
         ipv6 = _stack("ipv6", [_MAC, _UNRESOLVED, _MAC, ""])
@@ -215,8 +250,10 @@ class RefreshAndVerifyGatewayResolutionTest(unittest.TestCase):
 
     def test_unreadable_diagnostic_keeps_its_error_message(self) -> None:
         ipv6 = _stack("ipv6", [_UNRESOLVED])
+        # Readable while the gate waits for sessions to start, unreadable when
+        # the failure diagnostics read it again.
         type(ipv6).SessionStatus = PropertyMock(
-            side_effect=RuntimeError("session gone")
+            side_effect=[["up"], RuntimeError("session gone")]
         )
         self._use_device_groups(_device_group("DEVICE_GROUP_IPV6_IBGP", ipv6=[ipv6]))
 

@@ -124,7 +124,7 @@ from taac.testconfigs.fboss_solution_tests.fboss_bgp_and_platform_hardening_conv
 from taac.utils.json_thrift_utils import thrift_to_json
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
-from taac.test_as_a_config.thrift_types import Params, PointInTimeHealthCheck
+from taac.test_as_a_config.types import Params, PointInTimeHealthCheck
 
 # Services SERVICE_RESTART_CHECK monitors on agent-restart playbooks.
 # Modeled on Meta's ``SERVICES_TO_MONITOR_DURING_AGENT_RESTART = [fsdb,

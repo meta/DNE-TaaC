@@ -102,6 +102,7 @@ def create_device_core_dumps_check(
     use_start_time: bool = True,
     use_end_time: bool = False,
     start_time_jq_var: str = "test_case_start_time",
+    core_dump_processes_to_ignore: t.Optional[t.List[str]] = None,
 ) -> PointInTimeHealthCheck:
     """DEVICE_CORE_DUMPS_CHECK — detects new device core dumps.
 
@@ -112,8 +113,9 @@ def create_device_core_dumps_check(
     not supplied. See ``DeviceCoreDumpsHealthCheck._resolve_time_window``.
 
     Args:
-        core_dumps_to_ignore: Process names whose core dumps should NOT cause
-            the check to fail (e.g. ``["bgpd_main"]`` for force-kill tests).
+        core_dumps_to_ignore: Exact core filenames whose dumps should not fail.
+        core_dump_processes_to_ignore: Opt-in process names matched against
+            FBOSS packaged core/metadata paths; does not change legacy matching.
         use_start_time: When True (default), scopes the check to dumps after
             the jq timestamp named by ``start_time_jq_var``. Set False for the
             bare variant (no check_params).
@@ -124,11 +126,18 @@ def create_device_core_dumps_check(
             null — the check then falls back to *now*, which is the desired
             behavior anyway. Kept for forward-compatibility.
     """
-    if not use_start_time and not use_end_time and core_dumps_to_ignore is None:
+    if (
+        not use_start_time
+        and not use_end_time
+        and core_dumps_to_ignore is None
+        and core_dump_processes_to_ignore is None
+    ):
         return PointInTimeHealthCheck(name=hc_types.CheckName.DEVICE_CORE_DUMPS_CHECK)
     json_payload: t.Dict[str, t.Any] = {}
     if core_dumps_to_ignore is not None:
         json_payload["core_dumps_to_ignore"] = core_dumps_to_ignore
+    if core_dump_processes_to_ignore is not None:
+        json_payload["core_dump_processes_to_ignore"] = core_dump_processes_to_ignore
     jq_params: t.Dict[str, str] = {}
     if use_start_time:
         jq_params["start_time"] = f".{start_time_jq_var}"
@@ -695,6 +704,7 @@ def create_ixia_packet_loss_check(
 
 def create_core_dumps_snapshot_check(
     core_dumps_to_ignore: t.Optional[t.List[str]] = None,
+    core_dump_processes_to_ignore: t.Optional[t.List[str]] = None,
 ) -> SnapshotHealthCheck:
     """Create a snapshot check that no new core dumps appeared during the playbook.
 
@@ -704,18 +714,18 @@ def create_core_dumps_snapshot_check(
     churn) to catch unexpected daemon crashes.
 
     Args:
-        core_dumps_to_ignore: Core filenames or process names whose dumps do not
-            fail this check. All other new cores remain blocking.
+        core_dumps_to_ignore: Exact filenames (or EOS process names) to ignore.
+        core_dump_processes_to_ignore: Opt-in process names matched against
+            FBOSS packaged core/metadata paths. Other new cores remain blocking.
     """
+    params = {}
+    if core_dumps_to_ignore is not None:
+        params["core_dumps_to_ignore"] = core_dumps_to_ignore
+    if core_dump_processes_to_ignore is not None:
+        params["core_dump_processes_to_ignore"] = core_dump_processes_to_ignore
     return SnapshotHealthCheck(
         name=hc_types.CheckName.CORE_DUMPS_CHECK,
-        check_params=(
-            Params(
-                json_params=json.dumps({"core_dumps_to_ignore": core_dumps_to_ignore})
-            )
-            if core_dumps_to_ignore is not None
-            else None
-        ),
+        check_params=Params(json_params=json.dumps(params)) if params else None,
     )
 
 
@@ -2386,6 +2396,7 @@ def create_next_hop_count_snapshot_check() -> SnapshotHealthCheck:
 def create_bgp_peer_route_snapshot_check(
     parent_peers_to_ignore: t.Optional[t.List[str]] = None,
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
+    fail_on_collection_error: bool = False,
 ) -> SnapshotHealthCheck:
     """Create a snapshot check that BGP per-peer route counts are unchanged across the playbook.
 
@@ -2403,15 +2414,20 @@ def create_bgp_peer_route_snapshot_check(
             otherwise-steady peers. NOTE this switches the check off the cheap
             session counters onto per-peer post-filter RIB dumps.
 
+        fail_on_collection_error: When True, propagate filtered-RIB collection
+            failures instead of retaining the legacy zero-count fallback.
+
     Returns:
         A `SnapshotHealthCheck` with `name=BGP_PEER_ROUTE_CHECK`, carrying
-        `check_params` only when an ignore list is supplied.
+        `check_params` when an ignore list or strict collection is supplied.
     """
     json_payload: t.Dict[str, t.Any] = {}
     if parent_peers_to_ignore is not None:
         json_payload["parent_peers_to_ignore"] = parent_peers_to_ignore
     if parent_prefixes_to_ignore is not None:
         json_payload["parent_prefixes_to_ignore"] = parent_prefixes_to_ignore
+    if fail_on_collection_error:
+        json_payload["fail_on_collection_error"] = True
     return SnapshotHealthCheck(
         name=hc_types.CheckName.BGP_PEER_ROUTE_CHECK,
         check_params=(

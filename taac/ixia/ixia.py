@@ -734,6 +734,44 @@ def _bgp_session_indices_spec(indices: t.Iterable[int]) -> str:
     )
 
 
+def _is_resolved_gateway_mac(value: object) -> bool:
+    """True only for a non-zero 48-bit MAC, such as `00:1c:73:aa:bb:cc`.
+
+    Anything else, including IxNetwork's unresolved placeholder text, an
+    all-zero MAC or an empty value, counts as unresolved.
+    """
+    hex_digits = re.sub(r"[\s:.-]", "", str(value)).lower()
+    return (
+        re.fullmatch(r"[0-9a-f]{12}", hex_digits) is not None
+        and hex_digits != "0" * 12
+    )
+
+
+def _sampled_session_values(
+    values: t.Sequence[object], indices: t.Sequence[int]
+) -> list[str]:
+    """Read per-session `values` at the 1-based `indices`.
+
+    A single value applies to every session, and an index past the end of a
+    shorter list reads `missing` instead of failing the whole sample.
+    """
+    if len(values) == 1:
+        return [str(values[0])] * len(indices)
+    return [
+        str(values[index - 1]) if 0 < index <= len(values) else "missing"
+        for index in indices
+    ]
+
+
+@dataclass(frozen=True)
+class _GatewayStack:
+    """One IPv4 or IPv6 stack whose gateway MACs a resolution gate checks."""
+
+    device_group_name: str
+    family: str
+    stack: t.Any
+
+
 class IxiaSetupError(Exception):
     pass
 
@@ -903,6 +941,12 @@ _BGP_UP_STATUS: str = "up"
 # A dead port shows up only in the server's appErrors ("Port ... is not CPU
 # ready"), not in per-session state, so the failure quotes the latest ones.
 _BGP_START_FAILURE_SERVER_ERRORS: int = 5
+
+# Gateways resolve within seconds of ARP/NS once the DUT owns the gateway
+# addresses, so the timeout only bounds the unanswered case.
+_GATEWAY_RESOLUTION_TIMEOUT_SECONDS: int = 60
+_GATEWAY_RESOLUTION_POLL_SECONDS: int = 3
+_GATEWAY_RESOLUTION_FAILURE_SAMPLE_SIZE: int = 10
 _IXIA_SERVER_ERROR_LEVELS: t.FrozenSet[str] = frozenset({"kError", "kWarning"})
 
 # Stamped on the installed transport wrapper, holding the `Ixia` that owns it,
@@ -5354,7 +5398,38 @@ class Ixia:
             f"{bgp_peer.Name}: {len(indices)} {state} "
             f"[{_bgp_session_indices_spec(sample)}"
             f"{', ...' if len(indices) > len(sample) else ''}], "
-            f"SessionInfo={info}, inactive={inactive}"
+            f"SessionInfo={info}, inactive={inactive}, "
+            f"ip={Ixia._bgp_ip_layer_detail(bgp_peer, sample)}"
+        )
+
+    @staticmethod
+    def _bgp_ip_layer_detail(bgp_peer: t.Any, sample: t.Sequence[int]) -> str:
+        """Summarize the IP stack beneath `bgp_peer` for the sampled sessions.
+
+        BGP Stop/Start leaves this layer alone, so a session whose gateway MAC
+        never resolved stays down however often BGP restarts.
+        """
+        try:
+            stack = bgp_peer.parent
+            stack.refresh()
+            ip_count, bgp_count = int(stack.Count), int(bgp_peer.Count)
+            if ip_count != bgp_count:
+                return f"unavailable (IP Count {ip_count} != BGP Count {bgp_count})"
+            statuses = list(stack.SessionStatus)
+            infos = list(stack.SessionInfo)
+            macs = list(stack.ResolvedGatewayMac or [])
+            status = dict(Counter(_sampled_session_values(statuses, sample)))
+            info = dict(Counter(_sampled_session_values(infos, sample)))
+            unresolved = [
+                index
+                for index in sample
+                if index > len(macs) or not _is_resolved_gateway_mac(macs[index - 1])
+            ]
+        except Exception as error:
+            return f"unavailable ({type(error).__name__}: {error})"
+        return (
+            f"{{SessionStatus={status}, SessionInfo={info}, "
+            f"unresolved_gateways=[{_bgp_session_indices_spec(unresolved)}]}}"
         )
 
     @external_api
@@ -8178,6 +8253,148 @@ class Ixia:
         # Recurse into child device groups
         for child_dg in device_group.DeviceGroup.find():
             self._send_arp_ns_on_device_group(child_dg)
+
+    @external_api
+    def refresh_and_verify_gateway_resolution(
+        self,
+        device_group_names: t.Sequence[str],
+        timeout_seconds: float = _GATEWAY_RESOLUTION_TIMEOUT_SECONDS,
+    ) -> None:
+        """Re-send ARP/NS on the named device groups and require every gateway MAC.
+
+        `start_and_verify_protocols` sends ARP/NS once, right after
+        StartAllProtocols, when some sessions may not have started yet and the
+        DUT may not own the gateway addresses. Call this after the DUT owns
+        them. ARP/NS is sent once per stack and never re-sent. Raises
+        `IxiaOperationStateError` naming the unresolved sessions if any gateway
+        MAC is still unresolved after `timeout_seconds`.
+        """
+        gateway_stacks = self._gateway_stacks(device_group_names)
+        stale = self._unresolved_gateways(gateway_stacks)
+        if stale:
+            self.logger.warning(
+                "Gateway MACs unresolved before ARP/NS refresh: "
+                + "; ".join(
+                    f"{gateway_stack.device_group_name} {gateway_stack.family} "
+                    f"{len(indices)}/{count} "
+                    f"[{_bgp_session_indices_spec(indices)}]"
+                    for gateway_stack, count, indices in stale
+                )
+            )
+        for gateway_stack in gateway_stacks:
+            self._send_gateway_resolution_request(gateway_stack)
+        deadline = time.monotonic() + timeout_seconds
+        unresolved = self._unresolved_gateways(gateway_stacks)
+        while unresolved:
+            if time.monotonic() >= deadline:
+                raise IxiaOperationStateError(
+                    f"Gateway MACs unresolved {timeout_seconds}s after ARP/NS: "
+                    + "; ".join(
+                        self._gateway_resolution_failure_detail(
+                            gateway_stack, count, indices
+                        )
+                        for gateway_stack, count, indices in unresolved
+                    )
+                    + f"; Ixia server errors: {self._recent_ixia_server_errors()}"
+                )
+            time.sleep(_GATEWAY_RESOLUTION_POLL_SECONDS)
+            unresolved = self._unresolved_gateways(gateway_stacks)
+        self.logger.info(
+            f"Resolved every gateway MAC on {', '.join(device_group_names)} "
+            f"({len(gateway_stacks)} IP stack(s))"
+        )
+
+    def _gateway_stacks(
+        self, device_group_names: t.Sequence[str]
+    ) -> list[_GatewayStack]:
+        if not device_group_names:
+            raise ValueError("device_group_names must name at least one device group")
+        device_groups_by_name: dict[str, list[t.Any]] = defaultdict(list)
+        for device_group in self.find_device_groups():
+            device_groups_by_name[str(device_group.Name)].append(device_group)
+        gateway_stacks = []
+        for name in device_group_names:
+            matches = device_groups_by_name.get(name, [])
+            if len(matches) != 1:
+                raise IxiaOperationStateError(
+                    f"Expected one device group named {name}, found {len(matches)}"
+                )
+            stacks = [
+                _GatewayStack(name, family, stack)
+                for ethernet in matches[0].Ethernet.find()
+                for family, family_stacks in (
+                    ("IPv4", ethernet.Ipv4.find()),
+                    ("IPv6", ethernet.Ipv6.find()),
+                )
+                for stack in family_stacks
+            ]
+            if not stacks:
+                raise IxiaOperationStateError(
+                    f"Device group {name} has no IPv4 or IPv6 stack"
+                )
+            gateway_stacks.extend(stacks)
+        return gateway_stacks
+
+    def _send_gateway_resolution_request(self, gateway_stack: _GatewayStack) -> None:
+        if gateway_stack.family == "IPv4":
+            gateway_stack.stack.SendArp()
+            request = "ARP"
+        else:
+            gateway_stack.stack.SendNs()
+            request = "NS"
+        self.logger.info(
+            f"[{gateway_stack.device_group_name}] Re-sent {request} on "
+            f"{gateway_stack.family} stack"
+        )
+
+    @staticmethod
+    def _unresolved_gateways(
+        gateway_stacks: t.Sequence[_GatewayStack],
+    ) -> list[t.Tuple[_GatewayStack, int, list[int]]]:
+        unresolved = []
+        for gateway_stack in gateway_stacks:
+            stack = gateway_stack.stack
+            # restpy serves attributes from the snapshot taken by find().
+            stack.refresh()
+            macs = list(stack.ResolvedGatewayMac or [])
+            count = int(stack.Count)
+            indices = [
+                index
+                for index in range(1, count + 1)
+                if index > len(macs) or not _is_resolved_gateway_mac(macs[index - 1])
+            ]
+            if indices:
+                unresolved.append((gateway_stack, count, indices))
+        return unresolved
+
+    @staticmethod
+    def _gateway_resolution_failure_detail(
+        gateway_stack: _GatewayStack, count: int, indices: t.Sequence[int]
+    ) -> str:
+        stack = gateway_stack.stack
+        sample = indices[:_GATEWAY_RESOLUTION_FAILURE_SAMPLE_SIZE]
+
+        def sampled(read: t.Callable[[], t.Any]) -> list[str] | str:
+            try:
+                return _sampled_session_values(list(read()), sample)
+            except Exception as error:
+                return f"unavailable ({type(error).__name__}: {error})"
+
+        def counted(read: t.Callable[[], t.Any]) -> dict[str, int] | str:
+            values = sampled(read)
+            return values if isinstance(values, str) else dict(Counter(values))
+
+        return (
+            f"{gateway_stack.device_group_name} {gateway_stack.family}: "
+            f"{len(indices)}/{count} unresolved "
+            f"[{_bgp_session_indices_spec(sample)}"
+            f"{', ...' if len(indices) > len(sample) else ''}], "
+            f"Address={sampled(lambda: stack.Address.Values)}, "
+            f"GatewayIp={sampled(lambda: stack.GatewayIp.Values)}, "
+            f"ResolvedGatewayMac={sampled(lambda: stack.ResolvedGatewayMac)}, "
+            f"SessionStatus={counted(lambda: stack.SessionStatus)}, "
+            f"SessionInfo={counted(lambda: stack.SessionInfo)}"
+        )
 
     def apply_flow_control_config(
         self, fcoe: "Fcoe", flow_control_config: ixia_types.FlowControlConfig

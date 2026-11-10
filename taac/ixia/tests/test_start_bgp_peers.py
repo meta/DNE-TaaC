@@ -496,6 +496,71 @@ class StartBgpPeersVerifyUpTest(_BgpSessionStatusTestBase):
         self.assertEqual(2, self.peer.Stop.call_count)
         self.assertEqual(3, self.peer.Start.call_count)
 
+    def test_not_up_failure_reports_ip_layer_state(self) -> None:
+        self._set_statuses(["up", "down", "down"])
+        self.peer.Count = 3
+        self.peer.SessionInfo = ["none", "none", "none"]
+        ip_stack = self.peer.parent
+        ip_stack.Count = 3
+        ip_stack.SessionStatus = ["up", "up", "down"]
+        ip_stack.SessionInfo = ["none", "none", "resolveMacFailed"]
+        ip_stack.ResolvedGatewayMac = ["00:1c:73:aa:bb:cc", "Unresolved", ""]
+
+        with self.assertRaises(IxiaOperationStateError) as raised:
+            self._start_up()
+
+        self.assertIn(
+            "ip={SessionStatus={'up': 1, 'down': 1}, "
+            "SessionInfo={'none': 1, 'resolveMacFailed': 1}, "
+            "unresolved_gateways=[2-3]}",
+            str(raised.exception),
+        )
+        ip_stack.refresh.assert_called()
+
+    def test_short_ip_layer_lists_degrade_per_session(self) -> None:
+        self._set_statuses(["up", "down", "down"])
+        self.peer.Count = 3
+        self.peer.SessionInfo = ["none", "none", "none"]
+        ip_stack = self.peer.parent
+        ip_stack.Count = 3
+        ip_stack.SessionStatus = ["up", "down"]
+        ip_stack.SessionInfo = ["resolveMacFailed"]
+        ip_stack.ResolvedGatewayMac = ["00:1c:73:aa:bb:cc", "Unresolved", ""]
+
+        with self.assertRaises(IxiaOperationStateError) as raised:
+            self._start_up()
+
+        self.assertIn(
+            "ip={SessionStatus={'down': 1, 'missing': 1}, "
+            "SessionInfo={'resolveMacFailed': 2}, "
+            "unresolved_gateways=[2-3]}",
+            str(raised.exception),
+        )
+
+    def test_unreadable_ip_layer_keeps_bgp_failure(self) -> None:
+        self._set_statuses(["up", "down", "up"])
+        self.peer.SessionInfo = ["none", "none", "none"]
+        self.peer.parent.refresh.side_effect = RuntimeError("gateway timeout")
+
+        with self.assertRaises(IxiaOperationStateError) as raised:
+            self._start_up()
+
+        message = str(raised.exception)
+        self.assertIn("BGP_PEER_IPV6_IBGP: 1 not up [2]", message)
+        self.assertIn("ip=unavailable (RuntimeError: gateway timeout)", message)
+
+    def test_ip_layer_with_different_session_count_is_not_mapped(self) -> None:
+        self._set_statuses(["up", "down", "up"])
+        self.peer.SessionInfo = ["none", "none", "none"]
+        self.peer.parent.Count = 1
+
+        with self.assertRaises(IxiaOperationStateError) as raised:
+            self._start_up()
+
+        self.assertIn(
+            "ip=unavailable (IP Count 1 != BGP Count 5)", str(raised.exception)
+        )
+
     def test_requires_verify_started(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires verify_started"):
             self.ixia.start_bgp_peers(

@@ -1715,3 +1715,130 @@ class PerformanceScalingRouteFilterClearTest(unittest.TestCase):
             "exactly one bgp_clear_route_filter task must be wired so injected "
             "prefixes are not blocked by the route registry",
         )
+
+
+def _is_bgpcpp_enable(task) -> bool:
+    return (
+        task.task_name == "arista_daemon_control"
+        and _task_json_params(task).get("daemon_name") == "Bgpcpp"
+        and _task_json_params(task).get("action") == "enable"
+    )
+
+
+def _gateway_gate_indices(tasks) -> list:
+    return [
+        index
+        for index, task in enumerate(tasks)
+        if task.task_name == "invoke_ixia_api"
+        and _task_json_params(task).get("api_name")
+        == "refresh_and_verify_gateway_resolution"
+    ]
+
+
+def _daemon_task(action: str, ixia_needed: bool = True) -> Task:
+    return Task(
+        task_name="arista_daemon_control",
+        ixia_needed=ixia_needed,
+        params=Params(
+            json_params=json.dumps(
+                {"hostname": "dut", "daemon_name": "Bgpcpp", "action": action}
+            )
+        ),
+    )
+
+
+def _interface_ip_task(ixia_needed: bool = True) -> Task:
+    return Task(
+        task_name="interface_ip_configuration",
+        ixia_needed=ixia_needed,
+        params=Params(json_params="{}"),
+    )
+
+
+class PerformanceScalingGatewayResolutionGateTest(unittest.TestCase):
+    """IXIA sends its only ARP/NS before the DUT owns its gateway addresses,
+    so SC1 must re-resolve every IXIA BGP gateway between the DUT interface IP
+    configuration and the first Bgpcpp enable."""
+
+    def test_nrqeb008_sc1_gates_first_bgpcpp_enable_on_bgp_gateways(self) -> None:
+        tasks = (
+            cicd_ebb_int_tc.NRQEB008_SC1_EGRESS_PEER_SCALE_TEST_CONFIG_UG.setup_tasks
+            or []
+        )
+        gates = _gateway_gate_indices(tasks)
+        last_interface_ip = max(
+            index
+            for index, task in enumerate(tasks)
+            if task.task_name == "interface_ip_configuration"
+        )
+        first_enable_after_ips = next(
+            index
+            for index in range(last_interface_ip + 1, len(tasks))
+            if _is_bgpcpp_enable(tasks[index])
+        )
+
+        self.assertEqual(1, len(gates))
+        self.assertTrue(tasks[gates[0]].ixia_needed)
+        self.assertTrue(tasks[last_interface_ip].ixia_needed)
+        self.assertEqual(first_enable_after_ips - 1, gates[0])
+        self.assertEqual(
+            {
+                "device_group_names": [
+                    "DEVICE_GROUP_IPV6_EBGP",
+                    "DEVICE_GROUP_IPV4_EBGP",
+                    "DEVICE_GROUP_IPV6_IBGP",
+                    "DEVICE_GROUP_IPV4_IBGP",
+                ]
+            },
+            json.loads(_task_json_params(tasks[gates[0]])["args_json"]),
+        )
+
+    def test_gate_skips_bgpcpp_enable_before_interface_ips(self) -> None:
+        tasks = characteristic_factory._insert_gateway_resolution_gate(
+            [
+                _daemon_task("enable"),
+                _interface_ip_task(),
+                _daemon_task("disable"),
+                _daemon_task("enable"),
+                _daemon_task("enable"),
+            ]
+        )
+
+        self.assertEqual([3], _gateway_gate_indices(tasks))
+        self.assertEqual(6, len(tasks))
+
+    def test_pre_ixia_interface_ips_gate_first_post_ixia_enable(self) -> None:
+        tasks = characteristic_factory._insert_gateway_resolution_gate(
+            [
+                _interface_ip_task(ixia_needed=False),
+                _daemon_task("enable", ixia_needed=False),
+                _daemon_task("enable"),
+            ]
+        )
+
+        self.assertEqual([2], _gateway_gate_indices(tasks))
+
+    def test_unreadable_daemon_task_params_do_not_anchor_the_gate(self) -> None:
+        unreadable = Task(
+            task_name="arista_daemon_control",
+            ixia_needed=True,
+            params=Params(json_params="{not json"),
+        )
+
+        tasks = characteristic_factory._insert_gateway_resolution_gate(
+            [_interface_ip_task(), unreadable, _daemon_task("enable")]
+        )
+
+        self.assertEqual([2], _gateway_gate_indices(tasks))
+
+    def test_gate_requires_interface_ip_configuration(self) -> None:
+        with self.assertRaisesRegex(ValueError, "interface_ip_configuration"):
+            characteristic_factory._insert_gateway_resolution_gate(
+                [_daemon_task("enable")]
+            )
+
+    def test_gate_requires_bgpcpp_enable_after_interface_ips(self) -> None:
+        with self.assertRaisesRegex(ValueError, "post-IXIA Bgpcpp enable"):
+            characteristic_factory._insert_gateway_resolution_gate(
+                [_daemon_task("enable"), _interface_ip_task(), _daemon_task("disable")]
+            )

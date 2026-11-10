@@ -423,7 +423,8 @@ class TrafficGenerator:
                 is_logical_port=direct_ixia_connection.is_logical_port,
             )
             direct_ixia_connection_assets.append(ixia_endpoint)
-        return list(set(direct_ixia_connection_assets))
+        # The declared order decides which port IXIA creates first.
+        return list(dict.fromkeys(direct_ixia_connection_assets))
 
     def create_ixia_endpoint(
         self, endpoint: taac_types.TrafficEndpoint
@@ -871,7 +872,7 @@ class TrafficGenerator:
                     f"[OSS Mode] Using {len(direct_ixia_connection_assets)} direct IXIA connection(s) "
                     f"for endpoint {endpoint.name}"
                 )
-                desired_ixia_assets = list(set(direct_ixia_connection_assets))
+                desired_ixia_assets = direct_ixia_connection_assets
                 self._ixia_asset_snapshot_by_endpoint[endpoint.name] = (
                     desired_ixia_assets
                 )
@@ -892,7 +893,7 @@ class TrafficGenerator:
                 f"Using {len(direct_ixia_connection_assets)} direct IXIA connection(s) "
                 f"for endpoint {endpoint.name}, skipping LLDP/optical switch discovery"
             )
-            desired_ixia_assets = list(set(direct_ixia_connection_assets))
+            desired_ixia_assets = direct_ixia_connection_assets
             self._ixia_asset_snapshot_by_endpoint[endpoint.name] = desired_ixia_assets
             return desired_ixia_assets
 

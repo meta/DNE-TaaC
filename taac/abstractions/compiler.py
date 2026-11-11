@@ -18,6 +18,7 @@ from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
     build_fibagent_bgp_config_restore_cmd,
     build_fibagent_bgp_config_verify_cmd,
     build_update_group_setting_override_cmd,
+    FIBAGENT_BGP_CONF_CONFIGERATOR_PATH,
     FIBAGENT_BGP_CONF_DEPLOY_CMD,
     FIBAGENT_BGP_CONF_DEVICE_PATH,
     FIBAGENT_CONF_DEPLOY_CMD,
@@ -102,6 +103,7 @@ from taac.task_definitions import (
     create_arista_create_file_from_config_task,
     create_arista_daemon_control_task,
     create_bgp_clear_route_filter_task,
+    create_configure_bgpcpp_startup_task,
     create_deploy_tls_certs_task,
     create_eos_compiler_lifecycle_task,
     create_interface_ip_cleanup_task,
@@ -627,6 +629,7 @@ class _EbbFullScaleSetupArgs:
     bgpcpp_configerator_path: str
     enable_update_group: bool
     bgpcpp_logging_config_override: str | None = None
+    fibagent_bgp_thrift_queue_timeout_ms: int | None = None
     fibagent_bgp_nhg_watermark_high: int | None = None
     fibagent_bgp_nhg_watermark_low: int | None = None
 
@@ -727,6 +730,24 @@ class _BoundedEcmpArgs:
     bgp_asn: int
     router_id: str | None
     bgpcpp_configerator_path: str | None
+    enable_update_group: bool
+    openr_mode: OpenRMode
+
+
+@dataclass(frozen=True)
+class _RouteChurnScaleArgs:
+    device_name: str
+    ixia_chassis_ip: str
+    ebgp_group: BoundDeviceGroup
+    ibgp_peer_1_group: BoundDeviceGroup
+    ibgp_peers_rest_group: BoundDeviceGroup
+    ebgp_interface: str
+    ebgp_ixia_port: str
+    ibgp_interface: str
+    ibgp_ixia_port: str
+    bgp_asn: int
+    bgpcpp_configerator_path: str
+    agent_thrift_recv_timeout_ms: int
     enable_update_group: bool
     openr_mode: OpenRMode
 
@@ -853,11 +874,45 @@ def _ebb_full_scale_bgpcpp_deployment_tasks(
             ]
         )
 
+    queue_timeout_ms = args.fibagent_bgp_thrift_queue_timeout_ms
+    if queue_timeout_ms is not None and (
+        isinstance(queue_timeout_ms, bool)
+        or not isinstance(queue_timeout_ms, int)
+        or not 0 < queue_timeout_ms <= 2_147_483_647
+    ):
+        raise ValueError("FibAgentBgp Thrift queue timeout must be a positive i32")
+
     fibagent_bgp_watermarks = validate_fibagent_bgp_nhg_watermarks(
         args.fibagent_bgp_nhg_watermark_high,
         args.fibagent_bgp_nhg_watermark_low,
     )
-    if fibagent_bgp_watermarks is not None:
+    if queue_timeout_ms is not None:
+        json_i32_overrides = [
+            {"path": ["1", "rec", "36", "i32"], "value": queue_timeout_ms}
+        ]
+        if fibagent_bgp_watermarks is not None:
+            high_watermark, low_watermark = fibagent_bgp_watermarks
+            json_i32_overrides.extend(
+                [
+                    {
+                        "path": ["10", "rec", "1", "i32"],
+                        "value": high_watermark,
+                    },
+                    {
+                        "path": ["10", "rec", "2", "i32"],
+                        "value": low_watermark,
+                    },
+                ]
+            )
+        fibagent_bgp_config_task = create_eos_compiler_lifecycle_task(
+            hostname=device_name,
+            action="routing_config_install",
+            source_path=FIBAGENT_BGP_CONF_CONFIGERATOR_PATH,
+            destination=FIBAGENT_BGP_CONF_DEVICE_PATH,
+            json_i32_overrides=json_i32_overrides,
+            ixia_needed=True,
+        )
+    elif fibagent_bgp_watermarks is not None:
         high_watermark, low_watermark = fibagent_bgp_watermarks
         fibagent_bgp_config_task = create_run_commands_on_shell_task(
             hostname=device_name,
@@ -1265,6 +1320,11 @@ def _characteristic_setup_phases(
         enable_update_group=enable_update_group,
         bgpcpp_logging_config_override=(
             bound.device_config.bgpcpp_logging_config_override
+            if bound.device_config is not None
+            else None
+        ),
+        fibagent_bgp_thrift_queue_timeout_ms=(
+            bound.device_config.fibagent_bgp_thrift_queue_timeout_ms
             if bound.device_config is not None
             else None
         ),
@@ -5014,6 +5074,8 @@ class ProfileFreeEosBgpCppCompiler(TopologyCompiler):
             return _compile_transient_memory_route_scale_artifacts(bound)
         if _is_profile_free_ingress_peer_scale(bound):
             return _compile_ingress_peer_scale_artifacts(bound)
+        if _is_profile_free_route_churn_scale(bound):
+            return _compile_route_churn_scale_artifacts(bound)
         if _is_profile_free_egress_peer_scale(bound):
             return _preserve_egress_peer_scale_task_artifacts(bound)
         if _is_profile_free_ipv6_update_packing(bound):
@@ -6358,6 +6420,410 @@ def _compile_ingress_peer_scale_artifacts(
     )
 
 
+def _is_profile_free_route_churn_scale(bound: BoundTopology) -> bool:
+    return (
+        bound.logical_topology.legacy_profile is None
+        and bound.logical_topology.task_compatibility_profile
+        is TaskCompatibilityProfile.ROUTE_CHURN_SCALE
+    )
+
+
+def _route_churn_scale_args(bound: BoundTopology) -> _RouteChurnScaleArgs:
+    expected = (
+        ("dg_route_churn_scale_ebgp_v6", "ebgp", "v6", 100),
+        ("dg_route_churn_scale_ibgp_peer_1_v6", "ibgp", "v6", 1),
+        ("dg_route_churn_scale_ibgp_peers_rest_v6", "ibgp", "v6", 99),
+    )
+    actual = tuple(
+        (group.name, group.role, group.afi, group.peer_count)
+        for group in bound.device_groups
+    )
+    if actual != expected:
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path="device_groups",
+                    code="invalid_route_churn_scale_shape",
+                    message=f"route churn scale requires {expected!r}; got {actual!r}",
+                )
+            ],
+        )
+
+    groups = {group.name: group for group in bound.device_groups}
+    ebgp_group = groups["dg_route_churn_scale_ebgp_v6"]
+    ibgp_peer_1_group = groups["dg_route_churn_scale_ibgp_peer_1_v6"]
+    ibgp_peers_rest_group = groups["dg_route_churn_scale_ibgp_peers_rest_v6"]
+    expected_ixia_identity = (
+        ("DEVICE_GROUP_IPV6_EBGP", "BGP_PEER_IPV6_EBGP", 0),
+        (
+            "DEVICE_GROUP_IPV6_IBGP_PEER_1",
+            "BGP_PEER_IPV6_IBGP_PEER_1",
+            0,
+        ),
+        (
+            "DEVICE_GROUP_IPV6_IBGP_PEERS_REST",
+            "BGP_PEER_IPV6_IBGP_PEERS_REST",
+            1,
+        ),
+    )
+    actual_ixia_identity = tuple(
+        (
+            group.legacy_ixia_device_group_name,
+            group.legacy_ixia_bgp_peer_name,
+            group.legacy_ixia_device_group_index,
+        )
+        for group in bound.device_groups
+    )
+    issues: list[ValidationIssue] = []
+    if actual_ixia_identity != expected_ixia_identity:
+        issues.append(
+            ValidationIssue(
+                path="device_groups.legacy_ixia_identity",
+                code="invalid_route_churn_scale_ixia_identity",
+                message="route churn scale requires its three checked IXIA identities",
+            )
+        )
+    for group in bound.device_groups:
+        assignment = group.port_assignment
+        if (
+            not isinstance(group.peer_group, BgpPeerGroup)
+            or assignment is None
+            or assignment.logical_role != group.role
+            or group.remote_asn is None
+            or not group.parent_network
+            or len(group.a_ips) != group.peer_count
+            or len(group.z_ips) != group.peer_count
+        ):
+            issues.append(
+                ValidationIssue(
+                    path=f"device_groups.{group.name}",
+                    code="missing_route_churn_scale_input",
+                    message="compiler requires complete peer, IXIA, and ASN inputs",
+                )
+            )
+    expected_advertisements = {
+        ebgp_group.name: (),
+        ibgp_peer_1_group.name: (
+            "PREFIX_POOL_IPV6_IBGP_PEER_1_CHURNED",
+            "PREFIX_POOL_IPV6_IBGP_PEER_1_CONTROL",
+        ),
+        ibgp_peers_rest_group.name: ("PREFIX_POOL_IPV6_IBGP_PEERS_REST",),
+    }
+    for group in bound.device_groups:
+        actual_names = tuple(
+            advertisement.spec.legacy_ixia_name
+            for advertisement in group.prefix_advertisements
+        )
+        if actual_names != expected_advertisements[group.name]:
+            issues.append(
+                ValidationIssue(
+                    path=f"device_groups.{group.name}.prefix_advertisements",
+                    code="invalid_route_churn_scale_route_intent",
+                    message=(
+                        "route churn scale requires the checked churn/control "
+                        f"route pools; got {actual_names!r}"
+                    ),
+                )
+            )
+
+    ebgp_assignment = _resolved_ixia_assignment(bound, ebgp_group)
+    ibgp_assignments = tuple(
+        _resolved_ixia_assignment(bound, group)
+        for group in (ibgp_peer_1_group, ibgp_peers_rest_group)
+    )
+    if (
+        len(
+            {
+                (
+                    assignment.dut_interface,
+                    assignment.ixia_port,
+                    assignment.physical_inventory_index,
+                )
+                for assignment in ibgp_assignments
+            }
+        )
+        != 1
+    ):
+        issues.append(
+            ValidationIssue(
+                path="device_groups.ibgp.port_assignment",
+                code="invalid_route_churn_scale_mapping",
+                message="both iBGP slices must share one physical IXIA port",
+            )
+        )
+
+    device_config = bound.device_config
+    if (
+        not isinstance(device_config, RoutingDeviceConfig)
+        or device_config.openr_mode is not OpenRMode.NONE
+        or device_config.bgpcpp_logging_config_override != "INFO;default:async=true"
+        or device_config.bgpcpp_agent_thrift_recv_timeout_ms != 600_000
+        or device_config.fibagent_bgp_thrift_queue_timeout_ms != 60_000
+    ):
+        issues.append(
+            ValidationIssue(
+                path="device_config",
+                code="invalid_route_churn_scale_device_config",
+                message=(
+                    "route churn scale requires no OpenR, INFO async logging, "
+                    "a 600000ms BGP client timeout, and a 60000ms "
+                    "FibAgentBgp queue timeout"
+                ),
+            )
+        )
+    inventory = bound.physical_inventory
+    required_inventory = {
+        "device_name": getattr(inventory, "device_name", None),
+        "ixia_chassis_ip": getattr(inventory, "ixia_chassis_ip", None),
+        "dut_bgp_as": getattr(inventory, "dut_bgp_as", None),
+        "bgpcpp_configerator_path": getattr(
+            inventory, "bgpcpp_configerator_path", None
+        ),
+    }
+    for name, value in required_inventory.items():
+        if not value:
+            issues.append(
+                ValidationIssue(
+                    path=f"physical_inventory.{name}",
+                    code="missing_route_churn_scale_input",
+                    message=f"route churn scale requires physical_inventory.{name}",
+                )
+            )
+    if issues:
+        raise TopologyValidationError(bound.logical_topology.name, issues)
+
+    assert isinstance(device_config, RoutingDeviceConfig)
+    return _RouteChurnScaleArgs(
+        device_name=t.cast(str, required_inventory["device_name"]),
+        ixia_chassis_ip=t.cast(str, required_inventory["ixia_chassis_ip"]),
+        ebgp_group=ebgp_group,
+        ibgp_peer_1_group=ibgp_peer_1_group,
+        ibgp_peers_rest_group=ibgp_peers_rest_group,
+        ebgp_interface=ebgp_assignment.dut_interface,
+        ebgp_ixia_port=ebgp_assignment.ixia_port,
+        ibgp_interface=ibgp_assignments[0].dut_interface,
+        ibgp_ixia_port=ibgp_assignments[0].ixia_port,
+        bgp_asn=t.cast(int, required_inventory["dut_bgp_as"]),
+        bgpcpp_configerator_path=t.cast(
+            str, required_inventory["bgpcpp_configerator_path"]
+        ),
+        agent_thrift_recv_timeout_ms=t.cast(
+            int, device_config.bgpcpp_agent_thrift_recv_timeout_ms
+        ),
+        enable_update_group=device_config.update_group_enable,
+        openr_mode=device_config.openr_mode,
+    )
+
+
+def _route_churn_scale_route_scales(
+    bound: BoundTopology,
+    group: BoundDeviceGroup,
+) -> list[taac_types.RouteScaleSpec]:
+    result = []
+    for advertisement in group.prefix_advertisements:
+        spec = advertisement.spec
+        source = advertisement.prefix_set.spec.source
+        route_attributes = spec.route_attributes
+        if route_attributes is None or len(route_attributes.community_rows) != 1:
+            raise TopologyValidationError(
+                bound.logical_topology.name,
+                [
+                    ValidationIssue(
+                        path=(
+                            f"device_groups.{group.name}.prefix_advertisements."
+                            f"{spec.name}.route_attributes"
+                        ),
+                        code="invalid_route_churn_scale_route_attributes",
+                        message="route churn pools require one community row",
+                    )
+                ],
+            )
+        result.append(
+            taac_types.RouteScaleSpec(
+                v6_route_scale=taac_types.RouteScale(
+                    prefix_name=spec.legacy_ixia_name,
+                    starting_prefixes=advertisement.path_at(0, 0).prefix,
+                    prefix_step=_step_address(_ip_step(source.prefix_step, "v6"), "v6"),
+                    prefix_length=source.prefix_length,
+                    multiplier=1,
+                    prefix_count=spec.allocation.prefixes_per_peer,
+                    ip_address_family=ixia_types.IpAddressFamily.IPV6,
+                    bgp_communities=[
+                        f"{community.asn}:{community.value}"
+                        for community in route_attributes.community_rows[0]
+                    ],
+                ),
+                multiplier=1,
+                network_group_index=spec.allocation.network_group_index,
+            )
+        )
+    return result
+
+
+def _route_churn_scale_device_group_config(
+    bound: BoundTopology,
+    group: BoundDeviceGroup,
+) -> taac_types.DeviceGroupConfig:
+    first_peer = _first_resolved_peer(bound, group)
+    bgp_config = taac_types.BgpConfig(
+        bgp_peer_name=group.legacy_ixia_bgp_peer_name,
+        local_as_4_bytes=group.remote_asn,
+        enable_4_byte_local_as=True,
+        enable_graceful_restart=False if group.role == "ibgp" else None,
+        bgp_capabilities=[ixia_types.BgpCapability.IpV6Unicast],
+        bgp_peer_type=(
+            ixia_types.BgpPeerType.EBGP
+            if group.role == "ebgp"
+            else ixia_types.BgpPeerType.IBGP
+        ),
+        route_scales=(
+            _route_churn_scale_route_scales(bound, group)
+            if group.prefix_advertisements
+            else None
+        ),
+    )
+    return taac_types.DeviceGroupConfig(
+        device_group_name=group.legacy_ixia_device_group_name,
+        device_group_index=_required_legacy_device_group_index(bound, group),
+        multiplier=group.peer_count,
+        v6_addresses_config=taac_types.IpAddressesConfig(
+            starting_ip=first_peer.z_ip,
+            increment_ip="0:0:0:0::2",
+            gateway_starting_ip=first_peer.a_ip,
+            gateway_increment_ip="0:0:0:0::2",
+            start_index=0,
+        ),
+        v6_bgp_config=bgp_config,
+    )
+
+
+def _route_churn_scale_peer_plan(bound: BoundTopology) -> BgpPeerPlan:
+    plan = _eos_bgpcpp_peer_plan(bound)
+    family_ordinals: dict[str, int] = {}
+    peers = []
+    groups = {group.name: group for group in bound.device_groups}
+    for peer in plan.peers:
+        family = _bgp_role_family(groups[peer.device_group].role)
+        ordinal = family_ordinals.get(family, 0) + 1
+        peers.append(
+            replace(
+                peer,
+                description=f"IXIA_{peer.afi.upper()}_PEER_{ordinal}",
+            )
+        )
+        family_ordinals[family] = ordinal
+    return replace(plan, peers=tuple(peers))
+
+
+def _compile_route_churn_scale_artifacts(
+    bound: BoundTopology,
+) -> CompiledTaacArtifacts:
+    _validate_characteristic_compatibility_intent(
+        bound, allow_single_community_row=True
+    )
+    args = _route_churn_scale_args(bound)
+    state_guard_setup, state_guard_teardown = _ebb_device_state_guard_tasks(
+        device_name=args.device_name,
+        operation_namespace="ebb_sc6",
+    )
+    startup_override = create_configure_bgpcpp_startup_task(
+        hostname=args.device_name,
+        flags={"agent_thrift_recv_timeout_ms": str(args.agent_thrift_recv_timeout_ms)},
+        use_managed_shell=True,
+        restart_bgp=False,
+        set_outer_hostname=True,
+        ixia_needed=True,
+    )
+    phases = _characteristic_setup_phases(
+        bound,
+        device_name=args.device_name,
+        bgp_asn=args.bgp_asn,
+        ebgp_interface=args.ebgp_interface,
+        ibgp_interface=args.ibgp_interface,
+        router_id=None,
+        bgpcpp_configerator_path=args.bgpcpp_configerator_path,
+        enable_update_group=args.enable_update_group,
+        openr_mode=args.openr_mode,
+        peer_plan=_route_churn_scale_peer_plan(bound),
+        finalization_tasks=(
+            create_bgp_clear_route_filter_task(
+                hostname=args.device_name,
+                set_outer_hostname=True,
+                ixia_needed=True,
+            ),
+        ),
+    )
+    (
+        host_preparation,
+        component_configuration,
+        interface_configuration,
+        component_startup,
+        peer_configuration,
+        peer_restart,
+        host_finalization,
+    ) = phases
+    update_group_validation = tuple(
+        task
+        for task in component_startup.tasks
+        if task.task_name == "validate_bgpcpp_update_group_state"
+    )
+    component_startup_tasks = tuple(
+        task
+        for task in component_startup.tasks
+        if task.task_name != "validate_bgpcpp_update_group_state"
+    )
+    setup_tasks = [
+        *state_guard_setup,
+        startup_override,
+        *host_preparation.tasks,
+        *component_configuration.tasks,
+        *component_startup_tasks,
+        *interface_configuration.tasks,
+        *peer_configuration.tasks,
+        *peer_restart.tasks,
+        *update_group_validation,
+        *host_finalization.tasks,
+    ]
+    connections = (
+        (args.ebgp_interface, args.ebgp_ixia_port),
+        (args.ibgp_interface, args.ibgp_ixia_port),
+    )
+    return CompiledTaacArtifacts(
+        endpoints=[
+            _checked_characteristic_endpoint(
+                device_name=args.device_name,
+                ixia_chassis_ip=args.ixia_chassis_ip,
+                ixia_interfaces=tuple(interface for interface, _ in connections),
+                connections=connections,
+            )
+        ],
+        host_os_type_map={args.device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
+        setup_tasks=setup_tasks,
+        teardown_tasks=state_guard_teardown,
+        basic_port_configs=[
+            taac_types.BasicPortConfig(
+                endpoint=f"{args.device_name}:{args.ebgp_interface}",
+                device_group_configs=[
+                    _route_churn_scale_device_group_config(bound, args.ebgp_group)
+                ],
+            ),
+            taac_types.BasicPortConfig(
+                endpoint=f"{args.device_name}:{args.ibgp_interface}",
+                device_group_configs=[
+                    _route_churn_scale_device_group_config(
+                        bound, args.ibgp_peer_1_group
+                    ),
+                    _route_churn_scale_device_group_config(
+                        bound, args.ibgp_peers_rest_group
+                    ),
+                ],
+            ),
+        ],
+        basic_traffic_item_configs=[],
+    )
+
+
 def _is_profile_free_ebb_full_scale(bound: BoundTopology) -> bool:
     return (
         bound.logical_topology.legacy_profile is None
@@ -7161,6 +7627,9 @@ def _ebb_full_scale_setup_args(bound: BoundTopology) -> _EbbFullScaleSetupArgs:
         bgpcpp_configerator_path=bgpcpp_configerator_path,
         enable_update_group=device_config.update_group_enable,
         bgpcpp_logging_config_override=device_config.bgpcpp_logging_config_override,
+        fibagent_bgp_thrift_queue_timeout_ms=(
+            device_config.fibagent_bgp_thrift_queue_timeout_ms
+        ),
         fibagent_bgp_nhg_watermark_high=(device_config.fibagent_bgp_nhg_watermark_high),
         fibagent_bgp_nhg_watermark_low=(device_config.fibagent_bgp_nhg_watermark_low),
     )

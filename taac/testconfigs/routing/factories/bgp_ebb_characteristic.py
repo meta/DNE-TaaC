@@ -92,6 +92,12 @@ from taac.abstractions.topologies.ipv6_update_packing import (
     IPV6_UPDATE_PACKING_PEER_GROUPS,
     IPV6_UPDATE_PACKING_PORT_MAP,
 )
+from taac.abstractions.topologies.route_churn_scale import (
+    ROUTE_CHURN_SCALE,
+    ROUTE_CHURN_SCALE_AS_NUMBERS,
+    ROUTE_CHURN_SCALE_PEER_GROUPS,
+    ROUTE_CHURN_SCALE_PORT_MAP,
+)
 from taac.abstractions.topologies.separable_policy_evaluation import (
     SEPARABLE_POLICY_EVALUATION,
     SEPARABLE_POLICY_EVALUATION_AS_NUMBERS,
@@ -2774,9 +2780,9 @@ def create_bgp_ebb_characteristic_route_churn_processing_test_config(
     ``testbed.device_name`` as ``{DEVICE}_SC6_CHURN_PROCESSING_TEST`` + ``_UPDATE_GROUP``
     when ``enable_update_group=True``.
 
-    Provisioning goes through the engine's ``get_update_packing_setup_tasks``
-    recipe -- the same one SC2/SC3/SC4 run. Update-group is folded into the
-    config that recipe deploys, rather than patched on afterwards.
+    The factory binds the DICE topology to physical inventory. The compiler
+    owns the endpoint, IXIA, peer, state-guard, setup, and teardown artifacts;
+    this factory retains only the churn workload and playbook.
 
     Args:
         testbed: PhysicalInventory with ixia_ports, bgpcpp_configerator_path,
@@ -2785,8 +2791,10 @@ def create_bgp_ebb_characteristic_route_churn_processing_test_config(
             enabled and includes a UG health check in the playbook postchecks.
     """
     assert testbed.ixia_ports, "factory requires IXIA port map on testbed"
-
-    device_name = testbed.device_name
+    assert testbed.bgpcpp_configerator_path, (
+        "factory requires bgpcpp_configerator_path on testbed"
+    )
+    assert testbed.dut_bgp_as is not None, "factory requires dut_bgp_as on testbed"
 
     name = name_override or (
         f"{testbed.device_name.upper().replace('.', '_')}_SC6_CHURN_PROCESSING_TEST"
@@ -2798,31 +2806,18 @@ def create_bgp_ebb_characteristic_route_churn_processing_test_config(
         ixia_chassis_ip=testbed.ixia_chassis_ip,
     )
 
-    pre_setup_tasks = [
-        # SC6 drives the largest full SyncFib of any config here (50K prefixes
-        # at the top of the sweep), and was the only one still on bgpd's 45s
-        # default FIB-agent receive timeout.
-        #
-        # The task must precede the managed recipe's Bgp enable so the daemon
-        # reads the new value without a redundant restart.
-        create_configure_bgpcpp_startup_task(
-            hostname=device_name,
-            flags={
-                "agent_thrift_recv_timeout_ms": _SC6_AGENT_THRIFT_RECV_TIMEOUT_MS,
-            },
-            use_managed_shell=True,
-            restart_bgp=False,
-            set_outer_hostname=True,
-            ixia_needed=True,
+    bound = ROUTE_CHURN_SCALE.bind_to_inventory(
+        physical_inventory=testbed,
+        port_map=ROUTE_CHURN_SCALE_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=ROUTE_CHURN_SCALE_PEER_GROUPS,
+        as_numbers=ROUTE_CHURN_SCALE_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=OpenRMode.NONE,
+            update_group_enable=enable_update_group,
         ),
-    ]
-    extra_setup_tasks = [
-        create_bgp_clear_route_filter_task(
-            hostname=device_name,
-            set_outer_hostname=True,
-            ixia_needed=True,
-        ),
-    ]
+    )
+    compiled = bound.compile()
 
     # Queue-backpressure monitoring is a generic bgpd health signal now bundled
     # into create_standard_periodic_tasks (like CPU/memory), so the churn
@@ -2830,8 +2825,11 @@ def create_bgp_ebb_characteristic_route_churn_processing_test_config(
     test_config = create_bgp_ebb_scaling_route_churn_prefix_test_config(
         testbed,
         name=name,
-        pre_setup_tasks=pre_setup_tasks,
-        extra_setup_tasks=extra_setup_tasks,
+        setup_tasks=compiled.setup_tasks,
+        teardown_tasks=compiled.teardown_tasks,
+        endpoints=compiled.endpoints,
+        host_os_type_map=compiled.host_os_type_map,
+        basic_port_configs=compiled.basic_port_configs,
         ebgp_peer_count=100,
         ibgp_peer_count=100,
         ebgp_remote_as=EBGP_REMOTE_AS,

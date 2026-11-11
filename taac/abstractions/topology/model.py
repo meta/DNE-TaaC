@@ -310,6 +310,7 @@ class TaskCompatibilityProfile(str, Enum):
     EGRESS_PEER_SCALE = "egress_peer_scale"
     INGRESS_PEER_SCALE = "ingress_peer_scale"
     IPV6_UPDATE_PACKING = "ipv6_update_packing"
+    ROUTE_CHURN_SCALE = "route_churn_scale"
     TRANSIENT_MEMORY_ROUTE_SCALE = "transient_memory_route_scale"
     UG_ADD_PEER_DYNAMIC = "ug_add_peer_dynamic"
     UG_BACKPRESSURE = "ug_backpressure"
@@ -443,6 +444,8 @@ class RoutingDeviceConfig:
     bgp_connect_retry_timer_s: int = 120
     graceful_restart_timer_s: int | None = None
     bgpcpp_logging_config_override: str | None = None
+    bgpcpp_agent_thrift_recv_timeout_ms: int | None = None
+    fibagent_bgp_thrift_queue_timeout_ms: int | None = None
     fibagent_bgp_nhg_watermark_high: int | None = None
     fibagent_bgp_nhg_watermark_low: int | None = None
     _taac_overridden_fields: tuple[str, ...] = field(

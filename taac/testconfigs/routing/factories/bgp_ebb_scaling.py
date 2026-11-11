@@ -1139,14 +1139,17 @@ def create_bgp_ebb_scaling_route_churn_prefix_test_config(
     queue_backpressure_gate_mode: str | None = None,
     churn_prefix_start_v6: str = SC6_CHURN_PREFIX_START_V6,
     postcheck_prefix_count: int | None = None,
+    setup_tasks: list | None = None,
+    teardown_tasks: list | None = None,
+    endpoints: list[Endpoint] | None = None,
+    host_os_type_map: dict[str, taac_types.DeviceOsType] | None = None,
+    basic_port_configs: list[BasicPortConfig] | None = None,
 ) -> TestConfig:
     """BGP++ route-churn prefix-scaling TestConfig -- perf-scaling case 6 (prefix scaling).
 
-    Provisioning goes through ``get_update_packing_setup_tasks``, the same shared
-    recipe SC2/SC3/SC4 use. There is deliberately no raw-SSH alternative: the
-    previous one defaulted to the ``admin`` lab-default credential, which exists
-    only on the ``ebXX.lab.ash6`` lab boxes, so it silently failed on any
-    ``cicd``/``qual`` device with ``Permission denied (publickey,password)``.
+    DICE callers provide compiler-owned lifecycle and IXIA artifacts. The
+    inventory-derived branch remains as a compatibility boundary for callers
+    that have not migrated yet; there is deliberately no raw-SSH alternative.
     """
     if prefix_configs is None:
         prefix_configs = [(5000, 600)]
@@ -1173,37 +1176,74 @@ def create_bgp_ebb_scaling_route_churn_prefix_test_config(
     ixia_interface_mimic_ibgp = physical_inventory.ixia_ports[1][0]
     host_driver_args = physical_inventory.host_driver_args
     oss_mock_device_data = physical_inventory.oss_mock_device_data
-    host_os_type_map = {device_name: taac_types.DeviceOsType.ARISTA_FBOSS}
-    direct_ixia_connections = _direct_ixia_conns_two_port(physical_inventory)
+    resolved_host_os_type_map = (
+        host_os_type_map
+        if host_os_type_map is not None
+        else {device_name: taac_types.DeviceOsType.ARISTA_FBOSS}
+    )
 
     max_prefix_count = max(pc for pc, _ in prefix_configs)
-    state_guard_setup_tasks, state_guard_teardown_tasks = (
-        get_ebb_device_state_guard_tasks(
-            device_name=device_name,
-            operation_namespace="ebb_sc6",
+    if setup_tasks is None:
+        state_guard_setup_tasks, resolved_teardown_tasks = (
+            get_ebb_device_state_guard_tasks(
+                device_name=device_name,
+                operation_namespace="ebb_sc6",
+            )
         )
-    )
 
-    # Startup-script edits must precede the managed recipe's Bgp enable so the
-    # newly started daemon reads them. Appended tasks run after that enable.
-    setup_tasks = [*state_guard_setup_tasks, *(pre_setup_tasks or [])]
-    setup_tasks += _managed_route_churn_setup_tasks(
-        physical_inventory=physical_inventory,
-        ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-        ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-        ebgp_peer_count=ebgp_peer_count,
-        ibgp_peer_count=ibgp_peer_count,
-        ebgp_remote_as=ebgp_remote_as,
-        ibgp_remote_as=ibgp_remote_as,
-        ixia_ebgp_ic_parent_network_v6=ixia_ebgp_ic_parent_network_v6,
-        ixia_ibgp_ic_parent_network_v6=ixia_ibgp_ic_parent_network_v6,
-        peergroup_ebgp_v6=peergroup_ebgp_v6,
-        peergroup_ibgp_v6=peergroup_ibgp_v6,
-        enable_update_group=enable_update_group,
-    )
+        # Startup-script edits must precede the managed recipe's Bgp enable so
+        # the newly started daemon reads them. Appended tasks run after that
+        # enable.
+        resolved_setup_tasks = [
+            *state_guard_setup_tasks,
+            *(pre_setup_tasks or []),
+        ]
+        resolved_setup_tasks += _managed_route_churn_setup_tasks(
+            physical_inventory=physical_inventory,
+            ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
+            ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
+            ebgp_peer_count=ebgp_peer_count,
+            ibgp_peer_count=ibgp_peer_count,
+            ebgp_remote_as=ebgp_remote_as,
+            ibgp_remote_as=ibgp_remote_as,
+            ixia_ebgp_ic_parent_network_v6=ixia_ebgp_ic_parent_network_v6,
+            ixia_ibgp_ic_parent_network_v6=ixia_ibgp_ic_parent_network_v6,
+            peergroup_ebgp_v6=peergroup_ebgp_v6,
+            peergroup_ibgp_v6=peergroup_ibgp_v6,
+            enable_update_group=enable_update_group,
+        )
+        if extra_setup_tasks:
+            resolved_setup_tasks.extend(extra_setup_tasks)
+    else:
+        resolved_setup_tasks = setup_tasks
+        resolved_teardown_tasks = teardown_tasks or []
 
-    if extra_setup_tasks:
-        setup_tasks.extend(extra_setup_tasks)
+    resolved_endpoints = endpoints
+    if resolved_endpoints is None:
+        resolved_endpoints = [
+            Endpoint(
+                name=device_name,
+                dut=True,
+                ixia_ports=[ixia_interface_mimic_ebgp, ixia_interface_mimic_ibgp],
+                direct_ixia_connections=_direct_ixia_conns_two_port(physical_inventory),
+            )
+        ]
+    resolved_basic_port_configs = basic_port_configs
+    if resolved_basic_port_configs is None:
+        resolved_basic_port_configs = create_ebb_route_churn_test_basic_port_configs(
+            device_name=device_name,
+            ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
+            ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
+            ebgp_peer_count_v6=ebgp_peer_count,
+            ibgp_peer_count_v6=ibgp_peer_count,
+            ebgp_remote_as=ebgp_remote_as,
+            ibgp_remote_as=ibgp_remote_as,
+            initial_prefix_count=max_prefix_count,
+            churn_count=churn_count,
+            ixia_ebgp_ic_parent_network_v6=ixia_ebgp_ic_parent_network_v6,
+            ixia_ibgp_ic_parent_network_v6=ixia_ibgp_ic_parent_network_v6,
+            churn_prefix_start_v6=churn_prefix_start_v6,
+        )
 
     postchecks = [
         create_bgp_session_establish_check(
@@ -1275,34 +1315,14 @@ def create_bgp_ebb_scaling_route_churn_prefix_test_config(
         skip_ixia_protocol_verification=True,
         log_collection_timeout=None,
         basset_pool="dne.test",
-        endpoints=[
-            Endpoint(
-                name=device_name,
-                dut=True,
-                ixia_ports=[ixia_interface_mimic_ebgp, ixia_interface_mimic_ibgp],
-                direct_ixia_connections=direct_ixia_connections,
-            ),
-        ],
+        endpoints=resolved_endpoints,
         host_driver_args=host_driver_args,
         oss_mock_device_data=oss_mock_device_data,
-        host_os_type_map=host_os_type_map,
+        host_os_type_map=resolved_host_os_type_map,
         startup_checks=[],
-        setup_tasks=setup_tasks,
-        teardown_tasks=state_guard_teardown_tasks,
-        basic_port_configs=create_ebb_route_churn_test_basic_port_configs(
-            device_name=device_name,
-            ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-            ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-            ebgp_peer_count_v6=ebgp_peer_count,
-            ibgp_peer_count_v6=ibgp_peer_count,
-            ebgp_remote_as=ebgp_remote_as,
-            ibgp_remote_as=ibgp_remote_as,
-            initial_prefix_count=max_prefix_count,
-            churn_count=churn_count,
-            ixia_ebgp_ic_parent_network_v6=ixia_ebgp_ic_parent_network_v6,
-            ixia_ibgp_ic_parent_network_v6=ixia_ibgp_ic_parent_network_v6,
-            churn_prefix_start_v6=churn_prefix_start_v6,
-        ),
+        setup_tasks=resolved_setup_tasks,
+        teardown_tasks=resolved_teardown_tasks,
+        basic_port_configs=resolved_basic_port_configs,
         playbooks=[
             get_bgp_ebb_churn_processing_playbook(
                 description="Test BGP++ route churn convergence across multiple prefix scales",

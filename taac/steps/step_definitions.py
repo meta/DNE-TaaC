@@ -11670,20 +11670,23 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             )
         if taac_types.Service.OPENR in input.services and self.is_fboss:
             fboss_driver = t.cast(FbossSwitch, self.driver)
+            timeout = (
+                input.service_convergence_timeout.get(taac_types.Service.OPENR)
+                or input.timeout
+            )
             start_time = time.time()
             if TAAC_OSS:
                 # OpenR initialization events need the Meta-internal OpenR client.
-                timeout = (
-                    input.service_convergence_timeout.get(taac_types.Service.OPENR)
-                    or input.timeout
-                )
                 await self._async_wait_for_systemd_active(
                     fboss_driver, FbossSystemctlServiceName.OPENR, timeout
                 )
                 openr_state = "systemd active"
             else:
                 await fboss_driver.async_wait_for_openr_initialized()
-                openr_state = "initialized"
+                await self._async_wait_for_systemd_active(
+                    fboss_driver, FbossSystemctlServiceName.OPENR, timeout
+                )
+                openr_state = "initialized and systemd active"
             end_time = time.time()
             self.logger.info(
                 f"OpenR reached {openr_state} state in {end_time - start_time} seconds"
@@ -11707,6 +11710,11 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             start_time = time.time()
             # pyre-ignore
             await self.driver.async_wait_for_qsfp_service_state_active(timeout)
+            await self._async_wait_for_systemd_active(
+                t.cast(FbossSwitch, self.driver),
+                FbossSystemctlServiceName.QSFP,
+                timeout,
+            )
             end_time = time.time()
             self.logger.info(
                 f"qsfp_service reached active state in {end_time - start_time} seconds"
@@ -11719,6 +11727,11 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             start_time = time.time()
             # pyre-ignore
             await self.driver.async_wait_for_fsdb_state_active(timeout)
+            await self._async_wait_for_systemd_active(
+                t.cast(FbossSwitch, self.driver),
+                FbossSystemctlServiceName.FSDB,
+                timeout,
+            )
             end_time = time.time()
             self.logger.info(
                 f"fsdb reached active state in {end_time - start_time} seconds"

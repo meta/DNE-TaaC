@@ -63,6 +63,12 @@ from taac.abstractions.topologies.bounded_ecmp import (
     BOUNDED_ECMP_PEER_GROUPS,
     BOUNDED_ECMP_PORT_MAP,
 )
+from taac.abstractions.topologies.constant_attribute_storage import (
+    CONSTANT_ATTRIBUTE_STORAGE,
+    CONSTANT_ATTRIBUTE_STORAGE_AS_NUMBERS,
+    CONSTANT_ATTRIBUTE_STORAGE_PEER_GROUPS,
+    CONSTANT_ATTRIBUTE_STORAGE_PORT_MAP,
+)
 from taac.abstractions.topologies.egress_peer_scale import (
     EGRESS_PEER_SCALE,
     EGRESS_PEER_SCALE_AS_NUMBERS,
@@ -1242,6 +1248,7 @@ def test_config_constant_attribute_storage_varying_combinations_on_eos(
     peergroup_ibgp_v4: str | None = None,
     ssh_password: str = "",
     setup_tasks: list[Task] | None = None,
+    basic_port_configs: list[BasicPortConfig] | None = None,
     oss_mock_device_data=None,
     host_os_type_map=None,
     host_driver_args=None,
@@ -1423,22 +1430,26 @@ def test_config_constant_attribute_storage_varying_combinations_on_eos(
         startup_checks=[],
         setup_tasks=setup_tasks if setup_tasks else [],
         teardown_tasks=[],
-        basic_port_configs=[
-            BasicPortConfig(
-                endpoint=f"{device_name}:{ixia_interface_mimic_ebgp}",
-                device_group_configs=ebgp_device_groups,
-            ),
-            *(
-                [
-                    BasicPortConfig(
-                        endpoint=f"{device_name}:{ixia_interface_mimic_ibgp}",
-                        device_group_configs=ibgp_device_groups,
-                    ),
-                ]
-                if ibgp_device_groups
-                else []
-            ),
-        ],
+        basic_port_configs=(
+            basic_port_configs
+            if basic_port_configs is not None
+            else [
+                BasicPortConfig(
+                    endpoint=f"{device_name}:{ixia_interface_mimic_ebgp}",
+                    device_group_configs=ebgp_device_groups,
+                ),
+                *(
+                    [
+                        BasicPortConfig(
+                            endpoint=f"{device_name}:{ixia_interface_mimic_ibgp}",
+                            device_group_configs=ibgp_device_groups,
+                        ),
+                    ]
+                    if ibgp_device_groups
+                    else []
+                ),
+            ]
+        ),
         playbooks=[
             get_bgp_ebb_constant_attribute_storage_playbook(
                 device_name=device_name,
@@ -2298,14 +2309,6 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
 
     device_name = testbed.device_name
     ixia_interface_mimic_ebgp = testbed.ixia_ports[0][0]
-    # get_update_packing_setup_tasks requires an iBGP interface argument even
-    # when ibgp_peer_count=0. Reuse the eBGP interface when inventory exposes
-    # only the single port that this ingress-only scenario actually consumes.
-    ixia_interface_mimic_ibgp = (
-        testbed.ixia_ports[1][0]
-        if len(testbed.ixia_ports) >= 2
-        else ixia_interface_mimic_ebgp
-    )
 
     name = name_override or (
         f"{device_name.upper().replace('.', '_')}"
@@ -2318,41 +2321,24 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
         ixia_chassis_ip=testbed.ixia_chassis_ip,
     )
 
-    # Ingress-only device setup: eBGP peers only (ibgp_peer_count=0), IPv6-only.
-    setup_tasks = get_update_packing_setup_tasks(
-        device_name=device_name,
-        bgp_asn=testbed.dut_bgp_as,
-        ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-        ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-        ebgp_peer_count=_INGRESS_ATTR_EBGP_PEER_COUNT,
-        ibgp_peer_count=0,
-        ebgp_remote_as=EBGP_REMOTE_AS,
-        ibgp_remote_as=IBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=resolved_parent_networks["ebgp_v6"],
-        ixia_ibgp_ic_parent_network_v6=resolved_parent_networks["ibgp_v6"],
-        router_id=testbed.router_id,
-        bgpcpp_configerator_path=testbed.bgpcpp_configerator_path,
-        profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
-        enable_update_group=enable_update_group,
-        # Nexthops are deliberately left RESOLVABLE (the WITHOUT_OPEN_R profile
-        # enables bgp_resolve_nexthops_from_interface_state and the IXIA eBGP
-        # peers sit on a directly-connected subnet). A populated, best-path
-        # selected RIB is the realistic state char-2 should measure, and it is
-        # what the sc2_nexthops_resolved gate asserts.
-        #
-        # Selection state does NOT pollute the sc2_memory_growth ratio: the path
-        # count is FIXED at 800K across every sweep point, so selection is a
-        # constant additive term, identical at N=100K and N=800K. It shifts the
-        # intercept, not the growth curve. Ingress-only is delivered by having
-        # NO egress peer configured, not by breaking nexthop resolution.
+    bound = CONSTANT_ATTRIBUTE_STORAGE.bind_to_inventory(
+        physical_inventory=testbed,
+        port_map=CONSTANT_ATTRIBUTE_STORAGE_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=CONSTANT_ATTRIBUTE_STORAGE_PEER_GROUPS,
+        as_numbers=CONSTANT_ATTRIBUTE_STORAGE_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=OpenRMode.NONE,
+            update_group_enable=enable_update_group,
+        ),
     )
-    # Clear the route_registry / CRF so injected scale prefixes are accepted.
-    # This scenario remains ingress-only because it has no iBGP egress peers.
-    setup_tasks.append(
-        create_bgp_clear_route_filter_task(
-            device_name, set_outer_hostname=True, ixia_needed=True
+    compiled = bound.compile()
+    if len(compiled.endpoints) != 1:
+        raise ValueError(
+            "SC2 compiler must emit exactly one endpoint; "
+            f"got {len(compiled.endpoints)}"
         )
-    )
+    direct_ixia_connections = compiled.endpoints[0].direct_ixia_connections
 
     config = test_config_constant_attribute_storage_varying_combinations_on_eos(
         test_config_name=name,
@@ -2376,15 +2362,7 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
         unique_combination_counts=_INGRESS_ATTR_COMBINATION_SWEEP,
         soak_time_minutes=2,
         direct_ixia_connections=(
-            [
-                DirectIxiaConnection(
-                    interface=ixia_interface_mimic_ebgp,
-                    ixia_chassis_ip=testbed.ixia_chassis_ip,
-                    ixia_port=testbed.ixia_ports[0][1],
-                )
-            ]
-            if include_direct_ixia_connections
-            else None
+            direct_ixia_connections if include_direct_ixia_connections else None
         ),
         # SC2 is a scale-CHARACTERISTIC measurement, so both activities this
         # flag enables are switched off:
@@ -2400,7 +2378,8 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
         # Set back to True only for one-off attribute-correctness debugging.
         dump_attribute_assignments=False,
         test_address_families=["ipv6"],
-        setup_tasks=setup_tasks,
+        setup_tasks=compiled.setup_tasks,
+        basic_port_configs=compiled.basic_port_configs,
         constant_acceptance_communities=_CONSTANT_ATTR_ACCEPTANCE_COMMUNITIES,
         peergroup_ebgp_v6=PEERGROUP_EBGP_V6,
         peergroup_ebgp_v4=PEERGROUP_EBGP_V4,

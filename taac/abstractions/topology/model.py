@@ -304,6 +304,7 @@ class OpenRMode(str, Enum):
 
 class TaskCompatibilityProfile(str, Enum):
     BOUNDED_ECMP = "bounded_ecmp"
+    CONSTANT_ATTRIBUTE_STORAGE = "constant_attribute_storage"
     EBB_FULL_SCALE_NO_BGPMON = "ebb_full_scale_no_bgpmon"
     EBB_FULL_SCALE_WITH_BGPMON = "ebb_full_scale_with_bgpmon"
     EGRESS_PEER_SCALE = "egress_peer_scale"

@@ -586,6 +586,7 @@ class _EbbFullScaleInterfaces:
     ibgp: str
     bgpmon: str | None
     include_bgpmon: bool
+    include_ibgp: bool = True
 
 
 @dataclass(frozen=True)
@@ -711,8 +712,9 @@ def _ebb_full_scale_pre_ixia_setup_tasks(
     ]
     candidate_ixia_interfaces = [
         (interfaces.ebgp, "IXIA_MIMIC_EBGP"),
-        (interfaces.ibgp, "IXIA_MIMIC_IBGP"),
     ]
+    if interfaces.include_ibgp:
+        candidate_ixia_interfaces.append((interfaces.ibgp, "IXIA_MIMIC_IBGP"))
     if interfaces.include_bgpmon:
         assert interfaces.bgpmon is not None
         candidate_ixia_interfaces.append((interfaces.bgpmon, "IXIA_MIMIC_BGP_MON"))
@@ -1215,6 +1217,7 @@ def _characteristic_setup_phases(
     openr_mode: OpenRMode,
     bgpcpp_local_as_4_byte: int | None = None,
     finalization_tasks: t.Sequence[t.Any] = (),
+    include_ibgp_interface: bool = True,
 ) -> tuple[EosBgpCppSetupPhase, ...]:
     setup_args = _EbbFullScaleSetupArgs(
         interfaces=_EbbFullScaleInterfaces(
@@ -1223,6 +1226,7 @@ def _characteristic_setup_phases(
             ibgp=ibgp_interface,
             bgpmon=None,
             include_bgpmon=False,
+            include_ibgp=include_ibgp_interface,
         ),
         bgp_asn=bgp_asn,
         bgpcpp_configerator_path=bgpcpp_configerator_path,
@@ -1265,6 +1269,7 @@ def build_eos_bgpcpp_characteristic_setup_tasks(
     bgpcpp_local_as_4_byte: int | None = None,
     component_startup_prefix_tasks: t.Sequence[t.Any] = (),
     finalization_tasks: t.Sequence[t.Any] = (),
+    include_ibgp_interface: bool = True,
 ) -> list[t.Any]:
     """Build EOS BGP++ characteristic setup from explicit bound intent."""
     phases = _characteristic_setup_phases(
@@ -1279,6 +1284,7 @@ def build_eos_bgpcpp_characteristic_setup_tasks(
         openr_mode=openr_mode,
         bgpcpp_local_as_4_byte=bgpcpp_local_as_4_byte,
         finalization_tasks=finalization_tasks,
+        include_ibgp_interface=include_ibgp_interface,
     )
     if component_startup_prefix_tasks:
         startup_phase_index = next(
@@ -4970,6 +4976,8 @@ class ProfileFreeEosBgpCppCompiler(TopologyCompiler):
     def compile(self, bound: BoundTopology) -> CompiledTaacArtifacts:
         if _is_profile_free_bounded_ecmp(bound):
             return _preserve_bounded_ecmp_task_artifacts(bound)
+        if _is_profile_free_constant_attribute_storage(bound):
+            return _compile_constant_attribute_storage_artifacts(bound)
         if _is_profile_free_egress_peer_scale(bound):
             return _preserve_egress_peer_scale_task_artifacts(bound)
         if _is_profile_free_ipv6_update_packing(bound):
@@ -5434,6 +5442,227 @@ def _is_profile_free_bounded_ecmp(bound: BoundTopology) -> bool:
         bound.logical_topology.legacy_profile is None
         and bound.logical_topology.task_compatibility_profile
         is TaskCompatibilityProfile.BOUNDED_ECMP
+    )
+
+
+def _validate_characteristic_prefix_exclusions(bound: BoundTopology) -> None:
+    issues = [
+        ValidationIssue(
+            path=f"prefix_sets.{advertisement.spec.prefix_set}.source.excluded_indices",
+            code="unsupported_backend_prefix_exclusions",
+            message=(
+                "characteristic IXIA compatibility lowering cannot represent "
+                "sparse prefix-source exclusions"
+            ),
+        )
+        for group in bound.device_groups
+        for advertisement in group.prefix_advertisements
+        if advertisement.prefix_set.spec.source.excluded_indices
+    ]
+    if issues:
+        raise TopologyValidationError(bound.logical_topology.name, issues)
+
+
+def _is_profile_free_constant_attribute_storage(bound: BoundTopology) -> bool:
+    return (
+        bound.logical_topology.legacy_profile is None
+        and bound.logical_topology.task_compatibility_profile
+        is TaskCompatibilityProfile.CONSTANT_ATTRIBUTE_STORAGE
+    )
+
+
+def _validate_characteristic_compatibility_intent(bound: BoundTopology) -> None:
+    _validate_bound_provenance_for_compile(bound)
+    endpoint = _primary_dut_endpoint(bound)
+    if endpoint.setup_mode != "full":
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path=f"endpoints.{endpoint.name}.setup_mode",
+                    code="unsupported_characteristic_setup_mode",
+                    message=(
+                        "characteristic task compatibility lowering requires "
+                        f"setup_mode='full'; got {endpoint.setup_mode!r}"
+                    ),
+                )
+            ],
+        )
+    _validate_route_attributes_for_compile(bound)
+    _validate_legacy_peer_prefix_activation_support(bound)
+    _validate_characteristic_prefix_exclusions(bound)
+    issues = [
+        ValidationIssue(
+            path=(
+                f"device_groups.{group.name}.prefix_advertisements"
+                f"[{index}].next_hop.mode"
+            ),
+            code="unsupported_next_hop_mode",
+            message=(
+                "characteristic IXIA compatibility lowering supports only "
+                f"SELF next hops; got {advertisement.spec.next_hop.mode.value!r}"
+            ),
+        )
+        for group in bound.device_groups
+        for index, advertisement in enumerate(group.prefix_advertisements)
+        if advertisement.spec.next_hop.mode is not NextHopMode.SELF
+    ]
+    if issues:
+        raise TopologyValidationError(bound.logical_topology.name, issues)
+
+
+def _compile_constant_attribute_storage_artifacts(
+    bound: BoundTopology,
+) -> CompiledTaacArtifacts:
+    _validate_characteristic_compatibility_intent(bound)
+    expected_shape = (("ebgp", "v6"),)
+    actual_shape = tuple((group.role, group.afi) for group in bound.device_groups)
+    if actual_shape != expected_shape:
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path="device_groups",
+                    code="invalid_constant_attribute_storage_shape",
+                    message=(
+                        "constant attribute storage requires one IPv6 eBGP "
+                        f"group; got {actual_shape!r}"
+                    ),
+                )
+            ],
+        )
+
+    group = bound.device_groups[0]
+    inventory = bound.physical_inventory
+    device_config = bound.device_config or bound.logical_topology.device_config
+    assignment = _resolved_ixia_assignment(bound, group)
+    required_values = {
+        "physical_inventory": inventory,
+        "device_name": getattr(inventory, "device_name", None),
+        "ixia_chassis_ip": getattr(inventory, "ixia_chassis_ip", None),
+        "peer_group": group.peer_group,
+        "legacy_ixia_device_group_name": group.legacy_ixia_device_group_name,
+        "legacy_ixia_bgp_peer_name": group.legacy_ixia_bgp_peer_name,
+        "legacy_ixia_device_group_index": group.legacy_ixia_device_group_index,
+        "remote_asn": group.remote_asn,
+        "parent_network": group.parent_network,
+    }
+    missing = [name for name, value in required_values.items() if value is None]
+    if missing or len(group.prefix_advertisements) != 1:
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path="device_groups",
+                    code="missing_constant_attribute_storage_input",
+                    message=(
+                        "constant attribute storage requires complete bound "
+                        f"inventory and IXIA intent; missing={missing!r}"
+                    ),
+                )
+            ],
+        )
+
+    assert inventory is not None
+    device_name = t.cast(str, required_values["device_name"])
+    ixia_chassis_ip = t.cast(str, required_values["ixia_chassis_ip"])
+    first_peer = _first_resolved_peer(bound, group)
+    route_scales = _ipv6_update_packing_route_scales(bound, group)
+    basic_port_configs = [
+        taac_types.BasicPortConfig(
+            endpoint=f"{device_name}:{assignment.dut_interface}",
+            device_group_configs=[
+                taac_types.DeviceGroupConfig(
+                    device_group_name=group.legacy_ixia_device_group_name,
+                    device_group_index=_required_legacy_device_group_index(
+                        bound, group
+                    ),
+                    multiplier=group.peer_count,
+                    v6_addresses_config=taac_types.IpAddressesConfig(
+                        starting_ip=first_peer.z_ip,
+                        increment_ip="0:0:0:0::2",
+                        gateway_starting_ip=first_peer.a_ip,
+                        gateway_increment_ip="0:0:0:0::2",
+                        start_index=0,
+                    ),
+                    v6_bgp_config=taac_types.BgpConfig(
+                        bgp_peer_name=group.legacy_ixia_bgp_peer_name,
+                        local_as_4_bytes=group.remote_asn,
+                        enable_4_byte_local_as=True,
+                        bgp_peer_type=ixia_types.BgpPeerType.EBGP,
+                        route_scales=route_scales,
+                    ),
+                )
+            ],
+        )
+    ]
+    phases = _characteristic_setup_phases(
+        bound,
+        device_name=device_name,
+        bgp_asn=t.cast(int, inventory.dut_bgp_as),
+        ebgp_interface=assignment.dut_interface,
+        ibgp_interface=assignment.dut_interface,
+        router_id=inventory.router_id,
+        bgpcpp_configerator_path=t.cast(str, inventory.bgpcpp_configerator_path),
+        enable_update_group=device_config.update_group_enable,
+        openr_mode=device_config.openr_mode,
+        finalization_tasks=(
+            create_bgp_clear_route_filter_task(
+                device_name,
+                set_outer_hostname=True,
+                ixia_needed=True,
+            ),
+        ),
+        include_ibgp_interface=False,
+    )
+    if len(phases) != 7:
+        raise RuntimeError(
+            "constant attribute storage compatibility lowering requires "
+            "seven characteristic setup phases"
+        )
+    (
+        host_preparation,
+        component_configuration,
+        interface_configuration,
+        component_startup,
+        peer_configuration,
+        peer_restart,
+        host_finalization,
+    ) = phases
+    update_group_validation = tuple(
+        task
+        for task in component_startup.tasks
+        if task.task_name == "validate_bgpcpp_update_group_state"
+    )
+    component_startup_tasks = tuple(
+        task
+        for task in component_startup.tasks
+        if task.task_name != "validate_bgpcpp_update_group_state"
+    )
+    setup_tasks = [
+        *host_preparation.tasks,
+        *component_configuration.tasks,
+        *component_startup_tasks,
+        *interface_configuration.tasks,
+        *peer_configuration.tasks,
+        *peer_restart.tasks,
+        *update_group_validation,
+        *host_finalization.tasks,
+    ]
+    return CompiledTaacArtifacts(
+        endpoints=[
+            _checked_characteristic_endpoint(
+                device_name=device_name,
+                ixia_chassis_ip=ixia_chassis_ip,
+                ixia_interfaces=(assignment.dut_interface,),
+                connections=((assignment.dut_interface, assignment.ixia_port),),
+            )
+        ],
+        host_os_type_map={device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
+        setup_tasks=setup_tasks,
+        teardown_tasks=[],
+        basic_port_configs=basic_port_configs,
+        basic_traffic_item_configs=[],
     )
 
 

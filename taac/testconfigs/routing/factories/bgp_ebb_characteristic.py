@@ -95,6 +95,12 @@ from taac.abstractions.topologies.separable_policy_evaluation import (
     SEPARABLE_POLICY_EVALUATION_PORT_MAP,
     SEPARABLE_POLICY_EVALUATION_SWEEP,
 )
+from taac.abstractions.topologies.transient_memory_route_scale import (
+    TRANSIENT_MEMORY_ROUTE_SCALE,
+    TRANSIENT_MEMORY_ROUTE_SCALE_AS_NUMBERS,
+    TRANSIENT_MEMORY_ROUTE_SCALE_PEER_GROUPS,
+    TRANSIENT_MEMORY_ROUTE_SCALE_PORT_MAP,
+)
 from taac.abstractions.topology import (
     BgpPeerGroup,
     BoundDeviceGroup,
@@ -827,6 +833,8 @@ def test_config_sc3_transient_memory_route_scale_on_eos(
     oss_mock_device_data=None,
     host_os_type_map=None,
     host_driver_args=None,
+    setup_tasks: list[Task] | None = None,
+    basic_port_configs: list[BasicPortConfig] | None = None,
     dedup_gate_mode: str | None = None,
     adjrib_out_memory_gate_mode: str | None = None,
     transient_gate_mode: str | None = None,
@@ -879,56 +887,59 @@ def test_config_sc3_transient_memory_route_scale_on_eos(
     # the device is provisioned at each fixed axis' per-AFI count.
     ebgp_peer_count_per_afi = ebgp_peer_count // 2
     ibgp_peer_count_per_afi = ibgp_peer_count // 2
-    setup_tasks = get_update_packing_setup_tasks(
-        device_name=device_name,
-        bgp_asn=dut_bgp_as,
-        ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-        ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-        ebgp_peer_count=ebgp_peer_count_per_afi,
-        ibgp_peer_count=ibgp_peer_count_per_afi,
-        ebgp_remote_as=ebgp_remote_as,
-        # The device iBGP peer's remote-as must equal the IXIA iBGP peer's own
-        # (local) AS for the session to establish; both are ``ibgp_local_as``.
-        ibgp_remote_as=ibgp_local_as,
-        ixia_ebgp_ic_parent_network_v6=ixia_ebgp_ic_parent_network_v6,
-        ixia_ibgp_ic_parent_network_v6=ixia_ibgp_ic_parent_network_v6,
-        router_id=router_id,
-        bgpcpp_configerator_path=bgpcpp_configerator_path,
-        profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
-        ixia_ebgp_ic_parent_network_v4=ixia_ebgp_ic_parent_network_v4,
-        ixia_ibgp_ic_parent_network_v4=ixia_ibgp_ic_parent_network_v4,
-        enable_update_group=enable_update_group,
-        # Dual-stack: align the generated v4 peers with the device's v4
-        # secondary IPs (offset 10) rather than the default 16.
-        v4_peer_start_offset=IXIA_IPV4_START_OFFSET,
-    )
-    # Clear the baked-in route registry so injected scale prefixes are accepted.
-    setup_tasks.append(
-        create_bgp_clear_route_filter_task(
-            hostname=device_name,
-            set_outer_hostname=True,
-            ixia_needed=True,
+    if setup_tasks is None:
+        resolved_setup_tasks = get_update_packing_setup_tasks(
+            device_name=device_name,
+            bgp_asn=dut_bgp_as,
+            ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
+            ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
+            ebgp_peer_count=ebgp_peer_count_per_afi,
+            ibgp_peer_count=ibgp_peer_count_per_afi,
+            ebgp_remote_as=ebgp_remote_as,
+            # The device iBGP peer's remote-as must equal the IXIA iBGP peer's own
+            # (local) AS for the session to establish; both are ``ibgp_local_as``.
+            ibgp_remote_as=ibgp_local_as,
+            ixia_ebgp_ic_parent_network_v6=ixia_ebgp_ic_parent_network_v6,
+            ixia_ibgp_ic_parent_network_v6=ixia_ibgp_ic_parent_network_v6,
+            router_id=router_id,
+            bgpcpp_configerator_path=bgpcpp_configerator_path,
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
+            ixia_ebgp_ic_parent_network_v4=ixia_ebgp_ic_parent_network_v4,
+            ixia_ibgp_ic_parent_network_v4=ixia_ibgp_ic_parent_network_v4,
+            enable_update_group=enable_update_group,
+            # Dual-stack: align the generated v4 peers with the device's v4
+            # secondary IPs (offset 10) rather than the default 16.
+            v4_peer_start_offset=IXIA_IPV4_START_OFFSET,
         )
-    )
-    # The route-scale-sweep step measures without ever restarting Bgp, so bounce
-    # it here so the nexthop flag and the CRF-free state take effect before the
-    # sweep begins. (SC1 relies on its per-stage Bgp restart for this.)
-    setup_tasks.append(
-        create_arista_daemon_control_task(
-            hostname=device_name,
-            daemon_name="Bgpcpp",
-            action="disable",
-            ixia_needed=True,
+        # Clear the baked-in route registry so injected scale prefixes are accepted.
+        resolved_setup_tasks.append(
+            create_bgp_clear_route_filter_task(
+                hostname=device_name,
+                set_outer_hostname=True,
+                ixia_needed=True,
+            )
         )
-    )
-    setup_tasks.append(
-        create_arista_daemon_control_task(
-            hostname=device_name,
-            daemon_name="Bgpcpp",
-            action="enable",
-            ixia_needed=True,
+        # The route-scale-sweep step measures without ever restarting Bgp, so bounce
+        # it here so the nexthop flag and the CRF-free state take effect before the
+        # sweep begins. (SC1 relies on its per-stage Bgp restart for this.)
+        resolved_setup_tasks.append(
+            create_arista_daemon_control_task(
+                hostname=device_name,
+                daemon_name="Bgpcpp",
+                action="disable",
+                ixia_needed=True,
+            )
         )
-    )
+        resolved_setup_tasks.append(
+            create_arista_daemon_control_task(
+                hostname=device_name,
+                daemon_name="Bgpcpp",
+                action="enable",
+                ixia_needed=True,
+            )
+        )
+    else:
+        resolved_setup_tasks = setup_tasks
 
     return TestConfig(
         name=test_config_name,
@@ -949,9 +960,11 @@ def test_config_sc3_transient_memory_route_scale_on_eos(
         oss_mock_device_data=oss_mock_device_data,
         host_os_type_map=host_os_type_map,
         startup_checks=[],
-        setup_tasks=setup_tasks,
+        setup_tasks=resolved_setup_tasks,
         teardown_tasks=[],
-        basic_port_configs=[
+        basic_port_configs=basic_port_configs
+        if basic_port_configs is not None
+        else [
             BasicPortConfig(
                 endpoint=f"{device_name}:{ixia_interface_mimic_ebgp}",
                 device_group_configs=[
@@ -1135,14 +1148,14 @@ def create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
     a complete fallback to per-peer Adj-RIB-Out storage and verify that the
     fixed attribute pools stay deduplicated.
 
-    Mirrors the SC1 perf-scaling factory: the DUT is provisioned via
-    ``get_update_packing_setup_tasks`` and the name derives from
-    ``testbed.device_name`` as ``{DEVICE}_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST``
-    (+ ``_UPDATE_GROUP``). ``name_override`` provides a stable lifecycle
-    selector when the same factory is rebound to another physical inventory.
-    ``include_direct_ixia_connections`` independently opts the TestConfig into
-    explicit chassis/port bindings; overriding address pools alone does not
-    change endpoint binding semantics.
+    The factory binds the DICE topology to physical inventory; the compiler
+    lowers its peer, IXIA, endpoint, host, and setup intent into the established
+    SC3 artifact order. The name derives from ``testbed.device_name`` as
+    ``{DEVICE}_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST`` (+ ``_UPDATE_GROUP``).
+    ``name_override`` provides a stable lifecycle selector when the same factory
+    is rebound to another physical inventory. ``include_direct_ixia_connections``
+    independently opts the TestConfig into explicit chassis/port bindings;
+    overriding address pools alone does not change endpoint binding semantics.
 
     All SC tests run with update-group enabled, so ``enable_update_group=True``
     is the variant that is actually run; the non-UG form does not work and is
@@ -1167,13 +1180,32 @@ def create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
         ixia_chassis_ip=testbed.ixia_chassis_ip,
     )
 
+    bound = TRANSIENT_MEMORY_ROUTE_SCALE.bind_to_inventory(
+        physical_inventory=testbed,
+        port_map=TRANSIENT_MEMORY_ROUTE_SCALE_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=TRANSIENT_MEMORY_ROUTE_SCALE_PEER_GROUPS,
+        as_numbers=TRANSIENT_MEMORY_ROUTE_SCALE_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=OpenRMode.NONE,
+            update_group_enable=enable_update_group,
+        ),
+    )
+    compiled = bound.compile()
+    if len(compiled.endpoints) != 1:
+        raise ValueError(
+            "SC3 compiler must emit exactly one endpoint; "
+            f"got {len(compiled.endpoints)}"
+        )
+    direct_ixia_connections = compiled.endpoints[0].direct_ixia_connections
+
     config = test_config_sc3_transient_memory_route_scale_on_eos(
         test_config_name=name,
         device_name=testbed.device_name,
         # Bind the DUT to the BGP++-aware AristaFbossSwitch driver (thrift), so
         # the BGP session health check queries BGP++ instead of falling back to
         # native ar-bgp CLI. Mirrors SC2.
-        host_os_type_map={testbed.device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
+        host_os_type_map=compiled.host_os_type_map,
         ixia_interface_mimic_ebgp=testbed.ixia_ports[0][0],
         ixia_interface_mimic_ibgp=testbed.ixia_ports[1][0],
         ebgp_remote_as=EBGP_REMOTE_AS,
@@ -1203,10 +1235,10 @@ def create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
         community_pool_size=50,
         as_path_length=4,
         direct_ixia_connections=(
-            _two_port_direct_ixia_connections(testbed)
-            if include_direct_ixia_connections
-            else None
+            direct_ixia_connections if include_direct_ixia_connections else None
         ),
+        setup_tasks=compiled.setup_tasks,
+        basic_port_configs=compiled.basic_port_configs,
     )
     return config(basset_pool=testbed.basset_pool)
 

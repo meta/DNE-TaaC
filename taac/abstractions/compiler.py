@@ -1218,6 +1218,7 @@ def _characteristic_setup_phases(
     bgpcpp_local_as_4_byte: int | None = None,
     finalization_tasks: t.Sequence[t.Any] = (),
     include_ibgp_interface: bool = True,
+    peer_plan: BgpPeerPlan | None = None,
 ) -> tuple[EosBgpCppSetupPhase, ...]:
     setup_args = _EbbFullScaleSetupArgs(
         interfaces=_EbbFullScaleInterfaces(
@@ -1247,7 +1248,7 @@ def _characteristic_setup_phases(
         *_characteristic_setup_suffix_phases(
             bound,
             setup_args=setup_args,
-            peer_plan=_eos_bgpcpp_peer_plan(bound),
+            peer_plan=peer_plan or _eos_bgpcpp_peer_plan(bound),
             router_id=router_id,
             local_as_4_byte=bgpcpp_local_as_4_byte,
             finalization_tasks=finalization_tasks,
@@ -4978,6 +4979,8 @@ class ProfileFreeEosBgpCppCompiler(TopologyCompiler):
             return _preserve_bounded_ecmp_task_artifacts(bound)
         if _is_profile_free_constant_attribute_storage(bound):
             return _compile_constant_attribute_storage_artifacts(bound)
+        if _is_profile_free_transient_memory_route_scale(bound):
+            return _compile_transient_memory_route_scale_artifacts(bound)
         if _is_profile_free_egress_peer_scale(bound):
             return _preserve_egress_peer_scale_task_artifacts(bound)
         if _is_profile_free_ipv6_update_packing(bound):
@@ -5662,6 +5665,383 @@ def _compile_constant_attribute_storage_artifacts(
         setup_tasks=setup_tasks,
         teardown_tasks=[],
         basic_port_configs=basic_port_configs,
+        basic_traffic_item_configs=[],
+    )
+
+
+def _is_profile_free_transient_memory_route_scale(bound: BoundTopology) -> bool:
+    return (
+        bound.logical_topology.legacy_profile is None
+        and bound.logical_topology.task_compatibility_profile
+        is TaskCompatibilityProfile.TRANSIENT_MEMORY_ROUTE_SCALE
+    )
+
+
+def _transient_memory_route_scale_args(
+    bound: BoundTopology,
+) -> _EgressPeerScaleArgs:
+    expected = (
+        ("ebgp", "v6", 1),
+        ("ebgp", "v4", 1),
+        ("ibgp", "v6", 250),
+        ("ibgp", "v4", 250),
+    )
+    actual = tuple(
+        (group.role, group.afi, group.peer_count) for group in bound.device_groups
+    )
+    if actual != expected:
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path="device_groups",
+                    code="invalid_transient_memory_route_scale_shape",
+                    message=(
+                        "transient-memory route scale requires "
+                        f"{expected!r}; got {actual!r}"
+                    ),
+                )
+            ],
+        )
+
+    groups = {(group.role, group.afi): group for group in bound.device_groups}
+    issues: list[ValidationIssue] = []
+    expected_ixia_identity = (
+        ("DEVICE_GROUP_IPV6_EBGP", "BGP_PEER_IPV6_EBGP", 0),
+        ("DEVICE_GROUP_IPV4_EBGP", "BGP_PEER_IPV4_EBGP", 1),
+        ("DEVICE_GROUP_IPV6_IBGP", "BGP_PEER_IPV6_IBGP", 0),
+        ("DEVICE_GROUP_IPV4_IBGP", "BGP_PEER_IPV4_IBGP", 1),
+    )
+    actual_ixia_identity = tuple(
+        (
+            group.legacy_ixia_device_group_name,
+            group.legacy_ixia_bgp_peer_name,
+            group.legacy_ixia_device_group_index,
+        )
+        for group in bound.device_groups
+    )
+    if actual_ixia_identity != expected_ixia_identity:
+        issues.append(
+            ValidationIssue(
+                path="device_groups.legacy_ixia_identity",
+                code="invalid_transient_memory_route_scale_ixia_identity",
+                message=(
+                    "transient-memory route scale requires its four checked "
+                    "IXIA identities"
+                ),
+            )
+        )
+    for role, afi, peer_count in expected:
+        group = groups[(role, afi)]
+        assignment = group.port_assignment
+        if (
+            not isinstance(group.peer_group, BgpPeerGroup)
+            or assignment is None
+            or assignment.logical_role != role
+            or not group.legacy_ixia_device_group_name
+            or not group.legacy_ixia_bgp_peer_name
+            or group.legacy_ixia_device_group_index is None
+            or group.remote_asn is None
+            or not group.parent_network
+            or len(group.a_ips) != peer_count
+            or len(group.z_ips) != peer_count
+        ):
+            issues.append(
+                ValidationIssue(
+                    path=f"device_groups.{group.name}",
+                    code="missing_transient_memory_route_scale_input",
+                    message="compiler requires complete peer, IXIA, and ASN inputs",
+                )
+            )
+        advertisements = group.prefix_advertisements
+        if (role == "ebgp" and len(advertisements) != 1) or (
+            role == "ibgp" and advertisements
+        ):
+            issues.append(
+                ValidationIssue(
+                    path=f"device_groups.{group.name}.prefix_advertisements",
+                    code="invalid_transient_memory_route_scale_route_intent",
+                    message="eBGP leaves require one advertisement; iBGP leaves none",
+                )
+            )
+
+    for role in ("ebgp", "ibgp"):
+        assignments = tuple(groups[(role, afi)].port_assignment for afi in ("v6", "v4"))
+        if (
+            None in assignments
+            or len(
+                {
+                    (
+                        assignment.dut_interface,
+                        assignment.ixia_port,
+                        assignment.physical_inventory_index,
+                    )
+                    for assignment in assignments
+                    if assignment is not None
+                }
+            )
+            != 1
+        ):
+            issues.append(
+                ValidationIssue(
+                    path=f"device_groups.{role}.port_assignment",
+                    code="invalid_transient_memory_route_scale_mapping",
+                    message=f"{role} IPv4 and IPv6 leaves must share one port",
+                )
+            )
+
+    device_config = bound.device_config
+    if (
+        not isinstance(device_config, RoutingDeviceConfig)
+        or device_config.openr_mode is not OpenRMode.NONE
+    ):
+        issues.append(
+            ValidationIssue(
+                path="device_config.openr_mode",
+                code="invalid_transient_memory_route_scale_device_config",
+                message="transient-memory route scale requires OpenRMode.NONE",
+            )
+        )
+
+    inventory = bound.physical_inventory
+    required_inventory = {
+        "device_name": getattr(inventory, "device_name", None),
+        "ixia_chassis_ip": getattr(inventory, "ixia_chassis_ip", None),
+        "dut_bgp_as": getattr(inventory, "dut_bgp_as", None),
+        "bgpcpp_configerator_path": getattr(
+            inventory, "bgpcpp_configerator_path", None
+        ),
+    }
+    for name, value in required_inventory.items():
+        if not value:
+            issues.append(
+                ValidationIssue(
+                    path=f"physical_inventory.{name}",
+                    code="missing_transient_memory_route_scale_input",
+                    message=(
+                        "transient-memory route scale requires "
+                        f"physical_inventory.{name}"
+                    ),
+                )
+            )
+    if issues:
+        raise TopologyValidationError(bound.logical_topology.name, issues)
+
+    ebgp_assignment = _resolved_ixia_assignment(bound, groups[("ebgp", "v6")])
+    ibgp_assignment = _resolved_ixia_assignment(bound, groups[("ibgp", "v6")])
+    assert isinstance(device_config, RoutingDeviceConfig)
+    return _EgressPeerScaleArgs(
+        device_name=t.cast(str, required_inventory["device_name"]),
+        ixia_chassis_ip=t.cast(str, required_inventory["ixia_chassis_ip"]),
+        groups=groups,
+        ebgp_interface=ebgp_assignment.dut_interface,
+        ebgp_ixia_port=ebgp_assignment.ixia_port,
+        ibgp_interface=ibgp_assignment.dut_interface,
+        ibgp_ixia_port=ibgp_assignment.ixia_port,
+        bgp_asn=t.cast(int, required_inventory["dut_bgp_as"]),
+        router_id=t.cast(str | None, getattr(inventory, "router_id", None)),
+        bgpcpp_configerator_path=t.cast(
+            str, required_inventory["bgpcpp_configerator_path"]
+        ),
+        enable_update_group=device_config.update_group_enable,
+        openr_mode=device_config.openr_mode,
+    )
+
+
+def _transient_memory_route_scale_route_scales(
+    bound: BoundTopology,
+    group: BoundDeviceGroup,
+) -> list[taac_types.RouteScaleSpec]:
+    advertisement = _single_prefix_advertisement(bound, group)
+    spec = advertisement.spec
+    source = advertisement.prefix_set.spec.source
+    route_scale = taac_types.RouteScale(
+        prefix_name=spec.legacy_ixia_name,
+        starting_prefixes=advertisement.path_at(0, 0).prefix,
+        prefix_step=_step_address(_ip_step(source.prefix_step, group.afi), group.afi),
+        prefix_length=source.prefix_length,
+        multiplier=1,
+        prefix_count=spec.allocation.prefixes_per_peer,
+        ip_address_family=(
+            ixia_types.IpAddressFamily.IPV4
+            if group.afi == "v4"
+            else ixia_types.IpAddressFamily.IPV6
+        ),
+        bgp_communities=[],
+    )
+    return [
+        taac_types.RouteScaleSpec(
+            v4_route_scale=route_scale if group.afi == "v4" else None,
+            v6_route_scale=route_scale if group.afi == "v6" else None,
+            multiplier=1,
+            network_group_index=spec.allocation.network_group_index,
+        )
+    ]
+
+
+def _transient_memory_route_scale_device_group_config(
+    bound: BoundTopology,
+    group: BoundDeviceGroup,
+) -> taac_types.DeviceGroupConfig:
+    first_peer = _first_resolved_peer(bound, group)
+    increment = "0.0.0.2" if group.afi == "v4" else "0:0:0:0::2"
+    address_config = taac_types.IpAddressesConfig(
+        starting_ip=first_peer.z_ip,
+        increment_ip=increment,
+        gateway_starting_ip=first_peer.a_ip,
+        gateway_increment_ip=increment,
+        mask=31 if group.afi == "v4" else None,
+        start_index=0,
+    )
+    bgp_config = taac_types.BgpConfig(
+        bgp_peer_name=group.legacy_ixia_bgp_peer_name,
+        local_as_4_bytes=group.remote_asn,
+        enable_4_byte_local_as=True,
+        bgp_peer_type=(
+            ixia_types.BgpPeerType.EBGP
+            if group.role == "ebgp"
+            else ixia_types.BgpPeerType.IBGP
+        ),
+        route_scales=(
+            _transient_memory_route_scale_route_scales(bound, group)
+            if group.role == "ebgp"
+            else None
+        ),
+    )
+    return taac_types.DeviceGroupConfig(
+        device_group_name=group.legacy_ixia_device_group_name,
+        device_group_index=_required_legacy_device_group_index(bound, group),
+        multiplier=group.peer_count,
+        v4_addresses_config=address_config if group.afi == "v4" else None,
+        v6_addresses_config=address_config if group.afi == "v6" else None,
+        v4_bgp_config=bgp_config if group.afi == "v4" else None,
+        v6_bgp_config=bgp_config if group.afi == "v6" else None,
+    )
+
+
+def _transient_memory_route_scale_peer_plan(bound: BoundTopology) -> BgpPeerPlan:
+    plan = _eos_bgpcpp_peer_plan(bound)
+    group_ordinals: dict[str, int] = {}
+    peers = []
+    for peer in plan.peers:
+        group_ordinal = group_ordinals.get(peer.device_group, 0)
+        peers.append(
+            replace(
+                peer,
+                description=(f"IXIA_{peer.afi.upper()}_PEER_{group_ordinal + 1}"),
+            )
+        )
+        group_ordinals[peer.device_group] = group_ordinal + 1
+    return replace(plan, peers=tuple(peers))
+
+
+def _compile_transient_memory_route_scale_artifacts(
+    bound: BoundTopology,
+) -> CompiledTaacArtifacts:
+    _validate_characteristic_compatibility_intent(bound)
+    args = _transient_memory_route_scale_args(bound)
+    groups = args.groups
+    phases = _characteristic_setup_phases(
+        bound,
+        device_name=args.device_name,
+        bgp_asn=args.bgp_asn,
+        ebgp_interface=args.ebgp_interface,
+        ibgp_interface=args.ibgp_interface,
+        router_id=args.router_id,
+        bgpcpp_configerator_path=args.bgpcpp_configerator_path,
+        enable_update_group=args.enable_update_group,
+        openr_mode=args.openr_mode,
+        peer_plan=_transient_memory_route_scale_peer_plan(bound),
+        finalization_tasks=(
+            create_bgp_clear_route_filter_task(
+                hostname=args.device_name,
+                set_outer_hostname=True,
+                ixia_needed=True,
+            ),
+            create_arista_daemon_control_task(
+                hostname=args.device_name,
+                daemon_name="Bgpcpp",
+                action="disable",
+                ixia_needed=True,
+            ),
+            create_arista_daemon_control_task(
+                hostname=args.device_name,
+                daemon_name="Bgpcpp",
+                action="enable",
+                ixia_needed=True,
+            ),
+        ),
+    )
+    if len(phases) != 7:
+        raise RuntimeError(
+            "transient-memory route scale compatibility lowering requires "
+            "seven characteristic setup phases"
+        )
+    (
+        host_preparation,
+        component_configuration,
+        interface_configuration,
+        component_startup,
+        peer_configuration,
+        peer_restart,
+        host_finalization,
+    ) = phases
+    update_group_validation = tuple(
+        task
+        for task in component_startup.tasks
+        if task.task_name == "validate_bgpcpp_update_group_state"
+    )
+    component_startup_tasks = tuple(
+        task
+        for task in component_startup.tasks
+        if task.task_name != "validate_bgpcpp_update_group_state"
+    )
+    setup_tasks = [
+        *host_preparation.tasks,
+        *component_configuration.tasks,
+        *component_startup_tasks,
+        *interface_configuration.tasks,
+        *peer_configuration.tasks,
+        *peer_restart.tasks,
+        *update_group_validation,
+        *host_finalization.tasks,
+    ]
+    connections = (
+        (args.ebgp_interface, args.ebgp_ixia_port),
+        (args.ibgp_interface, args.ibgp_ixia_port),
+    )
+    return CompiledTaacArtifacts(
+        endpoints=[
+            _checked_characteristic_endpoint(
+                device_name=args.device_name,
+                ixia_chassis_ip=args.ixia_chassis_ip,
+                ixia_interfaces=tuple(interface for interface, _ in connections),
+                connections=connections,
+            )
+        ],
+        host_os_type_map={args.device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
+        setup_tasks=setup_tasks,
+        teardown_tasks=[],
+        basic_port_configs=[
+            taac_types.BasicPortConfig(
+                endpoint=f"{args.device_name}:{args.ebgp_interface}",
+                device_group_configs=[
+                    _transient_memory_route_scale_device_group_config(
+                        bound, groups[("ebgp", afi)]
+                    )
+                    for afi in ("v6", "v4")
+                ],
+            ),
+            taac_types.BasicPortConfig(
+                endpoint=f"{args.device_name}:{args.ibgp_interface}",
+                device_group_configs=[
+                    _transient_memory_route_scale_device_group_config(
+                        bound, groups[("ibgp", afi)]
+                    )
+                    for afi in ("v6", "v4")
+                ],
+            ),
+        ],
         basic_traffic_item_configs=[],
     )
 

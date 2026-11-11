@@ -1677,7 +1677,8 @@ async def backup_config_exists(driver: t.Any, backup_file: str) -> bool:
     output = await driver.async_run_cmd_on_shell(
         f"bash test -f {shlex.quote(backup_path)} && echo {sentinel} || true"
     )
-    return sentinel in (output or "")
+    # The output starts with the echoed command, which contains the sentinel too.
+    return any(line.strip() == sentinel for line in (output or "").splitlines())
 
 
 async def restore_running_config(

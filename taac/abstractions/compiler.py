@@ -19,8 +19,11 @@ from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
     build_fibagent_bgp_config_verify_cmd,
     build_update_group_setting_override_cmd,
     FIBAGENT_BGP_CONF_DEPLOY_CMD,
+    FIBAGENT_BGP_CONF_DEVICE_PATH,
     FIBAGENT_CONF_DEPLOY_CMD,
+    FIBAGENT_CONF_DEVICE_PATH,
     REQUIRE_THRIFT_ACL_FILES_CMD,
+    THRIFT_ACL_FILES,
     VERIFY_THRIFT_ACL_USER_IDS_CMD,
 )
 from taac.abstractions.compatibility.legacy_ebb_binding import (
@@ -100,6 +103,7 @@ from taac.task_definitions import (
     create_arista_daemon_control_task,
     create_bgp_clear_route_filter_task,
     create_deploy_tls_certs_task,
+    create_eos_compiler_lifecycle_task,
     create_interface_ip_cleanup_task,
     create_interface_ip_configuration_task,
     create_invoke_ixia_api_task,
@@ -136,6 +140,31 @@ _EGRESS_PEER_SCALE_TOPOLOGY = "egress_peer_scale"
 _BOUNDED_ECMP_PROFILE = "bounded_ecmp"
 _BOUNDED_ECMP_TOPOLOGY = "bounded_ecmp"
 _EBB_BGPCPP_CONFIG_PATH = "/mnt/flash/bgpcpp_config"
+_EBB_BGPCPP_STARTUP_PATH = "/usr/sbin/run_bgpcpp.sh"
+# patternlint-disable-next-line no-dev-shm-usage
+_EBB_BGP_RP_STATE_PATH = "/dev/shm/bgp_rp_state.txt"
+_EBB_STATE_GUARD_DIRECTORIES = (
+    "/usr/facebook/thrift_acls",
+    "/mnt/fb/agent_configs",
+    "/mnt/fb/certs",
+)
+_EBB_STATE_GUARD_FILES = (
+    ("bgpcpp_config", _EBB_BGPCPP_CONFIG_PATH),
+    ("bgp_rp_state", _EBB_BGP_RP_STATE_PATH),
+    ("auth_kill_switch", "/usr/facebook/thrift_acls/auth_kill_switch_file"),
+    ("fib_agent_bgp_config", FIBAGENT_BGP_CONF_DEVICE_PATH),
+    ("fib_agent_config", FIBAGENT_CONF_DEVICE_PATH),
+    *((f"thrift_acl_{index}", path) for index, path in enumerate(THRIFT_ACL_FILES)),
+    ("tls_fib_agent", "/mnt/fb/certs/AristaFibAgent_server.pem"),
+    ("tls_bgpcpp", "/mnt/fb/certs/Bgpcpp_server.pem"),
+    ("tls_openr", "/mnt/fb/certs/fb-openr_server.pem"),
+    ("peer_input_base64", "/tmp/peers.b64"),
+    ("peer_input_json", "/tmp/experiment_peers.json"),
+)
+_EBB_STATE_GUARD_FIREWALL_CHAINS = (
+    {"family": "ipv4", "chain": "EOS_BGP"},
+    {"family": "ipv6", "chain": "EOS_BGP"},
+)
 _EBB_NO_SETUP_MODES = frozenset({"skip", "verify_only"})
 _EBB_IBGP_ROLES = (
     "ibgp_dc_p1",
@@ -257,6 +286,8 @@ def _validate_bound_provenance_for_compile(bound: BoundTopology) -> None:
 
 def _validate_route_attributes_for_compile(
     bound: BoundTopology,
+    *,
+    allow_single_community_row: bool = False,
 ) -> None:
     for device_group in bound.device_groups:
         for advertisement_index, advertisement in enumerate(
@@ -292,7 +323,7 @@ def _validate_route_attributes_for_compile(
                         )
                     ],
                 )
-            if bound.logical_topology.legacy_profile in {
+            if allow_single_community_row or bound.logical_topology.legacy_profile in {
                 _EGRESS_PEER_SCALE_PROFILE,
                 _BOUNDED_ECMP_PROFILE,
             }:
@@ -4981,6 +5012,8 @@ class ProfileFreeEosBgpCppCompiler(TopologyCompiler):
             return _compile_constant_attribute_storage_artifacts(bound)
         if _is_profile_free_transient_memory_route_scale(bound):
             return _compile_transient_memory_route_scale_artifacts(bound)
+        if _is_profile_free_ingress_peer_scale(bound):
+            return _compile_ingress_peer_scale_artifacts(bound)
         if _is_profile_free_egress_peer_scale(bound):
             return _preserve_egress_peer_scale_task_artifacts(bound)
         if _is_profile_free_ipv6_update_packing(bound):
@@ -5474,7 +5507,11 @@ def _is_profile_free_constant_attribute_storage(bound: BoundTopology) -> bool:
     )
 
 
-def _validate_characteristic_compatibility_intent(bound: BoundTopology) -> None:
+def _validate_characteristic_compatibility_intent(
+    bound: BoundTopology,
+    *,
+    allow_single_community_row: bool = False,
+) -> None:
     _validate_bound_provenance_for_compile(bound)
     endpoint = _primary_dut_endpoint(bound)
     if endpoint.setup_mode != "full":
@@ -5491,7 +5528,9 @@ def _validate_characteristic_compatibility_intent(bound: BoundTopology) -> None:
                 )
             ],
         )
-    _validate_route_attributes_for_compile(bound)
+    _validate_route_attributes_for_compile(
+        bound, allow_single_community_row=allow_single_community_row
+    )
     _validate_legacy_peer_prefix_activation_support(bound)
     _validate_characteristic_prefix_exclusions(bound)
     issues = [
@@ -6041,6 +6080,279 @@ def _compile_transient_memory_route_scale_artifacts(
                     for afi in ("v6", "v4")
                 ],
             ),
+        ],
+        basic_traffic_item_configs=[],
+    )
+
+
+def _is_profile_free_ingress_peer_scale(bound: BoundTopology) -> bool:
+    return (
+        bound.logical_topology.legacy_profile is None
+        and bound.logical_topology.task_compatibility_profile
+        is TaskCompatibilityProfile.INGRESS_PEER_SCALE
+    )
+
+
+def _ingress_peer_scale_args(bound: BoundTopology) -> _EgressPeerScaleArgs:
+    expected = (("ebgp", "v6", 16), ("ibgp", "v6", 500))
+    actual = tuple(
+        (group.role, group.afi, group.peer_count) for group in bound.device_groups
+    )
+    if actual != expected:
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path="device_groups",
+                    code="invalid_ingress_peer_scale_shape",
+                    message=f"ingress peer scale requires {expected!r}; got {actual!r}",
+                )
+            ],
+        )
+    groups = {(group.role, group.afi): group for group in bound.device_groups}
+    issues: list[ValidationIssue] = []
+    for role, afi, peer_count in expected:
+        group = groups[(role, afi)]
+        assignment = group.port_assignment
+        if (
+            not isinstance(group.peer_group, BgpPeerGroup)
+            or assignment is None
+            or assignment.logical_role != role
+            or not group.legacy_ixia_device_group_name
+            or not group.legacy_ixia_bgp_peer_name
+            or group.legacy_ixia_device_group_index != 0
+            or group.remote_asn is None
+            or not group.parent_network
+            or len(group.a_ips) != peer_count
+            or len(group.z_ips) != peer_count
+        ):
+            issues.append(
+                ValidationIssue(
+                    path=f"device_groups.{group.name}",
+                    code="missing_ingress_peer_scale_input",
+                    message="compiler requires complete peer, IXIA, and ASN inputs",
+                )
+            )
+    if (
+        len(groups[("ebgp", "v6")].prefix_advertisements) != 1
+        or groups[("ibgp", "v6")].prefix_advertisements
+    ):
+        issues.append(
+            ValidationIssue(
+                path="device_groups.prefix_advertisements",
+                code="invalid_ingress_peer_scale_route_intent",
+                message="eBGP requires one advertisement and iBGP requires none",
+            )
+        )
+    for key in ("ebgp_v4", "ebgp_v6", "ibgp_v6"):
+        if not bound.parent_networks.get(key):
+            issues.append(
+                ValidationIssue(
+                    path=f"parent_networks.{key}",
+                    code="missing_ingress_peer_scale_input",
+                    message=f"ingress peer scale requires parent network {key}",
+                )
+            )
+    device_config = bound.device_config
+    if (
+        not isinstance(device_config, RoutingDeviceConfig)
+        or device_config.openr_mode is not OpenRMode.NONE
+    ):
+        issues.append(
+            ValidationIssue(
+                path="device_config.openr_mode",
+                code="invalid_ingress_peer_scale_device_config",
+                message="ingress peer scale requires OpenRMode.NONE",
+            )
+        )
+    inventory = bound.physical_inventory
+    required_inventory = {
+        "device_name": getattr(inventory, "device_name", None),
+        "ixia_chassis_ip": getattr(inventory, "ixia_chassis_ip", None),
+        "dut_bgp_as": getattr(inventory, "dut_bgp_as", None),
+        "bgpcpp_configerator_path": getattr(
+            inventory, "bgpcpp_configerator_path", None
+        ),
+    }
+    for name, value in required_inventory.items():
+        if not value:
+            issues.append(
+                ValidationIssue(
+                    path=f"physical_inventory.{name}",
+                    code="missing_ingress_peer_scale_input",
+                    message=f"ingress peer scale requires physical_inventory.{name}",
+                )
+            )
+    if issues:
+        raise TopologyValidationError(bound.logical_topology.name, issues)
+    ebgp_assignment = _resolved_ixia_assignment(bound, groups[("ebgp", "v6")])
+    ibgp_assignment = _resolved_ixia_assignment(bound, groups[("ibgp", "v6")])
+    assert isinstance(device_config, RoutingDeviceConfig)
+    return _EgressPeerScaleArgs(
+        device_name=t.cast(str, required_inventory["device_name"]),
+        ixia_chassis_ip=t.cast(str, required_inventory["ixia_chassis_ip"]),
+        groups=groups,
+        ebgp_interface=ebgp_assignment.dut_interface,
+        ebgp_ixia_port=ebgp_assignment.ixia_port,
+        ibgp_interface=ibgp_assignment.dut_interface,
+        ibgp_ixia_port=ibgp_assignment.ixia_port,
+        bgp_asn=t.cast(int, required_inventory["dut_bgp_as"]),
+        router_id=t.cast(str | None, getattr(inventory, "router_id", None)),
+        bgpcpp_configerator_path=t.cast(
+            str, required_inventory["bgpcpp_configerator_path"]
+        ),
+        enable_update_group=device_config.update_group_enable,
+        openr_mode=device_config.openr_mode,
+    )
+
+
+def _ebb_device_state_guard_tasks(
+    *,
+    device_name: str,
+    operation_namespace: str,
+) -> tuple[list[t.Any], list[t.Any]]:
+    component_operation_id = f"{operation_namespace}:routing_component"
+    guarded_files = [
+        (f"{operation_namespace}:{suffix}", destination)
+        for suffix, destination in _EBB_STATE_GUARD_FILES
+    ]
+    setup_tasks = [
+        create_eos_compiler_lifecycle_task(
+            hostname=device_name,
+            action="routing_component_snapshot",
+            operation_id=component_operation_id,
+            startup_path=_EBB_BGPCPP_STARTUP_PATH,
+            daemon_names=[*BGPCPP_DAEMONS, "BgpTcpdump"],
+            directory_paths=list(_EBB_STATE_GUARD_DIRECTORIES),
+            firewall_chains=list(_EBB_STATE_GUARD_FIREWALL_CHAINS),
+        ),
+        *(
+            create_eos_compiler_lifecycle_task(
+                hostname=device_name,
+                action="routing_config_snapshot",
+                operation_id=operation_id,
+                destination=destination,
+            )
+            for operation_id, destination in guarded_files
+        ),
+    ]
+    teardown_tasks = [
+        create_eos_compiler_lifecycle_task(
+            hostname=device_name,
+            action="routing_component_restore",
+            operation_id=component_operation_id,
+            startup_path=_EBB_BGPCPP_STARTUP_PATH,
+            file_restores=[
+                {"operation_id": operation_id, "destination": destination}
+                for operation_id, destination in guarded_files
+            ],
+            force_restart_daemons=["Bgpcpp"],
+        )
+    ]
+    return setup_tasks, teardown_tasks
+
+
+def _compile_ingress_peer_scale_artifacts(
+    bound: BoundTopology,
+) -> CompiledTaacArtifacts:
+    _validate_characteristic_compatibility_intent(
+        bound, allow_single_community_row=True
+    )
+    args = _ingress_peer_scale_args(bound)
+    state_guard_setup, state_guard_teardown = _ebb_device_state_guard_tasks(
+        device_name=args.device_name,
+        operation_namespace="ebb_sc4",
+    )
+    phases = _characteristic_setup_phases(
+        bound,
+        device_name=args.device_name,
+        bgp_asn=args.bgp_asn,
+        ebgp_interface=args.ebgp_interface,
+        ibgp_interface=args.ibgp_interface,
+        router_id=args.router_id,
+        bgpcpp_configerator_path=args.bgpcpp_configerator_path,
+        enable_update_group=args.enable_update_group,
+        openr_mode=args.openr_mode,
+        peer_plan=_transient_memory_route_scale_peer_plan(bound),
+        finalization_tasks=(
+            create_interface_ip_configuration_task(
+                interface=args.ebgp_interface,
+                peer_count=16,
+                ipv4_base_network=bound.parent_networks["ebgp_v4"],
+                ipv6_base_network=bound.parent_networks["ebgp_v6"],
+                address_families=["ipv6"],
+                clear_existing=True,
+                ipv4_start_offset=IXIA_IPV4_START_OFFSET,
+                ipv6_start_offset=IXIA_IPV6_START_OFFSET,
+                hostname=args.device_name,
+                ixia_needed=True,
+            ),
+            create_bgp_clear_route_filter_task(
+                hostname=args.device_name,
+                set_outer_hostname=True,
+                ixia_needed=True,
+            ),
+        ),
+    )
+    (
+        host_preparation,
+        component_configuration,
+        interface_configuration,
+        component_startup,
+        peer_configuration,
+        peer_restart,
+        host_finalization,
+    ) = phases
+    update_group_validation = tuple(
+        task
+        for task in component_startup.tasks
+        if task.task_name == "validate_bgpcpp_update_group_state"
+    )
+    component_startup_tasks = tuple(
+        task
+        for task in component_startup.tasks
+        if task.task_name != "validate_bgpcpp_update_group_state"
+    )
+    setup_tasks = [
+        *state_guard_setup,
+        *host_preparation.tasks,
+        *component_configuration.tasks,
+        *component_startup_tasks,
+        *interface_configuration.tasks,
+        *peer_configuration.tasks,
+        *peer_restart.tasks,
+        *update_group_validation,
+        *host_finalization.tasks,
+    ]
+    connections = (
+        (args.ebgp_interface, args.ebgp_ixia_port),
+        (args.ibgp_interface, args.ibgp_ixia_port),
+    )
+    return CompiledTaacArtifacts(
+        endpoints=[
+            _checked_characteristic_endpoint(
+                device_name=args.device_name,
+                ixia_chassis_ip=args.ixia_chassis_ip,
+                ixia_interfaces=tuple(interface for interface, _ in connections),
+                connections=connections,
+            )
+        ],
+        host_os_type_map={args.device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
+        setup_tasks=setup_tasks,
+        teardown_tasks=state_guard_teardown,
+        basic_port_configs=[
+            taac_types.BasicPortConfig(
+                endpoint=f"{args.device_name}:{interface}",
+                device_group_configs=[
+                    _egress_peer_scale_device_group_config(
+                        bound, args.groups[(role, "v6")]
+                    )
+                ],
+            )
+            for role, interface in (
+                ("ebgp", args.ebgp_interface),
+                ("ibgp", args.ibgp_interface),
+            )
         ],
         basic_traffic_item_configs=[],
     )

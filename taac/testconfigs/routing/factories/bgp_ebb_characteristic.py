@@ -79,6 +79,12 @@ from taac.abstractions.topologies.egress_peer_scale import (
     EGRESS_PEER_SCALE_PREFIX_COUNT,
     EGRESS_PEER_SCALE_SWEEP_PEER_COUNTS,
 )
+from taac.abstractions.topologies.ingress_peer_scale import (
+    INGRESS_PEER_SCALE,
+    INGRESS_PEER_SCALE_AS_NUMBERS,
+    INGRESS_PEER_SCALE_PEER_GROUPS,
+    INGRESS_PEER_SCALE_PORT_MAP,
+)
 from taac.abstractions.topologies.ipv6_update_packing import (
     IPV6_UPDATE_PACKING,
     IPV6_UPDATE_PACKING_AS_NUMBERS,
@@ -154,7 +160,6 @@ from taac.task_definitions import (
     create_coop_apply_patchers_task,
     create_coop_register_patcher_task,
     create_coop_unregister_patchers_task,
-    create_interface_ip_configuration_task,
     create_replace_bgp_peers_task,
     create_run_commands_on_shell_task,
     create_scp_file_template_task,
@@ -176,7 +181,6 @@ from taac.testconfigs.routing.util.bgp_ebb_constants import (
     IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
     IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
     IXIA_IPV4_START_OFFSET,
-    IXIA_IPV6_START_OFFSET,
     PEERGROUP_EBGP_V4,
     PEERGROUP_EBGP_V6,
     PEERGROUP_IBGP_V4,
@@ -187,7 +191,6 @@ from taac.testconfigs.routing.util.bgp_ebb_periodic_tasks import (
 )
 from taac.testconfigs.routing.util.bgp_ebb_setup_tasks import (
     build_per_iteration_factory_v4_capable,
-    get_ebb_device_state_guard_tasks,
     get_update_packing_setup_tasks,
     insert_gateway_resolution_gate,
 )
@@ -2651,9 +2654,9 @@ def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
     Routes are resolvable and advertised, so each point exercises the full
     ingress-absorb -> best-path -> egress-advertise burst.
 
-    Mirrors the SC1 perf-scaling factory: the DUT is provisioned via
-    ``get_update_packing_setup_tasks`` and the name derives from
-    ``testbed.device_name`` as
+    The factory binds the DICE topology to physical inventory, and the compiler
+    lowers endpoint, IXIA, peer, state-guard, setup, and teardown artifacts in
+    the established SC4 order. The name derives from ``testbed.device_name`` as
     ``{DEVICE}_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST`` (+ ``_UPDATE_GROUP``).
 
     All SC tests run with update-group enabled, so ``enable_update_group=True`` is
@@ -2667,7 +2670,6 @@ def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
 
     device_name = testbed.device_name
     ixia_interface_mimic_ebgp = testbed.ixia_ports[0][0]
-    ixia_interface_mimic_ibgp = testbed.ixia_ports[1][0]
 
     name = name_override or (
         f"{testbed.device_name.upper().replace('.', '_')}"
@@ -2680,88 +2682,26 @@ def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
         ixia_chassis_ip=testbed.ixia_chassis_ip,
     )
 
-    state_guard_setup_tasks, state_guard_teardown_tasks = (
-        get_ebb_device_state_guard_tasks(
-            device_name=device_name,
-            operation_namespace="ebb_sc4",
-        )
+    bound = INGRESS_PEER_SCALE.bind_to_inventory(
+        physical_inventory=testbed,
+        port_map=INGRESS_PEER_SCALE_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=INGRESS_PEER_SCALE_PEER_GROUPS,
+        as_numbers=INGRESS_PEER_SCALE_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=OpenRMode.NONE,
+            update_group_enable=enable_update_group,
+        ),
     )
-    setup_tasks = [*state_guard_setup_tasks]
-    setup_tasks.extend(
-        get_update_packing_setup_tasks(
-            device_name=device_name,
-            bgp_asn=testbed.dut_bgp_as,
-            ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-            ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-            # Write the peer list ONCE at the sweep MAX. The sweep resizes the IXIA
-            # eBGP device group rather than rescaling the device, so the configured
-            # peer set must be a superset of every sweep point -- otherwise senders
-            # above the initial count have no configured neighbour and can never
-            # establish (observed: at n=2 the gate saw expected 502 / found 501).
-            # Senders above the current point stay idle, which the exact-count
-            # session gate ignores.
-            ebgp_peer_count=max(_SC4_INGRESS_EBGP_PEER_COUNTS),
-            ibgp_peer_count=_SC4_FIXED_IBGP_PEER_COUNT,
-            ebgp_remote_as=EBGP_REMOTE_AS,
-            ibgp_remote_as=IBGP_REMOTE_AS,
-            ixia_ebgp_ic_parent_network_v6=resolved_parent_networks["ebgp_v6"],
-            ixia_ibgp_ic_parent_network_v6=resolved_parent_networks["ibgp_v6"],
-            # v6-only ingress: a v4 parent network here writes a v4 eBGP peer to the
-            # device that the v6-only IXIA never answers, so it sits IDLE for the whole
-            # run (10.163.28.11), inflating the session total and polluting every
-            # non-established list.
-            ixia_ebgp_ic_parent_network_v4=None,
-            # iBGP egress is v6-only (the per-iteration factory + IXIA side write 0 v4
-            # iBGP peers). Passing a v4 network here would make get_update_packing lay
-            # the iBGP interface DUAL-STACK -- 500 v6 + 500 v4 secondaries on one
-            # interface -- overflowing Arista's ~500-secondary-per-interface ceiling,
-            # so v6 iBGP peers past ~250 get no local source IP and stay IDLE
-            # (P2441146392). None keeps only the 500 v6 secondaries the test uses.
-            ixia_ibgp_ic_parent_network_v4=None,
-            router_id=testbed.router_id,
-            bgpcpp_configerator_path=testbed.bgpcpp_configerator_path,
-            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
-            enable_update_group=enable_update_group,
-            v4_peer_start_offset=IXIA_IPV4_START_OFFSET,
-        )
-    )
-    # The swept axis is eBGP: re-lay the eBGP interface's secondary IPs once at the
-    # full sweep max so every Stage's eBGP senders have a local source address
-    # (mirrors SC1's re-lay of the iBGP interface). The iBGP egress interface is
-    # laid by get_update_packing_setup_tasks for the constant fan-out and never
-    # needs re-laying.
-    setup_tasks.append(
-        create_interface_ip_configuration_task(
-            interface=ixia_interface_mimic_ebgp,
-            peer_count=max(_SC4_INGRESS_EBGP_PEER_COUNTS),
-            ipv4_base_network=resolved_parent_networks["ebgp_v4"],
-            ipv6_base_network=resolved_parent_networks["ebgp_v6"],
-            # v6-only ingress: lay only the v6 eBGP secondary IPs (no v4 senders).
-            address_families=["ipv6"],
-            clear_existing=True,
-            ipv4_start_offset=IXIA_IPV4_START_OFFSET,
-            ipv6_start_offset=IXIA_IPV6_START_OFFSET,
-            hostname=device_name,
-            ixia_needed=True,
-        )
-    )
-    # Scale prefixes are not in the device's baked-in route registry; clear the
-    # Centralized Route Filter so inbound prefixes are not denied (the clear
-    # persists across the per-stage Bgp restarts).
-    setup_tasks.append(
-        create_bgp_clear_route_filter_task(
-            hostname=device_name,
-            set_outer_hostname=True,
-            ixia_needed=True,
-        )
-    )
+    compiled = bound.compile()
     config = create_bgp_ebb_scaling_ingress_peer_scale_test_config(
         testbed,
         name=name,
         host_driver_args=None,
         oss_mock_device_data=None,
-        host_os_type_map={device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
-        direct_ixia_connections=_two_port_direct_ixia_connections(testbed),
+        host_os_type_map=compiled.host_os_type_map,
+        endpoints=compiled.endpoints,
+        basic_port_configs=compiled.basic_port_configs,
         ingress_peer_counts=_SC4_INGRESS_EBGP_PEER_COUNTS,
         ibgp_peer_count=_SC4_FIXED_IBGP_PEER_COUNT,
         prefix_count=_SC4_TOTAL_PREFIX_COUNT,
@@ -2776,8 +2716,8 @@ def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
         ebgp_prefixes_per_sender=_SC4_INITIAL_PREFIXES_PER_SENDER,
         ebgp_v6_prefix_block_step=_SC4_INITIAL_V6_PEER_PREFIX_STEP,
         log_collection_timeout=600,
-        setup_tasks=setup_tasks,
-        teardown_tasks=state_guard_teardown_tasks,
+        setup_tasks=compiled.setup_tasks,
+        teardown_tasks=compiled.teardown_tasks,
         # The sweep lives inside the convergence custom step (it resizes the IXIA
         # eBGP device group per point), so there are no per-Stage setup steps and
         # therefore no per-Stage Bgp restart.

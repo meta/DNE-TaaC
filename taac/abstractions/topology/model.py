@@ -308,6 +308,7 @@ class TaskCompatibilityProfile(str, Enum):
     EBB_FULL_SCALE_NO_BGPMON = "ebb_full_scale_no_bgpmon"
     EBB_FULL_SCALE_WITH_BGPMON = "ebb_full_scale_with_bgpmon"
     EGRESS_PEER_SCALE = "egress_peer_scale"
+    INGRESS_PEER_SCALE = "ingress_peer_scale"
     IPV6_UPDATE_PACKING = "ipv6_update_packing"
     TRANSIENT_MEMORY_ROUTE_SCALE = "transient_memory_route_scale"
     UG_ADD_PEER_DYNAMIC = "ug_add_peer_dynamic"

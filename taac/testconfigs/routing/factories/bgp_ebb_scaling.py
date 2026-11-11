@@ -338,6 +338,8 @@ def create_bgp_ebb_scaling_ingress_peer_scale_test_config(
     host_driver_args: dict[str, str] | None = None,
     oss_mock_device_data: dict[str, taac_types.MockDeviceInfo] | None = None,
     host_os_type_map: dict[str, taac_types.DeviceOsType] | None = None,
+    endpoints: list[Endpoint] | None = None,
+    basic_port_configs: list[BasicPortConfig] | None = None,
     sweep_playbook: taac_types.Playbook | None = None,
     ebgp_prefixes_per_sender: int = 50000,
     ebgp_v6_prefix_block_step: str = "0:0:0:0:0:0:0:0",
@@ -390,24 +392,30 @@ def create_bgp_ebb_scaling_ingress_peer_scale_test_config(
         skip_ixia_protocol_verification=True,
         log_collection_timeout=log_collection_timeout,
         basset_pool="dne.test",
-        endpoints=[
-            Endpoint(
-                name=device_name,
-                dut=True,
-                ixia_ports=[
-                    ixia_interface_mimic_ebgp,
-                    ixia_interface_mimic_ibgp,
-                ],
-                direct_ixia_connections=resolved_direct_ixia_connections,
-            ),
-        ],
+        endpoints=(
+            endpoints
+            if endpoints is not None
+            else [
+                Endpoint(
+                    name=device_name,
+                    dut=True,
+                    ixia_ports=[
+                        ixia_interface_mimic_ebgp,
+                        ixia_interface_mimic_ibgp,
+                    ],
+                    direct_ixia_connections=resolved_direct_ixia_connections,
+                ),
+            ]
+        ),
         host_driver_args=resolved_host_driver_args,
         oss_mock_device_data=resolved_oss_mock_device_data,
         host_os_type_map=resolved_host_os_type_map,
         startup_checks=[],
         setup_tasks=setup_tasks if setup_tasks is not None else [],
         teardown_tasks=teardown_tasks if teardown_tasks is not None else [],
-        basic_port_configs=create_ebb_performance_scale_basic_port_configs(
+        basic_port_configs=basic_port_configs
+        if basic_port_configs is not None
+        else create_ebb_performance_scale_basic_port_configs(
             device_name=device_name,
             ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
             ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,

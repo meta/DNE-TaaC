@@ -5777,13 +5777,18 @@ class FbossSwitch(AbstractSwitch):
         self.logger.info(
             f"Waiting for agent to reach configured state on {self.hostname}"
         )
-        end_time = time.time() + timeout
-        while time.time() < end_time:
+        deadline = time.monotonic() + timeout
+        while True:
             if await self.async_is_agent_configured():
+                self.logger.info(
+                    f"Agent has reached configured state on {self.hostname}"
+                )
                 return
-            await asyncio.sleep(interval)
-        self.logger.info(f"Agent has reached configured state on {self.hostname}")
-        raise Exception(
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(interval, remaining))
+        raise TimeoutError(
             f"Agent did not reach configured state within {timeout} seconds on {self.hostname}"
         )
 

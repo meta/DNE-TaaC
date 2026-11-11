@@ -131,6 +131,24 @@ class FbossSwitchTest(TestCase):
             "pkill -9 -x fboss_sw_agent; pkill -9 -x fboss_hw_agent"
         )
 
+    async def test_wait_for_agent_configured_checks_deadline_boundary(self) -> None:
+        self.switch.async_is_agent_configured = AsyncMock(side_effect=[False, True])
+
+        with (
+            patch(
+                "neteng.test_infra.dne.taac.driver.fboss_switch.time.monotonic",
+                side_effect=[0, 0],
+            ),
+            patch(
+                "neteng.test_infra.dne.taac.driver.fboss_switch.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as sleep,
+        ):
+            await self.switch.async_wait_for_agent_configured(timeout=5, interval=5)
+
+        self.assertEqual(2, self.switch.async_is_agent_configured.await_count)
+        sleep.assert_awaited_once_with(5)
+
 
 class SwitchRunStateRetryTest(TestCase):
     def setUp(self) -> None:

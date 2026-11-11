@@ -5066,26 +5066,45 @@ class ProfileFreeEosBgpCppCompiler(TopologyCompiler):
     """EOS BGP++ compiler that prefers native profile-free artifacts."""
 
     def compile(self, bound: BoundTopology) -> CompiledTaacArtifacts:
-        if _is_profile_free_bounded_ecmp(bound):
-            return _preserve_bounded_ecmp_task_artifacts(bound)
-        if _is_profile_free_constant_attribute_storage(bound):
-            return _compile_constant_attribute_storage_artifacts(bound)
-        if _is_profile_free_transient_memory_route_scale(bound):
-            return _compile_transient_memory_route_scale_artifacts(bound)
-        if _is_profile_free_ingress_peer_scale(bound):
-            return _compile_ingress_peer_scale_artifacts(bound)
-        if _is_profile_free_route_churn_scale(bound):
-            return _compile_route_churn_scale_artifacts(bound)
-        if _is_profile_free_egress_peer_scale(bound):
-            return _preserve_egress_peer_scale_task_artifacts(bound)
-        if _is_profile_free_ipv6_update_packing(bound):
-            return _preserve_ipv6_update_packing_task_artifacts(bound)
-        if _is_profile_free_ug_new_peer_join(bound):
-            return _preserve_ug_new_peer_join_task_artifacts(bound)
-        if _is_profile_free_ug_add_peer_dynamic(bound):
-            return _preserve_ug_new_peer_join_task_artifacts(bound)
-        if _is_profile_free_ug_backpressure(bound):
-            return _preserve_ug_backpressure_task_artifacts(bound)
+        compatibility_compilers = (
+            (_is_profile_free_bounded_ecmp, _preserve_bounded_ecmp_task_artifacts),
+            (
+                _is_profile_free_constant_attribute_storage,
+                _compile_constant_attribute_storage_artifacts,
+            ),
+            (
+                _is_profile_free_transient_memory_route_scale,
+                _compile_transient_memory_route_scale_artifacts,
+            ),
+            (
+                _is_profile_free_ingress_peer_scale,
+                _compile_ingress_peer_scale_artifacts,
+            ),
+            (_is_profile_free_route_churn_scale, _compile_route_churn_scale_artifacts),
+            (
+                _is_profile_free_egress_peer_scale,
+                _preserve_egress_peer_scale_task_artifacts,
+            ),
+            (
+                _is_profile_free_ipv6_update_packing,
+                _preserve_ipv6_update_packing_task_artifacts,
+            ),
+            (
+                _is_profile_free_ug_new_peer_join,
+                _preserve_ug_new_peer_join_task_artifacts,
+            ),
+            (
+                _is_profile_free_ug_add_peer_dynamic,
+                _preserve_ug_new_peer_join_task_artifacts,
+            ),
+            (
+                _is_profile_free_ug_backpressure,
+                _preserve_ug_backpressure_task_artifacts,
+            ),
+        )
+        for matches, compile_artifacts in compatibility_compilers:
+            if matches(bound):
+                return compile_artifacts(bound)
         if _is_profile_free_ebb_full_scale(bound) and (
             bound.logical_topology.traffic_flows
             or any(group.ixia_children for group in bound.device_groups)
@@ -5546,7 +5565,7 @@ def _is_profile_free_bounded_ecmp(bound: BoundTopology) -> bool:
 def _validate_characteristic_prefix_exclusions(bound: BoundTopology) -> None:
     issues = [
         ValidationIssue(
-            path=f"prefix_sets.{advertisement.spec.prefix_set}.source.excluded_indices",
+            path=f"prefix_sets.{advertisement.prefix_set.spec.name}.source.excluded_indices",
             code="unsupported_backend_prefix_exclusions",
             message=(
                 "characteristic IXIA compatibility lowering cannot represent "

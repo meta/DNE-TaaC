@@ -1300,6 +1300,10 @@ def test_config_constant_attribute_storage_varying_combinations_on_eos(
     ``testconfigs/routing/ebb/test_config_performance_scaling_case2``
     ``test_config_constant_attribute_storage_varying_combinations_on_eos``.
     """
+    if basic_port_configs is not None and not basic_port_configs:
+        raise ValueError(
+            "basic_port_configs override must contain at least one port config"
+        )
     if test_address_families is None:
         test_address_families = ["ipv4", "ipv6"]
 

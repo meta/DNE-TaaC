@@ -67,6 +67,38 @@ from taac.test_as_a_config.types import Params, Playbook, Task
 _ROUTER_ID_ASSIGN = "c['router_id']="
 
 
+class ConstantAttributeStoragePortOverrideTest(unittest.TestCase):
+    def _config(self, basic_port_configs):
+        return characteristic_factory.test_config_constant_attribute_storage_varying_combinations_on_eos(
+            test_config_name="SC2_PORT_OVERRIDE_TEST",
+            device_name="nrqeb006.ash6",
+            ixia_interface_mimic_ebgp="Ethernet1",
+            ebgp_remote_as=65334,
+            ixia_ebgp_ic_parent_network_v6="2001:db8:1",
+            ixia_ebgp_ic_parent_network_v4="192.0.2",
+            unique_combination_counts=[1],
+            test_address_families=["ipv6"],
+            basic_port_configs=basic_port_configs,
+        )
+
+    def test_empty_override_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "basic_port_configs override.*at least one"
+        ):
+            self._config([])
+
+    def test_none_uses_legacy_defaults(self) -> None:
+        config = self._config(None)
+        self.assertEqual(len(config.basic_port_configs or []), 1)
+        self.assertEqual(
+            config.basic_port_configs[0].endpoint, "nrqeb006.ash6:Ethernet1"
+        )
+        self.assertEqual(
+            config.basic_port_configs[0].device_group_configs[0].device_group_name,
+            "DEVICE_GROUP_IPV6_EBGP",
+        )
+
+
 class IngressPeerScaleIxiaGeometryTest(unittest.TestCase):
     def test_disjoint_compact_geometry_is_forwarded_to_ixia_builder(self) -> None:
         config = create_bgp_ebb_scaling_ingress_peer_scale_test_config(

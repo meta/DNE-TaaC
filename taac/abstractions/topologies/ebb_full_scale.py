@@ -75,6 +75,7 @@ from taac.abstractions.routing_semantics import PeerRelationship
 from taac.abstractions.topologies.ebb_prefix_inventory import (
     EBB_IBGP_V4_EXCLUDED_PREFIX_INDICES,
     EBB_IBGP_V6_EXCLUDED_PREFIX_INDICES,
+    EBB_IBGP_VETTED_CANDIDATE_SPAN,
 )
 from taac.abstractions.topology import (
     AddressPlan,
@@ -157,6 +158,11 @@ class EbbScaleProfile:
             equality, not two numbers that happen to match.
         allows_bgp_monitor: Whether a topology at this scale may carry the
             BGP-monitor session group.
+        allows_dense_unvetted_route_tail: Whether the HE route demand may
+            extend past the candidate span the migration exclusion inventory
+            vetted, into dense synthetic prefixes nothing vetted. Topology
+            construction fails when the demand needs that tail and this is
+            false.
         next_hop_step: Address stride between consecutive HE sites. Must match
             the stride the plane's advertised route next hops use.
         bgp_total_path_limit: BGP++ ``switch_limit_config.total_path_limit``
@@ -173,6 +179,7 @@ class EbbScaleProfile:
     fa_routes_per_peer: int
     openr_injection_headroom: int
     allows_bgp_monitor: bool
+    allows_dense_unvetted_route_tail: bool
     next_hop_step: int = 2
     bgp_total_path_limit: int | None = None
 
@@ -195,11 +202,12 @@ class EbbScaleProfile:
         _require_count(
             "openr_injection_headroom", self.openr_injection_headroom, minimum=0
         )
-        if not isinstance(self.allows_bgp_monitor, bool):
-            raise ValueError(
-                f"EBB scale allows_bgp_monitor must be a bool; got "
-                f"{self.allows_bgp_monitor!r}"
-            )
+        for field_name in ("allows_bgp_monitor", "allows_dense_unvetted_route_tail"):
+            value = getattr(self, field_name)
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"EBB scale {field_name} must be a bool; got {value!r}"
+                )
         if self.advertised_pnh_count != self.ibgp_peers_per_group:
             raise ValueError(
                 f"{self.name}: advertised_pnh_count {self.advertised_pnh_count} "
@@ -239,12 +247,15 @@ EBB_FY26_SCALE = EbbScaleProfile(
     fa_routes_per_peer=750,
     openr_injection_headroom=1,
     allows_bgp_monitor=True,
+    allows_dense_unvetted_route_tail=False,
 )
 
 # FY27 Scenario 1, from the owner's authoritative scale sheet. Not scheduled
 # anywhere: 100 peers per AF-specific HE/MP group, an injection of exactly the
 # 100 advertised next hops per range, 1,000 routes per HE peer (100,000 unique
-# HE routes/AFI) and per FA peer, and no BGP monitor.
+# HE routes/AFI) and per FA peer, and no BGP monitor. 100,000 retained routes
+# need 100,750 candidates; the first 47,250 keep the vetted FY26 exclusions,
+# and the remaining 53,500 are declared dense synthetic prefixes.
 EBB_FY27_SCALE = EbbScaleProfile(
     name="EBB_FY27",
     he_sites_per_range=100,
@@ -257,6 +268,7 @@ EBB_FY27_SCALE = EbbScaleProfile(
     # 30,000,000 total-path limit the EBB BGP++ config deploys.
     bgp_total_path_limit=32_000_000,
     allows_bgp_monitor=False,
+    allows_dense_unvetted_route_tail=True,
 )
 
 
@@ -562,27 +574,152 @@ def _ebb_route_inventory_issues(
     return issues
 
 
+# Adjacent space an iBGP progression continues into once its demand outgrows
+# the FY26 parent. Neither widens to a supernet: the only aligned /7 holding
+# 11/8 is 10.0.0.0/7, which also holds the iBGP session networks.
+_EBB_IBGP_EXTENSION_PARENT_NETWORKS: dict[str, str] = {
+    EBB_IBGP_V4_PREFIX_SET.name: "12.0.0.0/8",
+    EBB_IBGP_V6_PREFIX_SET.name: "2001:db8:1::/48",
+}
+
+
+def _exclusions_within(excluded: tuple[int, ...], count: int) -> tuple[int, ...]:
+    """The excluded candidates that fall before the last of ``count`` retained."""
+    retained = 0
+    while retained < len(excluded) and excluded[retained] < count + retained:
+        retained += 1
+    return excluded[:retained]
+
+
+def _formulaic_candidate_capacity(
+    start_prefix: str,
+    prefix_step: int,
+    parent_networks: t.Sequence[str],
+) -> int:
+    """Candidates from ``start_prefix`` to the end of its contiguous parents."""
+    start = int(ipaddress.ip_address(start_prefix))
+    end: int | None = None
+    for network in sorted(
+        (ipaddress.ip_network(parent) for parent in parent_networks),
+        key=lambda network: int(network.network_address),
+    ):
+        first, last = int(network.network_address), int(network.broadcast_address)
+        if end is None and first <= start <= last:
+            end = last
+        elif end is not None and first == end + 1:
+            end = last
+    return 0 if end is None else (end - start) // prefix_step + 1
+
+
+def _ebb_sized_prefix_set(
+    prefix_set: PrefixSet,
+    count: int,
+    *,
+    demand: str,
+    vetted_span: int | None = None,
+) -> tuple[PrefixSet, list[ValidationIssue]]:
+    """Size one EBB route inventory to ``count`` retained prefixes.
+
+    Every way the inventory can fall short is reported as a named issue
+    rather than left to surface later as an out-of-range index.
+    """
+    source = prefix_set.source
+    path = f"prefix_sets.{prefix_set.name}"
+    excluded = _exclusions_within(source.excluded_indices, count)
+    span = count + len(excluded)
+    issues = []
+    if vetted_span is not None and span > vetted_span:
+        issues.append(
+            ValidationIssue(
+                path=path,
+                code="ebb_route_window_unvetted",
+                message=(
+                    f"{demand} needs a {span:,}-candidate span from "
+                    f"{prefix_set.name}, but its exclusion inventory vetted only "
+                    f"the first {vetted_span:,} candidates against the migration "
+                    f"route inventory, leaving {span - vetted_span:,} unvetted. "
+                    "Regenerate the exclusion inventory for the larger span, or "
+                    "declare allows_dense_unvetted_route_tail on the scale profile."
+                ),
+            )
+        )
+    parents = (source.parent_network,)
+    step = int(source.prefix_step)
+    extension = _EBB_IBGP_EXTENSION_PARENT_NETWORKS.get(prefix_set.name)
+    if extension and span > _formulaic_candidate_capacity(
+        source.start_prefix, step, parents
+    ):
+        parents = (*parents, extension)
+    capacity = _formulaic_candidate_capacity(source.start_prefix, step, parents)
+    if span > capacity:
+        issues.append(
+            ValidationIssue(
+                path=path,
+                code="ebb_route_prefix_capacity_exceeded",
+                message=(
+                    f"{demand} needs {count:,} prefixes from {prefix_set.name}, a "
+                    f"{span:,}-candidate span with {len(excluded):,} exclusions, "
+                    f"but {', '.join(parents)} hold {capacity:,} candidates from "
+                    f"{source.start_prefix}. Reduce the demand or extend the "
+                    "inventory with an adjacent parent network."
+                ),
+            )
+        )
+    sized = replace(
+        prefix_set,
+        source=replace(
+            source,
+            count=count,
+            excluded_indices=excluded,
+            extension_parent_networks=parents[1:],
+        ),
+    )
+    return sized, issues
+
+
 def _ebb_prefix_sets(
     topology_name: str,
     scale: EbbScaleProfile,
     ebgp_prefix_count: int,
 ) -> tuple[PrefixSet, ...]:
-    counts = {
-        EBB_EBGP_V4_PREFIX_SET.name: ebgp_prefix_count,
-        EBB_EBGP_V6_PREFIX_SET.name: ebgp_prefix_count,
-        EBB_IBGP_V4_PREFIX_SET.name: scale.he_routes_per_afi,
-        EBB_IBGP_V6_PREFIX_SET.name: scale.he_routes_per_afi,
-    }
-    issues = _ebb_route_inventory_issues(counts.keys())
+    he_demand = (
+        f"{scale.name} ({scale.ibgp_peers_per_group} HE peers x "
+        f"{scale.routes_per_he_peer} routes)"
+    )
+    fa_demand = f"{scale.name} ({ebgp_prefix_count} FA routes per peer)"
+    vetted_span = (
+        None
+        if scale.allows_dense_unvetted_route_tail
+        else EBB_IBGP_VETTED_CANDIDATE_SPAN
+    )
+    issues = _ebb_route_inventory_issues(
+        {
+            EBB_EBGP_V4_PREFIX_SET.name,
+            EBB_EBGP_V6_PREFIX_SET.name,
+            *_EBB_IBGP_EXTENSION_PARENT_NETWORKS,
+        }
+    )
     if issues:
         raise TopologyValidationError(topology_name, issues)
-    return tuple(
-        replace(
-            prefix_set,
-            source=replace(prefix_set.source, count=counts[prefix_set.name]),
-        )
-        for prefix_set in EBB_PREFIX_SETS
-    )
+    # Past the check, a set that is not iBGP is one of the two eBGP sets.
+    sized_sets = []
+    for prefix_set in EBB_PREFIX_SETS:
+        if prefix_set.name in _EBB_IBGP_EXTENSION_PARENT_NETWORKS:
+            sized, set_issues = _ebb_sized_prefix_set(
+                prefix_set,
+                scale.he_routes_per_afi,
+                demand=he_demand,
+                vetted_span=vetted_span,
+            )
+        else:
+            sized, set_issues = _ebb_sized_prefix_set(
+                prefix_set, ebgp_prefix_count, demand=fa_demand
+            )
+        sized_sets.append(sized)
+        issues.extend(set_issues)
+    if issues:
+        raise TopologyValidationError(topology_name, issues)
+    return tuple(sized_sets)
 
 
 EBB_ACCEPT_POLICY = BgpPolicy(

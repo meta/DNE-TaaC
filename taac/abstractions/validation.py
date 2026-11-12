@@ -405,10 +405,13 @@ def _validate_prefix_set(
                 "prefix_step must be positive and in the prefix-set AFI",
             )
         )
+    parents = _validated_prefix_parents(
+        source, parsed_parent, prefix_set.afi, path, issues
+    )
     span = _validated_prefix_span(source, path, issues)
     if span is None:
         return
-    if parsed_start is None or parsed_parent is None or step is None:
+    if parsed_start is None or parents is None or step is None:
         return
     block_size = 1 << (parsed_start.max_prefixlen - source.prefix_length)
     if int(parsed_start) % block_size or step % block_size:
@@ -429,9 +432,9 @@ def _validate_prefix_set(
                 "formulaic prefix set overflows its AFI",
             )
         )
-    elif (
-        parsed_start not in parsed_parent
-        or ipaddress.ip_address(terminal) not in parsed_parent
+    elif not any(
+        int(first) <= int(parsed_start) and terminal <= int(last)
+        for first, last in parents
     ):
         issues.append(
             _issue(
@@ -440,6 +443,72 @@ def _validate_prefix_set(
                 "formulaic prefix set is not contained by parent_network",
             )
         )
+
+
+def _validated_prefix_parents(
+    source: t.Any,
+    parsed_parent: ipaddress.IPv4Network | ipaddress.IPv6Network | None,
+    afi: str,
+    path: str,
+    issues: list[ValidationIssue],
+) -> list[tuple[t.Any, t.Any]] | None:
+    """Merge the parent and its extensions into one contiguous address range."""
+    extensions = source.extension_parent_networks
+    if not isinstance(extensions, tuple) or not all(
+        isinstance(network, str) for network in extensions
+    ):
+        issues.append(
+            _issue(
+                f"{path}.source.extension_parent_networks",
+                "invalid_parent_network",
+                "extension_parent_networks must be a tuple of network strings",
+            )
+        )
+        return None
+    networks = [parsed_parent]
+    for index, network in enumerate(extensions):
+        parsed = _parse_network(network, afi)
+        if parsed is None:
+            issues.append(
+                _issue(
+                    f"{path}.source.extension_parent_networks[{index}]",
+                    "invalid_parent_network",
+                    "extension parent must be a network in the prefix-set AFI",
+                )
+            )
+        networks.append(parsed)
+    if any(network is None for network in networks):
+        return None
+    ordered = sorted(
+        t.cast(list[ipaddress.IPv4Network | ipaddress.IPv6Network], networks),
+        key=lambda network: int(network.network_address),
+    )
+    merged: list[tuple[t.Any, t.Any]] = []
+    for network in ordered:
+        if merged and int(network.network_address) <= int(merged[-1][1]):
+            issues.append(
+                _issue(
+                    f"{path}.source.extension_parent_networks",
+                    "overlapping_parent_networks",
+                    f"parent networks overlap at {network}",
+                )
+            )
+            return None
+        if merged and int(network.network_address) > int(merged[-1][1]) + 1:
+            issues.append(
+                _issue(
+                    f"{path}.source.extension_parent_networks",
+                    "non_contiguous_parent_networks",
+                    f"parent networks must form one contiguous range; {network} "
+                    f"starts after a gap following {merged[-1][1]}",
+                )
+            )
+            return None
+        if merged:
+            merged[-1] = (merged[-1][0], network.broadcast_address)
+        else:
+            merged.append((network.network_address, network.broadcast_address))
+    return merged
 
 
 def _validated_prefix_span(

@@ -91,6 +91,7 @@ from taac.abstractions.topology import (
     NextHopDistribution,
     NextHopIntent,
     NextHopMode,
+    OpenRInjectionScale,
     OpenRMode,
     PeerPrefixActivation,
     PeerPrefixDistribution,
@@ -105,6 +106,60 @@ from taac.abstractions.topology import (
     StandardCommunity,
     TaskCompatibilityProfile,
 )
+
+
+@dataclass(frozen=True)
+class EbbScaleProfile:
+    """The EBB fleet scale one topology instance emulates.
+
+    A scale is a fiscal-year fleet target, not a chassis or a testbed: it says
+    how many HE sites each DC plane stands in for, and therefore how much
+    synthetic Open/R reachability the DUT must be given. It carries no
+    addresses -- those come from the bound topology -- so the same profile is
+    correct on every chassis.
+
+    ``he_sites_per_range`` is deliberately independent of the emulated peer
+    count. The injection has to cover every advertised route next hop with
+    room to spare, so it is sized to the fleet the plane represents rather
+    than to the number of IXIA sessions standing in for it.
+
+    Attributes:
+        name: Stable identifier for the profile, used in diagnostics.
+        he_sites_per_range: HE sites emulated per DC plane, which is also the
+            synthetic nodes and host routes injected per range, per AFI.
+        next_hop_step: Address stride between consecutive HE sites. Must match
+            the stride the plane's advertised route next hops use.
+    """
+
+    name: str
+    he_sites_per_range: int
+    next_hop_step: int = 2
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("EBB scale profile requires a name")
+        # Resolve once at construction so an invalid site count or stride is
+        # rejected here rather than at the first bind. Discarding the result
+        # is the point: OpenRInjectionScale owns the validation.
+        _ = self.openr_injection_scale
+
+    @property
+    def openr_injection_scale(self) -> OpenRInjectionScale:
+        return OpenRInjectionScale(
+            count=self.he_sites_per_range,
+            step=self.next_hop_step,
+        )
+
+
+# Scheduled: every EBB CICD binding runs this. 4 DC planes x 63 HE sites gives
+# 252 synthetic nodes and 504 injected host routes.
+EBB_FY26_SCALE = EbbScaleProfile(name="EBB_FY26", he_sites_per_range=63)
+
+# Not scheduled anywhere. Defined so the FY27 fleet target is expressible and
+# testable -- 4 x 80 gives 320 synthetic nodes and 640 injected host routes --
+# before any testbed is committed to running it.
+EBB_FY27_SCALE = EbbScaleProfile(name="EBB_FY27", he_sites_per_range=80)
+
 
 EBB_PARENT_NETWORKS: dict[str, str] = {
     "ebgp_v6": IXIA_EBGP_IC_PARENT_NETWORK_V6,
@@ -1003,6 +1058,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v6_dc_p1",
             role="ibgp_dc_p1",
+            openr_injection_range_ordinal=1,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v6",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1023,6 +1079,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v6_dc_p2",
             role="ibgp_dc_p2",
+            openr_injection_range_ordinal=2,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v6",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1043,6 +1100,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v6_dc_p3",
             role="ibgp_dc_p3",
+            openr_injection_range_ordinal=3,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v6",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1063,6 +1121,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v6_dc_p4",
             role="ibgp_dc_p4",
+            openr_injection_range_ordinal=4,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v6",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1084,6 +1143,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v4_dc_p1",
             role="ibgp_dc_p1",
+            openr_injection_range_ordinal=1,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v4",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1104,6 +1164,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v4_dc_p2",
             role="ibgp_dc_p2",
+            openr_injection_range_ordinal=2,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v4",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1124,6 +1185,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v4_dc_p3",
             role="ibgp_dc_p3",
+            openr_injection_range_ordinal=3,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v4",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1144,6 +1206,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v4_dc_p4",
             role="ibgp_dc_p4",
+            openr_injection_range_ordinal=4,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v4",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1363,6 +1426,7 @@ def _with_ebb_route_intent(
     extra_advertisements: t.Mapping[str, tuple[PrefixAdvertisement, ...]] | None = None,
     next_hops: EbbNextHopScheme,
     route_storm_shards: bool = False,
+    scale: EbbScaleProfile,
 ) -> LogicalTopology:
     if ebgp_prefix_count < 750:
         raise ValueError("ebgp_prefix_count must be at least 750")
@@ -1441,6 +1505,11 @@ def _with_ebb_route_intent(
             openr_mode=openr_mode,
             openr_injected_start_ipv4s=tuple(injected_v4),
             openr_injected_start_ipv6s=tuple(injected_v6),
+            openr_injection_scale=(
+                scale.openr_injection_scale
+                if openr_mode is OpenRMode.STANDALONE
+                else None
+            ),
         ),
         policies=(EBB_ACCEPT_POLICY,),
         prefix_sets=(*prefix_sets, *extra_prefix_sets),
@@ -1452,6 +1521,7 @@ EBB_FULL_SCALE_WITH_BGPMON = replace(
         _EBB_FULL_SCALE_WITH_BGPMON_BASE,
         openr_mode=OpenRMode.NONE,
         next_hops=EBB_NEXT_HOPS,
+        scale=EBB_FY26_SCALE,
     ),
     legacy_profile=None,
     task_compatibility_profile=TaskCompatibilityProfile.EBB_FULL_SCALE_WITH_BGPMON,
@@ -1482,6 +1552,7 @@ EBB_FULL_SCALE_NO_BGPMON = replace(
         _EBB_FULL_SCALE_NO_BGPMON_BASE,
         openr_mode=OpenRMode.NONE,
         next_hops=EBB_NEXT_HOPS,
+        scale=EBB_FY26_SCALE,
     ),
     legacy_profile=None,
     task_compatibility_profile=TaskCompatibilityProfile.EBB_FULL_SCALE_NO_BGPMON,
@@ -1501,6 +1572,7 @@ def ebb_full_scale_topology(
     extra_advertisements: t.Mapping[str, tuple[PrefixAdvertisement, ...]] | None = None,
     next_hops: EbbNextHopScheme = EBB_NEXT_HOPS,
     route_storm_shards: bool = False,
+    scale: EbbScaleProfile,
 ) -> LogicalTopology:
     base = (
         _EBB_FULL_SCALE_WITH_BGPMON_BASE
@@ -1519,6 +1591,7 @@ def ebb_full_scale_topology(
         extra_advertisements=extra_advertisements,
         next_hops=next_hops,
         route_storm_shards=route_storm_shards,
+        scale=scale,
     )
     if not route_storm_shards:
         return topology
@@ -1536,6 +1609,8 @@ def ebb_full_scale_topology(
 
 __all__ = (
     "BGP_MON_PEER_GROUP",
+    "EBB_FY26_SCALE",
+    "EBB_FY27_SCALE",
     "EBB_AS_NUMBERS",
     "EBB_BASELINE_ATTRIBUTES",
     "EBB_DEVICE_CONFIG",
@@ -1559,6 +1634,7 @@ __all__ = (
     "EBB_OPENR_INJECTED_START_IPV6S_IXIA03",
     "EBB_PARENT_NETWORKS_IXIA03",
     "EbbNextHopScheme",
+    "EbbScaleProfile",
     "EBB_PARENT_NETWORKS",
     "EBB_PEER_GROUPS",
     "EBB_PREFIX_SETS",

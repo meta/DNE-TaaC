@@ -5,18 +5,30 @@ import json
 import runpy
 import typing as t
 import unittest
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
+from taac.abstractions.physical_inventory import NRQEB009_ASH6
 from taac.abstractions.topologies.ebb_full_scale import (
+    EBB_AS_NUMBERS,
+    EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
+    ebb_full_scale_topology,
+    EBB_FY26_SCALE,
+    EBB_NEXT_HOPS_IXIA03,
     EBB_OPENR_INJECTED_START_IPV4S,
     EBB_OPENR_INJECTED_START_IPV4S_IXIA03,
     EBB_OPENR_INJECTED_START_IPV6S,
     EBB_OPENR_INJECTED_START_IPV6S_IXIA03,
     EBB_PARENT_NETWORKS,
     EBB_PARENT_NETWORKS_IXIA03,
+    EBB_PEER_GROUPS,
 )
-from taac.abstractions.topology.model import BoundTopology
+from taac.abstractions.topology.model import (
+    BoundTopology,
+    NextHopMode,
+    OpenRMode,
+)
 from taac.constants import (
     BgpPlusPlusProfile,
     TESTBED_ISOLATION_BYPASS_TAG,
@@ -118,6 +130,7 @@ def _compiled_topology() -> mock.MagicMock:
 
 def _bound_shape(prefix_count: int) -> BoundTopology:
     topology = factory.ebb_full_scale_topology(
+        scale=EBB_FY26_SCALE,
         openr_mode=factory.OpenRMode.STANDALONE,
         ebgp_prefix_count=prefix_count,
     )
@@ -1028,3 +1041,76 @@ class GatewayGateScopeTest(unittest.TestCase):
             with self.subTest(config=name):
                 self.assertNotEqual(self.gateless[name], config)
                 self.assertEqual(self.gateless[name], _without_gateway_gates(config))
+
+
+class EbbInjectionRangeAnchorWithRuntimeAdvertisementsTest(unittest.TestCase):
+    """A plane may bind more than one advertisement and still anchor a range.
+
+    The TC7 runtime intents add a second, next-hop-self advertisement to the
+    DC planes. Counting advertisements rather than eligible injection sources
+    rejected the whole UG 2.7 suite at compile time, because a SELF
+    advertisement is auxiliary here: its next hops are the session addresses,
+    which no injection covers. These lock the filter in place.
+    """
+
+    def _bind_with_advertisements(
+        self, replacement: t.Callable[[t.Any], tuple[t.Any, ...]]
+    ) -> BoundTopology:
+        bound = ebb_full_scale_topology(
+            scale=EBB_FY26_SCALE,
+            openr_mode=OpenRMode.STANDALONE,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+        ).bind_to_inventory(
+            physical_inventory=NRQEB009_ASH6,
+            port_map=EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            peer_groups=EBB_PEER_GROUPS,
+            as_numbers=EBB_AS_NUMBERS,
+        )
+        return replace(
+            bound,
+            device_groups=tuple(
+                replace(group, prefix_advertisements=replacement(group))
+                if group.name == "dg_ibgp_v4_dc_p1"
+                else group
+                for group in bound.device_groups
+            ),
+        )
+
+    def test_zero_eligible_sources_is_rejected(self) -> None:
+        """Every advertisement next-hop-self leaves nothing to anchor on."""
+        bound = self._bind_with_advertisements(
+            lambda group: tuple(
+                replace(
+                    advertisement,
+                    spec=replace(
+                        advertisement.spec,
+                        next_hop=replace(
+                            advertisement.spec.next_hop, mode=NextHopMode.SELF
+                        ),
+                    ),
+                )
+                for advertisement in group.prefix_advertisements
+            )
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            bound.resolve_openr_injection_plan()
+        message = str(caught.exception)
+        self.assertIn("dg_ibgp_v4_dc_p1", message)
+        self.assertIn("0 eligible of 1", message)
+        self.assertIn("next-hop-self", message)
+
+    def test_multiple_eligible_sources_are_rejected(self) -> None:
+        """Two externally resolved advertisements make the anchor ambiguous."""
+        bound = self._bind_with_advertisements(
+            lambda group: group.prefix_advertisements * 2
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            bound.resolve_openr_injection_plan()
+        message = str(caught.exception)
+        self.assertIn("dg_ibgp_v4_dc_p1", message)
+        self.assertIn("2 eligible of 2", message)
+        self.assertIn("ambiguous", message)
+        self.assertIn("per_peer", message)

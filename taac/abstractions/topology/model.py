@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import ipaddress
 import typing as t
-from dataclasses import dataclass, field, fields, MISSING
+from dataclasses import dataclass, field, fields, MISSING, replace
 from enum import Enum
+from functools import cached_property
 
 from taac.abstractions.config_artifact_semantics import (
     ConfigArtifactRef,
@@ -28,7 +29,9 @@ from taac.abstractions.topology.attributes import (
     RouteAttributePool,
 )
 from taac.abstractions.topology.prefix import (
+    NextHopDistribution,
     NextHopIntent,
+    NextHopMode,
     PeerPrefixActivation,
     PrefixAllocation,
     PrefixMembership,
@@ -422,6 +425,269 @@ class OpenRStandaloneLink:
         }
 
 
+@dataclass(frozen=True)
+class OpenRInjectionScale:
+    """How much synthetic reachability each Open/R injection range carries.
+
+    Unresolved intent: it fixes the size and stride of every range without
+    naming an address. The addresses come from the bound topology, so a scale
+    is reusable across chassis and testbeds.
+
+    Attributes:
+        count: Synthetic nodes, and therefore host routes per address family,
+            injected per range.
+        step: Address stride between consecutive injected host routes. Must
+            match the stride the emulated peers' advertised next hops use, or
+            the advertised next hops land between injected routes and never
+            resolve.
+    """
+
+    count: int
+    step: int = 2
+
+    def __post_init__(self) -> None:
+        for name, value in (("count", self.count), ("step", self.step)):
+            # bool is an int subclass, and a float count silently yields a
+            # non-integer range, so both are rejected rather than coerced.
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"Open/R injection {name} must be an int; got {value!r}"
+                )
+            if value < 1:
+                raise ValueError(
+                    f"Open/R injection {name} must be positive; got {value}"
+                )
+
+
+@dataclass(frozen=True)
+class OpenRInjectionExpansion:
+    """The exact KvStore content one resolved injection plan owns.
+
+    Setup creates precisely these keys. Teardown does not delete them
+    individually: the withdrawal task passes no explicit delete count and the
+    Open/R daemon stop remains the cleanup boundary, which is pre-existing
+    behavior this model does not change. Holding the inventory as data --
+    rather than only as a side effect of the renderer -- is what lets a unit
+    test assert the injected scale without a device.
+
+    The key grammar mirrors ``internal/utils/openr_kvstore_utils.py``:
+    ``adj:<owner>`` for the owner's own adjacency database, ``adj:<node>``
+    for each synthetic node, and ``prefix:<node>:[<prefix>]`` for each
+    advertised host route.
+    """
+
+    owner_hostname: str
+    synthetic_node_names: tuple[str, ...]
+    ipv4_prefixes: tuple[str, ...]
+    ipv6_prefixes: tuple[str, ...]
+    local_adjacency_key: str
+    synthetic_adjacency_keys: tuple[str, ...]
+    ipv4_prefix_keys: tuple[str, ...]
+    ipv6_prefix_keys: tuple[str, ...]
+
+    @property
+    def synthetic_node_count(self) -> int:
+        return len(self.synthetic_node_names)
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return (
+            self.local_adjacency_key,
+            *self.synthetic_adjacency_keys,
+            *self.ipv4_prefix_keys,
+            *self.ipv6_prefix_keys,
+        )
+
+    @property
+    def key_count(self) -> int:
+        return len(self.keys)
+
+    @cached_property
+    def injected_addresses(
+        self,
+    ) -> frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        """Every address made reachable, parsed once.
+
+        Cached because callers check whole advertised inventories against it,
+        and rebuilding the set per address turns a linear check quadratic.
+        """
+        return frozenset(
+            ipaddress.ip_address(prefix.split("/", 1)[0])
+            for prefix in (*self.ipv4_prefixes, *self.ipv6_prefixes)
+        )
+
+    def covers(self, addresses: t.Iterable[str]) -> bool:
+        """Whether every address is reachable through an injected host route."""
+        injected = self.injected_addresses
+        return all(ipaddress.ip_address(address) in injected for address in addresses)
+
+    def uncovered(self, addresses: t.Iterable[str]) -> tuple[str, ...]:
+        """The addresses no injected host route reaches, deduplicated and sorted."""
+        injected = self.injected_addresses
+        return tuple(
+            sorted(
+                {
+                    address
+                    for address in addresses
+                    if ipaddress.ip_address(address) not in injected
+                }
+            )
+        )
+
+
+@dataclass(frozen=True)
+class OpenRInjectionPlan:
+    """A resolved synthetic Open/R injection: which ranges, how many, how far apart.
+
+    One range per plane and address family. ``start_ipv4s[i]`` and
+    ``start_ipv6s[i]`` describe the same plane, which is how the renderer
+    pairs them, so the two sequences must stay the same length and in the
+    same order.
+
+    ``advertised_pnh_count`` is how many leading nodes of every range the
+    emulated peers advertise as BGP next hops: rows ``0..N-1`` are advertised,
+    and the remaining ``count - N`` are injected headroom no BGP path uses.
+    It is read from the bound advertisements, never from ``count``, and is
+    None for a plan not resolved from a topology.
+    """
+
+    start_ipv4s: tuple[str, ...]
+    start_ipv6s: tuple[str, ...]
+    count: int
+    step: int
+    advertised_pnh_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.start_ipv4s:
+            raise ValueError("Open/R injection plan requires at least one range")
+        if len(self.start_ipv4s) != len(self.start_ipv6s):
+            raise ValueError(
+                "Open/R injection plan needs one IPv6 start per IPv4 start; got "
+                f"{len(self.start_ipv4s)} IPv4 and {len(self.start_ipv6s)} IPv6"
+            )
+        for starts, version in ((self.start_ipv4s, 4), (self.start_ipv6s, 6)):
+            if len(set(starts)) != len(starts):
+                raise ValueError(
+                    f"Open/R injection IPv{version} starts must be distinct; "
+                    f"got {list(starts)}"
+                )
+            for start in starts:
+                if ipaddress.ip_address(start).version != version:
+                    raise ValueError(
+                        f"Open/R injection expected an IPv{version} start; got {start!r}"
+                    )
+        # Reuses the scale validation so an inline plan cannot bypass it.
+        OpenRInjectionScale(count=self.count, step=self.step)
+        advertised = self.advertised_pnh_count
+        if advertised is not None:
+            if isinstance(advertised, bool) or not isinstance(advertised, int):
+                raise TypeError(
+                    "Open/R injection advertised_pnh_count must be an int; "
+                    f"got {advertised!r}"
+                )
+            if not 1 <= advertised <= self.count:
+                raise ValueError(
+                    "Open/R injection advertised_pnh_count must be within "
+                    f"1..{self.count}, the injected nodes per range; got {advertised}"
+                )
+        self._reject_overlapping_ranges()
+
+    def _reject_overlapping_ranges(self) -> None:
+        """Reject ranges whose expansions collide.
+
+        Distinct starts are not enough: two starts fewer than ``count * step``
+        apart expand into each other, and the overlapping nodes would then
+        carry the same prefix keys. The injected host count comes out silently
+        short, so this fails at construction instead of on the DUT.
+        """
+        for starts in (self.start_ipv4s, self.start_ipv6s):
+            owner_by_address: dict[int, str] = {}
+            for start in starts:
+                first = int(ipaddress.ip_address(start))
+                for index in range(self.count):
+                    address = first + self.step * index
+                    collided = owner_by_address.setdefault(address, start)
+                    if collided != start:
+                        raise ValueError(
+                            "Open/R injection ranges must not overlap; "
+                            f"{start} and {collided} both expand through "
+                            f"{ipaddress.ip_address(address)} at "
+                            f"count={self.count} step={self.step}"
+                        )
+
+    @classmethod
+    def from_scale(
+        cls,
+        scale: OpenRInjectionScale,
+        start_ipv4s: t.Sequence[str],
+        start_ipv6s: t.Sequence[str],
+    ) -> OpenRInjectionPlan:
+        return cls(
+            start_ipv4s=tuple(start_ipv4s),
+            start_ipv6s=tuple(start_ipv6s),
+            count=scale.count,
+            step=scale.step,
+        )
+
+    @property
+    def scale(self) -> OpenRInjectionScale:
+        return OpenRInjectionScale(count=self.count, step=self.step)
+
+    @property
+    def range_count(self) -> int:
+        return len(self.start_ipv4s)
+
+    @property
+    def synthetic_node_count(self) -> int:
+        return self.range_count * self.count
+
+    def host_routes(self, start: str) -> tuple[str, ...]:
+        """Expand one range start into the host routes injected for it."""
+        first = ipaddress.ip_address(start)
+        length = first.max_prefixlen
+        return tuple(
+            f"{type(first)(int(first) + self.step * index)}/{length}"
+            for index in range(self.count)
+        )
+
+    def expand(self, owner_hostname: str) -> OpenRInjectionExpansion:
+        """Resolve the plan into the KvStore content it owns on ``owner_hostname``.
+
+        Pure: no device, no client, no I/O. Mirrors the per-plane, per-index
+        iteration the runtime injector performs, including its synthetic node
+        naming, so the content can be asserted directly.
+        """
+        if not owner_hostname:
+            raise ValueError("Open/R injection expansion requires an owner hostname")
+        node_names: list[str] = []
+        ipv4_prefixes: list[str] = []
+        ipv6_prefixes: list[str] = []
+        ipv4_keys: list[str] = []
+        ipv6_keys: list[str] = []
+        for plane, (start_ipv4, start_ipv6) in enumerate(
+            zip(self.start_ipv4s, self.start_ipv6s)
+        ):
+            plane_ipv4 = self.host_routes(start_ipv4)
+            plane_ipv6 = self.host_routes(start_ipv6)
+            for index in range(self.count):
+                node_name = f"node.{owner_hostname}.{plane}.{index}"
+                node_names.append(node_name)
+                ipv4_prefixes.append(plane_ipv4[index])
+                ipv6_prefixes.append(plane_ipv6[index])
+                ipv4_keys.append(f"prefix:{node_name}:[{plane_ipv4[index]}]")
+                ipv6_keys.append(f"prefix:{node_name}:[{plane_ipv6[index]}]")
+        return OpenRInjectionExpansion(
+            owner_hostname=owner_hostname,
+            synthetic_node_names=tuple(node_names),
+            ipv4_prefixes=tuple(ipv4_prefixes),
+            ipv6_prefixes=tuple(ipv6_prefixes),
+            local_adjacency_key=f"adj:{owner_hostname}",
+            synthetic_adjacency_keys=tuple(f"adj:{name}" for name in node_names),
+            ipv4_prefix_keys=tuple(ipv4_keys),
+            ipv6_prefix_keys=tuple(ipv6_keys),
+        )
+
+
 @dataclass(frozen=True, init=False)
 class RoutingDeviceConfig:
     update_group_enable: bool = False
@@ -436,6 +702,13 @@ class RoutingDeviceConfig:
     # routes arrive, sit in the RIB unresolved, and never become installable.
     openr_injected_start_ipv4s: tuple[str, ...] = ()
     openr_injected_start_ipv6s: tuple[str, ...] = ()
+    # Size and stride of the synthetic reachability Open/R injects for the next
+    # hops the emulated peers advertise. The addresses are NOT recorded here:
+    # they are derived at lowering time from the bound route advertisements of
+    # the device groups that declare an injection range, so the injected set
+    # cannot drift from the advertised set. None means "use the renderer
+    # default", which is the ixia11 set at the legacy 63/2 scale.
+    openr_injection_scale: OpenRInjectionScale | None = None
     route_limit: int | str | None = None
     prefix_limit: int | str | None = None
     per_peer_max_route_limit: int | str | None = None
@@ -550,6 +823,14 @@ class DeviceGroupSpec:
     dut_neighbor_absent: bool = False
     peer_relationship: PeerRelationship | None = None
     slow_peer: BgpSlowPeerConfig | None = None
+    # 1-based ordinal of the Open/R injection range this group's advertised
+    # route next hops belong to, or None when the group owns no range. Declared
+    # per group rather than inferred from the role name, so the lowering never
+    # branches on a topology or role string and a group that must stay out of
+    # the injection -- an auxiliary, monitor, or MP plane -- is excluded simply
+    # by saying nothing. The ordinals fix the order the ranges are injected in;
+    # within one address family they must form 1..N exactly.
+    openr_injection_range_ordinal: int | None = None
 
 
 @dataclass(frozen=True)
@@ -835,6 +1116,114 @@ class BoundRoutingConfig:
             raise ValueError("bound routing config variants are not implemented")
 
 
+def _openr_injection_range_start(
+    group: BoundDeviceGroup,
+) -> tuple[str, tuple[str, ...]]:
+    """Read one declared injection range's start out of a bound device group.
+
+    A group may bind more than one advertisement: the TC7 runtime intents add
+    a next-hop-self advertisement alongside the plane's real one. Only an
+    advertisement whose next hops are externally resolved can anchor a range,
+    so the auxiliary SELF ones are filtered out rather than counted. Exactly
+    one eligible source must remain.
+
+    Returns the range start -- the numerically lowest next hop that source
+    advertises -- together with every next hop it advertises, which the caller
+    checks against the resolved injection.
+    """
+    # A SELF advertisement's next hops are the session addresses, which no
+    # injection covers; it is auxiliary here, not a candidate.
+    candidates = [
+        advertisement
+        for advertisement in group.prefix_advertisements
+        if advertisement.spec.next_hop.mode is not NextHopMode.SELF
+    ]
+    # Distribution is still enforced for every non-SELF candidate: an
+    # unsupported one is a malformed source, not something to skip past.
+    for candidate in candidates:
+        distribution = candidate.spec.next_hop.distribution
+        if distribution is not NextHopDistribution.PER_PEER:
+            observed = "unset" if distribution is None else distribution.value
+            raise ValueError(
+                f"{group.name} declares an Open/R injection range but its "
+                f"advertisement {candidate.spec.name!r} distributes next hops "
+                f"{observed!r}; range anchoring supports only "
+                f"{NextHopDistribution.PER_PEER.value!r}"
+            )
+    if len(candidates) != 1:
+        described = ", ".join(
+            f"{advertisement.spec.name!r}"
+            f"(mode={advertisement.spec.next_hop.mode.value}, "
+            f"distribution="
+            f"{getattr(advertisement.spec.next_hop.distribution, 'value', 'unset')})"
+            for advertisement in group.prefix_advertisements
+        )
+        reason = (
+            "advertises next-hop-self on every one, so none can anchor a range"
+            if not candidates
+            else "binds several externally resolved advertisements, so the "
+            "range anchor is ambiguous"
+        )
+        raise ValueError(
+            f"{group.name} declares an Open/R injection range but "
+            f"{reason}; {len(candidates)} eligible of "
+            f"{len(group.prefix_advertisements)} bound advertisement(s): "
+            f"{described}"
+        )
+    (advertisement,) = candidates
+    resolved = tuple(
+        str(advertisement.path_at(row, 0).next_hop) for row in range(group.peer_count)
+    )
+    if not resolved:
+        raise ValueError(
+            f"{group.name} declares an Open/R injection range but advertises "
+            "no route next hops"
+        )
+    # v4 rows are ordered lexically, so row 0 is not necessarily the lowest
+    # address; the range always starts at the numeric minimum.
+    start = min(resolved, key=lambda value: int(ipaddress.ip_address(value)))
+    return start, resolved
+
+
+def _openr_advertised_pnh_count(
+    advertised_by_group: t.Mapping[str, tuple[str, tuple[str, ...]]],
+    step: int,
+) -> int:
+    """How many leading rows every injection range is known to advertise.
+
+    Consumers address advertised next hops as injection rows ``0..N-1``. A
+    disabled peer may leave a gap and the two AFIs may advertise different
+    populations, so the safe shared bound is the shortest contiguous prefix
+    starting at row zero across all ranges. Rows beyond a gap remain covered
+    by the injection, but are deliberately outside this common consumer bound.
+    """
+    leading_counts: dict[str, int] = {}
+    for name, (start, advertised) in advertised_by_group.items():
+        first = int(ipaddress.ip_address(start))
+        offsets = {int(ipaddress.ip_address(address)) - first for address in advertised}
+        invalid_offsets = sorted(
+            offset for offset in offsets if offset < 0 or offset % step != 0
+        )
+        if invalid_offsets:
+            raise ValueError(
+                f"{name} advertises next hops that are not injection rows at "
+                f"step={step} from {start}; offsets: {invalid_offsets[:5]}..."
+            )
+        rows = {offset // step for offset in offsets}
+        leading_count = 0
+        while leading_count in rows:
+            leading_count += 1
+        leading_counts[name] = leading_count
+
+    count = min(leading_counts.values())
+    if count == 0:
+        raise ValueError(
+            "Open/R injection ranges have no common advertised prefix starting "
+            f"at row zero: {dict(sorted(leading_counts.items()))}"
+        )
+    return count
+
+
 @dataclass(frozen=True)
 class BoundTopology:
     """Resolved logical intent bound to a physical inventory."""
@@ -896,3 +1285,102 @@ class BoundTopology:
             "neteng.test_infra.dne.taac.abstractions.inspection"
         )
         return inspection.inspect_resolved_intent(self)
+
+    def resolve_openr_injection_plan(self) -> OpenRInjectionPlan | None:
+        """Resolve the synthetic Open/R injection this bound topology implies.
+
+        The injected range starts are read back out of the bound route
+        advertisements of the device groups that declare an injection range
+        ordinal, never from a chassis constant and never from the IXIA session
+        addresses. Emulated peers advertise those next hops and Open/R has to
+        make them resolvable, so expressing the two sets separately lets them
+        drift -- silently, because unresolved routes still arrive and sit in
+        the RIB. Deriving one from the other removes the failure mode.
+
+        Returns:
+            The resolved plan, or None when the device config declares no
+            injection scale, which leaves the renderer on its own defaults.
+
+        Raises:
+            ValueError: A declared range is unusable -- missing, duplicated,
+                not numbered 1..N, carrying no single advertisement, resolving
+                next-hop-self, or advertising a next hop the resolved
+                injection would not make reachable.
+        """
+        scale = self.device_config.openr_injection_scale if self.device_config else None
+        if scale is None:
+            return None
+
+        starts_by_afi: dict[str, dict[int, str]] = {"v4": {}, "v6": {}}
+        advertised_by_afi: dict[str, set[str]] = {"v4": set(), "v6": set()}
+        advertised_by_group: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for group in self.device_groups:
+            ordinal = group.spec.openr_injection_range_ordinal
+            if ordinal is None:
+                continue
+            afi = group.spec.afi
+            if afi not in starts_by_afi:
+                raise ValueError(
+                    f"{group.name} declares an Open/R injection range for "
+                    f"unsupported AFI {afi!r}"
+                )
+            if ordinal in starts_by_afi[afi]:
+                raise ValueError(
+                    f"Open/R injection range {ordinal} is declared twice for {afi}"
+                )
+            start, resolved = _openr_injection_range_start(group)
+            advertised_by_afi[afi].update(resolved)
+            advertised_by_group[group.name] = (start, resolved)
+            starts_by_afi[afi][ordinal] = start
+
+        if not starts_by_afi["v4"] and not starts_by_afi["v6"]:
+            raise ValueError(
+                f"{self.logical_topology.name} declares an Open/R injection "
+                "scale but no device group declares an injection range"
+            )
+        for afi, other in (("v4", "v6"), ("v6", "v4")):
+            if not starts_by_afi[afi]:
+                raise ValueError(
+                    f"{self.logical_topology.name} declares "
+                    f"{len(starts_by_afi[other])} Open/R injection range(s) for "
+                    f"{other} but none for {afi}; the injection is dual-stack "
+                    "and needs one range per plane in each address family"
+                )
+        range_count = len(starts_by_afi["v4"])
+        for afi, starts in starts_by_afi.items():
+            if sorted(starts) != list(range(1, range_count + 1)):
+                raise ValueError(
+                    f"Open/R injection {afi} ranges must be numbered "
+                    f"1..{range_count} with no gaps or duplicates; "
+                    f"got {sorted(starts)}"
+                )
+
+        plan = OpenRInjectionPlan.from_scale(
+            scale,
+            start_ipv4s=[
+                starts_by_afi["v4"][ordinal] for ordinal in range(1, range_count + 1)
+            ],
+            start_ipv6s=[
+                starts_by_afi["v6"][ordinal] for ordinal in range(1, range_count + 1)
+            ],
+        )
+        # Read-only evidence: the bound advertisements are the requirement, the
+        # injection is the supply. A next hop outside the injected set would
+        # arrive and never resolve.
+        expansion = plan.expand("validation")
+        unreachable = expansion.uncovered(
+            address for addresses in advertised_by_afi.values() for address in addresses
+        )
+        if unreachable:
+            raise ValueError(
+                f"{self.logical_topology.name} advertises {len(unreachable)} route "
+                f"next hop(s) the resolved Open/R injection would not make "
+                f"reachable at count={plan.count} step={plan.step}; "
+                f"sample: {unreachable[:5]}"
+            )
+        return replace(
+            plan,
+            advertised_pnh_count=_openr_advertised_pnh_count(
+                advertised_by_group, plan.step
+            ),
+        )

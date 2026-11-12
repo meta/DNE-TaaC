@@ -38,6 +38,7 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
     EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
     ebb_full_scale_topology,
+    EBB_FY26_SCALE,
     ebb_ibgp_route_next_hops,
     EBB_NEXT_HOPS,
     EBB_NEXT_HOPS_IXIA03,
@@ -189,6 +190,7 @@ def _bound_full_scale_automation_artifact(
     next_hops: t.Any,
 ) -> BoundTopology:
     topology = ebb_full_scale_topology(
+        scale=EBB_FY26_SCALE,
         openr_mode=OpenRMode.STANDALONE,
         include_bgpmon=True,
         ebgp_prefix_count=_DEFAULT_EBGP_PREFIX_COUNT,

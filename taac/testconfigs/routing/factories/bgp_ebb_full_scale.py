@@ -20,6 +20,7 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_FULL_SCALE_PORT_MAP,
     EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
     ebb_full_scale_topology,
+    EBB_FY26_SCALE,
     ebb_ibgp_route_next_hop_starts,
     EBB_NEXT_HOPS,
     EBB_PARENT_NETWORKS,
@@ -1689,6 +1690,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
         else _DEFAULT_EBGP_PREFIX_COUNT
     )
     topology = topology_override or ebb_full_scale_topology(
+        scale=EBB_FY26_SCALE,
         next_hops=next_hops,
         openr_mode=openr_mode,
         include_bgpmon=include_auxiliary_observers,

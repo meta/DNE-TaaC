@@ -25,6 +25,7 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
     EBB_FULL_SCALE_PORT_MAP,
     ebb_full_scale_topology,
+    EBB_FY26_SCALE,
     EBB_PARENT_NETWORKS,
     EBB_PEER_GROUPS,
 )
@@ -196,6 +197,7 @@ def build_bag_conveyor_test_config(
         else OpenRMode.NONE
     )
     bound = ebb_full_scale_topology(
+        scale=EBB_FY26_SCALE,
         openr_mode=openr_mode,
         include_bgpmon=False,
         ebgp_graceful_restart=ebgp_graceful_restart,
@@ -426,6 +428,7 @@ def _create_eb03_distribution_correctness_test_config(
     lab_password = get_lab_device_password(lab_password_env)
     compiled = (
         ebb_full_scale_topology(
+            scale=EBB_FY26_SCALE,
             openr_mode=OpenRMode.NONE,
             include_bgpmon=False,
         )

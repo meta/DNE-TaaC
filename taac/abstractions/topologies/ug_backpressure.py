@@ -10,6 +10,7 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
     EBB_FULL_SCALE_PORT_MAP,
     ebb_full_scale_topology,
+    EBB_FY26_SCALE,
     EBB_PARENT_NETWORKS,
     EBB_PEER_GROUPS,
 )
@@ -35,6 +36,7 @@ from taac.abstractions.topology import (
 
 _PREFIXES_PER_PEER = 750
 _UG_BACKPRESSURE_BASE = ebb_full_scale_topology(
+    scale=EBB_FY26_SCALE,
     openr_mode=OpenRMode.NONE,
     include_bgpmon=False,
     include_legacy_community_rows=False,

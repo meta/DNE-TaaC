@@ -15,6 +15,7 @@ from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
     ACL_COMMANDS,
     ADD_INTERN_USER_IDS_CMD,
     BGPCPP_DAEMONS,
+    build_bgp_total_path_limit_override_cmd,
     build_fibagent_bgp_config_deploy_cmd,
     build_fibagent_bgp_config_restore_cmd,
     build_fibagent_bgp_config_verify_cmd,
@@ -646,6 +647,7 @@ class _EbbFullScaleSetupArgs:
     fibagent_bgp_thrift_queue_timeout_ms: int | None = None
     fibagent_bgp_nhg_watermark_high: int | None = None
     fibagent_bgp_nhg_watermark_low: int | None = None
+    bgp_total_path_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -878,6 +880,30 @@ def _ebb_full_scale_bgpcpp_deployment_tasks(
             validate_output=True,
         ),
     ]
+
+    # The deployed config may cap total paths below what the scale needs, so
+    # the override lands before any BGP++ start reads the file.
+    if args.bgp_total_path_limit is not None:
+        tasks.extend(
+            [
+                create_run_commands_on_shell_task(
+                    hostname=device_name,
+                    cmds=[
+                        build_bgp_total_path_limit_override_cmd(
+                            args.bgp_total_path_limit
+                        )
+                    ],
+                    set_outer_hostname=True,
+                    ixia_needed=True,
+                    validate_output=True,
+                ),
+                create_validate_bgpcpp_config_on_device_task(
+                    hostname=device_name,
+                    config_path=_EBB_BGPCPP_CONFIG_PATH,
+                    ixia_needed=True,
+                ),
+            ]
+        )
 
     if not args.enable_update_group:
         tasks.extend(
@@ -7771,6 +7797,7 @@ def _ebb_full_scale_setup_args(bound: BoundTopology) -> _EbbFullScaleSetupArgs:
         ),
         fibagent_bgp_nhg_watermark_high=(device_config.fibagent_bgp_nhg_watermark_high),
         fibagent_bgp_nhg_watermark_low=(device_config.fibagent_bgp_nhg_watermark_low),
+        bgp_total_path_limit=device_config.bgp_total_path_limit,
     )
 
 

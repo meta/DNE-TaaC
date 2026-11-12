@@ -2591,6 +2591,24 @@ def _validate_fibagent_bgp_nhg_watermarks(
         )
 
 
+def _validate_bgp_total_path_limit(
+    config: RoutingDeviceConfig,
+    path: str,
+    issues: list[ValidationIssue],
+) -> None:
+    limit = config.bgp_total_path_limit
+    if limit is None:
+        return
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        issues.append(
+            _issue(
+                f"{path}.bgp_total_path_limit",
+                "invalid_total_path_limit",
+                "bgp_total_path_limit must be None or a positive integer",
+            )
+        )
+
+
 def _validate_routing_device_config(
     config: RoutingDeviceConfig,
     path: str,
@@ -2634,6 +2652,7 @@ def _validate_routing_device_config(
             )
         )
     _validate_fibagent_bgp_nhg_watermarks(config, path, issues)
+    _validate_bgp_total_path_limit(config, path, issues)
     for attr in ("route_limit", "prefix_limit", "per_peer_max_route_limit"):
         value = getattr(config, attr)
         if isinstance(value, bool):

@@ -720,6 +720,9 @@ class RoutingDeviceConfig:
     fibagent_bgp_thrift_queue_timeout_ms: int | None = None
     fibagent_bgp_nhg_watermark_high: int | None = None
     fibagent_bgp_nhg_watermark_low: int | None = None
+    # BGP++ switch_limit_config.total_path_limit to write into the deployed
+    # bgpcpp_config before BGP++ starts. None keeps the deployed value.
+    bgp_total_path_limit: int | None = None
     _taac_overridden_fields: tuple[str, ...] = field(
         default=(),
         repr=False,

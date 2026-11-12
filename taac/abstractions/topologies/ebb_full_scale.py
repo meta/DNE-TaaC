@@ -169,6 +169,9 @@ class EbbScaleProfile:
         ibgp_planes_by_link: Tornado planes carried by each iBGP IXIA link, in
             port-map order. A plane's HE and MP groups always share its link,
             so a plane disruption stays on one physical link.
+        fa_diverse_nhg_memberships: Whether two FA peers sit out of each of
+            the 25 diverse-NHG prefix blocks, producing 50 width-138 baseline
+            NHGs. When false, every FA peer advertises every FA route.
         next_hop_step: Address stride between consecutive HE sites. Must match
             the stride the plane's advertised route next hops use.
         bgp_total_path_limit: BGP++ ``switch_limit_config.total_path_limit``
@@ -187,6 +190,7 @@ class EbbScaleProfile:
     allows_bgp_monitor: bool
     allows_dense_unvetted_route_tail: bool
     ibgp_planes_by_link: tuple[tuple[int, ...], ...]
+    fa_diverse_nhg_memberships: bool
     next_hop_step: int = 2
     bgp_total_path_limit: int | None = None
 
@@ -209,7 +213,11 @@ class EbbScaleProfile:
         _require_count(
             "openr_injection_headroom", self.openr_injection_headroom, minimum=0
         )
-        for field_name in ("allows_bgp_monitor", "allows_dense_unvetted_route_tail"):
+        for field_name in (
+            "allows_bgp_monitor",
+            "allows_dense_unvetted_route_tail",
+            "fa_diverse_nhg_memberships",
+        ):
             value = getattr(self, field_name)
             if not isinstance(value, bool):
                 raise ValueError(
@@ -275,6 +283,7 @@ EBB_FY26_SCALE = EbbScaleProfile(
     allows_bgp_monitor=True,
     allows_dense_unvetted_route_tail=False,
     ibgp_planes_by_link=(_EBB_TORNADO_PLANES,),
+    fa_diverse_nhg_memberships=True,
 )
 
 # FY27 Scenario 1, from the owner's authoritative scale sheet. Not scheduled
@@ -284,7 +293,9 @@ EBB_FY26_SCALE = EbbScaleProfile(
 # need 100,750 candidates; the first 47,250 keep the vetted FY26 exclusions,
 # and the remaining 53,500 are declared dense synthetic prefixes. Tornado
 # planes 1-2 and 3-4 split across two iBGP links so each carries 4 groups x
-# 100 = 400 addresses per AFI, inside the TAAC guard of 500.
+# 100 = 400 addresses per AFI, inside the TAAC guard of 500. The sheet counts
+# 280,000 FA paths (280 sessions x 1,000 routes), so every FA peer advertises
+# every FA route; the FY26 diverse-NHG membership mask would leave 276,000.
 EBB_FY27_SCALE = EbbScaleProfile(
     name="EBB_FY27",
     he_sites_per_range=100,
@@ -299,6 +310,7 @@ EBB_FY27_SCALE = EbbScaleProfile(
     allows_bgp_monitor=False,
     allows_dense_unvetted_route_tail=True,
     ibgp_planes_by_link=((1, 2), (3, 4)),
+    fa_diverse_nhg_memberships=False,
 )
 
 
@@ -1272,6 +1284,7 @@ def _ebb_advertisement(
     prefix_sets_by_name: t.Mapping[str, PrefixSet],
     ebgp_static_prefix_count: int,
     routes_per_he_peer: int,
+    fa_diverse_nhg_memberships: bool,
     next_hop_self: bool = False,
     include_legacy_community_rows: bool = False,
     next_hops: EbbNextHopScheme,
@@ -1333,7 +1346,7 @@ def _ebb_advertisement(
                 advertised_prefix_count,
                 peer_count=device_group.peer_count,
             )
-            if device_group.role == "uplink"
+            if device_group.role == "uplink" and fa_diverse_nhg_memberships
             else None
         ),
         route_attributes=(
@@ -1894,6 +1907,7 @@ def _with_ebb_route_intent(
             prefix_sets_by_name=prefix_sets_by_name,
             ebgp_static_prefix_count=static_prefix_count,
             routes_per_he_peer=scale.routes_per_he_peer,
+            fa_diverse_nhg_memberships=scale.fa_diverse_nhg_memberships,
             next_hop_self=next_hop_self,
             include_legacy_community_rows=include_legacy_community_rows,
             next_hops=next_hops,
@@ -1933,6 +1947,7 @@ def _with_ebb_route_intent(
                 if openr_mode is OpenRMode.STANDALONE
                 else None
             ),
+            bgp_total_path_limit=scale.bgp_total_path_limit,
         ),
         policies=(EBB_ACCEPT_POLICY,),
         prefix_sets=(*prefix_sets, *extra_prefix_sets),

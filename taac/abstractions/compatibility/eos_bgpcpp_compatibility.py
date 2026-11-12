@@ -894,12 +894,16 @@ POST_ACL_RESTART_DAEMONS = ["FibAgent", "FibAgentBgp", "Bgpcpp"]
 EBB_BGPCPP_LOGGING_CONFIG = "DBG1;default:async=true"
 
 
-def build_update_group_setting_override_cmd(
-    enable_update_group: bool,
-    *,
-    config_path: str = "/mnt/flash/bgpcpp_config",
+def _bgpcpp_config_override_cmd(
+    config_path: str,
+    mutation: t.Sequence[str],
+    message: str,
 ) -> str:
-    enabled_literal = repr(enable_update_group)
+    """Rewrite the on-device BGP++ config with ``mutation`` applied to ``config``.
+
+    The replacement is atomic, keeps the file's owner and mode, and is read
+    back before ``message`` is printed.
+    """
     script = "\n".join(
         [
             "import json",
@@ -909,8 +913,7 @@ def build_update_group_setting_override_cmd(
             "from pathlib import Path",
             f"config_path = Path({config_path!r})",
             "config = json.loads(config_path.read_text())",
-            "bgp_settings = config.setdefault('bgp_setting_config', {})",
-            f"bgp_settings['enable_update_group'] = {enabled_literal}",
+            *mutation,
             "updated_content = (json.dumps(config, indent=2) + '\\n').encode()",
             "metadata = config_path.stat()",
             "fd, temporary_name = tempfile.mkstemp(",
@@ -933,11 +936,64 @@ def build_update_group_setting_override_cmd(
             "    temporary_path.unlink(missing_ok=True)",
             "if config_path.read_bytes() != updated_content:",
             "    raise RuntimeError('failed to verify BGP++ config replacement')",
-            f"print('Set bgp_setting_config.enable_update_group={str(enable_update_group).lower()}')",
+            f"print({message!r})",
             "",
         ]
     )
     return _on_device_python_command(script)
+
+
+def build_update_group_setting_override_cmd(
+    enable_update_group: bool,
+    *,
+    config_path: str = "/mnt/flash/bgpcpp_config",
+) -> str:
+    return _bgpcpp_config_override_cmd(
+        config_path,
+        [
+            "bgp_settings = config.setdefault('bgp_setting_config', {})",
+            f"bgp_settings['enable_update_group'] = {enable_update_group!r}",
+        ],
+        "Set bgp_setting_config.enable_update_group="
+        f"{str(enable_update_group).lower()}",
+    )
+
+
+def build_bgp_total_path_limit_override_cmd(
+    total_path_limit: int,
+    *,
+    config_path: str = "/mnt/flash/bgpcpp_config",
+) -> str:
+    """Set ``switch_limit_config.total_path_limit`` in the deployed config.
+
+    Every other switch-limit field, including ``overload_protection_mode``,
+    keeps its deployed value. The deployed config must already carry the
+    block: a fresh one would leave ``prefix_limit`` and the overload mode to
+    BGP++ defaults, so the script fails without writing instead. BGP++ reads
+    the file only when it starts.
+    """
+    if (
+        isinstance(total_path_limit, bool)
+        or not isinstance(total_path_limit, int)
+        or total_path_limit <= 0
+    ):
+        raise ValueError(
+            "BGP++ total_path_limit must be a positive integer; got "
+            f"{total_path_limit!r}"
+        )
+    return _bgpcpp_config_override_cmd(
+        config_path,
+        [
+            "switch_limits = config.get('switch_limit_config')",
+            "if not isinstance(switch_limits, dict):",
+            "    raise RuntimeError(",
+            "        'BGP++ config has no switch_limit_config object; refusing to '",
+            "        f'set total_path_limit on {switch_limits!r}'",
+            "    )",
+            f"switch_limits['total_path_limit'] = {total_path_limit}",
+        ],
+        f"Set switch_limit_config.total_path_limit={total_path_limit}",
+    )
 
 
 # =============================================================================

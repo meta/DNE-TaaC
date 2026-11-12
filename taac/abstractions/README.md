@@ -386,7 +386,7 @@ expresses a fiscal-year fleet target as HE sites per DC plane:
 | Profile | HE sites per range | Ranges | Synthetic nodes | Injected prefixes | KvStore keys |
 |---|---|---|---|---|---|
 | `EBB_FY26_SCALE` | 63 | 4 | 252 | 504 (252 v4 /32 + 252 v6 /128) | 757 |
-| `EBB_FY27_SCALE` | 80 | 4 | 320 | 640 (320 v4 /32 + 320 v6 /128) | 961 |
+| `EBB_FY27_SCALE` | 100 | 4 | 400 | 800 (400 v4 /32 + 400 v6 /128) | 1,201 |
 
 Every scheduled EBB binding runs `EBB_FY26_SCALE`. `EBB_FY27_SCALE` is defined
 and unit-tested but deliberately unscheduled, so the FY27 target is a
@@ -410,14 +410,17 @@ RIB, so nothing errors and the shadow RIB silently collapses.
 **Advertised next hops are evidence, not input.** The resolver requires every
 advertised next hop of every declared range to fall inside the injected host
 routes, and rejects the topology otherwise. At FY26 that is 62 emulated peers
-per plane covered by 63 injected routes. The check only ever reads the bound
-advertisements; it never widens the injection to make a topology pass.
+per plane covered by 63 injected routes, and at FY27 100 covered by exactly
+100. The check only ever reads the bound advertisements; it never widens the
+injection to make a topology pass.
 
 **The advertised population is carried separately from the injection.** The
 resolver records how many leading rows of each range the peers advertise as
 `OpenRInjectionPlan.advertised_pnh_count`, rejecting gaps and ranges that
 disagree. Anything that observes injected rows through BGP must be bounded by
-it, never by `count`: an injection with headroom carries rows no BGP path uses.
+it, never by `count`: FY26 injects 63 rows per range for 62 advertised next
+hops, so row 62 carries no BGP path, while FY27 injects exactly its 100
+advertised rows, so rows 0-99 all do.
 
 **Setup and teardown are rendered from one plan.** The same resolved
 `OpenRInjectionPlan` produces the `inject` task and the `delete` task, so the

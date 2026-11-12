@@ -6,6 +6,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import typing as t
+from collections import Counter
 from dataclasses import dataclass, replace
 
 from ixia.ixia import types as ixia_types
@@ -37,7 +38,6 @@ from taac.abstractions.compatibility.legacy_ebb_topology import (
     EBGP_PEER_COUNT_V6,
     EBGP_REMOTE_AS,
     EGRESS_PEER_SCALE_SWEEP_PEER_COUNTS,
-    IBGP_PEER_SCALE_PER_PLANE,
     IBGP_REMOTE_AS,
 )
 from taac.abstractions.eos_bgpcpp_candidate_factory import (
@@ -189,16 +189,18 @@ _EBB_IBGP_ROLES = (
     "ibgp_mp_p3",
     "ibgp_mp_p4",
 )
-_EBB_REQUIRED_ROLE_AFI_COUNTS = {
+_EBB_IBGP_ROLE_AFIS = tuple(
+    (role, afi) for role in _EBB_IBGP_ROLES for afi in ("v4", "v6")
+)
+_EBB_REQUIRED_ROLE_AFIS = (("uplink", "v4"), ("uplink", "v6"), *_EBB_IBGP_ROLE_AFIS)
+# The iBGP peer count is a scale-profile decision, so it is read from the bound
+# topology rather than pinned here; only the unchanged eBGP and monitor groups
+# keep fixed counts.
+_EBB_FIXED_ROLE_AFI_COUNTS = {
     ("uplink", "v4"): EBGP_PEER_COUNT_V4,
     ("uplink", "v6"): EBGP_PEER_COUNT_V6,
-    **{
-        (role, afi): IBGP_PEER_SCALE_PER_PLANE
-        for role in _EBB_IBGP_ROLES
-        for afi in ("v4", "v6")
-    },
+    ("bgpmon", "v6"): BGP_MON_PEER_COUNT,
 }
-_EBB_OPTIONAL_ROLE_AFI_COUNTS = {("bgpmon", "v6"): BGP_MON_PEER_COUNT}
 _UG_NEW_PEER_JOIN_ROLE_COUNTS = (
     ("ebgp_ug_ctrl", 4),
     ("ebgp_ug_held", 1),
@@ -7794,13 +7796,72 @@ def _should_delegate_ebb_full_scale(bound: BoundTopology) -> bool:
     )
 
 
+def _ebb_ibgp_peer_count(
+    groups_by_role_afi: t.Mapping[
+        tuple[str, str], t.Sequence[tuple[int, BoundDeviceGroup]]
+    ],
+    issues: list[ValidationIssue],
+) -> int | None:
+    """The one peer count every HE and MP iBGP role/AFI group must carry.
+
+    The count is a scale-profile decision, so it is read from the bound groups
+    rather than pinned, but only from the complete population: a partial one
+    cannot vouch for itself, or a lone mis-authored group would define its own
+    expected count. A missing role/AFI or a disagreement is reported here and
+    no count is derived.
+    """
+    totals: dict[tuple[str, str], int] = {}
+    for role_afi in _EBB_IBGP_ROLE_AFIS:
+        indexed_groups = groups_by_role_afi.get(role_afi)
+        if not indexed_groups:
+            continue
+        _, device_group = indexed_groups[0]
+        partition = device_group.partition
+        totals[role_afi] = (
+            device_group.peer_count if partition is None else partition.total_peer_count
+        )
+    missing = [role_afi for role_afi in _EBB_IBGP_ROLE_AFIS if role_afi not in totals]
+    if missing:
+        issues.append(
+            ValidationIssue(
+                path="device_groups",
+                code="invalid_ebb_full_scale_shape",
+                message=(
+                    "delegated EBB full-scale helpers derive the iBGP peer count "
+                    f"only from all {len(_EBB_IBGP_ROLE_AFIS)} HE/MP role/AFI "
+                    f"groups; missing {missing}, so the {len(totals)} present "
+                    f"are unchecked: {dict(sorted(totals.items()))}"
+                ),
+            )
+        )
+        return None
+    tally = Counter(totals.values())
+    common_count, common_size = tally.most_common(1)[0]
+    if len(tally) > 1:
+        differing = {
+            role_afi: total
+            for role_afi, total in sorted(totals.items())
+            if total != common_count
+        }
+        issues.append(
+            ValidationIssue(
+                path="device_groups",
+                code="invalid_ebb_full_scale_shape",
+                message=(
+                    "delegated EBB full-scale helpers require one peer count "
+                    "across every iBGP role/AFI group, the scale profile's "
+                    f"ibgp_peers_per_group; {common_size} of {len(totals)} carry "
+                    f"{common_count}, but got {differing}"
+                ),
+            )
+        )
+        return None
+    return common_count
+
+
 def _validate_ebb_full_scale_shape(  # noqa: C901
     bound: BoundTopology,
 ) -> None:
-    allowed_counts = {
-        **_EBB_REQUIRED_ROLE_AFI_COUNTS,
-        **_EBB_OPTIONAL_ROLE_AFI_COUNTS,
-    }
     groups_by_role_afi: dict[tuple[str, str], list[tuple[int, BoundDeviceGroup]]] = {}
     for index, device_group in enumerate(bound.device_groups):
         groups_by_role_afi.setdefault((device_group.role, device_group.afi), []).append(
@@ -7808,9 +7869,13 @@ def _validate_ebb_full_scale_shape(  # noqa: C901
         )
 
     issues: list[ValidationIssue] = []
+    ibgp_peer_count = _ebb_ibgp_peer_count(groups_by_role_afi, issues)
+    allowed_counts: dict[tuple[str, str], int | None] = {
+        **_EBB_FIXED_ROLE_AFI_COUNTS,
+        **dict.fromkeys(_EBB_IBGP_ROLE_AFIS, ibgp_peer_count),
+    }
     for role_afi, indexed_groups in groups_by_role_afi.items():
-        expected_count = allowed_counts.get(role_afi)
-        if expected_count is None:
+        if role_afi not in allowed_counts:
             issues.append(
                 ValidationIssue(
                     path="device_groups",
@@ -7821,6 +7886,10 @@ def _validate_ebb_full_scale_shape(  # noqa: C901
                     ),
                 )
             )
+            continue
+        expected_count = allowed_counts[role_afi]
+        if expected_count is None:
+            # No iBGP count was derived; _ebb_ibgp_peer_count reported why.
             continue
         if len(indexed_groups) == 1 and indexed_groups[0][1].partition is None:
             _, device_group = indexed_groups[0]
@@ -7895,7 +7964,7 @@ def _validate_ebb_full_scale_shape(  # noqa: C901
                 )
             )
 
-    for role_afi in _EBB_REQUIRED_ROLE_AFI_COUNTS:
+    for role_afi in _EBB_REQUIRED_ROLE_AFIS:
         if role_afi not in groups_by_role_afi:
             issues.append(
                 ValidationIssue(

@@ -16,7 +16,6 @@ from taac.abstractions.physical_inventory import NRQEB009_ASH6
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
     EBB_FY26_SCALE,
-    EBB_FY27_SCALE,
     EBB_NEXT_HOPS_IXIA03,
     EBB_OPENR_INJECTED_START_IPV4S,
     EBB_OPENR_INJECTED_START_IPV4S_IXIA03,
@@ -1064,6 +1063,19 @@ class GatewayGateScopeTest(unittest.TestCase):
                 self.assertEqual(self.gateless[name], _without_gateway_gates(config))
 
 
+# The state D129805999 validated on NRQEB008: an 80-node FY27-era injection
+# over the unchanged 62-peer FY26 fleet. It keeps 18 rows of injected
+# headroom no peer advertises, which is what exposed the row-78 class of
+# failure, so it stays the regression scale for that class even though the
+# authoritative FY27 profile now injects exactly its advertised population.
+_INJECTION_ONLY_SCALE = replace(
+    EBB_FY26_SCALE,
+    name="EBB_FY27_INJECTION_ONLY",
+    he_sites_per_range=80,
+    openr_injection_headroom=18,
+)
+
+
 class EbbInjectionScaleReachesEveryPnhCheckTest(unittest.TestCase):
     """Every PNH readiness check must describe the injection setup performed.
 
@@ -1157,14 +1169,19 @@ class EbbInjectionScaleReachesEveryPnhCheckTest(unittest.TestCase):
     def test_fy26_scale_reaches_every_pnh_check(self) -> None:
         self._assert_every_check_matches_setup(EBB_FY26_SCALE)
 
-    def test_fy27_scale_reaches_every_pnh_check(self) -> None:
+    def test_injection_only_scale_reaches_every_pnh_check(self) -> None:
         """80 HE sites per range, through the real factory, end to end."""
-        self._assert_every_check_matches_setup(EBB_FY27_SCALE)
+        self._assert_every_check_matches_setup(_INJECTION_ONLY_SCALE)
 
     def test_sixty_two_node_override_reaches_every_pnh_check(self) -> None:
         """The tightest scale that still covers 62 advertised peers per plane."""
         self._assert_every_check_matches_setup(
-            EbbScaleProfile(name="EBB_TEST_62", he_sites_per_range=62)
+            replace(
+                EBB_FY26_SCALE,
+                name="EBB_TEST_62",
+                he_sites_per_range=62,
+                openr_injection_headroom=0,
+            )
         )
 
     def test_production_readiness_count_is_the_scale_not_the_peer_count(
@@ -1198,7 +1215,7 @@ class EbbInjectionScaleReachesEveryPnhCheckTest(unittest.TestCase):
         construction sites and not others: any check missing count or step
         means a builder the factory did not thread.
         """
-        config = self._config(EBB_FY27_SCALE)
+        config = self._config(_INJECTION_ONLY_SCALE)
         missing = [
             payload
             for payload in self._pnh_payloads(config)

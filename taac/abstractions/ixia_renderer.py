@@ -632,9 +632,11 @@ def _validate_partitioned_dual_stack_capability(
     *,
     include_monitor: bool,
 ) -> None:
-    expected_port_count = 3 if include_monitor else 2
+    # One external port, one or more internal ports (one per iBGP link), and
+    # the monitor port when present.
+    minimum_port_count = 3 if include_monitor else 2
     if (
-        len(request.plan.ports) != expected_port_count
+        len(request.plan.ports) < minimum_port_count
         or not request.plan.device_groups
         or len(request.plan.bgp_sessions) != len(request.plan.device_groups)
         or any(
@@ -644,7 +646,7 @@ def _validate_partitioned_dual_stack_capability(
     ):
         _unsupported(
             "partitioned dual-stack lowering requires "
-            f"{expected_port_count} active ports and one session per group"
+            f"{minimum_port_count} active ports and one session per group"
         )
     sessions_by_group = _sessions_by_group(request)
     if tuple(session.device_group_id for session in request.plan.bgp_sessions) != tuple(
@@ -760,13 +762,14 @@ def _partitioned_groups_by_relationship(
         }
         if include_monitor:
             allowed_relationships.add(PeerRelationship.MONITOR)
-        if (
-            relationship not in allowed_relationships
-            or relationship in groups_by_relationship
+        if relationship not in allowed_relationships or (
+            relationship in groups_by_relationship
+            and relationship is not PeerRelationship.INTERNAL
         ):
             _unsupported(
                 "partitioned dual-stack lowering requires one port per supported "
-                "peer relationship"
+                "peer relationship, except internal sessions, which may span "
+                "several ports"
             )
         _validate_unique_partitioned_group_indices(request, port)
         for group in groups:
@@ -782,7 +785,10 @@ def _partitioned_groups_by_relationship(
                 group,
                 session,
             )
-        groups_by_relationship[relationship] = groups
+        groups_by_relationship[relationship] = (
+            *groups_by_relationship.get(relationship, ()),
+            *groups,
+        )
     expected_relationships = {
         PeerRelationship.EXTERNAL,
         PeerRelationship.INTERNAL,

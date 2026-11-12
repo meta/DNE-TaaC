@@ -60,6 +60,10 @@ from taac.abstractions.validation import (
 _TRAFFIC_ENDPOINT_KINDS = frozenset({"ixia", "traffic", "trafficgen"})
 _TRAFFIC_ENDPOINT_ROLES = frozenset({"ixia", "traffic", "trafficgen"})
 _IXIA_4BYTE_ASN_MAX = IXIA_MAX_4BYTE_ASN
+# TAAC's own guard on DUT-side addresses per EOS interface and AFI, introduced
+# with D112268835. It is not a documented Arista EOS limit: EOS documents no
+# per-interface secondary-address maximum, and none has been measured near 500.
+# It is kept as a conservative bound until a lab run or Arista says otherwise.
 _EOS_SECONDARY_IP_LIMIT_PER_INTERFACE_AFI = 500
 _LEGACY_PEER_RELATIONSHIPS = {
     "uplink": PeerRelationship.EXTERNAL,
@@ -2975,12 +2979,12 @@ def _validate_eos_secondary_ip_limits(
                 message=(
                     f"EOS interface {interface} has {count} {afi} DUT-side "
                     f"peer IPs across device groups "
-                    f"{', '.join(sources[(interface, afi)])}; limit is "
+                    f"{', '.join(sources[(interface, afi)])}; TAAC's guard is "
                     f"{_EOS_SECONDARY_IP_LIMIT_PER_INTERFACE_AFI}"
                 ),
                 hint=(
                     "Split peers across additional interfaces or reduce peer_count "
-                    "so one EOS interface/AFI stays within the platform limit."
+                    "so one EOS interface/AFI stays within TAAC's guard."
                 ),
             )
         )

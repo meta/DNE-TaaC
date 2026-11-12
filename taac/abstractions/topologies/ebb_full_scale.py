@@ -114,6 +114,9 @@ from taac.abstractions.validation import (
 )
 
 
+_EBB_TORNADO_PLANES = (1, 2, 3, 4)
+
+
 def _require_count(name: str, value: object, *, minimum: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(
@@ -163,6 +166,9 @@ class EbbScaleProfile:
             vetted, into dense synthetic prefixes nothing vetted. Topology
             construction fails when the demand needs that tail and this is
             false.
+        ibgp_planes_by_link: Tornado planes carried by each iBGP IXIA link, in
+            port-map order. A plane's HE and MP groups always share its link,
+            so a plane disruption stays on one physical link.
         next_hop_step: Address stride between consecutive HE sites. Must match
             the stride the plane's advertised route next hops use.
         bgp_total_path_limit: BGP++ ``switch_limit_config.total_path_limit``
@@ -180,6 +186,7 @@ class EbbScaleProfile:
     openr_injection_headroom: int
     allows_bgp_monitor: bool
     allows_dense_unvetted_route_tail: bool
+    ibgp_planes_by_link: tuple[tuple[int, ...], ...]
     next_hop_step: int = 2
     bgp_total_path_limit: int | None = None
 
@@ -221,6 +228,18 @@ class EbbScaleProfile:
                 f"equal advertised_pnh_count {self.advertised_pnh_count} plus "
                 f"openr_injection_headroom {self.openr_injection_headroom}"
             )
+        links = self.ibgp_planes_by_link
+        if (
+            not isinstance(links, tuple)
+            or not links
+            or any(not isinstance(link, tuple) or not link for link in links)
+            or sorted(plane for link in links for plane in link)
+            != list(_EBB_TORNADO_PLANES)
+        ):
+            raise ValueError(
+                f"{self.name}: ibgp_planes_by_link must assign each Tornado plane "
+                f"{_EBB_TORNADO_PLANES} to exactly one nonempty link; got {links!r}"
+            )
 
     @property
     def openr_injection_scale(self) -> OpenRInjectionScale:
@@ -233,6 +252,13 @@ class EbbScaleProfile:
     def he_routes_per_afi(self) -> int:
         """Unique HE routes per AFI, shared by all four HE planes."""
         return self.ibgp_peers_per_group * self.routes_per_he_peer
+
+    def ibgp_link_of_plane(self, plane: int) -> int:
+        return next(
+            link
+            for link, planes in enumerate(self.ibgp_planes_by_link)
+            if plane in planes
+        )
 
 
 # Scheduled: every EBB CICD binding runs this. 4 DC planes x 63 HE sites gives
@@ -248,6 +274,7 @@ EBB_FY26_SCALE = EbbScaleProfile(
     openr_injection_headroom=1,
     allows_bgp_monitor=True,
     allows_dense_unvetted_route_tail=False,
+    ibgp_planes_by_link=(_EBB_TORNADO_PLANES,),
 )
 
 # FY27 Scenario 1, from the owner's authoritative scale sheet. Not scheduled
@@ -255,7 +282,9 @@ EBB_FY26_SCALE = EbbScaleProfile(
 # 100 advertised next hops per range, 1,000 routes per HE peer (100,000 unique
 # HE routes/AFI) and per FA peer, and no BGP monitor. 100,000 retained routes
 # need 100,750 candidates; the first 47,250 keep the vetted FY26 exclusions,
-# and the remaining 53,500 are declared dense synthetic prefixes.
+# and the remaining 53,500 are declared dense synthetic prefixes. Tornado
+# planes 1-2 and 3-4 split across two iBGP links so each carries 4 groups x
+# 100 = 400 addresses per AFI, inside the TAAC guard of 500.
 EBB_FY27_SCALE = EbbScaleProfile(
     name="EBB_FY27",
     he_sites_per_range=100,
@@ -269,6 +298,7 @@ EBB_FY27_SCALE = EbbScaleProfile(
     bgp_total_path_limit=32_000_000,
     allows_bgp_monitor=False,
     allows_dense_unvetted_route_tail=True,
+    ibgp_planes_by_link=((1, 2), (3, 4)),
 )
 
 
@@ -455,6 +485,49 @@ _EBB_IBGP_PORT_ASSIGNMENT = IxiaPortAssignment(
     reuse_group="ebb_ibgp",
 )
 _EBB_BGPMON_PORT_ASSIGNMENT = IxiaPortAssignment(logical_role="bgpmon")
+
+
+def ebb_ibgp_port_assignment(link: int) -> IxiaPortAssignment:
+    """The IXIA assignment for one iBGP link.
+
+    Link 0 keeps the FY26 role and reuse group. Each further link needs its
+    own logical role and its own reuse group, because a reuse group may claim
+    only one physical connection.
+    """
+    if link == 0:
+        return _EBB_IBGP_PORT_ASSIGNMENT
+    suffix = chr(ord("a") + link)
+    return IxiaPortAssignment(
+        logical_role=f"ibgp_{suffix}",
+        reuse_group=f"ebb_ibgp_{suffix}",
+    )
+
+
+def ebb_port_map(
+    scale: EbbScaleProfile,
+    *,
+    include_bgpmon: bool | None = None,
+) -> dict[str, int]:
+    """Map the EBB roles at ``scale`` onto ordered physical inventory entries.
+
+    The eBGP uplink takes entry 0, the iBGP links follow in order, and the BGP
+    monitor, when present, takes the next entry. FY26 therefore reproduces
+    ``EBB_PORT_MAP`` and ``EBB_PORT_MAP_WITH_BGPMON``; FY27's second iBGP link
+    takes entry 2, the lane the FY26 monitor uses.
+    """
+    if include_bgpmon is None:
+        include_bgpmon = scale.allows_bgp_monitor
+    if include_bgpmon and not scale.allows_bgp_monitor:
+        raise ValueError(f"{scale.name} models no BGP monitor")
+    port_map = {"uplink": 0}
+    for link in range(len(scale.ibgp_planes_by_link)):
+        port_map[ebb_ibgp_port_assignment(link).logical_role] = 1 + link
+    if include_bgpmon:
+        port_map["bgpmon"] = len(port_map)
+    return port_map
+
+
+EBB_FY27_PORT_MAP = ebb_port_map(EBB_FY27_SCALE)
 
 EBB_DEVICE_CONFIG = RoutingDeviceConfig(
     update_group_enable=False,
@@ -1798,7 +1871,13 @@ def _with_ebb_route_intent(
     device_groups = []
     for device_group in topology.device_groups:
         if device_group.role.startswith("ibgp_"):
-            device_group = replace(device_group, peer_count=scale.ibgp_peers_per_group)
+            device_group = replace(
+                device_group,
+                peer_count=scale.ibgp_peers_per_group,
+                port_assignment=ebb_ibgp_port_assignment(
+                    scale.ibgp_link_of_plane(_ebb_plane_number(device_group))
+                ),
+            )
         peer_group = device_group.peer_group
         if (
             device_group.role == "uplink"
@@ -1971,7 +2050,9 @@ __all__ = (
     "EBB_FY26_SCALE",
     "EBB_FY26_TOPOLOGY_NO_BGPMON",
     "EBB_FY26_TOPOLOGY_WITH_BGPMON",
+    "EBB_FY27_PORT_MAP",
     "EBB_FY27_SCALE",
+    "ebb_ibgp_port_assignment",
     "ebb_ibgp_route_next_hop_starts",
     "ebb_ibgp_route_next_hops",
     "ebb_ibgp_route_next_hops_from_start",
@@ -1988,6 +2069,7 @@ __all__ = (
     "EBB_PARENT_NETWORKS",
     "EBB_PARENT_NETWORKS_IXIA03",
     "EBB_PEER_GROUPS",
+    "ebb_port_map",
     "EBB_PORT_MAP",
     "EBB_PORT_MAP_WITH_BGPMON",
     "EBB_PREFIX_SETS",

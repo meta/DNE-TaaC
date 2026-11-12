@@ -440,10 +440,12 @@ behavioral risk, and is deliberately not part of this parameterization.
 
 Two capacity notes, because both have been misapplied to this path:
 
-- The EOS limit of 500 secondary addresses per interface constrains
-  *interface addressing*. It has no bearing on KvStore injection: synthetic
-  nodes carry their prefixes in KvStore, not as addresses on an interface, so
-  the injected scale is not bounded by it.
+- TAAC's guard of 500 DUT-side addresses per EOS interface and AFI
+  (`_EOS_SECONDARY_IP_LIMIT_PER_INTERFACE_AFI` in `topology/binding.py`)
+  constrains *interface addressing*. It is a TAAC binding check, not a
+  documented Arista EOS limit. It has no bearing on KvStore injection:
+  synthetic nodes carry their prefixes in KvStore, not as addresses on an
+  interface, so the injected scale is not bounded by it.
 - No KvStore capacity ceiling is asserted here. The FY27 figures above are
   what the model resolves to, not an observed limit. Any claim about how much
   KvStore content a DUT sustains needs measurement on hardware, and none has

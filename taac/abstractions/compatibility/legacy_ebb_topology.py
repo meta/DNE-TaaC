@@ -11,8 +11,10 @@ BGP_MON_PEER_COUNT = 2
 EBGP_PEER_COUNT_V4 = 140
 EBGP_PEER_COUNT_V6 = 140
 
-# EOS permits at most 500 secondary IPv4 addresses on one routed interface.
-# A scale of 62 produces 496 addresses across four DC and four MP device sets.
+# 62 peers in each of the four DC and four MP device sets is 496 DUT addresses
+# per AFI on the one FY26 iBGP interface, inside TAAC's own guard of 500 per
+# interface and AFI (binding.py, from D112268835). That guard is a TAAC
+# convention, not a documented Arista EOS limit.
 IBGP_PEER_SCALE_PER_PLANE = 62
 
 EBB_BGP_HOLD_TIMER_S = 180

@@ -629,7 +629,8 @@ def _named_sequence_signature(
 class _EbbFullScaleInterfaces:
     device_name: str
     ebgp: str
-    ibgp: str
+    # One DUT interface per iBGP IXIA link, in physical port order.
+    ibgp: tuple[str, ...]
     bgpmon: str | None
     include_bgpmon: bool
     include_ibgp: bool = True
@@ -764,21 +765,18 @@ class _RouteChurnScaleArgs:
     openr_mode: OpenRMode
 
 
-def _ebb_full_scale_pre_ixia_setup_tasks(
+def _ebb_ixia_interface_descriptions(
     interfaces: _EbbFullScaleInterfaces,
-) -> list:
-    tasks = [
-        create_arista_daemon_control_task(
-            hostname=interfaces.device_name,
-            daemon_name="BgpTcpdump",
-            action="disable",
-        )
-    ]
-    candidate_ixia_interfaces = [
-        (interfaces.ebgp, "IXIA_MIMIC_EBGP"),
-    ]
+) -> list[tuple[str, str]]:
+    candidate_ixia_interfaces = [(interfaces.ebgp, "IXIA_MIMIC_EBGP")]
     if interfaces.include_ibgp:
-        candidate_ixia_interfaces.append((interfaces.ibgp, "IXIA_MIMIC_IBGP"))
+        candidate_ixia_interfaces.extend(
+            (
+                interface,
+                "IXIA_MIMIC_IBGP" if link == 0 else f"IXIA_MIMIC_IBGP_{chr(65 + link)}",
+            )
+            for link, interface in enumerate(interfaces.ibgp)
+        )
     if interfaces.include_bgpmon:
         assert interfaces.bgpmon is not None
         candidate_ixia_interfaces.append((interfaces.bgpmon, "IXIA_MIMIC_BGP_MON"))
@@ -790,8 +788,21 @@ def _ebb_full_scale_pre_ixia_setup_tasks(
             continue
         seen_interface_roles.add(interface)
         ixia_interfaces.append(interface)
+    return ixia_interfaces
 
-    for interface_name, description in ixia_interfaces:
+
+def _ebb_full_scale_pre_ixia_setup_tasks(
+    interfaces: _EbbFullScaleInterfaces,
+) -> list:
+    tasks = [
+        create_arista_daemon_control_task(
+            hostname=interfaces.device_name,
+            daemon_name="BgpTcpdump",
+            action="disable",
+        )
+    ]
+
+    for interface_name, description in _ebb_ixia_interface_descriptions(interfaces):
         tasks.append(
             create_run_commands_on_shell_task(
                 hostname=interfaces.device_name,
@@ -1121,18 +1132,39 @@ def _ebb_full_scale_interface_ip_config_tasks(
         )
     ]
 
-    for plane_index, role in enumerate(_EBB_IBGP_ROLES):
+    # Each iBGP interface takes exactly one primary address: the first plane
+    # role configured on it clears the interface, and every later one on the
+    # same interface adds secondaries.
+    configured_interfaces: set[str] = set()
+    for role in _EBB_IBGP_ROLES:
         ipv4 = _required_interface_address_block(bound, plan, role, "v4")
         ipv6 = _required_interface_address_block(bound, plan, role, "v6")
+        if ipv4.interface != ipv6.interface:
+            raise TopologyValidationError(
+                bound.logical_topology.name,
+                [
+                    ValidationIssue(
+                        path=f"device_plan.interface_plan.{role}",
+                        code="split_ebb_dual_stack_interface",
+                        message=(
+                            f"EBB {role} must place both AFIs on one DUT "
+                            f"interface; got v4 on {ipv4.interface} and v6 on "
+                            f"{ipv6.interface}"
+                        ),
+                    )
+                ],
+            )
+        first_on_interface = ipv6.interface not in configured_interfaces
+        configured_interfaces.add(ipv6.interface)
         tasks.append(
             create_interface_ip_configuration_task(
-                interface=interfaces.ibgp,
+                interface=ipv6.interface,
                 peer_count=len(ipv6.local_addresses),
                 ipv4_base_network=ipv4.parent_network,
                 ipv6_base_network=ipv6.parent_network,
                 address_families=["ipv4", "ipv6"],
-                clear_existing=plane_index == 0,
-                all_secondary=plane_index > 0,
+                clear_existing=first_on_interface,
+                all_secondary=not first_on_interface,
                 hostname=interfaces.device_name,
                 ixia_needed=True,
                 save_running_config_backup=False,
@@ -1322,7 +1354,7 @@ def _characteristic_setup_phases(
         interfaces=_EbbFullScaleInterfaces(
             device_name=device_name,
             ebgp=ebgp_interface,
-            ibgp=ibgp_interface,
+            ibgp=(ibgp_interface,),
             bgpmon=None,
             include_bgpmon=False,
             include_ibgp=include_ibgp_interface,
@@ -2178,6 +2210,52 @@ def _ebb_full_scale_ibgp_plane_device_groups(
     ]
 
 
+def _ebb_plane_interface(
+    bound: BoundTopology,
+    args: _EbbFullScaleIxiaArgs,
+    plane_number: int,
+) -> str:
+    """The one iBGP interface a Tornado plane's HE and MP groups share."""
+    keys = [
+        (f"ibgp_{tier}_p{plane_number}", afi)
+        for tier in ("dc", "mp")
+        for afi in ("v4", "v6")
+    ]
+    missing = [key for key in keys if key not in args.groups]
+    if missing:
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path=f"device_groups.ibgp_p{plane_number}",
+                    code="missing_ebb_ibgp_plane_group",
+                    message=(
+                        f"EBB iBGP plane {plane_number} requires its HE and MP "
+                        f"groups in both AFIs; missing {missing}"
+                    ),
+                )
+            ],
+        )
+    interfaces = {args.groups[key].a_interface for key in keys}
+    if len(interfaces) != 1 or not interfaces <= set(args.interfaces.ibgp):
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path=f"device_groups.ibgp_p{plane_number}.interface",
+                    code="split_ebb_ibgp_plane",
+                    message=(
+                        f"EBB iBGP plane {plane_number} must keep its HE and MP "
+                        "groups on one of the iBGP links "
+                        f"{list(args.interfaces.ibgp)}; got "
+                        f"{sorted(str(interface) for interface in interfaces)}"
+                    ),
+                )
+            ],
+        )
+    return t.cast(str, next(iter(interfaces)))
+
+
 def _ebb_partition_family_base_address(
     address: str,
     device_group: BoundDeviceGroup,
@@ -2394,20 +2472,23 @@ def _ebb_full_scale_basic_port_configs(
         )
     ]
 
-    ibgp_device_groups = []
+    ibgp_device_groups: dict[str, list[taac_types.DeviceGroupConfig]] = {
+        interface: [] for interface in args.interfaces.ibgp
+    }
     for plane_number in range(1, 5):
-        ibgp_device_groups.extend(
+        ibgp_device_groups[_ebb_plane_interface(bound, args, plane_number)].extend(
             _ebb_full_scale_ibgp_plane_device_groups(
                 bound,
                 args,
                 plane_number,
             )
         )
-    configs.append(
+    configs.extend(
         taac_types.BasicPortConfig(
-            endpoint=f"{args.interfaces.device_name}:{args.interfaces.ibgp}",
-            device_group_configs=ibgp_device_groups,
+            endpoint=f"{args.interfaces.device_name}:{interface}",
+            device_group_configs=device_group_configs,
         )
+        for interface, device_group_configs in ibgp_device_groups.items()
     )
 
     if args.interfaces.include_bgpmon:
@@ -7378,14 +7459,7 @@ def _ebb_full_scale_ixia_connections(
                 if _device_group_base_role(device_group) in {"ebgp", "uplink"}
             ],
         ),
-        (
-            "ibgp",
-            [
-                device_group
-                for device_group in bound.device_groups
-                if _device_group_base_role(device_group) == "ibgp"
-            ],
-        ),
+        *_ebb_ibgp_link_groups(bound),
         (
             "bgpmon",
             [
@@ -7423,6 +7497,36 @@ def _ebb_full_scale_ixia_connections(
     if issues:
         raise TopologyValidationError(bound.logical_topology.name, issues)
     return connections
+
+
+def _ebb_ibgp_link_groups(
+    bound: BoundTopology,
+) -> list[tuple[str, list[BoundDeviceGroup]]]:
+    """iBGP device groups by IXIA logical role, in physical port order.
+
+    Each iBGP link is its own IXIA logical role, so a topology that splits its
+    planes across links resolves one connection per link rather than being
+    rejected as one ambiguous iBGP connection.
+    """
+    groups_by_role: dict[str, list[BoundDeviceGroup]] = {}
+    port_index_by_role: dict[str, int] = {}
+    for device_group in bound.device_groups:
+        if _device_group_base_role(device_group) != "ibgp":
+            continue
+        assignment = device_group.port_assignment
+        role = "ibgp" if assignment is None else assignment.logical_role
+        groups_by_role.setdefault(role, []).append(device_group)
+        if assignment is not None:
+            port_index_by_role[role] = min(
+                port_index_by_role.get(role, assignment.physical_inventory_index),
+                assignment.physical_inventory_index,
+            )
+    if not groups_by_role:
+        return [("ibgp", [])]
+    return sorted(
+        groups_by_role.items(),
+        key=lambda item: (port_index_by_role.get(item[0], -1), item[0]),
+    )
 
 
 def _ebb_ixia_connection_for_role(
@@ -7493,10 +7597,8 @@ def _ebb_ixia_connection_for_role(
 
 def _ebb_full_scale_ixia_args(bound: BoundTopology) -> _EbbFullScaleIxiaArgs:
     _validate_ebb_full_scale_shape(bound)
-    connections = {
-        connection.role: connection
-        for connection in _ebb_full_scale_ixia_connections(bound)
-    }
+    connection_list = _ebb_full_scale_ixia_connections(bound)
+    connections = {connection.role: connection for connection in connection_list}
     groups = {
         (device_group.role, device_group.afi): device_group
         for device_group in bound.device_groups
@@ -7551,7 +7653,11 @@ def _ebb_full_scale_ixia_args(bound: BoundTopology) -> _EbbFullScaleIxiaArgs:
         interfaces=_EbbFullScaleInterfaces(
             device_name=_ebb_device_name(bound),
             ebgp=connections["ebgp"].interface,
-            ibgp=connections["ibgp"].interface,
+            ibgp=tuple(
+                connection.interface
+                for connection in connection_list
+                if connection.role not in {"ebgp", "bgpmon"}
+            ),
             bgpmon=(
                 connections["bgpmon"].interface if "bgpmon" in connections else None
             ),
@@ -7687,15 +7793,17 @@ def _ebb_full_scale_interfaces(bound: BoundTopology) -> _EbbFullScaleInterfaces:
         for dg in bound.device_groups
         if _device_group_base_role(dg) in {"ebgp", "uplink"}
     ]
-    ibgp_groups = [
-        dg for dg in bound.device_groups if _device_group_base_role(dg) == "ibgp"
-    ]
     bgpmon_groups = [
         dg for dg in bound.device_groups if _device_group_base_role(dg) == "bgpmon"
     ]
 
     ebgp = _unique_dut_interface(bound, "ebgp", ebgp_groups, True, issues)
-    ibgp = _unique_dut_interface(bound, "ibgp", ibgp_groups, True, issues)
+    # Unfiltered: a link without one resolved interface reports an issue and
+    # fails the build below rather than dropping out of the compiled config.
+    ibgp_links = tuple(
+        _unique_dut_interface(bound, role, ibgp_groups, True, issues)
+        for role, ibgp_groups in _ebb_ibgp_link_groups(bound)
+    )
     include_bgpmon = bool(bgpmon_groups)
     bgpmon = _unique_dut_interface(
         bound, "bgpmon", bgpmon_groups, include_bgpmon, issues
@@ -7706,11 +7814,11 @@ def _ebb_full_scale_interfaces(bound: BoundTopology) -> _EbbFullScaleInterfaces:
 
     assert device_name
     assert ebgp is not None
-    assert ibgp is not None
+    assert ibgp_links and None not in ibgp_links
     return _EbbFullScaleInterfaces(
         device_name=device_name,
         ebgp=ebgp,
-        ibgp=ibgp,
+        ibgp=t.cast(tuple[str, ...], ibgp_links),
         bgpmon=bgpmon,
         include_bgpmon=include_bgpmon,
     )

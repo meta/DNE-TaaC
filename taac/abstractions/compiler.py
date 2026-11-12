@@ -82,6 +82,7 @@ from taac.abstractions.topology.model import (
     BoundTopology,
     EndpointSpec,
     LogicalTopology,
+    OpenRInjectionPlan,
     OpenRMode,
     OpenRStandaloneLink,
     ResolvedIxiaPortAssignment,
@@ -95,6 +96,7 @@ from taac.abstractions.topology.prefix import (
     RouteScaleMode,
 )
 from taac.abstractions.validation import (
+    resolve_validated_openr_injection_plan,
     TopologyValidationError,
     validate_fibagent_bgp_nhg_watermarks,
     ValidationIssue,
@@ -640,8 +642,7 @@ class _EosBgpCppOpenRInputs:
     device_name: str | None = None
     configerator_path: str | None = None
     standalone_link: OpenRStandaloneLink | None = None
-    injected_start_ipv4s: tuple[str, ...] = ()
-    injected_start_ipv6s: tuple[str, ...] = ()
+    injection: OpenRInjectionPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -4203,13 +4204,17 @@ def _eos_bgpcpp_openr_inputs(bound: BoundTopology) -> _EosBgpCppOpenRInputs:
             )
     if issues:
         raise TopologyValidationError(bound.logical_topology.name, issues)
+    injection = (
+        resolve_validated_openr_injection_plan(bound)
+        if mode is OpenRMode.STANDALONE
+        else None
+    )
     return _EosBgpCppOpenRInputs(
         mode=mode,
         device_name=device_name,
         configerator_path=configerator_path,
         standalone_link=standalone_link,
-        injected_start_ipv4s=device_config.openr_injected_start_ipv4s,
-        injected_start_ipv6s=device_config.openr_injected_start_ipv6s,
+        injection=injection,
     )
 
 
@@ -4260,8 +4265,7 @@ def _eos_bgpcpp_openr_tail_tasks(inputs: _EosBgpCppOpenRInputs) -> list:
         assert inputs.standalone_link is not None
         return get_openr_standalone_setup_tasks(
             inputs.standalone_link,
-            start_ipv4s=inputs.injected_start_ipv4s or None,
-            start_ipv6s=inputs.injected_start_ipv6s or None,
+            injection=inputs.injection,
         )
     return []
 
@@ -4882,8 +4886,7 @@ def _openr_teardown_tasks(
         )
     return get_openr_standalone_teardown_tasks(
         standalone_link,
-        start_ipv4s=openr_inputs.injected_start_ipv4s or None,
-        start_ipv6s=openr_inputs.injected_start_ipv6s or None,
+        injection=openr_inputs.injection,
     )
 
 

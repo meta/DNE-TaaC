@@ -48,6 +48,7 @@ from taac.abstractions.topologies.ebb_full_scale import (
 )
 from taac.abstractions.topology.model import (
     BoundTopology,
+    OpenRInjectionPlan,
     OpenRMode,
     RoutingDeviceConfig,
 )
@@ -349,13 +350,30 @@ def _locked_step_kwargs() -> dict:
     }
 
 
+# The factory threads one resolved injection plan into the PNH checks and the
+# Open/R churn steps, and those land in JSON step params, so the fake bound
+# topology has to return a real plan rather than a MagicMock.
+_FULL_SCALE_INJECTION = OpenRInjectionPlan(
+    start_ipv4s=tuple(
+        _ROUTE_NEXT_HOP_STARTS["ipv4"][str(plane)] for plane in range(1, 5)
+    ),
+    start_ipv6s=tuple(
+        _ROUTE_NEXT_HOP_STARTS["ipv6"][str(plane)] for plane in range(1, 5)
+    ),
+    count=EBB_FY26_SCALE.he_sites_per_range,
+    step=EBB_FY26_SCALE.next_hop_step,
+)
+
+
 def _full_scale_bound() -> BoundTopology:
     bound = MagicMock()
     bound.device_config = RoutingDeviceConfig(
         fibagent_bgp_nhg_watermark_high=1000,
         fibagent_bgp_nhg_watermark_low=1000,
+        openr_injection_scale=EBB_FY26_SCALE.openr_injection_scale,
     )
     bound.parent_networks = dict(_TEST_PARENT_NETWORKS)
+    bound.resolve_openr_injection_plan.return_value = _FULL_SCALE_INJECTION
     return t.cast(BoundTopology, bound)
 
 

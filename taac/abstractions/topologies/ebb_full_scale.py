@@ -1491,20 +1491,16 @@ def _with_ebb_route_intent(
             if route_storm_shards
             else resolved_group
         )
-    # Only STANDALONE injects; leaving the other modes empty keeps the NONE-mode
-    # module topologies byte-identical to what they were before this field.
-    if openr_mode is OpenRMode.STANDALONE:
-        injected_v4, injected_v6 = ebb_openr_injected_next_hops(next_hops)
-    else:
-        injected_v4, injected_v6 = [], []
+    # Only STANDALONE injects. Leaving the scale unset in the other modes keeps
+    # the NONE-mode module topologies byte-identical to what they were before
+    # this field, and the injected addresses are resolved from the bound route
+    # advertisements at lowering time rather than recorded here.
     return replace(
         topology,
         device_groups=tuple(device_groups),
         device_config=replace(
             topology.device_config,
             openr_mode=openr_mode,
-            openr_injected_start_ipv4s=tuple(injected_v4),
-            openr_injected_start_ipv6s=tuple(injected_v6),
             openr_injection_scale=(
                 scale.openr_injection_scale
                 if openr_mode is OpenRMode.STANDALONE

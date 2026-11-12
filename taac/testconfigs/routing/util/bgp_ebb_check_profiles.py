@@ -247,6 +247,11 @@ class ProfileContext:
     check_ibgp_pnh: bool = False
     ibgp_pnh_start_ipv4s: t.Optional[tuple[str, ...]] = None
     ibgp_pnh_start_ipv6s: t.Optional[tuple[str, ...]] = None
+    # Count and stride of the resolved Open/R injection, carried beside the
+    # starts so readiness describes the whole injected range. Left None by a
+    # caller with no plan, which serializes the pre-existing payload.
+    ibgp_pnh_count: t.Optional[int] = None
+    ibgp_pnh_step: t.Optional[int] = None
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None
     # Whether to exclude BGP-MON peers from the session checks, and which
@@ -339,6 +344,8 @@ def _daemon_restart(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
@@ -418,6 +425,8 @@ def _cold_start(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
@@ -455,6 +464,8 @@ def _oscillation(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
@@ -515,6 +526,8 @@ def _churn_storm(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
@@ -566,6 +579,8 @@ def _igp_instability(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=postchecks,
@@ -692,6 +707,8 @@ def _runtime_update(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         )
         + [

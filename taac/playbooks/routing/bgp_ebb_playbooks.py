@@ -316,6 +316,8 @@ def get_bgp_ebb_daemon_restart_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-01: BGP daemon restart.
@@ -383,6 +385,8 @@ def get_bgp_ebb_daemon_restart_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             parent_prefixes_to_ignore=parent_prefixes_to_ignore,
             expected_established_sessions=expected_established_sessions,
@@ -459,6 +463,8 @@ def get_bgp_ebb_cold_start_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
     gateway_resolution_device_group_names: t.Sequence[str] = (),
 ) -> Playbook:
     """
@@ -540,6 +546,8 @@ def get_bgp_ebb_cold_start_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             expected_established_sessions=expected_established_sessions,
             bgp_mon=bgp_mon_scope,
@@ -712,6 +720,8 @@ def get_bgp_ebb_attribute_churn_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """Build CICD-EBB-10: BGP attribute churn.
 
@@ -767,6 +777,8 @@ def get_bgp_ebb_attribute_churn_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             bgp_mon=bgp_mon_scope,
             full_session_snapshot=True,
             cpu_characterization=cpu_characterization,
@@ -883,6 +895,8 @@ def get_bgp_ebb_route_storm_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """Build CICD-EBB-11: BGP route storm.
 
@@ -933,6 +947,8 @@ def get_bgp_ebb_route_storm_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             bgp_mon=bgp_mon_scope,
             cpu_characterization=cpu_characterization,
             rss_delta=rss_delta,
@@ -988,6 +1004,8 @@ def get_bgp_ebb_igp_pnh_metric_oscillation_playbook(
     start_ipv6s: t.Optional[t.List[str]] = None,
     count: int = 63,
     step_size: int = 2,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
     duration: int = 2400,
     frequency: int = 30,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
@@ -1066,6 +1084,8 @@ def get_bgp_ebb_igp_pnh_metric_oscillation_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=tuple(start_ipv4s),
             ibgp_pnh_start_ipv6s=tuple(start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             bgp_mon=bgp_mon_scope,
             cpu_characterization=cpu_characterization,
@@ -1171,6 +1191,8 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-12: Route-registry runtime update.
@@ -1259,6 +1281,8 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             bgp_mon=bgp_mon_scope,
             exact_ebgp_peer_group_names=tuple(exact_ebgp_peer_group_names),
             route_count_expected=(
@@ -1399,6 +1423,8 @@ def get_bgp_ebb_multipath_group_oscillation_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-09: Multipath-group oscillation.
@@ -1478,6 +1504,8 @@ def get_bgp_ebb_multipath_group_oscillation_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             bgp_mon=bgp_mon_scope,
             snapshot_skip_flap=True,
             snapshot_skip_uptime=True,
@@ -1871,6 +1899,8 @@ def get_bgp_ebb_ebgp_route_oscillation_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-05: eBGP route oscillation.
@@ -1912,6 +1942,8 @@ def get_bgp_ebb_ebgp_route_oscillation_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             bgp_mon=bgp_mon_scope,
             parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
@@ -2006,6 +2038,8 @@ def get_bgp_ebb_ibgp_route_oscillation_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-06: iBGP route oscillation.
@@ -2047,6 +2081,8 @@ def get_bgp_ebb_ibgp_route_oscillation_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             bgp_mon=bgp_mon_scope,
             parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
@@ -2122,6 +2158,8 @@ def get_bgp_ebb_igp_unresolvable_pnh_playbook(
     restore_start_ipv6s: t.Optional[t.Sequence[str]] = None,
     count: int = 63,
     step_size: int = 2,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
@@ -2197,6 +2235,8 @@ def get_bgp_ebb_igp_unresolvable_pnh_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=tuple(restore_start_ipv4s),
             ibgp_pnh_start_ipv6s=tuple(restore_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             bgp_mon=bgp_mon_scope,
             cpu_characterization=cpu_characterization,
@@ -2286,6 +2326,8 @@ def get_bgp_ebb_ebgp_session_oscillation_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-03: eBGP session oscillation.
@@ -2324,6 +2366,8 @@ def get_bgp_ebb_ebgp_session_oscillation_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
             bgp_mon=bgp_mon_scope,
@@ -2428,6 +2472,8 @@ def get_bgp_ebb_ibgp_plane_session_oscillation_playbook(
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-04: iBGP plane session oscillation.
@@ -2469,6 +2515,8 @@ def get_bgp_ebb_ibgp_plane_session_oscillation_playbook(
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
             ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
             ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
             bgp_mon=bgp_mon_scope,

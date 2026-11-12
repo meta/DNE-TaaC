@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from taac.abstractions.topology.model import (
+    OpenRInjectionPlan,
     OpenRMode,
     OpenRStandaloneEndpoint,
     OpenRStandaloneLink,
@@ -33,8 +34,15 @@ _BGPCPP_CONFIG_PATH = "/mnt/flash/bgpcpp_config"
 POLICY_EVALUATION_SOURCE_CONFIG_PATH = (
     "/mnt/flash/taac_policy_evaluation_source_config.json"
 )
-_OPENR_STANDALONE_ROUTE_COUNT = 63
-_OPENR_STANDALONE_ROUTE_STEP = 2
+# The one compatibility default for callers that declare no injection scale:
+# the legacy ixia11 ranges at the scale the renderer hard-coded before the
+# scale became explicit. Public so no consumer has to restate 63/2.
+DEFAULT_OPENR_STANDALONE_INJECTION = OpenRInjectionPlan(
+    start_ipv4s=tuple(DEFAULT_OPENR_START_IPV4S),
+    start_ipv6s=tuple(DEFAULT_OPENR_START_IPV6S),
+    count=63,
+    step=2,
+)
 _RUN_BGPCPP_SCRIPT_PATH = "/usr/sbin/run_bgpcpp.sh"
 
 
@@ -474,8 +482,7 @@ def _openr_port_channel_command(
 
 def get_openr_standalone_setup_tasks(
     link: OpenRStandaloneLink,
-    start_ipv4s: t.Sequence[str] | None = None,
-    start_ipv6s: t.Sequence[str] | None = None,
+    injection: OpenRInjectionPlan | None = None,
 ) -> list[Task]:
     """Render the standardized EOS standalone link and KvStore sequence.
 
@@ -485,11 +492,14 @@ def get_openr_standalone_setup_tasks(
 
     Args:
         link: Owner/helper standalone link to render.
-        start_ipv4s: Per-plane IPv4 next hops to inject reachability for. These
-            must match the next hops the topology's emulated peers advertise,
-            or those routes never resolve. Defaults to the ixia11 set.
-        start_ipv6s: IPv6 counterpart of ``start_ipv4s``.
+        injection: Resolved injection plan -- the per-plane next-hop ranges,
+            how many synthetic nodes each carries, and their stride. The
+            ranges must match the next hops the topology's emulated peers
+            advertise, or those routes never resolve; resolving the plan from
+            the bound topology is what keeps the two in step. Defaults to the
+            legacy ixia11 set at 63 nodes per range.
     """
+    plan = injection or DEFAULT_OPENR_STANDALONE_INJECTION
     return [
         create_run_commands_on_shell_task(
             hostname=endpoint.hostname,
@@ -505,12 +515,12 @@ def get_openr_standalone_setup_tasks(
         create_openr_route_action_task(
             device_name=link.owner.hostname,
             action=OpenRRouteAction.INJECT.value,
-            start_ipv4s=list(start_ipv4s or DEFAULT_OPENR_START_IPV4S),
-            start_ipv6s=list(start_ipv6s or DEFAULT_OPENR_START_IPV6S),
+            start_ipv4s=list(plan.start_ipv4s),
+            start_ipv6s=list(plan.start_ipv6s),
             local_link=link.kv_link(link.owner),
             other_link=link.kv_link(link.helper),
-            count=_OPENR_STANDALONE_ROUTE_COUNT,
-            step=_OPENR_STANDALONE_ROUTE_STEP,
+            count=plan.count,
+            step=plan.step,
             ixia_needed=True,
             set_outer_hostname=True,
         )
@@ -519,26 +529,36 @@ def get_openr_standalone_setup_tasks(
 
 def get_openr_standalone_teardown_tasks(
     link: OpenRStandaloneLink,
-    start_ipv4s: t.Sequence[str] | None = None,
-    start_ipv6s: t.Sequence[str] | None = None,
+    injection: OpenRInjectionPlan | None = None,
 ) -> OpenRStandaloneTeardownTasks:
-    """Render the standalone link teardown, withdrawing the injected routes.
+    """Render the standalone link teardown and the legacy route withdrawal.
+
+    Teardown is rendered from the same resolved plan as setup -- the same
+    ranges, the same count, the same stride -- so the withdrawal cannot
+    address a different range, count, or stride than the injection did.
+
+    This renderer does not itself delete every injected KvStore key. The
+    withdrawal task carries no ``delete_count``, so the runtime applies its
+    own default, and the effective cleanup boundary remains the Open/R daemon
+    stop plus the port-channel teardown below. That behavior predates the
+    scale parameterization and is deliberately unchanged by it.
 
     Args:
         link: Owner/helper standalone link to tear down.
-        start_ipv4s: Per-plane IPv4 next hops to withdraw. Must match what
-            setup injected, or the withdrawal misses. Defaults to the ixia11 set.
-        start_ipv6s: IPv6 counterpart of ``start_ipv4s``.
+        injection: The plan setup injected. Must be the same plan, or the
+            withdrawal misses whatever the two disagree about. Defaults to the
+            legacy ixia11 set at 63 nodes per range.
     """
+    plan = injection or DEFAULT_OPENR_STANDALONE_INJECTION
     route_withdrawal = create_openr_route_action_task(
         device_name=link.owner.hostname,
         action=OpenRRouteAction.DELETE.value,
-        start_ipv4s=list(start_ipv4s or DEFAULT_OPENR_START_IPV4S),
-        start_ipv6s=list(start_ipv6s or DEFAULT_OPENR_START_IPV6S),
+        start_ipv4s=list(plan.start_ipv4s),
+        start_ipv6s=list(plan.start_ipv6s),
         local_link=link.kv_link(link.owner),
         other_link=link.kv_link(link.helper),
-        count=_OPENR_STANDALONE_ROUTE_COUNT,
-        step=_OPENR_STANDALONE_ROUTE_STEP,
+        count=plan.count,
+        step=plan.step,
         ixia_needed=True,
         set_outer_hostname=True,
     )

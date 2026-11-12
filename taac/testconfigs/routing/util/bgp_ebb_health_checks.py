@@ -181,6 +181,8 @@ def create_standard_prechecks(
     check_ibgp_pnh: bool = False,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
     check_bgp_convergence: bool = True,
     check_hardware_capacity: bool = True,
     rp_file_path: str | None = None,
@@ -218,6 +220,10 @@ def create_standard_prechecks(
         check_ibgp_pnh: Enable iBGP PNH metric check (only for Open/R profiles)
         ibgp_pnh_start_ipv4s: IPv4 route-range starts from the bound topology.
         ibgp_pnh_start_ipv6s: IPv6 route-range starts from the bound topology.
+        ibgp_pnh_count: Synthetic nodes per range, from the resolved Open/R
+            injection plan, so readiness covers the whole injected range
+            rather than its first address.
+        ibgp_pnh_step: Address stride within a range, from the same plan.
         check_bgp_convergence: Add the BGP++ initialization-events convergence
             precheck (default True). Asserts the device reached INITIALIZED
             within the convergence threshold (self-waits up to it). The strict
@@ -358,6 +364,8 @@ def create_standard_prechecks(
                 check_id="startup_ibgp_pnh_verification",
                 start_ipv4s=ibgp_pnh_start_ipv4s,
                 start_ipv6s=ibgp_pnh_start_ipv6s,
+                count=ibgp_pnh_count,
+                step=ibgp_pnh_step,
             )
         )
 

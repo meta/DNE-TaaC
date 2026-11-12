@@ -9,12 +9,16 @@ from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
+from taac.abstractions.compatibility.legacy_ebb_topology import (
+    IBGP_PEER_SCALE_PER_PLANE,
+)
 from taac.abstractions.physical_inventory import NRQEB009_ASH6
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
     EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
     ebb_full_scale_topology,
     EBB_FY26_SCALE,
+    EBB_FY27_SCALE,
     EBB_NEXT_HOPS_IXIA03,
     EBB_OPENR_INJECTED_START_IPV4S,
     EBB_OPENR_INJECTED_START_IPV4S_IXIA03,
@@ -23,12 +27,15 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_PARENT_NETWORKS,
     EBB_PARENT_NETWORKS_IXIA03,
     EBB_PEER_GROUPS,
+    EbbScaleProfile,
 )
 from taac.abstractions.topology.model import (
     BoundTopology,
     NextHopMode,
+    OpenRInjectionPlan,
     OpenRMode,
 )
+from taac.abstractions.validation import TopologyValidationError
 from taac.constants import (
     BgpPlusPlusProfile,
     TESTBED_ISOLATION_BYPASS_TAG,
@@ -153,6 +160,17 @@ def _bound_shape(prefix_count: int) -> BoundTopology:
     )
 
 
+# The factory resolves one injection plan from the bound topology and threads
+# it into the PNH checks and Open/R steps, so a fake bound topology has to hand
+# back a real plan.
+_FY26_INJECTION = OpenRInjectionPlan(
+    start_ipv4s=tuple(EBB_OPENR_INJECTED_START_IPV4S),
+    start_ipv6s=tuple(EBB_OPENR_INJECTED_START_IPV6S),
+    count=EBB_FY26_SCALE.he_sites_per_range,
+    step=EBB_FY26_SCALE.next_hop_step,
+)
+
+
 class BgpEbbFullScaleFactoryTest(unittest.TestCase):
     _AUTOMATION = factory._EbbAutomationContract(
         non_monitor_established_session_count=1272,
@@ -210,8 +228,10 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
                 device_config=SimpleNamespace(
                     fibagent_bgp_nhg_watermark_high=1000,
                     fibagent_bgp_nhg_watermark_low=1000,
+                    openr_mode=OpenRMode.STANDALONE,
                 ),
                 parent_networks={"bgpmon_v6": bgp_mon_parent_network},
+                resolve_openr_injection_plan=lambda: _FY26_INJECTION,
             ),
         )
         builders = {
@@ -301,10 +321,15 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
                         device_config=SimpleNamespace(
                             fibagent_bgp_nhg_watermark_high=1000,
                             fibagent_bgp_nhg_watermark_low=1000,
-                            openr_injected_start_ipv4s=start_ipv4s,
-                            openr_injected_start_ipv6s=start_ipv6s,
+                            openr_mode=OpenRMode.STANDALONE,
                         ),
                         parent_networks=parent_networks,
+                        resolve_openr_injection_plan=lambda plan=OpenRInjectionPlan(
+                            start_ipv4s=tuple(start_ipv4s),
+                            start_ipv6s=tuple(start_ipv6s),
+                            count=EBB_FY26_SCALE.he_sites_per_range,
+                            step=EBB_FY26_SCALE.next_hop_step,
+                        ): plan,
                     ),
                 )
                 builders = {
@@ -396,8 +421,10 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
                 device_config=SimpleNamespace(
                     fibagent_bgp_nhg_watermark_high=1000,
                     fibagent_bgp_nhg_watermark_low=1000,
+                    openr_mode=OpenRMode.STANDALONE,
                 ),
                 parent_networks={},
+                resolve_openr_injection_plan=lambda: _FY26_INJECTION,
             ),
         )
 
@@ -1043,6 +1070,149 @@ class GatewayGateScopeTest(unittest.TestCase):
                 self.assertEqual(self.gateless[name], _without_gateway_gates(config))
 
 
+class EbbInjectionScaleReachesEveryPnhCheckTest(unittest.TestCase):
+    """Every PNH readiness check must describe the injection setup performed.
+
+    Threading the resolved scale into two named playbooks and leaving the rest
+    on the starts alone is the failure this guards: the factory builds a dozen
+    playbooks that emit `startup_ibgp_pnh_verification`, and a check given
+    only the range starts falls back to the runtime's own defaults of 63
+    nodes at stride 2. Those equal the FY26 scale, so an unthreaded check
+    passes under FY26 by coincidence of two independent defaults while
+    validating 63 under every other scale, whatever setup injected. These run
+    the real public factory, with a real topology and inventory, and compare
+    every emitted check against the setup task's own numbers rather than
+    against a literal.
+    """
+
+    # Playbooks that emit the PNH readiness check and need neither the
+    # runtime-update prefix window nor route-storm sharding, so the override
+    # topology below matches what the factory would have built.
+    _SELECTED = [
+        "bgp_ebb_attribute_churn_playbook",
+        "bgp_ebb_igp_pnh_metric_oscillation_playbook",
+        "bgp_ebb_igp_unresolvable_pnh_playbook",
+        "bgp_ebb_ebgp_session_oscillation_playbook",
+        "bgp_ebb_ibgp_route_oscillation_playbook",
+    ]
+
+    @staticmethod
+    def _config(scale: EbbScaleProfile) -> taac_types.TestConfig:
+        topology = ebb_full_scale_topology(
+            scale=scale,
+            openr_mode=OpenRMode.STANDALONE,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+        )
+        return factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB009_ASH6,
+            name=f"PNH_SCALE_{scale.name}",
+            playbooks_selected=list(
+                EbbInjectionScaleReachesEveryPnhCheckTest._SELECTED
+            ),
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            topology_override=topology,
+        )
+
+    @staticmethod
+    def _json_params(params: taac_types.Params | None) -> dict:
+        if params is None or params.json_params is None:
+            raise AssertionError("expected serialized json_params")
+        return json.loads(params.json_params)
+
+    @classmethod
+    def _injection_task_params(cls, config: taac_types.TestConfig) -> dict:
+        tasks = [
+            cls._json_params(task.params)
+            for task in (config.setup_tasks or [])
+            if task.task_name == "openr_route_action"
+        ]
+        if len(tasks) != 1:
+            raise AssertionError(f"expected one injection task, got {len(tasks)}")
+        return tasks[0]
+
+    @classmethod
+    def _pnh_payloads(cls, config: taac_types.TestConfig) -> list[dict]:
+        return [
+            cls._json_params(check.check_params)
+            for playbook in (config.playbooks or [])
+            for check in (playbook.prechecks or [])
+            if check.check_id == "startup_ibgp_pnh_verification"
+        ]
+
+    def _assert_every_check_matches_setup(self, scale: EbbScaleProfile) -> None:
+        config = self._config(scale)
+        injected = self._injection_task_params(config)
+        payloads = self._pnh_payloads(config)
+
+        self.assertEqual(scale.he_sites_per_range, injected["count"])
+        self.assertEqual(scale.next_hop_step, injected["step"])
+        # Several playbooks emit the check; a single one passing would not
+        # show that the threading is complete.
+        self.assertGreater(len(payloads), 1)
+        for index, payload in enumerate(payloads):
+            with self.subTest(scale=scale.name, check=index):
+                self.assertEqual(injected["count"], payload["count"])
+                self.assertEqual(injected["step"], payload["step"])
+                self.assertEqual(
+                    injected["start_ipv4s"],
+                    payload["start_ipv4s"][: len(injected["start_ipv4s"])],
+                )
+
+    def test_fy26_scale_reaches_every_pnh_check(self) -> None:
+        self._assert_every_check_matches_setup(EBB_FY26_SCALE)
+
+    def test_fy27_scale_reaches_every_pnh_check(self) -> None:
+        """80 HE sites per range, through the real factory, end to end."""
+        self._assert_every_check_matches_setup(EBB_FY27_SCALE)
+
+    def test_sixty_two_node_override_reaches_every_pnh_check(self) -> None:
+        """The tightest scale that still covers 62 advertised peers per plane."""
+        self._assert_every_check_matches_setup(
+            EbbScaleProfile(name="EBB_TEST_62", he_sites_per_range=62)
+        )
+
+    def test_production_readiness_count_is_the_scale_not_the_peer_count(
+        self,
+    ) -> None:
+        """63 injected nodes per range, not the 62 emulated peers.
+
+        These two numbers differ by exactly one, and the wrong one is the
+        plausible mistake: the peer count is what the topology advertises,
+        while the injected count is what Open/R must make reachable, with one
+        node of headroom. Threading the peer count would leave the spare node
+        -- the one proving the injection has headroom -- unvalidated, and the
+        check would still pass. Asserted against the production FY26 config
+        the scheduled bindings use.
+        """
+        config = self._config(EBB_FY26_SCALE)
+        payloads = self._pnh_payloads(config)
+
+        self.assertGreater(len(payloads), 1)
+        self.assertEqual(63, EBB_FY26_SCALE.he_sites_per_range)
+        self.assertEqual(62, IBGP_PEER_SCALE_PER_PLANE)
+        for index, payload in enumerate(payloads):
+            with self.subTest(check=index):
+                self.assertEqual(EBB_FY26_SCALE.he_sites_per_range, payload["count"])
+                self.assertNotEqual(IBGP_PEER_SCALE_PER_PLANE, payload["count"])
+
+    def test_every_pnh_emitting_playbook_is_covered(self) -> None:
+        """No playbook emits a check the factory left without a scale.
+
+        Guards the specific regression of threading the scale into some
+        construction sites and not others: any check missing count or step
+        means a builder the factory did not thread.
+        """
+        config = self._config(EBB_FY27_SCALE)
+        missing = [
+            payload
+            for payload in self._pnh_payloads(config)
+            if "count" not in payload or "step" not in payload
+        ]
+        self.assertEqual([], missing)
+
+
 class EbbInjectionRangeAnchorWithRuntimeAdvertisementsTest(unittest.TestCase):
     """A plane may bind more than one advertisement and still anchor a range.
 
@@ -1052,6 +1222,67 @@ class EbbInjectionRangeAnchorWithRuntimeAdvertisementsTest(unittest.TestCase):
     advertisement is auxiliary here: its next hops are the session addresses,
     which no injection covers. These lock the filter in place.
     """
+
+    @staticmethod
+    def _tc7_config() -> taac_types.TestConfig:
+        """Compile the real UG 2.7 / TC7 topology with runtime advertisements."""
+        return factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB009_ASH6,
+            name="TC7_RUNTIME_ADVERTISEMENT_ANCHOR",
+            playbooks_selected=["bgp_ug_link_flap_recovery"],
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+        )
+
+    def test_tc7_topology_resolves_its_injection_with_runtime_advertisements(
+        self,
+    ) -> None:
+        config = self._tc7_config()
+
+        injections = [
+            json.loads(task.params.json_params)
+            for task in (config.setup_tasks or [])
+            if task.task_name == "openr_route_action"
+            and task.params is not None
+            and task.params.json_params is not None
+        ]
+        self.assertEqual(1, len(injections))
+        # The auxiliary SELF advertisement must not perturb the anchor: the
+        # resolved range starts are the plane next hops, at the FY26 scale.
+        self.assertEqual(EBB_FY26_SCALE.he_sites_per_range, injections[0]["count"])
+        self.assertEqual(EBB_FY26_SCALE.next_hop_step, injections[0]["step"])
+        self.assertEqual(4, len(injections[0]["start_ipv4s"]))
+        self.assertEqual(4, len(injections[0]["start_ipv6s"]))
+
+    def test_tc7_planes_really_do_bind_a_second_advertisement(self) -> None:
+        """Guards the guard: without this the test above proves nothing."""
+        topology = ebb_full_scale_topology(
+            scale=EBB_FY26_SCALE,
+            openr_mode=OpenRMode.STANDALONE,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            extra_advertisements=factory._tc7_runtime_intents(
+                {"bgp_ug_link_flap_recovery"}
+            )[1],
+            extra_prefix_sets=factory._tc7_runtime_intents(
+                {"bgp_ug_link_flap_recovery"}
+            )[0],
+        )
+        multi = [
+            group
+            for group in topology.device_groups
+            if group.openr_injection_range_ordinal is not None
+            and len(group.prefix_advertisements) > 1
+        ]
+        self.assertTrue(multi)
+        for group in multi:
+            with self.subTest(group=group.name):
+                self.assertTrue(
+                    any(
+                        advertisement.next_hop.mode is NextHopMode.SELF
+                        for advertisement in group.prefix_advertisements
+                    )
+                )
 
     def _bind_with_advertisements(
         self, replacement: t.Callable[[t.Any], tuple[t.Any, ...]]
@@ -1114,3 +1345,137 @@ class EbbInjectionRangeAnchorWithRuntimeAdvertisementsTest(unittest.TestCase):
         self.assertIn("2 eligible of 2", message)
         self.assertIn("ambiguous", message)
         self.assertIn("per_peer", message)
+
+    def _unresolvable_injection_topology(self) -> t.Any:
+        """The FY26 topology with range 1 declared twice for v4."""
+        logical = self._bind_with_advertisements(
+            lambda group: group.prefix_advertisements
+        ).logical_topology
+        return replace(
+            logical,
+            device_groups=tuple(
+                replace(group, openr_injection_range_ordinal=1)
+                if group.name == "dg_ibgp_v4_dc_p2"
+                else group
+                for group in logical.device_groups
+            ),
+        )
+
+    def test_factory_fails_closed_with_the_compilers_injection_issue(self) -> None:
+        """An unresolvable range is the same topology error at either layer.
+
+        The factory resolves the plan to build its playbooks before it compiles
+        the topology, so it reaches a bad declaration first. It must fail with
+        the structured issue the compiler raises, not with a bare ValueError.
+        """
+        duplicated = self._unresolvable_injection_topology()
+
+        def build(*, setup_only: bool) -> taac_types.TestConfig:
+            return factory.create_bgp_ebb_full_scale_test_config(
+                NRQEB009_ASH6,
+                name="UNRESOLVABLE_INJECTION",
+                playbooks_selected=(
+                    None
+                    if setup_only
+                    else ["bgp_ebb_igp_pnh_metric_oscillation_playbook"]
+                ),
+                profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+                next_hops=EBB_NEXT_HOPS_IXIA03,
+                setup_only=setup_only,
+                topology_override=duplicated,
+            )
+
+        with self.assertRaises(TopologyValidationError) as from_factory:
+            build(setup_only=False)
+        with self.assertRaises(TopologyValidationError) as from_compiler:
+            build(setup_only=True)
+
+        (issue,) = from_factory.exception.issues
+        self.assertEqual("device_config.openr_injection_scale", issue.path)
+        self.assertEqual("unresolvable_openr_injection", issue.code)
+        self.assertIn("range 1 is declared twice for v4", issue.message)
+        self.assertEqual(from_compiler.exception.issues, from_factory.exception.issues)
+
+    def test_non_standalone_binding_never_resolves_a_declared_injection(
+        self,
+    ) -> None:
+        """Without standalone Open/R the factory ignores a stale injection scale.
+
+        The compiler resolves the plan only for standalone Open/R. A profile
+        without Open/R binds the topology in NONE mode but leaves its declared
+        injection scale in place, so the factory must not resolve it either:
+        an unusable declaration builds exactly the config no declaration
+        builds, with no injection task and no PNH readiness check.
+        """
+        duplicated = self._unresolvable_injection_topology()
+
+        def build(topology: t.Any) -> taac_types.TestConfig:
+            return factory.create_bgp_ebb_full_scale_test_config(
+                NRQEB009_ASH6,
+                name="NON_STANDALONE_INJECTION",
+                playbooks_selected=["bgp_ebb_ebgp_session_oscillation_playbook"],
+                profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
+                parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+                next_hops=EBB_NEXT_HOPS_IXIA03,
+                topology_override=topology,
+            )
+
+        stale = build(duplicated)
+        undeclared = build(
+            replace(
+                duplicated,
+                device_config=replace(
+                    duplicated.device_config, openr_injection_scale=None
+                ),
+            )
+        )
+
+        self.assertEqual(undeclared, stale)
+        self.assertNotIn(
+            "openr_route_action",
+            [task.task_name for task in stale.setup_tasks or []],
+        )
+        self.assertEqual(
+            [], EbbInjectionScaleReachesEveryPnhCheckTest._pnh_payloads(stale)
+        )
+
+    def test_readiness_checks_the_compatibility_injection_without_a_plan(
+        self,
+    ) -> None:
+        """Standalone Open/R with no injection scale still injects a default.
+
+        The compiler renders the compatibility injection when no plan
+        resolves, so every PNH readiness check must assert that injection's
+        starts, count and step, not fall back to the runtime's own defaults.
+        """
+        logical = self._bind_with_advertisements(
+            lambda group: group.prefix_advertisements
+        ).logical_topology
+        unscaled = replace(
+            logical,
+            device_config=replace(logical.device_config, openr_injection_scale=None),
+        )
+        checks = EbbInjectionScaleReachesEveryPnhCheckTest
+        config = factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB009_ASH6,
+            name="UNSCALED_INJECTION",
+            playbooks_selected=list(checks._SELECTED),
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            topology_override=unscaled,
+        )
+
+        injected = checks._injection_task_params(config)
+        payloads = checks._pnh_payloads(config)
+
+        self.assertGreater(len(payloads), 1)
+        for index, payload in enumerate(payloads):
+            with self.subTest(check=index):
+                self.assertEqual(injected["count"], payload.get("count"))
+                self.assertEqual(injected["step"], payload.get("step"))
+                self.assertEqual(
+                    injected["start_ipv4s"],
+                    payload["start_ipv4s"][: len(injected["start_ipv4s"])],
+                )

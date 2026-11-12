@@ -9,6 +9,9 @@ import typing as t
 import uuid
 from collections import Counter
 
+from taac.abstractions.eos_bgpcpp_setup_tasks import (
+    DEFAULT_OPENR_STANDALONE_INJECTION,
+)
 from taac.abstractions.physical_inventory import PhysicalInventory
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_ACCEPT_POLICY,
@@ -43,6 +46,9 @@ from taac.abstractions.topology import (
     PrefixMembership,
     PrefixSet,
     RoutingDeviceConfig,
+)
+from taac.abstractions.validation import (
+    resolve_validated_openr_injection_plan,
 )
 from taac.constants import (
     BgpPlusPlusProfile,
@@ -1040,7 +1046,7 @@ def _characterization_gates(
     return gates_by_playbook.get(playbook_name, NO_CHARACTERIZATION_GATES)
 
 
-def _get_bgp_ebb_full_scale_playbooks(
+def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
     physical_inventory: PhysicalInventory,
     profile: BgpPlusPlusProfile,
     *,
@@ -1157,12 +1163,43 @@ def _get_bgp_ebb_full_scale_playbooks(
         ) from error
     bgp_mon_parent_prefix = f"{bound_bgp_mon_network}::/80"
     expected_peer_identity = build_expected_peer_identity(bound_parent_networks)
+    # One resolved plan feeds setup, the health checks, the churn steps, and
+    # teardown. Reading it back from the bound topology -- rather than from a
+    # chassis constant -- is what keeps the PNH inventory the checks assert
+    # identical to the reachability the compiler actually injects. A topology
+    # that declares no injection, or is not in standalone Open/R mode (every
+    # non-Open/R profile), keeps passing None so the playbooks stay on their
+    # own defaults, and the count/step come from the renderer's single
+    # compatibility default rather than from numbers restated here. Only
+    # standalone Open/R resolves the plan, exactly as the compiler does.
+    openr_injection = (
+        resolve_validated_openr_injection_plan(bound)
+        if device_config.openr_mode is OpenRMode.STANDALONE
+        else None
+    )
+    compatibility_injection = openr_injection or DEFAULT_OPENR_STANDALONE_INJECTION
+    # Readiness describes the injection setup renders. Standalone Open/R
+    # renders the compatibility default when no plan resolves, so readiness
+    # checks that rather than falling back to the runtime's own defaults.
+    rendered_injection = openr_injection
+    if rendered_injection is None and device_config.openr_mode is OpenRMode.STANDALONE:
+        rendered_injection = DEFAULT_OPENR_STANDALONE_INJECTION
     ibgp_pnh_start_ipv4s = (
-        tuple(getattr(device_config, "openr_injected_start_ipv4s", ())) or None
+        tuple(rendered_injection.start_ipv4s)
+        if rendered_injection is not None
+        else None
     )
     ibgp_pnh_start_ipv6s = (
-        tuple(getattr(device_config, "openr_injected_start_ipv6s", ())) or None
+        tuple(rendered_injection.start_ipv6s)
+        if rendered_injection is not None
+        else None
     )
+    openr_route_count = compatibility_injection.count
+    openr_route_step = compatibility_injection.step
+    openr_pnh_count = (
+        rendered_injection.count if rendered_injection is not None else None
+    )
+    openr_pnh_step = rendered_injection.step if rendered_injection is not None else None
     local_link = _openr_owner_kv_link(physical_inventory)
     other_link = _openr_helper_kv_link(physical_inventory)
     # The canonical 50-NHG topology consumes about 12.4K FEC entries before
@@ -1204,6 +1241,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
                 "bgp_ebb_attribute_churn_playbook", enable_update_group
@@ -1221,6 +1260,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             cycles=route_storm_cycles,
             quiet_window_seconds=route_storm_quiet_window_seconds,
             bounded_validation=route_storm_bounded_validation,
@@ -1247,6 +1288,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
                 "bgp_ebb_route_registry_runtime_update_playbook",
@@ -1267,6 +1310,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             test_duration_seconds=multipath_test_duration_seconds,
             oscillation_interval_seconds=multipath_oscillation_interval_seconds,
             cycle_count=multipath_cycle_count,
@@ -1295,6 +1340,10 @@ def _get_bgp_ebb_full_scale_playbooks(
             start_ipv6s=(
                 list(ibgp_pnh_start_ipv6s) if ibgp_pnh_start_ipv6s is not None else None
             ),
+            count=openr_route_count,
+            step_size=openr_route_step,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
                 "bgp_ebb_igp_pnh_metric_oscillation_playbook",
@@ -1351,6 +1400,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             # Deliberately unmeasured. Restarting bgpcpp replaces the PID
             # mid-bracket, and both collectors resolve the PID once at START:
             # CPU then reads a dead /proc entry and silently drops every
@@ -1373,6 +1424,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             gateway_resolution_device_group_names=gateway_device_group_names,
         ),
         get_bgp_ebb_ebgp_session_oscillation_playbook(
@@ -1388,6 +1441,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
                 "bgp_ebb_ebgp_session_oscillation_playbook", enable_update_group
@@ -1409,6 +1464,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
                 "bgp_ebb_ebgp_route_oscillation_playbook", enable_update_group
@@ -1427,6 +1484,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
                 "bgp_ebb_ibgp_plane_session_oscillation_playbook",
@@ -1444,6 +1503,8 @@ def _get_bgp_ebb_full_scale_playbooks(
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
                 "bgp_ebb_ibgp_route_oscillation_playbook", enable_update_group
@@ -1476,6 +1537,10 @@ def _get_bgp_ebb_full_scale_playbooks(
             restore_start_ipv6s=(
                 list(ibgp_pnh_start_ipv6s) if ibgp_pnh_start_ipv6s is not None else None
             ),
+            count=openr_route_count,
+            step_size=openr_route_step,
+            ibgp_pnh_count=openr_pnh_count,
+            ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
                 "bgp_ebb_igp_unresolvable_pnh_playbook", enable_update_group

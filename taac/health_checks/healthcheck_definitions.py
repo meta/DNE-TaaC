@@ -1449,6 +1449,8 @@ def create_ibgp_pnh_metric_check(
     check_id: t.Optional[str] = None,
     start_ipv4s: t.Optional[t.Sequence[str]] = None,
     start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    count: t.Optional[int] = None,
+    step: t.Optional[int] = None,
 ) -> PointInTimeHealthCheck:
     """Create a point-in-time check of iBGP protocol-next-hop (PNH) metric/AD vs Open/R.
 
@@ -1463,6 +1465,14 @@ def create_ibgp_pnh_metric_check(
         check_id: Optional unique identifier for the check.
         start_ipv4s: Optional IPv4 route-range starts from the bound topology.
         start_ipv6s: Optional IPv6 route-range starts from the bound topology.
+        count: Optional synthetic nodes per range, from the resolved Open/R
+            injection plan. The runtime check defaults to 63 nodes at stride
+            2 when these are omitted, which happens to equal the FY26 scale,
+            so FY26 validated the right population only by coincidence of two
+            independent defaults. Passing the resolved values removes that
+            coincidence and is what makes any non-FY26 scale validate the
+            population its setup actually injected.
+        step: Optional address stride within a range, from the same plan.
 
     Returns:
         A `PointInTimeHealthCheck` with `name=IBGP_PNH_METRIC_CHECK`.
@@ -1475,6 +1485,12 @@ def create_ibgp_pnh_metric_check(
         payload["start_ipv4s"] = list(start_ipv4s)
     if start_ipv6s is not None:
         payload["start_ipv6s"] = list(start_ipv6s)
+    # Omitted rather than defaulted: a caller that does not resolve a plan
+    # serializes exactly the payload it did before these fields existed.
+    if count is not None:
+        payload["count"] = count
+    if step is not None:
+        payload["step"] = step
 
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.IBGP_PNH_METRIC_CHECK,

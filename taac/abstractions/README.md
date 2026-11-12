@@ -419,6 +419,22 @@ resolver records how many leading rows of each range the peers advertise as
 disagree. Anything that observes injected rows through BGP must be bounded by
 it, never by `count`: an injection with headroom carries rows no BGP path uses.
 
+**Setup and teardown are rendered from one plan.** The same resolved
+`OpenRInjectionPlan` produces the `inject` task and the `delete` task, so the
+withdrawal cannot address a different range, count, or stride than the
+injection did. The compiler and the playbook factories both resolve it through
+`resolve_validated_openr_injection_plan()`, so an unusable range declaration
+fails as one `unresolvable_openr_injection` topology issue whichever layer
+reaches it first.
+
+Scale parameterization does **not** make teardown delete every injected
+KvStore key, and nothing here should be read as claiming it does. The
+withdrawal task passes no `delete_count`, so the runtime applies its own
+default; the effective cleanup boundary is still stopping the Open/R daemon
+and tearing down the port channel, exactly as before. Making teardown
+withdraw each injected key explicitly is separate work with its own
+behavioral risk, and is deliberately not part of this parameterization.
+
 Two capacity notes, because both have been misapplied to this path:
 
 - The EOS limit of 500 secondary addresses per interface constrains

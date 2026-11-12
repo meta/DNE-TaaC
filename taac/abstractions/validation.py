@@ -37,9 +37,11 @@ from taac.abstractions.topology.prefix import (
 
 if t.TYPE_CHECKING:
     from taac.abstractions.topology.model import (
+        BoundTopology,
         DeviceGroupSpec,
         EndpointSpec,
         LogicalTopology,
+        OpenRInjectionPlan,
         PrefixAdvertisement,
         PrefixPool,
         PrefixSet,
@@ -125,6 +127,34 @@ def validate_logical_topology(logical_topology: LogicalTopology) -> None:
     issues = collect_logical_topology_issues(logical_topology)
     if issues:
         raise TopologyValidationError(logical_topology.name or "<unnamed>", issues)
+
+
+def resolve_validated_openr_injection_plan(
+    bound: BoundTopology,
+) -> OpenRInjectionPlan | None:
+    """Resolve ``bound``'s Open/R injection, failing as a topology error.
+
+    The compiler and the playbook factories both read the plan, and either can
+    be first to resolve it, so both resolve through here and an unusable range
+    declaration fails the same way whichever layer reaches it.
+
+    Raises:
+        TopologyValidationError: The declared injection ranges cannot be
+            resolved; the issue message names the offending declaration.
+    """
+    try:
+        return bound.resolve_openr_injection_plan()
+    except ValueError as error:
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path="device_config.openr_injection_scale",
+                    code="unresolvable_openr_injection",
+                    message=str(error),
+                )
+            ],
+        ) from error
 
 
 def collect_logical_topology_issues(

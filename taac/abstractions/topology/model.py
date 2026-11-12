@@ -696,12 +696,6 @@ class RoutingDeviceConfig:
     openr_mode: OpenRMode = OpenRMode.NONE
     openr_configerator_path: str | None = None
     openr_standalone_link: OpenRStandaloneLink | None = None
-    # Reachability Open/R must inject for the next hops the emulated peers
-    # advertise. Empty means "use the renderer default", which is the ixia11
-    # set. A topology whose next hops sit elsewhere has to say so here, or its
-    # routes arrive, sit in the RIB unresolved, and never become installable.
-    openr_injected_start_ipv4s: tuple[str, ...] = ()
-    openr_injected_start_ipv6s: tuple[str, ...] = ()
     # Size and stride of the synthetic reachability Open/R injects for the next
     # hops the emulated peers advertise. The addresses are NOT recorded here:
     # they are derived at lowering time from the bound route advertisements of

@@ -306,6 +306,11 @@ class OpenRMode(str, Enum):
 
 
 class TaskCompatibilityProfile(str, Enum):
+    # The EBB members keep their "full scale" spelling deliberately. Their
+    # values are serialized into TestConfig and are byte-identical to the
+    # LogicalTopology names the EOS lowering matches on, so this enum is
+    # serialized identity rather than a topology identifier and is out of
+    # scope for the fiscal-year rename.
     BOUNDED_ECMP = "bounded_ecmp"
     CONSTANT_ATTRIBUTE_STORAGE = "constant_attribute_storage"
     EBB_FULL_SCALE_NO_BGPMON = "ebb_full_scale_no_bgpmon"

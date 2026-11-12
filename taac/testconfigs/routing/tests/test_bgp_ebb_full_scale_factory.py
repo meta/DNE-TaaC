@@ -15,8 +15,6 @@ from taac.abstractions.compatibility.legacy_ebb_topology import (
 from taac.abstractions.physical_inventory import NRQEB009_ASH6
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
-    EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
-    ebb_full_scale_topology,
     EBB_FY26_SCALE,
     EBB_FY27_SCALE,
     EBB_NEXT_HOPS_IXIA03,
@@ -27,6 +25,8 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_PARENT_NETWORKS,
     EBB_PARENT_NETWORKS_IXIA03,
     EBB_PEER_GROUPS,
+    EBB_PORT_MAP_WITH_BGPMON,
+    ebb_topology,
     EbbScaleProfile,
 )
 from taac.abstractions.topology.model import (
@@ -136,7 +136,7 @@ def _compiled_topology() -> mock.MagicMock:
 
 
 def _bound_shape(prefix_count: int) -> BoundTopology:
-    topology = factory.ebb_full_scale_topology(
+    topology = factory.ebb_topology(
         scale=EBB_FY26_SCALE,
         openr_mode=factory.OpenRMode.STANDALONE,
         ebgp_prefix_count=prefix_count,
@@ -203,9 +203,7 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
         ):
             with self.subTest(profile=profile):
                 topology = _compiled_topology()
-                with mock.patch.object(
-                    factory, "ebb_full_scale_topology", return_value=topology
-                ):
+                with mock.patch.object(factory, "ebb_topology", return_value=topology):
                     config = factory.create_bgp_ebb_full_scale_test_config(
                         _inventory(),
                         name="ISOLATION_POLICY_TEST",
@@ -628,7 +626,7 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
         topology = _compiled_topology()
         with (
             mock.patch.object(
-                factory, "ebb_full_scale_topology", return_value=topology
+                factory, "ebb_topology", return_value=topology
             ) as topology_builder,
             mock.patch.object(
                 factory, "_get_bgp_ebb_full_scale_playbooks"
@@ -665,7 +663,7 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
         playbook = taac_types.Playbook(name=_C16_PLAYBOOK)
         with (
             mock.patch.object(
-                factory, "ebb_full_scale_topology", return_value=topology
+                factory, "ebb_topology", return_value=topology
             ) as topology_builder,
             mock.patch.object(
                 factory,
@@ -690,7 +688,7 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
         playbook = taac_types.Playbook(name=playbook_name)
         with (
             mock.patch.object(
-                factory, "ebb_full_scale_topology", return_value=topology
+                factory, "ebb_topology", return_value=topology
             ) as topology_builder,
             mock.patch.object(
                 factory,
@@ -862,9 +860,7 @@ class GatewayResolutionGateTest(unittest.TestCase):
         topology = _compiled_topology()
         compiled = topology.bind_to_inventory.return_value.compile.return_value
         compiled.basic_port_configs = []
-        with mock.patch.object(
-            factory, "ebb_full_scale_topology", return_value=topology
-        ):
+        with mock.patch.object(factory, "ebb_topology", return_value=topology):
             config = factory.create_bgp_ebb_full_scale_test_config(
                 _inventory(), name="NO_IXIA_DEVICE_GROUPS", setup_only=True
             )
@@ -879,9 +875,7 @@ class GatewayResolutionGateTest(unittest.TestCase):
         compiled = topology.bind_to_inventory.return_value.compile.return_value
         compiled.setup_tasks = []
         with (
-            mock.patch.object(
-                factory, "ebb_full_scale_topology", return_value=topology
-            ),
+            mock.patch.object(factory, "ebb_topology", return_value=topology),
             self.assertRaisesRegex(ValueError, "interface_ip_configuration"),
         ):
             factory.create_bgp_ebb_full_scale_test_config(
@@ -1098,7 +1092,7 @@ class EbbInjectionScaleReachesEveryPnhCheckTest(unittest.TestCase):
 
     @staticmethod
     def _config(scale: EbbScaleProfile) -> taac_types.TestConfig:
-        topology = ebb_full_scale_topology(
+        topology = ebb_topology(
             scale=scale,
             openr_mode=OpenRMode.STANDALONE,
             next_hops=EBB_NEXT_HOPS_IXIA03,
@@ -1257,7 +1251,7 @@ class EbbInjectionRangeAnchorWithRuntimeAdvertisementsTest(unittest.TestCase):
 
     def test_tc7_planes_really_do_bind_a_second_advertisement(self) -> None:
         """Guards the guard: without this the test above proves nothing."""
-        topology = ebb_full_scale_topology(
+        topology = ebb_topology(
             scale=EBB_FY26_SCALE,
             openr_mode=OpenRMode.STANDALONE,
             next_hops=EBB_NEXT_HOPS_IXIA03,
@@ -1287,13 +1281,13 @@ class EbbInjectionRangeAnchorWithRuntimeAdvertisementsTest(unittest.TestCase):
     def _bind_with_advertisements(
         self, replacement: t.Callable[[t.Any], tuple[t.Any, ...]]
     ) -> BoundTopology:
-        bound = ebb_full_scale_topology(
+        bound = ebb_topology(
             scale=EBB_FY26_SCALE,
             openr_mode=OpenRMode.STANDALONE,
             next_hops=EBB_NEXT_HOPS_IXIA03,
         ).bind_to_inventory(
             physical_inventory=NRQEB009_ASH6,
-            port_map=EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
+            port_map=EBB_PORT_MAP_WITH_BGPMON,
             parent_networks=EBB_PARENT_NETWORKS_IXIA03,
             peer_groups=EBB_PEER_GROUPS,
             as_numbers=EBB_AS_NUMBERS,

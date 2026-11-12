@@ -298,12 +298,12 @@ EBB_PEER_GROUPS: dict[str, BgpPeerGroup] = {
     PEERGROUP_BGP_MON: BGP_MON_PEER_GROUP,
 }
 
-EBB_FULL_SCALE_PORT_MAP = {
+EBB_PORT_MAP = {
     "uplink": 0,
     "ibgp": 1,
 }
-EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON = {
-    **EBB_FULL_SCALE_PORT_MAP,
+EBB_PORT_MAP_WITH_BGPMON = {
+    **EBB_PORT_MAP,
     "bgpmon": 2,
 }
 
@@ -1005,7 +1005,7 @@ def _with_ebb_route_storm_shards(
 # Variant A: with bgpmon - 3 physical interfaces, 19 DeviceGroups total.
 # Keep this first topology instance explicit so it can be reviewed against
 # Appendix 1 without following helper loops or generated DG lists.
-_EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
+_EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE = LogicalTopology(
     name="ebb_full_scale_with_bgpmon",
     legacy_profile="ebb_full_scale",
     endpoints=(
@@ -1512,9 +1512,9 @@ def _with_ebb_route_intent(
     )
 
 
-EBB_FULL_SCALE_WITH_BGPMON = replace(
+EBB_FY26_TOPOLOGY_WITH_BGPMON = replace(
     _with_ebb_route_intent(
-        _EBB_FULL_SCALE_WITH_BGPMON_BASE,
+        _EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE,
         openr_mode=OpenRMode.NONE,
         next_hops=EBB_NEXT_HOPS,
         scale=EBB_FY26_SCALE,
@@ -1526,13 +1526,13 @@ EBB_FULL_SCALE_WITH_BGPMON = replace(
 # Variant B: without bgpmon - 2 physical interfaces, 18 DeviceGroups total.
 # This small derived filter keeps the two variants consistent without hiding
 # the full Appendix-style listing above.
-_EBB_FULL_SCALE_NO_BGPMON_BASE = LogicalTopology(
+_EBB_FY26_TOPOLOGY_NO_BGPMON_BASE = LogicalTopology(
     name="ebb_full_scale_no_bgpmon",
     legacy_profile="ebb_full_scale",
-    endpoints=_EBB_FULL_SCALE_WITH_BGPMON_BASE.endpoints,
+    endpoints=_EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE.endpoints,
     device_groups=tuple(
         dg
-        for dg in _EBB_FULL_SCALE_WITH_BGPMON_BASE.device_groups
+        for dg in _EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE.device_groups
         if dg.role != "bgpmon" and dg.name != "dg_bgp_mon_v6"
     ),
     device_config=EBB_DEVICE_CONFIG,
@@ -1543,9 +1543,9 @@ _EBB_FULL_SCALE_NO_BGPMON_BASE = LogicalTopology(
     ),
 )
 
-EBB_FULL_SCALE_NO_BGPMON = replace(
+EBB_FY26_TOPOLOGY_NO_BGPMON = replace(
     _with_ebb_route_intent(
-        _EBB_FULL_SCALE_NO_BGPMON_BASE,
+        _EBB_FY26_TOPOLOGY_NO_BGPMON_BASE,
         openr_mode=OpenRMode.NONE,
         next_hops=EBB_NEXT_HOPS,
         scale=EBB_FY26_SCALE,
@@ -1555,7 +1555,7 @@ EBB_FULL_SCALE_NO_BGPMON = replace(
 )
 
 
-def ebb_full_scale_topology(
+def ebb_topology(
     *,
     openr_mode: OpenRMode,
     include_bgpmon: bool = True,
@@ -1571,9 +1571,9 @@ def ebb_full_scale_topology(
     scale: EbbScaleProfile,
 ) -> LogicalTopology:
     base = (
-        _EBB_FULL_SCALE_WITH_BGPMON_BASE
+        _EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE
         if include_bgpmon
-        else _EBB_FULL_SCALE_NO_BGPMON_BASE
+        else _EBB_FY26_TOPOLOGY_NO_BGPMON_BASE
     )
     topology = _with_ebb_route_intent(
         base,
@@ -1605,8 +1605,6 @@ def ebb_full_scale_topology(
 
 __all__ = (
     "BGP_MON_PEER_GROUP",
-    "EBB_FY26_SCALE",
-    "EBB_FY27_SCALE",
     "EBB_AS_NUMBERS",
     "EBB_BASELINE_ATTRIBUTES",
     "EBB_DEVICE_CONFIG",
@@ -1615,34 +1613,36 @@ __all__ = (
     "EBB_DIVERSE_NHG_PREFIXES_PER_GROUP",
     "EBB_EBGP_V4_PREFIX_SET",
     "EBB_EBGP_V6_PREFIX_SET",
-    "EBB_FULL_SCALE_NO_BGPMON",
-    "EBB_FULL_SCALE_PORT_MAP",
-    "EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON",
-    "EBB_FULL_SCALE_WITH_BGPMON",
+    "EBB_FY26_SCALE",
+    "EBB_FY26_TOPOLOGY_NO_BGPMON",
+    "EBB_FY26_TOPOLOGY_WITH_BGPMON",
+    "EBB_FY27_SCALE",
+    "ebb_ibgp_route_next_hop_starts",
+    "ebb_ibgp_route_next_hops",
+    "ebb_ibgp_route_next_hops_from_start",
     "EBB_IBGP_V4_PREFIX_SET",
     "EBB_IBGP_V6_PREFIX_SET",
     "EBB_LONGEVITY_COMMUNITY_BASELINE_COUNT",
     "EBB_NEXT_HOPS",
     "EBB_NEXT_HOPS_IXIA03",
+    "ebb_openr_injected_next_hops",
     "EBB_OPENR_INJECTED_START_IPV4S",
     "EBB_OPENR_INJECTED_START_IPV4S_IXIA03",
     "EBB_OPENR_INJECTED_START_IPV6S",
     "EBB_OPENR_INJECTED_START_IPV6S_IXIA03",
-    "EBB_PARENT_NETWORKS_IXIA03",
-    "EbbNextHopScheme",
-    "EbbScaleProfile",
     "EBB_PARENT_NETWORKS",
+    "EBB_PARENT_NETWORKS_IXIA03",
     "EBB_PEER_GROUPS",
+    "EBB_PORT_MAP",
+    "EBB_PORT_MAP_WITH_BGPMON",
     "EBB_PREFIX_SETS",
     "EBB_ROUTE_STORM_SHARD_PEER_COUNTS",
     "EBB_ROUTE_STORM_SHARD_ROUTE_COUNTS",
+    "ebb_topology",
+    "EbbNextHopScheme",
+    "EbbScaleProfile",
     "EBGP_V4_PEER_GROUP",
     "EBGP_V6_PEER_GROUP",
     "IBGP_V4_PEER_GROUP",
     "IBGP_V6_PEER_GROUP",
-    "ebb_full_scale_topology",
-    "ebb_ibgp_route_next_hop_starts",
-    "ebb_ibgp_route_next_hops",
-    "ebb_ibgp_route_next_hops_from_start",
-    "ebb_openr_injected_next_hops",
 )

@@ -36,8 +36,6 @@ from taac.abstractions.physical_inventory import (
 )
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
-    EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
-    ebb_full_scale_topology,
     EBB_FY26_SCALE,
     ebb_ibgp_route_next_hops,
     EBB_NEXT_HOPS,
@@ -45,6 +43,8 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_PARENT_NETWORKS,
     EBB_PARENT_NETWORKS_IXIA03,
     EBB_PEER_GROUPS,
+    EBB_PORT_MAP_WITH_BGPMON,
+    ebb_topology,
 )
 from taac.abstractions.topology.model import (
     BoundTopology,
@@ -190,7 +190,7 @@ def _bound_full_scale_automation_artifact(
     parent_networks: t.Mapping[str, str],
     next_hops: t.Any,
 ) -> BoundTopology:
-    topology = ebb_full_scale_topology(
+    topology = ebb_topology(
         scale=EBB_FY26_SCALE,
         openr_mode=OpenRMode.STANDALONE,
         include_bgpmon=True,
@@ -199,7 +199,7 @@ def _bound_full_scale_automation_artifact(
     )
     return topology.bind_to_inventory(
         physical_inventory=inventory,
-        port_map=EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
+        port_map=EBB_PORT_MAP_WITH_BGPMON,
         parent_networks=parent_networks,
         peer_groups=EBB_PEER_GROUPS,
         as_numbers=EBB_AS_NUMBERS,
@@ -2409,7 +2409,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         )
         topology_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
-            "bgp_ebb_full_scale.ebb_full_scale_topology"
+            "bgp_ebb_full_scale.ebb_topology"
         )
         playbooks_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
@@ -2448,7 +2448,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         )
         topology_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
-            "bgp_ebb_full_scale.ebb_full_scale_topology"
+            "bgp_ebb_full_scale.ebb_topology"
         )
         playbooks_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
@@ -2509,7 +2509,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         )
         topology_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
-            "bgp_ebb_full_scale.ebb_full_scale_topology"
+            "bgp_ebb_full_scale.ebb_topology"
         )
         playbooks_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
@@ -2595,7 +2595,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         )
         topology_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
-            "bgp_ebb_full_scale.ebb_full_scale_topology"
+            "bgp_ebb_full_scale.ebb_topology"
         )
         topology = MagicMock()
         topology.bind_to_inventory.return_value = MagicMock()
@@ -2648,7 +2648,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         )
         topology_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
-            "bgp_ebb_full_scale.ebb_full_scale_topology"
+            "bgp_ebb_full_scale.ebb_topology"
         )
 
         with (

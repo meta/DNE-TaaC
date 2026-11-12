@@ -23,11 +23,11 @@ import typing as t
 from taac.abstractions.physical_inventory import PhysicalInventory
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
-    EBB_FULL_SCALE_PORT_MAP,
-    ebb_full_scale_topology,
     EBB_FY26_SCALE,
     EBB_PARENT_NETWORKS,
     EBB_PEER_GROUPS,
+    EBB_PORT_MAP,
+    ebb_topology,
 )
 from taac.abstractions.topology import (
     OpenRMode,
@@ -196,7 +196,7 @@ def build_bag_conveyor_test_config(
         if profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R
         else OpenRMode.NONE
     )
-    bound = ebb_full_scale_topology(
+    bound = ebb_topology(
         scale=EBB_FY26_SCALE,
         openr_mode=openr_mode,
         include_bgpmon=False,
@@ -206,7 +206,7 @@ def build_bag_conveyor_test_config(
         extra_advertisements=extra_prefix_advertisements,
     ).bind_to_inventory(
         physical_inventory=physical_inventory,
-        port_map=EBB_FULL_SCALE_PORT_MAP,
+        port_map=EBB_PORT_MAP,
         parent_networks=EBB_PARENT_NETWORKS,
         peer_groups=EBB_PEER_GROUPS,
         as_numbers=EBB_AS_NUMBERS,
@@ -427,14 +427,14 @@ def _create_eb03_distribution_correctness_test_config(
     lab_admin_username = physical_inventory.extras.get("lab_admin_username", "admin")
     lab_password = get_lab_device_password(lab_password_env)
     compiled = (
-        ebb_full_scale_topology(
+        ebb_topology(
             scale=EBB_FY26_SCALE,
             openr_mode=OpenRMode.NONE,
             include_bgpmon=False,
         )
         .bind_to_inventory(
             physical_inventory=physical_inventory,
-            port_map=EBB_FULL_SCALE_PORT_MAP,
+            port_map=EBB_PORT_MAP,
             parent_networks=EBB_PARENT_NETWORKS,
             peer_groups=EBB_PEER_GROUPS,
             as_numbers=EBB_AS_NUMBERS,

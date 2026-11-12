@@ -6,9 +6,9 @@ import typing as t
 from dataclasses import replace
 
 from taac.abstractions.topologies.ebb_full_scale import (
-    ebb_full_scale_topology,
     EBB_FY26_SCALE,
     EBB_NEXT_HOPS,
+    ebb_topology,
     EbbNextHopScheme,
 )
 from taac.abstractions.topology import (
@@ -51,7 +51,7 @@ def ebb16_ebbfs_with_traffic_topology(
     ):
         raise ValueError("EBB16 traffic line rate must be from 1% through 10%")
     return replace(
-        ebb_full_scale_topology(
+        ebb_topology(
             scale=EBB_FY26_SCALE,
             openr_mode=openr_mode,
             include_bgpmon=include_bgpmon,

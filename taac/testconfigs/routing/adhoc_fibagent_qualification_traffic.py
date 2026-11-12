@@ -14,9 +14,9 @@ from taac.abstractions.topologies.ebb16_ebbfs_with_traffic import (
     EBB16_PREFIX_CONTINUITY_TRAFFIC_ITEMS,
 )
 from taac.abstractions.topologies.ebb_full_scale import (
-    EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
     EBB_NEXT_HOPS_IXIA03,
     EBB_PARENT_NETWORKS_IXIA03,
+    EBB_PORT_MAP_WITH_BGPMON,
 )
 from taac.abstractions.topology import OpenRMode
 from taac.constants import BgpPlusPlusProfile
@@ -53,7 +53,7 @@ def _build_nrqeb009_ebb16_traffic_test_config() -> TestConfig:
         bgpcpp_logging_config_override="DBG1;default:async=true",
         parent_networks=EBB_PARENT_NETWORKS_IXIA03,
         next_hops=EBB_NEXT_HOPS_IXIA03,
-        port_map=EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
+        port_map=EBB_PORT_MAP_WITH_BGPMON,
         # 20 epochs keeps a lab run near 1.5 h; the canonical contract is 48.
         nhg_storm_epoch_count=20,
         nhg_storm_epoch_interval_seconds=25,

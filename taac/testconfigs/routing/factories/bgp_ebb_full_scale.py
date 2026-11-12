@@ -20,14 +20,14 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_EBGP_V6_PREFIX_SET,
     EBB_FIBAGENT_BGP_NHG_WATERMARK_HIGH,
     EBB_FIBAGENT_BGP_NHG_WATERMARK_LOW,
-    EBB_FULL_SCALE_PORT_MAP,
-    EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON,
-    ebb_full_scale_topology,
     EBB_FY26_SCALE,
     ebb_ibgp_route_next_hop_starts,
     EBB_NEXT_HOPS,
     EBB_PARENT_NETWORKS,
     EBB_PEER_GROUPS,
+    EBB_PORT_MAP,
+    EBB_PORT_MAP_WITH_BGPMON,
+    ebb_topology,
     EbbNextHopScheme,
 )
 from taac.abstractions.topology import (
@@ -1122,7 +1122,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
         return playbooks
 
     device_name = physical_inventory.device_name
-    resolved_port_map = EBB_FULL_SCALE_PORT_MAP if port_map is None else port_map
+    resolved_port_map = EBB_PORT_MAP if port_map is None else port_map
     missing_port_roles = sorted({"uplink", "ibgp"} - resolved_port_map.keys())
     if missing_port_roles:
         raise ValueError(
@@ -1744,9 +1744,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
         not selected_tc7_playbooks and len(physical_inventory.ixia_ports) > 2
     )
     default_port_map = (
-        EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON
-        if include_auxiliary_observers
-        else EBB_FULL_SCALE_PORT_MAP
+        EBB_PORT_MAP_WITH_BGPMON if include_auxiliary_observers else EBB_PORT_MAP
     )
     resolved_port_map = dict(default_port_map if port_map is None else port_map)
     ebgp_prefix_count = (
@@ -1754,7 +1752,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
         if enable_runtime_update
         else _DEFAULT_EBGP_PREFIX_COUNT
     )
-    topology = topology_override or ebb_full_scale_topology(
+    topology = topology_override or ebb_topology(
         scale=EBB_FY26_SCALE,
         next_hops=next_hops,
         openr_mode=openr_mode,

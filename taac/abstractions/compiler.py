@@ -122,6 +122,15 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 _T = t.TypeVar("_T")
 _TRAFFIC_ENDPOINT_ROLES = frozenset({"ixia", "traffic", "trafficgen"})
+# These two hold serialized identity, not Python identifiers, and keep their
+# "full scale" spelling through the fiscal-year rename. The EOS lowering
+# selects the EBB compile path by matching the literal LogicalTopology name
+# and legacy_profile, two of the four names below are built by concatenation
+# in the topology module, and the profile value also keys compact IXIA
+# prefix-length selection in binding.py. Renaming the serialized values would
+# change compiled output and, worse, fail silently: an unmatched name simply
+# compiles nothing. (Selecting behavior from a topology name is anti-pattern
+# 10 in section 8 of this package's README; unwinding it is separate work.)
 _EBB_FULL_SCALE_PROFILE = "ebb_full_scale"
 _EBB_FULL_SCALE_TOPOLOGY_NAMES = frozenset(
     {

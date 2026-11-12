@@ -220,8 +220,8 @@ Factories should import concrete topology instances from:
 
 ```python
 from taac.abstractions.topologies.ebb_full_scale import (
-    EBB_FULL_SCALE_NO_BGPMON,
-    EBB_FULL_SCALE_WITH_BGPMON,
+    EBB_FY26_TOPOLOGY_NO_BGPMON,
+    EBB_FY26_TOPOLOGY_WITH_BGPMON,
 )
 ```
 
@@ -554,7 +554,7 @@ factory has durable authored, bound, compiled, and catalog assertions.
 
 The checked production topologies are:
 
-- `EBB_FULL_SCALE_NO_BGPMON` and `EBB_FULL_SCALE_WITH_BGPMON`
+- `EBB_FY26_TOPOLOGY_NO_BGPMON` and `EBB_FY26_TOPOLOGY_WITH_BGPMON`
 - `UG_NEW_PEER_JOIN` and `UG_BACKPRESSURE`
 - `IPV6_UPDATE_PACKING`, `EGRESS_PEER_SCALE`, and `BOUNDED_ECMP`
 

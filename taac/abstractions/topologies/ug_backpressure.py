@@ -8,11 +8,11 @@ from dataclasses import replace
 
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
-    EBB_FULL_SCALE_PORT_MAP,
-    ebb_full_scale_topology,
     EBB_FY26_SCALE,
     EBB_PARENT_NETWORKS,
     EBB_PEER_GROUPS,
+    EBB_PORT_MAP,
+    ebb_topology,
 )
 from taac.abstractions.topology import (
     DeviceGroupPartition,
@@ -35,14 +35,14 @@ from taac.abstractions.topology import (
 )
 
 _PREFIXES_PER_PEER = 750
-_UG_BACKPRESSURE_BASE = ebb_full_scale_topology(
+_UG_BACKPRESSURE_BASE = ebb_topology(
     scale=EBB_FY26_SCALE,
     openr_mode=OpenRMode.NONE,
     include_bgpmon=False,
     include_legacy_community_rows=False,
 )
 
-UG_BACKPRESSURE_PORT_MAP = dict(EBB_FULL_SCALE_PORT_MAP)
+UG_BACKPRESSURE_PORT_MAP = dict(EBB_PORT_MAP)
 UG_BACKPRESSURE_PARENT_NETWORKS = {
     key: value for key, value in EBB_PARENT_NETWORKS.items() if key != "bgpmon_v6"
 }

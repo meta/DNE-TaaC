@@ -5,6 +5,7 @@ import asyncio
 import functools
 import ipaddress
 import json
+import os
 import random
 import threading
 import time
@@ -2579,9 +2580,10 @@ class IxiaPacketCaptureTask(BaseTask):
         Args (from params dict):
             hostname: Device hostname (for interface lookup)
             interface: Interface name on device
-            mode: "start", "stop", or "save"
+            mode: "start", "stop", "save", or "download"
             capture_filter: BPF filter (default: "tcp port 179")
             pcap_filename: Filename for saved PCAP (for save mode)
+            local_pcap_path: Absolute client path (for download mode)
             capture_id: Unique ID to track vport_href across steps
         """
         mode = params["mode"]
@@ -2610,6 +2612,8 @@ class IxiaPacketCaptureTask(BaseTask):
                 hostname=hostname,
                 interface=interface,
                 capture_filter=capture_filter,
+                control_plane=params.get("control_plane", True),
+                control_buffer_percent=params.get("control_buffer_percent", 30),
             )
 
             # Store vport_href for later use
@@ -2651,9 +2655,36 @@ class IxiaPacketCaptureTask(BaseTask):
             # Clean up stored vport_href
             del IxiaPacketCaptureTask._vport_href_storage[capture_id]
 
+        elif mode == "download":
+            pcap_filename = params.get("pcap_filename", "bgp_capture.pcap")
+            remote_path = IxiaPacketCaptureTask._pcap_path_storage.get(pcap_filename)
+            if not remote_path:
+                raise ValueError(
+                    f"No saved PCAP found for {pcap_filename!r}. "
+                    "Did you save capture first?"
+                )
+            local_path = params.get("local_pcap_path")
+            if (
+                not isinstance(local_path, str)
+                or os.path.dirname(local_path) != "/tmp"
+                or not os.path.basename(local_path)
+            ):
+                raise ValueError(
+                    "local_pcap_path must name a file directly under /tmp"
+                )
+            # Never let a failed download leave an earlier run's capture
+            # available to the following verification step.
+            try:
+                os.unlink(local_path)
+            except FileNotFoundError:
+                pass
+            ixia.download_capture_file(remote_path, local_path)
+            self.logger.info(f"IXIA packet capture downloaded to {local_path}")
+
         else:
             raise ValueError(
-                f"Invalid mode: {mode}. Must be 'start', 'stop', or 'save'"
+                f"Invalid mode: {mode}. Must be 'start', 'stop', 'save', or "
+                "'download'"
             )
 
 

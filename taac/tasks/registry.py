@@ -188,10 +188,18 @@ from taac.tasks.rbb_edge_ebgp_task import RbbEdgeEbgpTask
 from taac.tasks.rbb_srv6_counter_delta_task import (
     RbbSrv6CounterDeltaTask,
 )
+from taac.tasks.rbb_srv6_capture_mirror_task import (
+    RbbSrv6CaptureMirrorTask,
+)
 from taac.tasks.rbb_srv6_direct_route_task import (
     RbbSrv6DirectRouteTask,
 )
+from taac.tasks.rbb_srv6_named_nhg_task import RbbSrv6NamedNhgTask
+from taac.tasks.rbb_srv6_pcap_verify_task import RbbSrv6PcapVerifyTask
 from taac.tasks.rbb_srv6_verify_task import RbbSrv6VerifyTask
+from taac.tasks.rbb_traffic_counter_correlation_task import (
+    RbbTrafficCounterCorrelationTask,
+)
 from taac.tasks.setup_base_configs_task import (
     SetupBaseConfigsTask,
 )
@@ -259,8 +267,12 @@ TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     RbbDutBootstrapTask,
     RbbEdgeEbgpTask,
     RbbSrv6CounterDeltaTask,
+    RbbSrv6CaptureMirrorTask,
     RbbSrv6DirectRouteTask,
+    RbbSrv6NamedNhgTask,
+    RbbSrv6PcapVerifyTask,
     RbbSrv6VerifyTask,
+    RbbTrafficCounterCorrelationTask,
 ]
 
 # Add internal tasks only when not in OSS mode

@@ -50,6 +50,7 @@ class TestRbbPreflight(TestCase):
         with_traffic: bool = False,
         setup_duts: bool = False,
         setup_dut_edges: bool = False,
+        suite: str = "base",
         environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
         command = [
@@ -58,6 +59,8 @@ class TestRbbPreflight(TestCase):
             "taac.runner.rbb_preflight",
             "--config-dir",
             str(self.config_dir),
+            "--suite",
+            suite,
         ]
         if with_traffic:
             command.append("--with-traffic")
@@ -179,6 +182,24 @@ class TestRbbPreflight(TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("requires --setup-dut-edges", result.stderr)
+
+    def test_srv6_wire_suite_requires_traffic(self) -> None:
+        result = subprocess.run(
+            [str(self.runner), "--suite", "srv6-wire"],
+            cwd=self.repo_root,
+            env=self._clean_environment(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires --with-traffic", result.stderr)
+
+    def test_preflight_rejects_srv6_wire_without_traffic(self) -> None:
+        self._write_valid_config()
+        result = self._run_check(suite="srv6-wire")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("requires --with-traffic", result.stderr)
 
     def test_check_accepts_device_path_without_ixia_credentials(self) -> None:
         self._write_valid_config(ixia_credentials=False)

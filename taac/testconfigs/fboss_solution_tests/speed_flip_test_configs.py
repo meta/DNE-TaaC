@@ -42,6 +42,7 @@ from taac.steps.step_definitions import (
     create_service_interruption_step,
     create_system_reboot_step,
 )
+from taac.utils.oss_taac_constants import TAAC_OSS
 from taac.task_definitions import (
     create_configure_parallel_bgp_peers_task,
     create_coop_apply_patchers_task,
@@ -400,7 +401,9 @@ def build_speed_flip_subsume_churn_playbook(
         create_steps_stage(
             steps=[
                 create_fpf_set_interface_admin_step(
-                    interfaces=[f_circuit.a_end_interface_name], enable=False
+                    interfaces=[f_circuit.a_end_interface_name],
+                    enable=False,
+                    skip_missing=TAAC_OSS,
                 ),
             ]
         )

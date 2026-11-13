@@ -67,6 +67,10 @@ from taac.testconfigs.ai_bb.rdsw004_c086_u001_ash6_fsdb_path_scale_test_config i
 from taac.testconfigs.ai_bb.rdsw004_c086_u001_ash6_fsdb_stable_state_test_config import (
     RDSW004_C086_U001_ASH6_FSDB_STABLE_STATE,
 )
+from taac.testconfigs.ai_bb.rtsw_mp3n_qza1_rdma_disruption_test_config import (
+    RTSW_MP3N_QZA1_LOCAL_RDMA_WARMBOOT_TROUBLESHOOTING,
+    RTSW_MP3N_QZA1_RDMA_NBR_UPLINK_FLAP,
+)
 from taac.testconfigs.ai_bb.wedge400_ecmp_resource_testing_config import (
     RTSW001_L1003_C084_ECMP_RESOURCE_TESTING,
     RTSW001_U001_C081_ECMP_RESOURCE_TESTING,
@@ -104,5 +108,7 @@ __all__ = [
     "RDSW004_C086_U001_ASH6_FSDB_STABLE_STATE",
     "RTSW001_L1003_C084_ECMP_RESOURCE_TESTING",
     "RTSW001_U001_C081_ECMP_RESOURCE_TESTING",
+    "RTSW_MP3N_QZA1_LOCAL_RDMA_WARMBOOT_TROUBLESHOOTING",
+    "RTSW_MP3N_QZA1_RDMA_NBR_UPLINK_FLAP",
     "TEST_SNC1_C084_DSF_FR4_LITE_OPTICS",
 ]

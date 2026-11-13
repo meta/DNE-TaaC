@@ -23428,13 +23428,24 @@ def _nbr_flap_non_circuit_checks(
     )
 
 
-def _warmboot_nbr_flap_non_circuit_checks() -> t.List[PointInTimeHealthCheck]:
+def _warmboot_nbr_flap_non_circuit_checks(
+    restart_service_check: PointInTimeHealthCheck = AGENT_WARMBOOT_SERVICE_CHECK,
+    systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
+) -> t.List[PointInTimeHealthCheck]:
     """Mid-test checks for the agent-warmboot + neighbour-flap window.
 
     Thin wrapper kept so the landed warmboot playbook's serialized output is
     unchanged by the generalization above.
     """
-    return _nbr_flap_non_circuit_checks(AGENT_WARMBOOT_SERVICE_CHECK)
+    checks = _nbr_flap_non_circuit_checks(restart_service_check)
+    if systemctl_active_check is not None:
+        checks = [
+            systemctl_active_check
+            if check.name == hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK
+            else check
+            for check in checks
+        ]
+    return checks
 
 
 def create_gtsw_warmboot_nbr_uplink_flap_playbook(
@@ -23445,6 +23456,8 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
     longevity_sec: int = 300,
     playbook_name: str = "test_warmboot_nbr_uplink_flap",
     traffic_items_to_configure: t.Optional[t.Mapping[str, TrafficItemSettings]] = None,
+    restart_service_check: PointInTimeHealthCheck = AGENT_WARMBOOT_SERVICE_CHECK,
+    systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
 ) -> Playbook:
     """Build a `test_warmboot_nbr_uplink_flap` Playbook.
 
@@ -23498,7 +23511,11 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
     Returns:
         A `Playbook` named `playbook_name`.
     """
-    non_circuit_checks = _warmboot_nbr_flap_non_circuit_checks()
+    active_check = systemctl_active_check or create_systemctl_active_state_check()
+    non_circuit_checks = _warmboot_nbr_flap_non_circuit_checks(
+        restart_service_check=restart_service_check,
+        systemctl_active_check=active_check,
+    )
 
     def _nbr_flap_step(duration_sec: int) -> Step:
         return create_fpf_rapid_flap_step_lldp(
@@ -23519,8 +23536,8 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
         iteration=iteration,
         traffic_items_to_configure=traffic_items_to_configure,
         postchecks=[
-            AGENT_WARMBOOT_SERVICE_CHECK,
-            create_systemctl_active_state_check(),
+            restart_service_check,
+            active_check,
             create_device_core_dumps_check(),
             create_unclean_exit_check(),
             create_lldp_check(),
@@ -23585,6 +23602,7 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
     post_restart_settle_sec: int = 0,
     extra_post_flap_checks: t.Optional[t.Sequence[PointInTimeHealthCheck]] = None,
     traffic_items_to_configure: t.Optional[t.Mapping[str, TrafficItemSettings]] = None,
+    systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
 ) -> Playbook:
     """Restart one service on the DUT, then flap the neighbour's uplinks.
 
@@ -23637,7 +23655,14 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
     Returns:
         A `Playbook` named `playbook_name`.
     """
+    active_check = systemctl_active_check or create_systemctl_active_state_check()
     non_circuit_checks = list(_nbr_flap_non_circuit_checks(restart_service_check))
+    non_circuit_checks = [
+        active_check
+        if check.name == hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK
+        else check
+        for check in non_circuit_checks
+    ]
     non_circuit_checks.extend(extra_post_flap_checks or [])
 
     restart_steps = [
@@ -23664,7 +23689,7 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
         traffic_items_to_configure=traffic_items_to_configure,
         postchecks=[
             restart_service_check,
-            create_systemctl_active_state_check(),
+            active_check,
             create_device_core_dumps_check(),
             create_unclean_exit_check(),
             create_lldp_check(),
@@ -27297,6 +27322,11 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
     name: str,
     traffic_item_name: str,
     longevity_duration_seconds: int = 300,
+    bgp_session_check: t.Optional[PointInTimeHealthCheck] = None,
+    systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
+    restart_service_check: t.Optional[PointInTimeHealthCheck] = None,
+    base_bandwidth_gbps: int = 200,
+    traffic_item_names: t.Optional[t.Sequence[str]] = None,
 ) -> Playbook:
     """Playbook factory for the IcePack GTSW agent-warmboot + RoCE
     troubleshooting Playbook.
@@ -27311,6 +27341,25 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
     Prechecks mirror the canonical IcePack GTSW panel
     (`add_common_checks_to_thft_playbooks`).
     """
+    bgp_check = bgp_session_check or create_bgp_session_establish_check(
+        min_established_pct=0.9
+    )
+    active_check = systemctl_active_check or create_systemctl_active_state_check()
+    service_check = restart_service_check or create_service_restart_check(
+        services=[
+            "wedge_agent",
+            "fboss_sw_agent",
+            "fboss_hw_agent@0",
+            "bgpd",
+        ],
+        expected_restarted_services=[
+            "wedge_agent",
+            "fboss_sw_agent",
+            "fboss_hw_agent@0",
+            "bgpd",
+        ],
+    )
+    checked_traffic_items = list(traffic_item_names or [traffic_item_name])
     return Playbook(
         name=name,
         prechecks=[
@@ -27319,8 +27368,8 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
             # not use the fabric, and the GTSW carries 2 structural always-IDLE
             # non-peer entries (an AS-0 aggregate + a self-ASN entry) that a
             # 100%-established gate flags. 48/50 real peers up = 0.96 > 0.9.
-            create_bgp_session_establish_check(min_established_pct=0.9),
-            create_systemctl_active_state_check(),
+            bgp_check,
+            active_check,
             create_memory_utilization_check(
                 threshold=5 * (1024**3),  # 5 GiB
                 start_time_jq_var="test_case_start_time",
@@ -27348,7 +27397,7 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
                 clear_traffic_stats=False,
                 thresholds=[
                     hc_types.PacketLossThreshold(
-                        names=[traffic_item_name],
+                        names=checked_traffic_items,
                         str_value="0",
                         metric=hc_types.PacketLossMetric.PERCENTAGE,
                     ),
@@ -27357,13 +27406,13 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
             create_ixia_traffic_rate_check(
                 thresholds=[
                     hc_types.TrafficRateThreshold(
-                        names=[traffic_item_name],
+                        names=checked_traffic_items,
                         value=45,
                         threshold_type=hc_types.ThresholdType.PERCENT,
                         metric=hc_types.TrafficRateMetric.TX_RATE,
                     ),
                 ],
-                base_bandwidth_gbps=200,  # IcePack GTSW IXIA links are 200G
+                base_bandwidth_gbps=base_bandwidth_gbps,
             ),
             create_port_counters_check(),
             # IcePack GTSW (TH6) runs the split sw/hw agent + wedge_agent + bgpd
@@ -27374,20 +27423,7 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
             # services that cycle on a Service.AGENT warmboot (verified live
             # 2026-07-28: wedge_agent/fboss_sw_agent/fboss_hw_agent@0/bgpd all
             # restart at the warmboot instant; fsdb/qsfp are preserved).
-            create_service_restart_check(
-                services=[
-                    "wedge_agent",
-                    "fboss_sw_agent",
-                    "fboss_hw_agent@0",
-                    "bgpd",
-                ],
-                expected_restarted_services=[
-                    "wedge_agent",
-                    "fboss_sw_agent",
-                    "fboss_hw_agent@0",
-                    "bgpd",
-                ],
-            ),
+            service_check,
             create_unclean_exit_check(),
             create_cpu_utilization_check(
                 threshold=400.0, start_time_jq_var="test_case_start_time"
@@ -27397,7 +27433,7 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
             create_core_dumps_snapshot_check(),
             create_bgp_peer_route_snapshot_check(),
         ],
-        traffic_items_to_start=[traffic_item_name],
+        traffic_items_to_start=checked_traffic_items,
         enabled=True,
     )
 

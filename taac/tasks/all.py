@@ -10,6 +10,7 @@ import json
 import os
 import random
 import re
+import shlex
 import tempfile
 import time
 import typing as t
@@ -775,6 +776,8 @@ class CoopRegisterPatcherTask(BaseTask):
         jq_program = params.get("jq_program")
         driver = await async_get_device_driver(hostname)
         if jq_program is not None:
+            if "py_func_name" in params or "patcher_args" in params:
+                raise ValueError("A COOP patcher must select only jq or Python")
             if TAAC_OSS:
                 raise NotImplementedError(
                     "generic jq COOP patchers are available only in Meta-internal TAAC"
@@ -1327,6 +1330,230 @@ def _truncate_cmd_for_log(cmd: str, max_chars: int = _MAX_LOGGED_CMD_CHARS) -> s
         return cmd
 
     return f"{cmd[:max_chars]}... [truncated {len(cmd)} chars]"
+
+
+class AssertAgentWarmBoot(BaseTask):
+    """Require reported SW and selected HW boot types to be WARM_BOOT."""
+
+    NAME = "assert_agent_warm_boot"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        hostname = params["hostname"]
+        indices = params.get("hw_switch_indices", [0])
+        if not indices or any(type(index) is not int or index < 0 for index in indices):
+            raise ValueError("hw_switch_indices must contain non-negative indices")
+        driver = await async_get_device_driver(hostname)
+        # Empty flags deliberately prohibit the driver's intentional cold-boot
+        # exemptions. Missing SW/HW Thrift responses propagate as failures.
+        await t.cast(t.Any, driver)._async_assert_warm_booted(indices, set())
+        self.logger.info(f"{hostname}: SW and HW agents {indices} report WARM_BOOT")
+
+
+class AssertProcessVmHwm(BaseTask):
+    """Read actual process VmHWM; missing processes or counters fail closed."""
+
+    NAME = "assert_process_vmhwm"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        hostname = params["hostname"]
+        threshold = int(params["threshold_bytes"])
+        services = params["services"]
+        if threshold <= 0 or not services:
+            raise ValueError("Positive threshold and nonempty services are required")
+        driver = await async_get_device_driver(hostname)
+        for service in services:
+            unit = await t.cast(t.Any, driver).async_get_systemctl_service_name(service)
+            raw_pid = await driver.async_run_cmd_on_shell(
+                f"systemctl show {shlex.quote(unit)} -p MainPID --value"
+            )
+            pid = int(raw_pid.strip())
+            if pid <= 0:
+                raise RuntimeError(f"{hostname}: {service} has no live MainPID")
+            status = await t.cast(t.Any, driver).async_read_file(f"/proc/{pid}/status")
+            match = re.search(r"^VmHWM:\s+(\d+)\s+kB$", status, re.MULTILINE)
+            if match is None:
+                raise RuntimeError(f"{hostname}: {service} did not report VmHWM")
+            peak_bytes = int(match.group(1)) * 1024
+            if peak_bytes >= threshold:
+                raise RuntimeError(
+                    f"{hostname}: {service} VmHWM {peak_bytes} >= {threshold}"
+                )
+            self.logger.info(
+                f"{hostname}: {service} VmHWM={peak_bytes} bytes < {threshold}"
+            )
+
+
+class VerifySelectedForwarding(BaseTask):
+    """Verify exact resolved FIB IP/RIF pairs and physical PORT bindings."""
+
+    NAME = "verify_selected_forwarding"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        hostname = params["hostname"]
+        expected_routes = params["routes"]
+        expected_ports = params["interface_ports"]
+        if not expected_routes or not expected_ports:
+            raise ValueError("Nonempty routes and interface_ports are required")
+        driver = await async_get_device_driver(hostname)
+        deadline = time.monotonic() + float(params.get("timeout_seconds", 60))
+        while True:
+            interfaces = await t.cast(t.Any, driver).async_get_all_interfaces()
+            errors = []
+            for rif, port in expected_ports.items():
+                interface = interfaces.get(int(rif))
+                if interface is None or getattr(interface, "portId", None) != int(port):
+                    errors.append(f"RIF {rif} does not bind physical port {port}")
+            wanted = {
+                str(ipaddress.ip_network(route["prefix"])): route
+                for route in expected_routes
+            }
+            if len(wanted) != len(expected_routes):
+                raise ValueError("Expected route prefixes must be unique")
+            observed = {}
+            for route in await t.cast(t.Any, driver).async_get_route_table_details():
+                prefix = str(
+                    ipaddress.ip_network(
+                        (
+                            ipaddress.ip_address(route.dest.ip.addr),
+                            route.dest.prefixLength,
+                        )
+                    )
+                )
+                if prefix not in wanted:
+                    continue
+                if prefix in observed:
+                    errors.append(f"Duplicate FIB entry {prefix}")
+                observed[prefix] = route
+            for prefix, expected in wanted.items():
+                route = observed.get(prefix)
+                if route is None:
+                    errors.append(f"Missing FIB entry {prefix}")
+                    continue
+                pairs = {
+                    (str(ipaddress.ip_address(hop.ip.addr)), int(hop.interfaceID))
+                    for hop in route.fwdInfo or []
+                }
+                expected_pairs = {
+                    (str(ipaddress.ip_address(hop["ip"])), int(hop["interface_id"]))
+                    for hop in expected["next_hops"]
+                }
+                if (
+                    not expected_pairs
+                    or str(route.action).upper() != "NEXTHOPS"
+                    or pairs != expected_pairs
+                ):
+                    errors.append(
+                        f"{prefix}: action={route.action}, resolved={sorted(pairs)}, expected={sorted(expected_pairs)}"
+                    )
+            if not errors:
+                self.logger.info(
+                    f"{hostname}: verified {len(wanted)} exact FIB entries and PORT bindings"
+                )
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"{hostname}: selected forwarding failed: " + "; ".join(errors[:8])
+                )
+            await asyncio.sleep(2)
+
+
+class VerifySelectedBgpRoutes(BaseTask):
+    """Require exact selected per-peer NLRI while allowing unrelated native routes."""
+
+    NAME = "verify_selected_bgp_routes"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        universe = {
+            str(ipaddress.ip_network(prefix)) for prefix in params["selected_prefixes"]
+        }
+        peers = {
+            peer: {str(ipaddress.ip_network(prefix)) for prefix in prefixes}
+            for peer, prefixes in params["peer_prefixes"].items()
+        }
+        allowed = {
+            peer: {str(ipaddress.ip_network(prefix)) for prefix in prefixes}
+            for peer, prefixes in params.get("allowed_extra_prefixes", {}).items()
+        }
+        expectations = params.get("path_expectations", {})
+        if (
+            not universe
+            or not peers
+            or any(not wanted or not wanted <= universe for wanted in peers.values())
+            or any(
+                peer not in peers or not extra <= universe
+                for peer, extra in allowed.items()
+            )
+        ):
+            raise ValueError(
+                "Nonempty per-peer expected prefixes must belong to the selected universe"
+            )
+        driver = await async_get_device_driver(params["hostname"])
+        deadline = time.monotonic() + float(params.get("timeout_seconds", 60))
+        while True:
+            errors = []
+            for peer, wanted in peers.items():
+                networks = await t.cast(
+                    t.Any, driver
+                ).async_get_postfilter_received_networks(peer)
+                paths = {
+                    str(
+                        ipaddress.ip_network(
+                            (ipaddress.ip_address(prefix.prefix_bin), prefix.num_bits),
+                            strict=False,
+                        )
+                    ): path
+                    for prefix, path in networks.items()
+                }
+                observed = set(paths) & universe
+                unexpected = observed - wanted - allowed.get(peer, set())
+                if not wanted <= observed or unexpected:
+                    errors.append(
+                        f"{peer}: missing={sorted(wanted - observed)[:4]}, unexpected_selected={sorted(unexpected)[:4]}"
+                    )
+                for prefix in wanted & observed:
+                    expected = expectations.get(peer, {}).get(prefix)
+                    if expected is None:
+                        continue
+                    path = paths[prefix]
+                    segments = list(path.as_path or [])
+                    sequence = [
+                        asn for segment in segments for asn in segment.asns_4_byte
+                    ]
+                    if "as_path" in expected and (
+                        any(
+                            str(segment.seg_type).split(".")[-1]
+                            not in ("AS_SEQUENCE", "2")
+                            for segment in segments
+                        )
+                        or sequence != expected["as_path"]
+                    ):
+                        errors.append(f"{peer} {prefix}: unexpected AS path {sequence}")
+                    communities = {
+                        f"{community.asn}:{community.value}"
+                        for community in path.communities or []
+                    }
+                    if not set(expected.get("communities", [])) <= communities:
+                        errors.append(f"{peer} {prefix}: required communities missing")
+                    if "next_hop" in expected and (
+                        path.next_hop is None
+                        or str(ipaddress.ip_address(path.next_hop.prefix_bin))
+                        != str(ipaddress.ip_address(expected["next_hop"]))
+                    ):
+                        errors.append(f"{peer} {prefix}: unexpected next hop")
+                if observed - wanted:
+                    self.logger.info(
+                        f"{peer}: allowed reflected selected routes={len(observed - wanted)}"
+                    )
+            if not errors:
+                self.logger.info(
+                    f"{params['hostname']}: exact selected post-policy prefixes verified for {len(peers)} peers"
+                )
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Selected post-policy RIB failed: " + "; ".join(errors[:8])
+                )
+            await asyncio.sleep(2)
 
 
 class RunCommandsOnShell(BaseTask):

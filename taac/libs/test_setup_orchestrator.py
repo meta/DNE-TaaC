@@ -101,6 +101,8 @@ class TestSetupOrchestrator:
         ixia_profile: str = "auto",
         trace_ixia_api: bool = False,
         ixia_primary_chassis: t.Optional[str] = None,
+        force_take_ixia_port_ownership: bool = True,
+        ixia_use_tx_rx_sync: bool = True,
     ) -> None:
         self.test_config = test_config
         self.logger = logger
@@ -109,6 +111,8 @@ class TestSetupOrchestrator:
         self._ixia_api_server = ixia_api_server
         # Chassis-chain primary, when it differs from the API server
         self._ixia_primary_chassis = ixia_primary_chassis
+        self._force_take_ixia_port_ownership = force_take_ixia_port_ownership
+        self._ixia_use_tx_rx_sync = ixia_use_tx_rx_sync
         # Ixia is required but the an ixia session has already been created.
         self._ixia_session_id = ixia_session_id
         # Ixia is not required. Primarily used for testing purposes
@@ -1378,6 +1382,8 @@ class TestSetupOrchestrator:
             tear_down_session=not skip_ixia_cleanup,
             primary_chassis_ip=candidate.api_server_ip,
             ixia_primary_chassis=self._ixia_primary_chassis,
+            force_take_port_ownership=self._force_take_ixia_port_ownership,
+            use_tx_rx_sync=self._ixia_use_tx_rx_sync,
             session_id=ixia_session_id,
             user_defined_traffic_items=candidate.user_defined_traffic_items,
             basic_traffic_item_configs=candidate.basic_traffic_item_configs,

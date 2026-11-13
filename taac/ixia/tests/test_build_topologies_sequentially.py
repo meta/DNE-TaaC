@@ -136,6 +136,22 @@ class BuildTopologiesSequentiallyTest(unittest.TestCase):
 
 
 class RehydrateVportIndicesTest(unittest.TestCase):
+    def test_tx_rx_sync_defaults_to_enabled(self):
+        ixia = _create_ixia_instance()
+
+        ixia.configure_tx_rx_sync()
+
+        self.assertTrue(ixia.ixnetwork.Traffic.UseTxRxSync)
+
+    def test_tx_rx_sync_can_be_disabled_per_instance(self):
+        ixia = _create_ixia_instance()
+        ixia.use_tx_rx_sync = False
+
+        ixia.configure_tx_rx_sync()
+
+        self.assertFalse(ixia.ixnetwork.Traffic.UseTxRxSync)
+        self.assertTrue(Ixia.use_tx_rx_sync)
+
     def test_existing_session_setup_rehydrates_before_use(self):
         ixia = _create_ixia_instance()
         port_configs = [MagicMock()]

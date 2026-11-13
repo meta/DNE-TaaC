@@ -1247,6 +1247,7 @@ class Ixia:
     _defer_traffic_preparation: bool = False
     auto_nrz_100g_rs_fec: bool = True
     ixia_primary_chassis: t.Optional[str] = None
+    use_tx_rx_sync: bool = True
 
     def __init__(
         self,
@@ -1270,6 +1271,7 @@ class Ixia:
         trace_api_calls: bool = False,
         auto_nrz_100g_rs_fec: bool = True,
         ixia_primary_chassis: t.Optional[str] = None,
+        use_tx_rx_sync: bool = True,
     ) -> None:
         """Instantiates the object of class Ixia
 
@@ -1386,6 +1388,7 @@ class Ixia:
         # that is already reserved
         self.force_take_port_ownership: bool = force_take_port_ownership
         self.auto_nrz_100g_rs_fec = auto_nrz_100g_rs_fec
+        self.use_tx_rx_sync = use_tx_rx_sync
         self.cleanup_config: bool = cleanup_config
         self.teardown_session: bool = teardown_session
 
@@ -8836,6 +8839,7 @@ class Ixia:
         _log(f"{_CYAN}{_BOLD}[1/7] Connecting to IXIA chassis...{_RESET}")
         _step_start = time.time()
         self.connect()
+        self.configure_tx_rx_sync()
         _log(f"{_GREEN}[IXIA]{_RESET} Connected in {time.time() - _step_start:.0f}s")
 
         # if we connected to existing session, and didn't clean it up
@@ -8969,6 +8973,19 @@ class Ixia:
         total_elapsed = time.time() - setup_start
         _log(
             f"\n{_GREEN}{_BOLD}[IXIA] Setup complete in {total_elapsed:.0f}s{_RESET}\n"
+        )
+
+    def configure_tx_rx_sync(self) -> None:
+        """Set the traffic clock policy immediately after session connect.
+
+        This deliberately runs before ports, topologies, TrafficItem Generate,
+        and Traffic.Apply. Single-chassis sessions without a physical primary
+        clock can opt out; the legacy default remains enabled.
+        """
+        self.ixnetwork.Traffic.UseTxRxSync = self.use_tx_rx_sync
+        self.logger.info(
+            f"[IXIA] Inter-chassis Tx/Rx synchronization "
+            f"{'enabled' if self.use_tx_rx_sync else 'disabled'}"
         )
 
     def _build_topologies_and_device_groups(
@@ -9639,12 +9656,61 @@ class Ixia:
                 primary_chassis_address
             ) or socket.gethostbyname(primary_chassis_address)  # @nolint PATTERNLINT(python-dns-deps)
         primary_chassis_ip = ipaddress.ip_address(primary_chassis_address)
+        physical_chassis_ips = {
+            ipaddress.ip_address(address) for address in chassis_ips_in_use
+        }
+        # RestPy creates fresh wrappers on iteration; compare remote identities,
+        # and keep the cable clock primary independent of the REST API endpoint.
+        all_chassis = list(self.ixnetwork.AvailableHardware.Chassis.find())
+        def find_clock_primary(chassis_records, allow_missing: bool = False):
+            candidates = [
+                chassis
+                for chassis in chassis_records
+                if ipaddress.ip_address(chassis.Hostname)
+                in physical_chassis_ips | {primary_chassis_ip}
+            ]
+            primary_flags = [getattr(chassis, "IsPrimary", None) for chassis in candidates]
+            if not any(isinstance(flag, bool) for flag in primary_flags):
+                return None
+            clock_primaries = [
+                chassis
+                for chassis, flag in zip(candidates, primary_flags)
+                if flag is True
+            ]
+            # An explicit clock chassis without test ports may not have been
+            # connected yet. Bootstrap it without forcing port ownership, then
+            # validate the refreshed cable flags before changing clock settings.
+            if (
+                allow_missing
+                and primary_chassis_ip not in physical_chassis_ips
+                and all(flag is False for flag in primary_flags)
+                and not any(
+                    ipaddress.ip_address(chassis.Hostname) == primary_chassis_ip
+                    for chassis in candidates
+                )
+            ):
+                return None
+            if not all(isinstance(flag, bool) for flag in primary_flags) or len(
+                clock_primaries
+            ) != 1:
+                raise ValueError("Unable to identify a unique physical clock primary")
+            return clock_primaries[0]
+
+        if self.ixia_primary_chassis:
+            clock_primary = None
+        else:
+            clock_primary = find_clock_primary(all_chassis, allow_missing=True)
+        if clock_primary is not None:
+            primary_chassis_address = clock_primary.Hostname
+            primary_chassis_ip = ipaddress.ip_address(primary_chassis_address)
         vport = None
-        if not any(
-            ipaddress.ip_address(port_config.phy_port_config.chassis_ip)
-            == primary_chassis_ip
-            for port_config in none_throws(self.ixia_config).port_configs
+        if self.ixia_primary_chassis and not any(
+            ipaddress.ip_address(chassis.Hostname) == primary_chassis_ip
+            for chassis in all_chassis
         ):
+            self._add_chassis(primary_chassis_address)
+            all_chassis = list(self.ixnetwork.AvailableHardware.Chassis.find())
+        elif not self.ixia_primary_chassis and primary_chassis_ip not in physical_chassis_ips:
             self.logger.info(
                 "Unable to locate any ports from the Ixia configuration that are associated "
                 "with the primary chassis."
@@ -9661,7 +9727,11 @@ class Ixia:
                     Name="DO_NOT_USE",
                 )
                 portmap_assistant.Connect(ForceOwnership=False)
-        all_chassis = self.ixnetwork.AvailableHardware.Chassis.find()
+            all_chassis = list(self.ixnetwork.AvailableHardware.Chassis.find())
+            clock_primary = find_clock_primary(all_chassis)
+            if clock_primary is not None:
+                primary_chassis_address = clock_primary.Hostname
+                primary_chassis_ip = ipaddress.ip_address(primary_chassis_address)
         primary_chassis = next(
             (
                 chassis
@@ -9674,17 +9744,17 @@ class Ixia:
         secondary_chassis = [
             chassis
             for chassis in all_chassis
-            if ipaddress.ip_address(chassis.Hostname) != primary_chassis_ip
+            if ipaddress.ip_address(chassis.Hostname) in physical_chassis_ips
+            and ipaddress.ip_address(chassis.Hostname) != primary_chassis_ip
         ]
         if not primary_chassis:
             raise ValueError(f"Primary chassis {primary_chassis_address} is not found")
+        primary_chassis.PrimaryChassis = ""
         primary_chassis.SequenceId = 1
         primary_chassis.ChainTopology = "daisy"
-        t.sequence_id = 2
-        for chassis in secondary_chassis:
-            chassis.MasterChassis = primary_chassis.Hostname
-            chassis.SequenceId = t.sequence_id
-            t.sequence_id += 1
+        for sequence_id, chassis in enumerate(secondary_chassis, start=2):
+            chassis.PrimaryChassis = primary_chassis.Hostname
+            chassis.SequenceId = sequence_id
         if vport:
             vport.remove()
         self.logger.info(
@@ -9693,18 +9763,16 @@ class Ixia:
         )
 
     def _add_chassis(self, chassis_address: str, timeout_s: int = 120) -> None:
-        # pyre-fixme[16]: `UhdIxnetwork` has no attribute `AvailableHardware`.
-        chassis = self.ixnetwork.AvailableHardware.Chassis.add(
-            Hostname=chassis_address
-        )
-        deadline = time.time() + timeout_s
-        while chassis.refresh().State != "ready":
-            if time.time() > deadline:
-                raise IxiaSetupError(
-                    f"Chassis {chassis_address} did not become ready within "
-                    f"{timeout_s}s (state={chassis.State})"
-                )
-            time.sleep(3)
+        ixnetwork = t.cast("IxnIxnetwork", self.ixnetwork)
+        chassis = ixnetwork.AvailableHardware.Chassis.add(Hostname=chassis_address)
+        deadline = time.monotonic() + timeout_s
+        with self.request_deadline(timeout_s, phase="explicit_primary_chassis_ready"):
+            while chassis.refresh().State != "ready":
+                if time.monotonic() >= deadline:
+                    raise IxiaSetupError(
+                        f"Chassis {chassis_address} did not become ready within {timeout_s}s (state={chassis.State})"
+                    )
+                time.sleep(min(3, max(0, deadline - time.monotonic())))
 
     @external_api
     @require_traffic_item

@@ -125,6 +125,8 @@ class TrafficGenerator:
         cache_candidate_name: t.Optional[str] = None,
         trace_api_calls: bool = False,
         wait_for_lldp_reconvergence: bool = False,
+        force_take_port_ownership: bool = True,
+        use_tx_rx_sync: bool = True,
         *args,
         **kwargs,
     ) -> None:
@@ -133,6 +135,8 @@ class TrafficGenerator:
         self.endpoint_names = list(self.name_to_endpoint.keys())
         self.primary_chassis_ip = primary_chassis_ip
         self.ixia_primary_chassis = ixia_primary_chassis
+        self.force_take_port_ownership = force_take_port_ownership
+        self.use_tx_rx_sync = use_tx_rx_sync
         self.cleanup_config: bool = cleanup_config
         self.session_id = session_id
         self.tear_down_session = tear_down_session
@@ -276,7 +280,8 @@ class TrafficGenerator:
                 session_name=self.get_session_name(),
                 cleanup_config=False if self.session_id else self.cleanup_config,
                 teardown_session=self.tear_down_session,
-                force_take_port_ownership=True,
+                force_take_port_ownership=self.force_take_port_ownership,
+                use_tx_rx_sync=self.use_tx_rx_sync,
                 session_id=self.session_id,
                 password=fetch_ixia_password(),
                 chassis_ip=(

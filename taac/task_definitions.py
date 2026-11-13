@@ -385,6 +385,98 @@ def create_ixia_sync_raw_source_macs_task(
     )
 
 
+def create_assert_agent_warm_boot_task(
+    hostname: str,
+    hw_switch_indices: t.Optional[t.List[int]] = None,
+) -> Task:
+    """Require SW and the selected HW agents to report an actual warm boot."""
+    return Task(
+        task_name="assert_agent_warm_boot",
+        hostname=hostname,
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "hw_switch_indices": hw_switch_indices
+                    if hw_switch_indices is not None
+                    else [0],
+                }
+            )
+        ),
+    )
+
+
+def create_assert_process_vmhwm_task(
+    hostname: str,
+    services: t.List[str],
+    threshold_bytes: int,
+) -> Task:
+    """Verify actual process peak RSS independently of memory.current metrics."""
+    return Task(
+        task_name="assert_process_vmhwm",
+        hostname=hostname,
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "services": services,
+                    "threshold_bytes": threshold_bytes,
+                }
+            )
+        ),
+    )
+
+
+def create_verify_selected_forwarding_task(
+    hostname: str,
+    routes: t.List[t.Dict[str, t.Any]],
+    interface_ports: t.Dict[str, int],
+    timeout_seconds: int = 60,
+) -> Task:
+    """Verify exact resolved FIB next hops on known physical PORT RIFs."""
+    return Task(
+        task_name="verify_selected_forwarding",
+        hostname=hostname,
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "routes": routes,
+                    "interface_ports": interface_ports,
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+        ),
+    )
+
+
+def create_verify_selected_bgp_routes_task(
+    hostname: str,
+    peer_prefixes: t.Dict[str, t.List[str]],
+    selected_prefixes: t.List[str],
+    timeout_seconds: int = 60,
+    allowed_extra_prefixes: t.Optional[t.Dict[str, t.List[str]]] = None,
+    path_expectations: t.Optional[t.Dict[str, t.Dict[str, t.Dict[str, t.Any]]]] = None,
+) -> Task:
+    """Audit the exact selected NLRI set per peer in the received post-policy RIB."""
+    return Task(
+        task_name="verify_selected_bgp_routes",
+        hostname=hostname,
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "peer_prefixes": peer_prefixes,
+                    "selected_prefixes": selected_prefixes,
+                    "timeout_seconds": timeout_seconds,
+                    "allowed_extra_prefixes": allowed_extra_prefixes or {},
+                    "path_expectations": path_expectations or {},
+                }
+            )
+        ),
+    )
+
+
 def create_coop_unregister_patchers_task(
     hostnames: t.List[str] | str,
     config_names: t.Optional[t.List[str]] = None,
@@ -471,6 +563,32 @@ def create_coop_register_patcher_task(
     return Task(
         task_name="coop_register_patcher",
         params=Params(json_params=json.dumps(params)),
+    )
+
+
+def create_coop_register_jq_patcher_task(
+    hostname: str,
+    patcher_name: str,
+    jq_program: str,
+    config_names: t.Optional[t.List[str]] = None,
+) -> Task:
+    """Register a whole-config jq transform through internal COOP."""
+    if not jq_program.strip():
+        raise ValueError("jq_program must be nonempty")
+    return Task(
+        task_name="coop_register_patcher",
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "patcher_name": patcher_name,
+                    "jq_program": jq_program,
+                    "config_names": ["bgpcpp"]
+                    if config_names is None
+                    else config_names,
+                }
+            )
+        ),
     )
 
 

@@ -461,6 +461,8 @@ class TaacRunner:
         ixia_profile: str = "auto",
         setup_only: bool = False,
         ixia_primary_chassis: t.Optional[str] = None,
+        force_take_ixia_port_ownership: bool = True,
+        ixia_use_tx_rx_sync: bool = True,
     ) -> None:
         self.test_config = (
             get_test_config(test_config)
@@ -545,6 +547,8 @@ class TaacRunner:
             ixia_profile=ixia_profile,
             trace_ixia_api=trace_ixia_api,
             ixia_primary_chassis=ixia_primary_chassis,
+            force_take_ixia_port_ownership=force_take_ixia_port_ownership,
+            ixia_use_tx_rx_sync=ixia_use_tx_rx_sync,
         )
         self.test_case_uuid = ""
         self._test_case_investigation_attempted = False

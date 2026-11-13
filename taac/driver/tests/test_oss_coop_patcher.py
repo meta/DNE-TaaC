@@ -397,6 +397,17 @@ class OssCoopPatcherTest(TestCase):
         )
         self.assertEqual({}, ocp._STATE.get(HOST, {}))
 
+    async def test_sflow_mirror_patcher_is_ignored(self) -> None:
+        await self._register(
+            ocp.OssPatcher(
+                name="configure_sflow_mirror_sampling",
+                config_name="agent",
+                py_func_name="configure_ingress_sflow_mirror_sampling",
+            )
+        )
+        self.assertEqual([], ocp.list_patchers(HOST, "agent"))
+        self.assertNotIn(AGENT_BASELINE, self.switch.files)
+
     async def test_softdrain_is_skipped_without_its_file(self) -> None:
         await self._register(
             ocp.OssPatcher(

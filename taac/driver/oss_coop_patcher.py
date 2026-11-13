@@ -84,6 +84,11 @@ _OPTIONAL_CONFIGS: t.FrozenSet[str] = frozenset({"bgpcpp_softdrain"})
 # Meta's hard-drain variant, which nothing creates in OSS.
 IGNORED_CONFIGS: t.FrozenSet[str] = frozenset({"bgpcpp_drain"})
 
+# Unported patchers that no OSS check reads. They log a warning, not an error.
+IGNORED_PY_FUNCS: t.FrozenSet[str] = frozenset(
+    {"configure_ingress_sflow_mirror_sampling"}
+)
+
 PATCHER_DIR_ENV = "TAAC_OSS_PATCHER_DIR"
 # A config change that removes a port (e.g. a speed change subsuming a /5) can
 # crash a running agent (T281221621), so such an apply cold boots the agent, as
@@ -201,6 +206,12 @@ async def async_register(
     host, config_name = switch.hostname, patcher.config_name
     if config_name in IGNORED_CONFIGS:
         switch.logger.info(f"[oss-patcher] ignoring {config_name} patcher on {host}")
+        return ""
+    if patcher.py_func_name in IGNORED_PY_FUNCS:
+        switch.logger.warning(
+            f"[oss-patcher] ignoring {patcher.name} ({patcher.py_func_name}) on "
+            f"{host}: not ported to the OSS patcher yet"
+        )
         return ""
     spec = _spec(config_name)
     _check_patcher_targets(patcher, spec)

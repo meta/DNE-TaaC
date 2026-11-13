@@ -5217,7 +5217,10 @@ class FbossSwitch(AbstractSwitch):
             "Will be implemented for OSS in a future update."
         )
 
-    async def async_wedge_qsfp_util_pause_remediation(self, duration: int) -> None:
+    async def async_wedge_qsfp_util_pause_remediation(
+        self, duration: int, ports: t.Sequence[str] = ()
+    ) -> None:
+        """Pause remediation on the modules of `ports` (all if empty). Zero resumes."""
         if duration == 0:
             self.logger.info(
                 f"Attempting to resume qsfp remediations on {self.hostname}."
@@ -5226,8 +5229,21 @@ class FbossSwitch(AbstractSwitch):
             self.logger.info(
                 f"Attempting to pause qsfp remediations duration on {self.hostname} for {duration} seconds."
             )
-        cmd = f"wedge_qsfp_util --pause_remediation {duration}"
-        await self.async_run_cmd_on_shell(cmd)
+        # --pause_remediation 0 sends no RPC, so resume with 1 second.
+        sent = max(duration, 1)
+        cmd = " ".join(
+            [wedge_qsfp_util_cmd(), *ports, "--pause_remediation", str(sent)]
+        )
+        out = await self.async_run_cmd_on_shell(cmd) or ""
+        confirmed = {line.strip() for line in out.splitlines()}
+        missing = [
+            p for p in ports if f"PauseRemediation set for port {p}" not in confirmed
+        ]
+        if missing:
+            raise RuntimeError(
+                f"wedge_qsfp_util --pause_remediation {sent} not confirmed on "
+                f"{self.hostname} for {missing}: {out!r}"
+            )
 
     async def async_get_global_system_port_offset(self) -> int:
         async with self.async_agent_client as client:

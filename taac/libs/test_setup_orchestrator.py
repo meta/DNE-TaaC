@@ -88,6 +88,7 @@ class TestSetupOrchestrator:
         skip_ixia_cleanup: bool = False,
         skip_post_setup_wait: bool = False,
         skip_basset_reservation: bool = False,
+        fail_on_foreign_basset_reservation: bool = False,
         skip_testbed_isolation: bool = True,
         desired_pkg_versions: t.Optional[t.Dict[FbossPackage, str]] = None,
         dsf_sequential_update: bool = False,
@@ -120,6 +121,7 @@ class TestSetupOrchestrator:
         self._skip_ixia_cleanup = skip_ixia_cleanup
         self._skip_post_setup_wait = skip_post_setup_wait
         self._skip_basset_reservation = skip_basset_reservation
+        self._fail_on_foreign_basset_reservation = fail_on_foreign_basset_reservation
         self._test_config_skips_testbed_isolation = test_config_skips_testbed_isolation(
             test_config
         )
@@ -914,7 +916,10 @@ class TestSetupOrchestrator:
         )
 
         success, self.basset_butler = await async_reserve_devices_in_basset(
-            self.test_config, static_device_names, self.logger
+            self.test_config,
+            static_device_names,
+            self.logger,
+            self._fail_on_foreign_basset_reservation,
         )
         if not success:
             raise Exception("Failed to reserve test devices in Basset")
@@ -1015,7 +1020,10 @@ class TestSetupOrchestrator:
                 _log("\033[36m[SETUP]\033[0m Phase 1: Reserving devices in Basset...")
                 with timed_phase("Basset device reservation", logger=self.logger):
                     success, self.basset_butler = await async_reserve_devices_in_basset(
-                        self.test_config, static_device_names, self.logger
+                        self.test_config,
+                        static_device_names,
+                        self.logger,
+                        self._fail_on_foreign_basset_reservation,
                     )
                     if not success:
                         raise Exception("Failed to reserve test devices in Basset")

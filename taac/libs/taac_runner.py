@@ -416,6 +416,7 @@ class TaacRunner:
         skip_testbed_isolation: bool = True,
         # Use with CAUTION!!  Should only be used for debugging or development purposes
         skip_basset_reservation: bool = False,
+        fail_on_foreign_basset_reservation: bool = False,
         desired_pkg_versions: t.Optional[t.Dict[FbossPackage, str]] = None,
         dsf_sequential_update: bool = False,
         allow_disruptive_configs: bool = False,
@@ -534,6 +535,7 @@ class TaacRunner:
             skip_ixia_cleanup,
             skip_post_setup_wait=skip_post_setup_wait,
             skip_basset_reservation=skip_basset_reservation,
+            fail_on_foreign_basset_reservation=fail_on_foreign_basset_reservation,
             skip_testbed_isolation=skip_testbed_isolation,
             desired_pkg_versions=desired_pkg_versions,
             dsf_sequential_update=dsf_sequential_update,

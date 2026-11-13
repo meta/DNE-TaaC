@@ -316,6 +316,12 @@ def build_speed_flip_subsume_churn_playbook(
     NOTE (review): create_fpf_set_interface_admin_step downs F on the DUT (a_end)
     only; the z_end side of F is not admin-downed by this builder.
     """
+    if churn_iterations < 1:
+        # With 0 cycles, churn_patcher_2 stays registered at the end.
+        raise ValueError(
+            f"SPD_041 subsume churn requires churn_iterations >= 1; "
+            f"got {churn_iterations}."
+        )
     if len(circuit_info) != 6:
         raise ValueError(
             f"SPD_041 subsume churn requires exactly 6 circuits "
@@ -453,6 +459,32 @@ def build_speed_flip_subsume_churn_playbook(
                 patcher_name, patcher_circuits[patcher_name], register, registered
             )
         )
+
+    # Restore: remove p1 and bring F up, so the start-versus-end speed check passes.
+    stages.append(
+        create_steps_stage(
+            steps=[
+                create_register_speed_flip_patcher_step(
+                    register_patcher=False,
+                    port_state_change=False,
+                    patcher_name=patcher1_name,
+                    endpoints=_circuit_endpoints(patcher1_circuits),
+                    speed_in_gbps=target_speed_gbps,
+                    target_port_cage_count=len(ordered_cages),
+                ),
+                create_fpf_set_interface_admin_step(
+                    interfaces=[f_circuit.a_end_interface_name],
+                    enable=True,
+                    skip_missing=TAAC_OSS,
+                ),
+                get_validation_step(
+                    _speed_flip_hc_params(
+                        _circuit_endpoints(circuit_info), baseline_speed_gbps
+                    )
+                ),
+            ]
+        )
+    )
 
     return create_speed_flip_playbook(
         name=playbook_name,

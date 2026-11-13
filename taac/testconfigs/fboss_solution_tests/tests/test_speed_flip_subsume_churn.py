@@ -39,10 +39,10 @@ class SubsumeChurnTest(unittest.TestCase):
 
         with patch.object(sf, "get_validation_step", record):
             self._build(churn_iterations)
-        # The first validation is the precheck, so skip it.
+        # The first validation is the precheck and the last is the restore stage.
         return [
             {i["interface_name"]: i["expected_speed"] for i in v["dut"]["interfaces"]}
-            for v in validations[1:]
+            for v in validations[1:-1]
         ]
 
     def test_missing_mate_is_skipped_only_in_oss(self):
@@ -55,8 +55,9 @@ class SubsumeChurnTest(unittest.TestCase):
                 if step.step_params
                 and "fpf_set_interface_admin" in step.step_params.json_params
             ]
-            self.assertEqual(len(params), 1)
-            self.assertEqual(params[0].get("skip_missing", False), taac_oss)
+            self.assertEqual([p["is_enable"] for p in params], [False, True])
+            for step_params in params:
+                self.assertEqual(step_params.get("skip_missing", False), taac_oss)
 
     def test_primary_speed_follows_the_patchers_that_stay_registered(self):
         up = {"eth1/1/1": TARGET, "eth1/2/1": TARGET, "eth1/3/1": TARGET}

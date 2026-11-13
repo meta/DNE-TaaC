@@ -631,3 +631,58 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
             ["agent", "bgpcpp", "bgpcpp_softdrain"],
         )
         self.assertEqual(cleanup_params.get("regex"), "^speed_flip_51t_")
+
+
+class SubsumeChurnRestoreTest(unittest.TestCase):
+    def setUp(self) -> None:
+        circuits = [
+            speed_flip_test_configs.Circuit(
+                "dut", f"eth1/{cage}/{sub}", "peer", f"eth1/{cage}/{sub}"
+            )
+            for cage in (1, 2, 3)
+            for sub in (1, 5)
+        ]
+        self.playbook = speed_flip_test_configs.build_speed_flip_subsume_churn_playbook(
+            "churn_playbook", circuits
+        )
+
+    def test_the_last_stage_removes_patcher_1_and_brings_f_up(self) -> None:
+        unregister, admin, validation = self.playbook.stages[-1].steps
+        params = json.loads(unregister.step_params.json_params)
+        self.assertEqual("churn_patcher_1", params["patcher_name"])
+        self.assertFalse(params["register_patcher"])
+        admin_params = json.loads(admin.step_params.json_params)
+        self.assertEqual(["eth1/3/5"], admin_params["interfaces"])
+        self.assertTrue(admin_params["is_enable"])
+        check = json.loads(validation.input_json)["point_in_time_checks"][0]
+        speeds = json.loads(check["check_params"]["json_params"])
+        expected = [
+            i["expected_speed"] for d in speeds.values() for i in d["interfaces"]
+        ]
+        self.assertEqual([400] * 12, expected)
+
+    def test_zero_churn_iterations_is_rejected(self) -> None:
+        circuits = [
+            speed_flip_test_configs.Circuit(
+                "dut", f"eth1/{cage}/{sub}", "peer", f"eth1/{cage}/{sub}"
+            )
+            for cage in (1, 2, 3)
+            for sub in (1, 5)
+        ]
+        with self.assertRaisesRegex(ValueError, "churn_iterations >= 1"):
+            speed_flip_test_configs.build_speed_flip_subsume_churn_playbook(
+                "churn_playbook", circuits, churn_iterations=0
+            )
+
+    def test_no_patcher_stays_registered_at_the_end(self) -> None:
+        registered = set()
+        for stage in self.playbook.stages:
+            for step in stage.steps:
+                if step.name != taac_types.StepName.REGISTER_SPEED_FLIP_PATCHER:
+                    continue
+                params = json.loads(step.step_params.json_params)
+                if params["register_patcher"]:
+                    registered.add(params["patcher_name"])
+                else:
+                    registered.discard(params["patcher_name"])
+        self.assertEqual(set(), registered)

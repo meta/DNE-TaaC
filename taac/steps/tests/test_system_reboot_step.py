@@ -16,6 +16,7 @@ from taac.test_as_a_config import types as taac_types
 
 _WEDGE_POWER = "/usr/local/bin/wedge_power.sh"
 _BOOT_ID_CMD = "cat /proc/sys/kernel/random/boot_id"
+_SYNC_CMD = "sync && echo SYNCED"
 
 
 class SystemRebootStepBmcCommandTest(TestCase):
@@ -44,7 +45,7 @@ class SystemRebootStepBmcCommandTest(TestCase):
         self.driver = AsyncMock()
         self.step.driver = self.driver
         self.driver.async_run_cmd_on_shell = AsyncMock(
-            side_effect=["boot-a\n", "boot-b\n"]
+            side_effect=["boot-a\n", "SYNCED\n", "boot-b\n"]
         )
         bmc = patch.object(step_definitions, "run_bmc_cmd_hwcontrol")
         self.bmc_mock = bmc.start()
@@ -186,3 +187,64 @@ class SystemRebootStepBmcCommandTest(TestCase):
 
         self.driver.async_run_cmd_on_shell.assert_awaited_once_with(_BOOT_ID_CMD)
         self.sleep.assert_not_awaited()
+
+    async def test_bmc_resets_sync_before_the_reset(self) -> None:
+        for trigger in (
+            taac_types.SystemRebootTrigger.BMC_POWER_RESET,
+            taac_types.SystemRebootTrigger.BMC_MICROSERVER_ONLY_RESET,
+        ):
+            with self.subTest(trigger=trigger.name):
+                order = MagicMock()
+                self.driver.async_run_cmd_on_shell = AsyncMock(
+                    side_effect=["boot-a\n", "SYNCED\n", "boot-b\n"]
+                )
+                order.attach_mock(self.driver.async_run_cmd_on_shell, "shell")
+                self.bmc_mock.reset_mock()
+                order.attach_mock(self.bmc_mock, "bmc")
+
+                await self._run(trigger)
+
+                events = [
+                    _SYNC_CMD if c[0] == "shell" and c.args[0] == _SYNC_CMD else c[0]
+                    for c in order.mock_calls
+                ]
+                self.assertLess(events.index(_SYNC_CMD), events.index("bmc"))
+
+    async def test_missing_sync_marker_warns_and_still_resets(self) -> None:
+        for sync_result in ("", None):
+            with self.subTest(sync_result=sync_result):
+                self.step.logger = MagicMock()
+                self.bmc_mock.reset_mock()
+                self.driver.async_run_cmd_on_shell = AsyncMock(
+                    side_effect=["boot-a\n", sync_result, "boot-b\n"]
+                )
+
+                await self._run(taac_types.SystemRebootTrigger.BMC_POWER_RESET)
+
+                self.step.logger.warning.assert_called_once()
+                self.assertIn("sync", self.step.logger.warning.call_args.args[0])
+                self.bmc_mock.assert_called_once()
+
+    async def test_failed_sync_does_not_block_the_reset(self) -> None:
+        self.step.logger = MagicMock()
+        self.driver.async_run_cmd_on_shell.side_effect = [
+            "boot-a\n",
+            ConnectionError("hung"),
+            "boot-b\n",
+        ]
+
+        await self._run(taac_types.SystemRebootTrigger.BMC_POWER_RESET)
+
+        self.step.logger.warning.assert_called_once()
+        self.bmc_mock.assert_called_once()
+
+    async def test_full_system_reboot_issues_no_sync(self) -> None:
+        # The reboot command flushes the disk itself.
+        self.driver.async_run_cmd_on_shell.side_effect = ["boot-a\n", "boot-b\n"]
+
+        await self._run(taac_types.SystemRebootTrigger.FULL_SYSTEM_REBOOT)
+
+        commands = [
+            c.args[0] for c in self.driver.async_run_cmd_on_shell.await_args_list
+        ]
+        self.assertEqual([_BOOT_ID_CMD, _BOOT_ID_CMD], commands)

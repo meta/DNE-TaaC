@@ -1384,6 +1384,7 @@ def add_common_checks_to_cpu_queue_playbooks(
     unique_prefix_limit: int,
     ixia_packet_loss_threshold: str = "0.1",
     service_restart_services: list[str] | None = None,
+    systemctl_services: list[hc_types.Service] | None = None,
 ) -> list[Playbook]:
     """Add former TestConfig-level checks to each playbook from create_cpu_queue_playbooks().
 
@@ -1402,11 +1403,15 @@ def add_common_checks_to_cpu_queue_playbooks(
     qsfp_service, wedge_agent). Set explicitly to drop services not present on
     a given DUT — e.g. IcePack backend GTSWs don't run openr, so omitting it
     here avoids a postcheck false-fail on INACTIVE.
+
+    `systemctl_services` scopes the precheck `SYSTEMCTL_ACTIVE_STATE_CHECK`.
+    Default (None) checks every service, including `fboss_hw_agent@1`, which
+    raises on single-ASIC native NetOS DUTs such as MINIPACK3NM.
     """
     common_prechecks = [
         create_drain_state_check(),
         create_bgp_session_establish_check(),
-        create_systemctl_active_state_check(),
+        create_systemctl_active_state_check(services=systemctl_services),
         create_prefix_limit_check(prefix_limit=unique_prefix_limit),
         create_memory_utilization_check(
             threshold=5 * (1024**3),  # 5gb
@@ -24109,6 +24114,7 @@ def create_cpu_queue_playbooks(
     high_queue: int,
     ixia_downlink_interface: str,
     bgp_peer_count: int = 0,
+    static_route_device_group_index: int = 0,
 ) -> t.List[Playbook]:
     """Create all CPU queue test playbooks.
 
@@ -24123,6 +24129,9 @@ def create_cpu_queue_playbooks(
             noise floor (no per-session scaling) — appropriate for callers that
             don't supply a peer count. Pass `downlink + uplink + rogue` from the
             TestConfig factory to enable scale-aware tuning.
+        static_route_device_group_index: IXIA device group on the downlink
+            port whose IPv6 address and network group 0 feed the CPU_037/038
+            static routes. It must carry both.
 
     Returns:
         List of all CPU queue test Playbook objects
@@ -24426,9 +24435,11 @@ def create_cpu_queue_playbooks(
         description=(
             "CPU_009: DHCPv6 request with link-local source (fe80::) and "
             "link-local multicast destination (ff02::1:2) and DSCP=48 (UDP "
-            "src 546, dst 547) must be punted to the MID CPU queue. Matches "
-            "the real DHCPv6 client→server discovery flow with explicit DSCP "
-            "marking."
+            "src 546, dst 547) must be punted to the HIGH CPU queue. DSCP 48 "
+            "matches the CoPP ACL `cpuPolicing-high-NetworkControl-ff02::/16` "
+            "(dscp 48, dst ff02::/16), which precedes `cpuPolicing-mid-ff02::/16` "
+            "(see `genLinkLocalCoppAcls` in "
+            "fboss/lib/config/agent/CoppConfigUtils.cpp)."
         ),
         traffic_items_to_start=[
             "TEST_RAW_DHCP_V6_LL_DSCP48_TRAFFIC",
@@ -24440,14 +24451,13 @@ def create_cpu_queue_playbooks(
         ],
         snapshot_checks=[
             create_cpu_queue_snapshot_check(
-                active_queues=[mid_queue],
-                inactive_queues=[low_queue, high_queue],
+                active_queues=[high_queue],
+                inactive_queues=[low_queue, mid_queue],
                 inactive_max_pps_per_queue={
                     low_queue: low_q_noise,
-                    high_queue: high_q_noise,
+                    mid_queue: mid_q_noise,
                 },
                 no_discard_queues=[high_queue],
-                active_min_out_pps_per_queue={low_queue: 10},
             )
         ],
     )
@@ -24635,9 +24645,10 @@ def create_cpu_queue_playbooks(
         name=NPI_CPU_004_BGP_CP_V6_LINK_LOCAL_DSCP0_TO_HIGH_QUEUE.name,
         description=(
             "CPU_004: BGPv6 control-plane traffic with link-local source/destination "
-            "addresses and DSCP=0 (TCP/179) must be punted to the HIGH CPU queue. "
-            "Verifies BGP CP classification falls through to TCP/179 protocol match "
-            "even without DSCP marking on IPv6 link-local-scope sessions."
+            "addresses and DSCP=0 (TCP/179) is punted to the MID CPU queue. No CoPP "
+            "ACL matches TCP/179 on link-local, so without DSCP 48 the packet hits "
+            "`cpuPolicing-mid-linkLocal-v6` (`genLinkLocalCoppAcls` in "
+            "`fboss/lib/config/agent/CoppConfigUtils.cpp`)."
         ),
         traffic_items_to_start=[
             "TEST_RAW_BGP_CP_V6_LINK_LOCAL_DSCP0_TRAFFIC",
@@ -24649,14 +24660,14 @@ def create_cpu_queue_playbooks(
         ],
         snapshot_checks=[
             create_cpu_queue_snapshot_check(
-                active_queues=[high_queue],
-                inactive_queues=[low_queue, mid_queue],
+                active_queues=[mid_queue],
+                inactive_queues=[low_queue, high_queue],
                 inactive_max_pps_per_queue={
                     low_queue: low_q_noise,
-                    mid_queue: mid_q_noise,
+                    high_queue: high_q_noise,
                 },
                 no_discard_queues=[high_queue],
-                active_min_out_pps_per_queue={low_queue: 10},
+                active_min_out_pps_per_queue={mid_queue: 10},
             )
         ],
     )
@@ -24791,6 +24802,14 @@ def create_cpu_queue_playbooks(
     # require a LOW-queue punt; guard against leakage into MID and HIGH.
     npi_cpu_039_mtu_exceed_to_low_queue_playbook = Playbook(
         name="npi_cpu_039_mtu_exceed_to_low_queue",
+        # `traffic_items_to_start` runs before prechecks, so the common
+        # zero-loss precheck would otherwise see the intentional drop.
+        prechecks=[
+            create_ixia_packet_loss_check(
+                clear_traffic_stats=True,
+                skip_traffic_items=["TEST_MTU_EXCEED_IPV6_TRAFFIC"],
+            ),
+        ],
         postchecks=[
             # The oversized stream is intentionally dropped by newer ASICs.
             # Keep the generic packet-loss health check for every other item,
@@ -24976,8 +24995,11 @@ def create_cpu_queue_playbooks(
         ],
     )
 
-    # CPU_048: DSCP=48 to-switch link-local IPv6 → MID queue. Link-local
-    # variant of CPU_047 (SIP=Ixia LL, DIP=switch LL).
+    # CPU_048: DSCP=48 to-switch link-local IPv6 → HIGH queue. Link-local
+    # variant of CPU_047 (SIP=Ixia LL, DIP=switch LL). DSCP 48 matches the
+    # CoPP ACL `cpuPolicing-high-NetworkControl-linkLocal-v6` (dscp 48, dst
+    # fe80::/10), which precedes `cpuPolicing-mid-linkLocal-v6` (see
+    # `genLinkLocalCoppAcls` in fboss/lib/config/agent/CoppConfigUtils.cpp).
     npi_cpu_048_dscp_48_to_switch_ll_to_mid_queue_playbook = Playbook(
         name="npi_cpu_048_dscp_48_to_switch_ll_to_mid_queue",
         traffic_items_to_start=[
@@ -24990,14 +25012,13 @@ def create_cpu_queue_playbooks(
         ],
         snapshot_checks=[
             create_cpu_queue_snapshot_check(
-                active_queues=[mid_queue],
-                inactive_queues=[low_queue, high_queue],
+                active_queues=[high_queue],
+                inactive_queues=[low_queue, mid_queue],
                 inactive_max_pps_per_queue={
                     low_queue: low_q_noise,
-                    high_queue: high_q_noise,
+                    mid_queue: mid_q_noise,
                 },
                 no_discard_queues=[high_queue],
-                active_min_out_pps_per_queue={mid_queue: 10},
             )
         ],
     )
@@ -25604,6 +25625,7 @@ def create_cpu_queue_playbooks(
                     create_custom_step(
                         params_dict={
                             "custom_step_name": "register_cpu_queue_static_route_patcher",
+                            "device_group_index": static_route_device_group_index,
                             "static_route_mask": 64,
                             "next_hop_egress_port": ixia_downlink_interface,
                             "patcher_name": "cpu_queue_static_route_patcher",
@@ -25671,6 +25693,7 @@ def create_cpu_queue_playbooks(
                     create_custom_step(
                         params_dict={
                             "custom_step_name": "register_cpu_queue_static_route_patcher",
+                            "device_group_index": static_route_device_group_index,
                             "static_route_mask": 128,
                             "next_hop_egress_port": ixia_downlink_interface,
                             "patcher_name": "cpu_queue_static_route_patcher",

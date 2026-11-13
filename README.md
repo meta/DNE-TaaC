@@ -60,6 +60,24 @@ For iterative work on TAAC source or thrift schemas in a bind-mounted workspace 
 
 First build takes ~22 min cold (mostly the deps compile). Docker's layer cache makes subsequent rebuilds after TAAC-only source changes finish in ~30 sec. See [`docker/README.md`](docker/README.md) for the layer cache contract and when to rebuild what.
 
+## Python packages
+
+TAAC also has a Python package build that uses standard `pyproject.toml`
+metadata. The existing Docker build is another supported workflow.
+
+The initial package artifacts target Linux x86_64 and CPython 3.12. Until the
+native runtime wheel is published, install from a release wheelhouse:
+
+```bash
+python -m pip install --find-links /path/to/wheelhouse dne-taac
+# Or, in an activated environment:
+uv pip install --find-links /path/to/wheelhouse dne-taac
+tictaac --help
+```
+
+See [Python packaging](docs/python-packaging.md) for source installation,
+running Python configs, and the current config-exporter limitation.
+
 ## Outputs
 
 Inside the `fboss-taac` image, generated thrift bindings + the TAAC Python source land under:

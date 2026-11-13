@@ -899,13 +899,38 @@ def _create_speed_flip_bgp_peer_setup_task(
     )
 
 
+# The cage-link BGP sessions as seen from each end: ssw003 peers with fsw003's
+# ::d/::2d and fsw003 peers with ssw003's ::c/::2c.
+_SPEED_FLIP_51T_CAGE_BGP_PEERS: t.List[str] = [
+    "2401:db00:e719:2:1000::d",
+    "2401:db00:e719:2:1000::2d",
+    "2401:db00:e719:2:1000::c",
+    "2401:db00:e719:2:1000::2c",
+]
+
+
+def _speed_flip_bgp_converged_check() -> taac_types.PointInTimeHealthCheck:
+    # Each speed change warmboots the agent on both ends, which restarts bgpd
+    # and drops the cage sessions, and how long they take to return varies from
+    # run to run. Recheck every 5 s for ~180 s (each check takes ~4 s) until the
+    # IXIA session and both cage sessions are up on each device, so traffic is
+    # never measured on a half-converged network.
+    return create_bgp_session_establish_check(
+        ignore_all_prefixes_except=(
+            _SPEED_FLIP_51T_IXIA_BGP_PEERS + _SPEED_FLIP_51T_CAGE_BGP_PEERS
+        ),
+        expected_established_sessions=3,
+        retry_count=20,
+        retry_delay_seconds=5,
+        retry_delay_multiplier=1.0,
+    )
+
+
 def _speed_flip_prechecks() -> t.List[taac_types.PointInTimeHealthCheck]:
     return [
         create_drain_state_check(),
         create_systemctl_active_state_check(),
-        create_bgp_session_establish_check(
-            ignore_all_prefixes_except=_SPEED_FLIP_51T_IXIA_BGP_PEERS,
-        ),
+        _speed_flip_bgp_converged_check(),
         create_lldp_check(),
         create_port_state_check(),
         create_ixia_packet_loss_check(
@@ -917,13 +942,13 @@ def _speed_flip_prechecks() -> t.List[taac_types.PointInTimeHealthCheck]:
 
 def _speed_flip_postchecks() -> t.List[taac_types.PointInTimeHealthCheck]:
     return [
-        create_bgp_session_establish_check(
-            ignore_all_prefixes_except=_SPEED_FLIP_51T_IXIA_BGP_PEERS,
-        ),
+        _speed_flip_bgp_converged_check(),
         create_lldp_check(),
         create_port_state_check(),
         create_ixia_packet_loss_check(
             thresholds=[hc_types.PacketLossThreshold(str_value="2")],
+            clear_traffic_stats=True,
+            sleep_time=30,
         ),
         create_ixia_port_stats_check(),
     ]
@@ -1257,7 +1282,7 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
                 remote_as=7001,
                 is_confed=True,
                 route_prefix="8000:51::",
-                communities=["65529:34814", "65441:131", "65446:201"],
+                communities=["65441:195"],
             ),
             _create_speed_flip_ixia_port_config(
                 hostname=_SPEED_FLIP_51T_PEER,

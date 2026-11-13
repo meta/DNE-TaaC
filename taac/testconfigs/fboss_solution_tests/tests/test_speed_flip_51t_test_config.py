@@ -561,6 +561,10 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         expected_peers = [
             "2401:db00:e50d:11:9::11",
             "2401:db00:e50d:11:8::11",
+            "2401:db00:e719:2:1000::d",
+            "2401:db00:e719:2:1000::2d",
+            "2401:db00:e719:2:1000::c",
+            "2401:db00:e719:2:1000::2c",
         ]
 
         for playbook in self.test_config.playbooks:

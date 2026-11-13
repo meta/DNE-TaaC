@@ -43,6 +43,7 @@ from taac.driver.config_modifiers import (
     COMMUNITY_LIVE,
     ConfigModifierError,
     drain_device,
+    FBOSS_DRAIN_DIR,
     generate_base_configs,
     LIVE_CONFIG_PATH,
     LOCAL_PREF_DRAIN,
@@ -95,6 +96,7 @@ class _Device:
         # and the default here, so the existing tests describe that path; an OSS
         # image names a real file instead.
         self.bgpd_config_path: str = STARTUP_CONFIG_SYMLINK
+        self.drain_dir_exists: bool = True
 
     @property
     def mutating_commands(self) -> list[str]:
@@ -120,7 +122,9 @@ class _Device:
             return f"{FILE_EXISTS_SENTINEL}\n" if path in self.files else "\n"
         if cmd.startswith("readlink "):
             return f"{self.symlink_target}\n"
-        if cmd.startswith("ln -sfn "):
+        if cmd.startswith("mkdir -p "):
+            self.drain_dir_exists = True
+        if cmd.startswith("ln -sfn ") and self.drain_dir_exists:
             # "ln -sfn <target> <staging> && mv -Tf <staging> <link>"
             self.symlink_target = cmd.split()[2]
         if cmd.startswith("systemctl cat "):
@@ -242,9 +246,14 @@ class DrainUndrainTest(TestCase):
         await drain_device(self.switch)
 
         self.assertEqual(
-            f"rm -f {MARKER_UNDRAINED} && touch {MARKER_SOFT_DRAINED}",
+            f"mkdir -p {FBOSS_DRAIN_DIR} && rm -f {MARKER_UNDRAINED} && touch {MARKER_SOFT_DRAINED}",
             self.device.command_containing("touch "),
         )
+
+    async def test_undrain_right_after_a_reboot_creates_the_drain_dir(self) -> None:
+        self.device.drain_dir_exists = False
+        await undrain_device(self.switch)
+        self.assertEqual(LIVE_CONFIG_PATH, self.device.symlink_target)
 
     async def test_drain_points_symlink_at_softdrain_config(self) -> None:
         await drain_device(self.switch)
@@ -1238,7 +1247,7 @@ class DrainOnRealConfigFileTest(TestCase):
 
         self.assertEqual(SOFTDRAIN_CONFIG_PATH, self.device.symlink_target)
         self.assertIn(
-            f"rm -f {MARKER_UNDRAINED} && touch {MARKER_SOFT_DRAINED}",
+            f"mkdir -p {FBOSS_DRAIN_DIR} && rm -f {MARKER_UNDRAINED} && touch {MARKER_SOFT_DRAINED}",
             self.device.commands,
         )
 

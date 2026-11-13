@@ -25610,7 +25610,9 @@ def create_cpu_queue_playbooks(
                         },
                     ),
                     create_service_interruption_step(service=Service.AGENT),
-                    create_service_convergence_step(),
+                    create_service_convergence_step(
+                        services=[Service.AGENT, Service.BGP],
+                    ),
                     create_interface_flap_step(
                         enable=False,
                         interfaces=[ixia_downlink_interface],
@@ -25629,7 +25631,9 @@ def create_cpu_queue_playbooks(
                         patcher_name="cpu_queue_static_route_patcher",
                     ),
                     create_service_interruption_step(service=Service.AGENT),
-                    create_service_convergence_step(),
+                    create_service_convergence_step(
+                        services=[Service.AGENT, Service.BGP],
+                    ),
                 ],
             )
         ],
@@ -25677,7 +25681,9 @@ def create_cpu_queue_playbooks(
                         },
                     ),
                     create_service_interruption_step(service=Service.AGENT),
-                    create_service_convergence_step(),
+                    create_service_convergence_step(
+                        services=[Service.AGENT, Service.BGP],
+                    ),
                     create_interface_flap_step(
                         enable=False,
                         interfaces=[ixia_downlink_interface],
@@ -25696,7 +25702,9 @@ def create_cpu_queue_playbooks(
                         patcher_name="cpu_queue_static_route_patcher",
                     ),
                     create_service_interruption_step(service=Service.AGENT),
-                    create_service_convergence_step(),
+                    create_service_convergence_step(
+                        services=[Service.AGENT, Service.BGP],
+                    ),
                 ],
             )
         ],

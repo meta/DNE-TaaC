@@ -263,3 +263,26 @@ class UnhPuntCheckpointTest(unittest.TestCase):
                 names,
                 pb.name,
             )
+
+    def test_convergence_after_agent_restart_waits_for_bgp(self) -> None:
+        # An agent restart also restarts bgpd, and bgpd returns later.
+        checked = 0
+        for pb in create_cpu_queue_playbooks(0, 2, 9, "eth1/32/1"):
+            steps = [s for stage in pb.stages for s in stage.steps or []]
+            for prev, step in zip(steps, steps[1:]):
+                if not (
+                    prev.name == taac_types.StepName.SERVICE_INTERRUPTION_STEP
+                    and json.loads(prev.input_json or "{}")["name"]
+                    == taac_types.Service.AGENT.value
+                ):
+                    continue
+                checked += 1
+                self.assertEqual(
+                    step.name, taac_types.StepName.SERVICE_CONVERGENCE_STEP, pb.name
+                )
+                self.assertIn(
+                    taac_types.Service.BGP.value,
+                    json.loads(step.input_json or "{}")["services"],
+                    pb.name,
+                )
+        self.assertGreaterEqual(checked, 4)

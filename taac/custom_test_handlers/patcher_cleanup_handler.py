@@ -10,7 +10,7 @@ from taac.custom_test_handlers.base_custom_test_handler import (
 )
 from taac.driver.driver_constants import FbossSystemctlServiceName
 from taac.utils.driver_factory import async_get_device_driver
-from taac.utils.oss_taac_lib_utils import ConsoleFileLogger
+from taac.utils.oss_taac_lib_utils import ConsoleFileLogger, oss_config_patcher_enabled
 
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
@@ -28,7 +28,8 @@ class PatcherCleanupHelper:
         self.logger = logger
 
     async def get_registered_patchers(self, hostname: str) -> dict:
-        if TAAC_OSS:
+        # With TAAC_OSS_META_INTERNAL, the driver has no OSS patcher calls.
+        if TAAC_OSS and not oss_config_patcher_enabled():
             return {config: [] for config in COOP_CONFIG_NAMES}
         driver = await async_get_device_driver(hostname)
         patchers = await asyncio.gather(
@@ -47,6 +48,9 @@ class PatcherCleanupHelper:
         initial = self.initial_patchers.get(hostname, {})
         current = self.current_patchers.get(hostname, {})
         driver = await async_get_device_driver(hostname)
+        if oss_config_patcher_enabled():
+            await self._cleanup_oss_patchers(hostname, driver, initial, current)
+            return
         remove_tasks = []
         for config, current_list in current.items():
             initial_list = initial.get(config, [])
@@ -59,6 +63,26 @@ class PatcherCleanupHelper:
             self.logger.debug(f"Removing {len(remove_tasks)} patchers for {hostname}")
             await asyncio.gather(*remove_tasks)
             await driver.async_restart_service(FbossSystemctlServiceName.AGENT)
+            await driver.async_wait_for_agent_configured()
+        else:
+            self.logger.debug(f"No patchers to remove for {hostname}")
+
+    async def _cleanup_oss_patchers(
+        self, hostname: str, driver, initial: dict, current: dict
+    ) -> None:
+        removed = 0
+        for config, current_list in current.items():
+            # OssPatcher is not hashable. Compare the names.
+            initial_names = {p.name for p in initial.get(config, [])}
+            for patcher in current_list:
+                if patcher.name not in initial_names:
+                    # One at a time: two removals at once can undo each other.
+                    await driver.async_coop_unregister_patchers(patcher.name, config)
+                    removed += 1
+        if removed:
+            self.logger.debug(f"Removed {removed} patchers for {hostname}")
+            # An OSS removal only changes the working copy. Apply it to activate.
+            await driver.async_apply_patchers()
             await driver.async_wait_for_agent_configured()
         else:
             self.logger.debug(f"No patchers to remove for {hostname}")

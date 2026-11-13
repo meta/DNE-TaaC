@@ -92,6 +92,7 @@ from taac.constants import (
 )
 from taac.driver.driver_constants import (
     AristaCriticalAgents,
+    wedge_qsfp_util_cmd,
     FbossSystemctlServiceName,
     OtherSystemctlServiceName,
     Service as DriverService,
@@ -12745,15 +12746,14 @@ class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
         subcmd: str,
         sequential: bool,
     ) -> None:
+        util = wedge_qsfp_util_cmd()
         coros = []
         if not sequential:
             ifaces = " ".join(interface_names)
-            coros = [
-                self.driver.async_run_cmd_on_shell(f"wedge_qsfp_util {subcmd} {ifaces}")
-            ]
+            coros = [self.driver.async_run_cmd_on_shell(f"{util} {subcmd} {ifaces}")]
         else:
             coros = [
-                self.driver.async_run_cmd_on_shell(f"wedge_qsfp_util {subcmd} {iface}")
+                self.driver.async_run_cmd_on_shell(f"{util} {subcmd} {iface}")
                 for iface in interface_names
             ]
         await self.run_coroutines(coros, sequential)

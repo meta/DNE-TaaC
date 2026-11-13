@@ -2154,6 +2154,105 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 self.logger.warning(f"ng.Stop() failed: {e}")
         self.logger.info(f"[toggle_dlb_pool_enabled] {pool_name} → enabled={enabled}")
 
+    def set_dlb_route_pools_active(
+        self,
+        pool_names: t.Sequence[str],
+        active: bool,
+        expected_route_cells: int,
+        settle_time_after_start: int = 10,
+    ) -> t.Dict[str, t.Dict[str, int]]:
+        """Atomically advertise or withdraw exact DLB BGP route pools.
+
+        Whole-DeviceGroup flaps conflate peer lifecycle with route lifecycle.
+        Case 18 needs the narrower operation: stop only the route-bearing
+        components, update each BGP route property's ``Active`` multivalue,
+        apply all pools once, and fail closed unless every expanded cell reads
+        back the requested value. Components restart only after verification.
+        """
+        self._validate_dlb_route_pool_toggle_args(
+            pool_names,
+            expected_route_cells,
+            settle_time_after_start,
+        )
+
+        shells = {
+            pool_name: self._find_dlb_ng_dg(pool_name) for pool_name in pool_names
+        }
+        for device_group, network_group, _pool, _route in shells.values():
+            device_group.Stop()
+            network_group.Stop()
+        for _device_group, _network_group, _pool, route in shells.values():
+            route.Active.Single(active)
+        self.apply_changes()
+
+        state: t.Dict[str, t.Dict[str, int]] = {}
+        for pool_name in pool_names:
+            route = self._find_dlb_ng_dg(pool_name)[3]
+            state[pool_name] = self._read_dlb_route_pool_active_state(
+                pool_name,
+                route,
+                active,
+                expected_route_cells,
+            )
+
+        for device_group, network_group, _pool, _route in shells.values():
+            network_group.Start()
+            device_group.Start()
+        if settle_time_after_start:
+            time.sleep(settle_time_after_start)
+        if active:
+            for device_group, _network_group, _pool, _route in shells.values():
+                self._send_arp_ns_on_device_group(device_group)
+        self.logger.info(
+            "Verified DLB route-pool Active state active=%s: %s", active, state
+        )
+        return state
+
+    @staticmethod
+    def _validate_dlb_route_pool_toggle_args(
+        pool_names: t.Sequence[str],
+        expected_route_cells: int,
+        settle_time_after_start: int,
+    ) -> None:
+        if not pool_names:
+            raise ValueError("pool_names must contain at least one exact pool name")
+        if len(set(pool_names)) != len(pool_names):
+            raise ValueError("pool_names must not contain duplicates")
+        if expected_route_cells <= 0:
+            raise ValueError("expected_route_cells must be positive")
+        if settle_time_after_start < 0:
+            raise ValueError("settle_time_after_start must be non-negative")
+
+    def _read_dlb_route_pool_active_state(
+        self,
+        pool_name: str,
+        route: t.Any,
+        active: bool,
+        expected_route_cells: int,
+    ) -> t.Dict[str, int]:
+        route.refresh()
+        values = list(route.Active.Values)
+        if len(values) != expected_route_cells:
+            raise RuntimeError(
+                f"DLB pool {pool_name!r} Active readback has {len(values)} "
+                f"cells; expected {expected_route_cells}"
+            )
+        mismatches = [
+            (index, value)
+            for index, value in enumerate(values)
+            if not self._enabled_readback_matches(value, active)
+        ]
+        if mismatches:
+            index, value = mismatches[0]
+            raise RuntimeError(
+                f"DLB pool {pool_name!r} Active readback mismatch at cell "
+                f"{index}: expected {active!r}, got {value!r}"
+            )
+        return {
+            "route_cells": len(values),
+            "active_cells": len(values) if active else 0,
+        }
+
     def configure_traffic_item(
         self,
         traffic_item_name: str,

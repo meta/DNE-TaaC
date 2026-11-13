@@ -133,6 +133,9 @@ class DlbResourceStickinessHealthCheck(
             expected_counts,
             expected_totals,
             snapshot_count=snapshot_count,
+            snapshot_expected_extra_groups=check_params.get(
+                "snapshot_expected_extra_groups", 0
+            ),
         )
 
         self.logger.info(f"Total unique next hop groups: {result.total_unique_nhgs}")

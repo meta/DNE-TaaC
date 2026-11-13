@@ -397,8 +397,10 @@ def _format_summary_insights(
     )
 
 
-def _format_snapshot_comparison(
-    snapshot_count: int, matrix_dlb_prefix_total: int
+def format_snapshot_comparison(
+    snapshot_count: int,
+    matrix_dlb_prefix_total: int,
+    expected_extra_groups: int = 0,
 ) -> t.Tuple[str, bool]:
     """Render the ECMP Groups Snapshot Comparison block.
 
@@ -434,12 +436,16 @@ def _format_snapshot_comparison(
     that range regardless of mode is in silicon's registry; anything
     outside (Silver's ``5000:ee::``) is not.
     """
-    diff = snapshot_count - matrix_dlb_prefix_total
-    match = snapshot_count == matrix_dlb_prefix_total
+    if expected_extra_groups < 0:
+        raise ValueError("expected_extra_groups must be non-negative")
+    expected_snapshot_count = matrix_dlb_prefix_total + expected_extra_groups
+    diff = snapshot_count - expected_snapshot_count
+    match = snapshot_count == expected_snapshot_count
     marker = "MATCH" if match else "MISMATCH"
     lines = [
         "=== ECMP Groups Snapshot Comparison ===",
-        f"Snapshot: {snapshot_count}  Matrix DLB-prefix total: {matrix_dlb_prefix_total}  Difference: {diff}   {marker}",
+        f"Snapshot: {snapshot_count}  Matrix DLB-prefix total: {matrix_dlb_prefix_total}  "
+        f"Expected extra groups: {expected_extra_groups}  Difference: {diff}   {marker}",
     ]
     return "\n".join(lines), match
 
@@ -452,6 +458,7 @@ def analyze(
     expected_totals: t.Optional[t.Dict[str, int]] = None,
     snapshot_count: t.Optional[int] = None,
     dlb_managed_prefix_pattern: str = "5000:dd::",
+    snapshot_expected_extra_groups: int = 0,
 ) -> DlbAnalysisResult:
     """Run the full DLB resource analysis + validation.
 
@@ -509,8 +516,10 @@ def analyze(
     snapshot_block = ""
     snapshot_match: t.Optional[bool] = None
     if snapshot_count is not None:
-        snapshot_block, snapshot_match = _format_snapshot_comparison(
-            snapshot_count, dlb_managed_prefix_total
+        snapshot_block, snapshot_match = format_snapshot_comparison(
+            snapshot_count,
+            dlb_managed_prefix_total,
+            expected_extra_groups=snapshot_expected_extra_groups,
         )
 
     header = (
@@ -561,8 +570,9 @@ def analyze(
         return _make_result(
             False,
             f"Snapshot mismatch: ECMP-snapshot={snapshot_count} vs "
-            f"matrix-{dlb_managed_category}-total={dlb_managed_prefix_total} "
-            f"(diff={snapshot_count - dlb_managed_prefix_total})",
+            f"matrix-{dlb_managed_category}-total={dlb_managed_prefix_total} + "
+            f"expected-extra={snapshot_expected_extra_groups} "
+            f"(diff={snapshot_count - dlb_managed_prefix_total - snapshot_expected_extra_groups})",
         )
 
     return _make_result(True, "DLB Resource Analysis:")

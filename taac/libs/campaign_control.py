@@ -80,11 +80,15 @@ class HostActionSpec:
     max_invocations: int = 1
     allow_perpetual: bool = False
     min_interval_seconds: float = 0.0
+    interface: str | None = None
+    max_hold_seconds: float = 60.0
+    verify_hrt_recovery: bool = True
+    continue_on_failure: bool = False
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901
         if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", self.action_id) is None:
             raise CampaignProtocolError("host action_id is invalid")
-        if self.kind != "restart_hrt":
+        if self.kind not in {"restart_hrt", "hrt_status", "hrt_logs", "link_disable"}:
             raise CampaignProtocolError(f"unsupported host action kind {self.kind!r}")
         if re.fullmatch(r"[A-Za-z0-9.-]+", self.host) is None:
             raise CampaignProtocolError("host action hostname is invalid")
@@ -93,6 +97,7 @@ class HostActionSpec:
         if (
             not isinstance(self.timeout_seconds, (int, float))
             or isinstance(self.timeout_seconds, bool)
+            or not math.isfinite(self.timeout_seconds)
             or self.timeout_seconds <= 0
         ):
             raise CampaignProtocolError("host action timeout must be positive")
@@ -100,6 +105,17 @@ class HostActionSpec:
             raise CampaignProtocolError("max_invocations must be a positive integer")
         if type(self.allow_perpetual) is not bool:
             raise CampaignProtocolError("allow_perpetual must be boolean")
+        if (
+            type(self.verify_hrt_recovery) is not bool
+            or type(self.continue_on_failure) is not bool
+        ):
+            raise CampaignProtocolError("restart policy flags must be boolean")
+        if self.kind != "restart_hrt" and (
+            not self.verify_hrt_recovery or self.continue_on_failure
+        ):
+            raise CampaignProtocolError(
+                "restart policy flags apply only to restart_hrt"
+            )
         if (
             not isinstance(self.min_interval_seconds, (int, float))
             or isinstance(self.min_interval_seconds, bool)
@@ -109,6 +125,20 @@ class HostActionSpec:
             raise CampaignProtocolError(
                 "min_interval_seconds must be finite and non-negative"
             )
+        if self.kind == "link_disable":
+            if (
+                not isinstance(self.interface, str)
+                or re.fullmatch(r"eth[0-9]+/[0-9]+/[0-9]+", self.interface) is None
+            ):
+                raise CampaignProtocolError("link action requires an exact interface")
+        elif self.interface is not None:
+            raise CampaignProtocolError("interface is only valid for link actions")
+        if (
+            type(self.max_hold_seconds) not in (int, float)
+            or not math.isfinite(self.max_hold_seconds)
+            or self.max_hold_seconds <= 0
+        ):
+            raise CampaignProtocolError("max_hold_seconds must be finite and positive")
 
     @classmethod
     def from_payload(cls, payload: object) -> HostActionSpec:
@@ -119,6 +149,10 @@ class HostActionSpec:
         optional_defaults = {
             "allow_perpetual": False,
             "min_interval_seconds": 0.0,
+            "interface": None,
+            "max_hold_seconds": 60.0,
+            "verify_hrt_recovery": True,
+            "continue_on_failure": False,
         }
         missing = expected - set(payload)
         unexpected = set(payload) - expected

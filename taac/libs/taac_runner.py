@@ -72,6 +72,11 @@ from taac.libs.baseline_lifecycle import (
     BaselineScope,
     BaselineTimeouts,
 )
+from taac.libs.campaign_control import (
+    BoundaryAction,
+    CampaignControl,
+    NoopCampaignControl,
+)
 from taac.libs.collectors.registry import set_test_case_start_time
 from taac.libs.investigation_report import (
     InvestigationReport,
@@ -464,6 +469,7 @@ class TaacRunner:
         ixia_primary_chassis: t.Optional[str] = None,
         force_take_ixia_port_ownership: bool = True,
         ixia_use_tx_rx_sync: bool = True,
+        campaign_control: CampaignControl | NoopCampaignControl | None = None,
     ) -> None:
         self.test_config = (
             get_test_config(test_config)
@@ -471,6 +477,15 @@ class TaacRunner:
             else test_config
         )
         self._validate_no_test_config_level_checks()
+        self.campaign_control = campaign_control or CampaignControl.from_environment()
+        if (
+            self.campaign_control.is_enabled
+            and self.campaign_control.manifest is not None
+            and self.campaign_control.manifest.test_config != self.test_config.name
+        ):
+            raise ValueError(
+                "campaign manifest TestConfig does not match the TAAC TestConfig"
+            )
         # One entry per (playbook, dut, iteration) executed by this run.
         self.playbook_results: t.List[trr_types.PlaybookResult] = []
         self.logger = logger or get_root_logger()
@@ -2510,7 +2525,7 @@ class TaacRunner:
                 resolved_playbooks.append(playbook)
         return resolved_playbooks
 
-    async def run_tests(
+    async def run_tests(  # noqa: C901
         self,
         playbooks: t.Optional[t.List[t.Union[str, taac_types.Playbook]]] = None,
         duts: t.Optional[t.List[str]] = None,
@@ -2544,6 +2559,7 @@ class TaacRunner:
         duts = none_throws(duts or self.duts)
         enabled_playbooks = [p for p in resolved_playbooks if p.enabled]
         failed_playbooks: t.List[t.Tuple[str, str, Exception]] = []
+        stop_requested = False
         for dut in duts:
             # pyrefly: ignore [missing-attribute]
             test_device = self.topology.get_device_by_name(dut)
@@ -2561,6 +2577,14 @@ class TaacRunner:
                 )
                 self.logger.info(f"\033[1m\033[36m{'=' * 70}\033[0m")
                 self._current_playbook = playbook
+                if self.campaign_control.is_enabled:
+                    self.campaign_control.publish_event(
+                        "PLAYBOOK_STARTED",
+                        playbook=playbook.name,
+                        dut=dut,
+                        index=pb_idx,
+                        total=total_playbooks,
+                    )
                 try:
                     # Cross-playbook IXIA health gate. Fires the in-band 5xx
                     # recovery if the chassis is in a Jetty-wedge state
@@ -2597,10 +2621,36 @@ class TaacRunner:
                             [error for _name, _dut, error in failed_playbooks],
                         )
                     self._ensure_baseline_safe_for_next_playbook(failed_playbooks)
+                    stop_requested = await self._campaign_boundary_requests_stop(
+                        playbook=playbook,
+                        dut=dut,
+                        outcome="FAILED",
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    if stop_requested:
+                        self.logger.warning(
+                            "Campaign requested normal teardown after failed "
+                            f"playbook {playbook.name!r}"
+                        )
+                        break
                     self.logger.info(
                         f"\033[33m  Continuing to next playbook "
                         f"({pb_idx}/{total_playbooks} complete)...\033[0m"
                     )
+                else:
+                    stop_requested = await self._campaign_boundary_requests_stop(
+                        playbook=playbook,
+                        dut=dut,
+                        outcome="PASSED",
+                    )
+                    if stop_requested:
+                        self.logger.warning(
+                            "Campaign requested normal teardown after successful "
+                            f"playbook {playbook.name!r}"
+                        )
+                        break
+            if stop_requested:
+                break
         if failed_playbooks:
             # Include each failed playbook's exception message in the outer
             # TestCaseFailure so the per-HC detail (introduced in D107926440
@@ -2619,6 +2669,49 @@ class TaacRunner:
                 f"{len(failed_playbooks)} playbook(s) failed:\n"
                 + "\n".join(detail_lines)
             ) from failed_playbooks[-1][2]
+
+    async def _campaign_boundary_requests_stop(
+        self,
+        *,
+        playbook: taac_types.Playbook,
+        dut: str,
+        outcome: str,
+        error: str | None = None,
+    ) -> bool:
+        if not self.campaign_control.is_enabled:
+            return False
+        self.campaign_control.publish_event(
+            "PLAYBOOK_FINISHED",
+            playbook=playbook.name,
+            dut=dut,
+            outcome=outcome,
+            error=error,
+        )
+        status = self.campaign_control.publish_status(
+            "WAITING_FOR_COMMAND",
+            playbook=playbook.name,
+            dut=dut,
+            outcome=outcome,
+            error=error,
+        )
+        action = await self.campaign_control.wait_for_boundary_action(
+            expected_state_version=status["state_version"],
+            allowed_actions={
+                BoundaryAction.CONTINUE,
+                BoundaryAction.STOP_FOR_PATCH,
+                BoundaryAction.ABORT_GRACEFULLY,
+            },
+        )
+        self.campaign_control.publish_event(
+            "BOUNDARY_DECISION",
+            playbook=playbook.name,
+            dut=dut,
+            action=action.value,
+        )
+        return action in {
+            BoundaryAction.STOP_FOR_PATCH,
+            BoundaryAction.ABORT_GRACEFULLY,
+        }
 
     def _ensure_baseline_safe_for_next_playbook(
         self, failed_playbooks: t.Sequence[t.Tuple[str, str, Exception]]

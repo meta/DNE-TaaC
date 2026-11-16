@@ -1,7 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
-
 """Structural tests for FPF graceful-restart collection contracts."""
 
 import importlib
@@ -837,13 +835,21 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
 
     def test_tc15_and_tc16_use_validated_twshared_interface(self):
         hosts = ["twshared1352.03.mwg2", "twshared1375.03.mwg2"]
+        owner_prefixes = [
+            fpf_shared_injection_suite.get_prefix(
+                host,
+                fpf_shared_injection_suite.PROD_PREFIX_DEVICE_ID,
+            )
+            for host in hosts
+        ]
+        cross_host_observations = {host: owner_prefixes for host in hosts}
         with (
             patch.object(fpf_shared_injection_suite, "GPU_HOSTS", hosts),
             patch.object(fpf_shared_injection_suite, "PROD_PREFIX_HOST", hosts[0]),
             patch.object(
                 fpf_shared_injection_suite,
                 "PROD_PREFIXES_BY_HOST",
-                {hosts[0]: [fpf_shared_injection_suite.PROD_TARGET_PREFIX]},
+                cross_host_observations,
             ),
             patch.dict(
                 os.environ,
@@ -957,8 +963,10 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
             if task.task_name == "fpf_start_collectors"
         )
         collector_params = json.loads(collector_task.params.json_params)
-        expected_observations = {
-            host: [fpf_shared_injection_suite.PROD_TARGET_PREFIX] for host in hosts
+        expected_observations = {host: owner_prefixes for host in hosts}
+        expected_affected_observations = {
+            hosts[0]: [owner_prefixes[1]],
+            hosts[1]: [owner_prefixes[0]],
         }
         self.assertEqual(
             collector_params["prod_prefixes_by_host"], expected_observations
@@ -966,9 +974,9 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
         self.assertNotIn("prod_prefix_host", collector_params)
         self.assertNotIn("prod_prefixes", collector_params)
 
-        # The dual-host collector is shared suite-wide, but only TC15 opts into
-        # dual-host assertions. Unrelated playbooks preserve the legacy origin-
-        # host scope instead of silently gaining a second verdict surface.
+        # Every prod-prefix check consumes the full observer x owner matrix.
+        # Event-specific checks separately identify the one source-owned route
+        # that must transition; the peer-owned route must remain stable.
         baseline = _playbook(config, "fpf_tc41_longevity_pristine")
         baseline_prod_checks = [
             check
@@ -982,8 +990,7 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
         self.assertEqual(len(baseline_prod_checks), 2)
         for check in baseline_prod_checks:
             self.assertEqual(
-                _check_params(check)["prefixes_by_host"],
-                {hosts[0]: [fpf_shared_injection_suite.PROD_TARGET_PREFIX]},
+                _check_params(check)["prefixes_by_host"], expected_observations
             )
 
         expected_conditional_route_impacts = {host: [0] for host in hosts}
@@ -1013,7 +1020,11 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
         )
         self.assertEqual(
             _check_params(recovery)["affected_prefixes_by_host"],
-            expected_observations,
+            expected_affected_observations,
+        )
+        self.assertEqual(
+            _check_params(transition)["affected_prefixes_by_host"],
+            expected_affected_observations,
         )
         self.assertEqual(
             fpf_shared_injection_suite._impacted_planes_by_host(circuits),
@@ -1075,6 +1086,25 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
                 _check_params(check)["prefixes_by_host"],
                 {host: [target] for host in hosts},
             )
+
+    def test_every_shared_suite_prod_check_requires_cross_host_matrix(self):
+        config = (
+            fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
+        )
+        expected = fpf_shared_injection_suite.PROD_PREFIXES_BY_HOST
+        prod_checks = [
+            check
+            for check in _all_checks(config)
+            if (check.check_id or "").startswith("fpf_prod_hrt_prefix")
+        ]
+
+        self.assertGreater(len(prod_checks), 0)
+        for check in prod_checks:
+            with self.subTest(check_id=check.check_id):
+                self.assertEqual(
+                    _check_params(check).get("prefixes_by_host"),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

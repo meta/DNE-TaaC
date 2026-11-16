@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# pyre-unsafe
 """FSDB steady-state validation at DSF BGP path scale on Ashburn RDSW004."""
 
 import json
@@ -36,6 +35,7 @@ from taac.task_definitions import (
     create_coop_register_patcher_task,
     create_coop_unregister_patchers_task,
     create_run_commands_on_shell_task,
+    create_wait_for_agent_convergence_task,
 )
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
@@ -43,6 +43,7 @@ from taac.test_as_a_config.types import TestConfig
 
 
 _DUT = "rdsw004.u001.c086.ash6"
+_EDSW = "edsw002.n000.l201.ash6"
 _DUT_MAC = "02:00:00:00:0f:0b"
 _DUT_ASN = 4200000004
 _IXIA_API_SERVER = "2401:db00:2066:3037::3004"
@@ -51,6 +52,22 @@ _POLICY_IN = "PROPAGATE_RDSW_IXIA_PATH_SCALE_IN"
 _POLICY_OUT = "PROPAGATE_RDSW_IXIA_PATH_SCALE_OUT"
 _ACTIVE_PEER = "2401:db00:206a:4068::100"
 _ACTIVE_PEER_DESCRIPTION = "TAAC FSDB path-scale active injector"
+_EDSW_MIN_LINK_PATCHER = "taac_edsw2052_minlinks_t284450882"
+_EDSW_SWITCH_ID = "2052"
+_RDSW_EDSW_PEER_GROUP = "PEERGROUP_RDSW_EDSW_V6"
+_RDSW_EDSW_TRANSIT_COMMUNITY = "65441:833"
+_EDSW_PEER_ADDRS = [
+    "2401:db00:e206:50::e:2",
+    "2401:db00:e206:50::f:2",
+    "2401:db00:e206:50::10:2",
+    "2401:db00:e206:50::11:2",
+    "2401:db00:e206:50::12:2",
+    "2401:db00:e206:50::13:2",
+    "2401:db00:e206:50::14:2",
+    "2401:db00:e206:50::15:2",
+    "2401:db00:e206:50::16:2",
+    "2401:db00:e206:50::17:2",
+]
 _PLAYBOOK_NAME = "test_fsdb_path_scale_stable_state"
 _CONTROL_PLANE_PLAYBOOK_NAME = "test_fsdb_path_scale_control_plane"
 _TRAFFIC_GOLDEN = "fsdb_path_scale_golden"
@@ -273,6 +290,29 @@ def _active_peer_check() -> taac_types.PointInTimeHealthCheck:
     )
 
 
+def _edsw_peer_check() -> taac_types.PointInTimeHealthCheck:
+    return create_bgp_session_establish_check(
+        ignore_all_prefixes_except=_EDSW_PEER_ADDRS,
+        expected_established_sessions=len(_EDSW_PEER_ADDRS),
+        retry_count=30,
+        retry_delay_seconds=5,
+        retry_delay_multiplier=1,
+    )
+
+
+def _edsw_advertised_routes_check() -> taac_types.PointInTimeHealthCheck:
+    return create_bgp_route_count_verification_check(
+        json_params={
+            "descriptions_to_check": [_EDSW],
+            "direction": "advertised",
+            "policy_type": "post_policy",
+            "expected_count": _EXPECTED_PREFIXES,
+            "retry_count": 30,
+            "retry_delay_seconds": 5,
+        }
+    )
+
+
 def _rib_path_scale_check() -> taac_types.PointInTimeHealthCheck:
     return create_bgp_route_count_verification_check(
         json_params={
@@ -345,7 +385,9 @@ _PRECHECKS = [
     create_dsf_drain_state_check(is_drained=False),
     create_dsf_traffic_rebalance_check(deviation_threshold_pct=20),
     _active_peer_check(),
+    _edsw_peer_check(),
     _rib_path_scale_check(),
+    _edsw_advertised_routes_check(),
     _fsdb_check(),
     create_ixia_port_stats_check(snapshot_baseline=True),
     _pfc_check("snapshot"),
@@ -360,7 +402,9 @@ _POSTCHECKS = [
     create_dsf_drain_state_check(is_drained=False),
     create_dsf_traffic_rebalance_check(deviation_threshold_pct=20),
     _active_peer_check(),
+    _edsw_peer_check(),
     _rib_path_scale_check(),
+    _edsw_advertised_routes_check(),
     create_bgp_stale_route_check(),
     _fsdb_check(),
     create_ixia_port_stats_check(),
@@ -511,7 +555,118 @@ def _path_scale_peer_group_tasks() -> list[taac_types.Task]:
     ]
 
 
+def _edsw_min_link_tasks() -> list[taac_types.Task]:
+    """Allow the reserved EDSW to join through its one healthy FDSW.
+
+    EDSW002 normally has sixteen fabric links and joins the VOQ domain at ten.
+    FDSW001 is unavailable under a separate Lab Doctor reservation, leaving
+    eight healthy links through FDSW002.  Patch both the legacy global fields
+    and the per-device fields coherently.  Agent-only COOP apply uses config
+    reload; it does not request a warmboot or coldboot.
+    """
+    return [
+        create_coop_unregister_patchers_task(
+            _EDSW,
+            config_names=["agent"],
+            regex=f"^{_EDSW_MIN_LINK_PATCHER}$",
+        ),
+        create_coop_register_patcher_task(
+            hostname=_EDSW,
+            config_name="agent",
+            patcher_name=_EDSW_MIN_LINK_PATCHER,
+            jq_program=(
+                ".sw.switchSettings.minLinksToJoinVOQDomain = 8 | "
+                ".sw.switchSettings.minLinksToRemainInVOQDomain = 4 | "
+                '.sw.switchSettings.switchIdToSwitchInfo["'
+                f"{_EDSW_SWITCH_ID}"
+                '"].minLinksPerDeviceToJoinVOQDomain = 8 | '
+                '.sw.switchSettings.switchIdToSwitchInfo["'
+                f"{_EDSW_SWITCH_ID}"
+                '"].minLinksPerDeviceToRemainInVOQDomain = 4'
+            ),
+        ),
+        create_coop_apply_patchers_task(
+            hostnames=[_EDSW],
+            config_name="agent",
+        ),
+        create_wait_for_agent_convergence_task(_EDSW),
+    ]
+
+
+def _rdsw_edsw_peer_and_policy_tasks() -> list[taac_types.Task]:
+    """Idempotently extend EDSW002 to ten peers and enable native export."""
+    new_peers = [
+        {
+            "description": _EDSW,
+            "local_addr": "2401:db00:e206:651::14:4",
+            "next_hop4": "0.0.0.0",
+            "next_hop6": "2401:db00:e206:651::14:4",
+            "peer_addr": "2401:db00:e206:50::15:2",
+            "peer_group_name": _RDSW_EDSW_PEER_GROUP,
+            "peer_id": f"{_EDSW}:v6:1",
+            "remote_as_4_byte": _DUT_ASN,
+        },
+        {
+            "description": _EDSW,
+            "local_addr": "2401:db00:e206:651::15:4",
+            "next_hop4": "0.0.0.0",
+            "next_hop6": "2401:db00:e206:651::15:4",
+            "peer_addr": "2401:db00:e206:50::16:2",
+            "peer_group_name": _RDSW_EDSW_PEER_GROUP,
+            "peer_id": f"{_EDSW}:v6:1",
+            "remote_as_4_byte": _DUT_ASN,
+        },
+        {
+            "description": _EDSW,
+            "local_addr": "2401:db00:e206:651::16:4",
+            "next_hop4": "0.0.0.0",
+            "next_hop6": "2401:db00:e206:651::16:4",
+            "peer_addr": "2401:db00:e206:50::17:2",
+            "peer_group_name": _RDSW_EDSW_PEER_GROUP,
+            "peer_id": f"{_EDSW}:v6:1",
+            "remote_as_4_byte": _DUT_ASN,
+        },
+    ]
+    peer_upserts = " | ".join(
+        f"upsert_peer({json.dumps(peer, sort_keys=True)})" for peer in new_peers
+    )
+    upsert_peers_program = (
+        "def upsert_peer($peer): "
+        ".peers = ((.peers // []) | "
+        "map(select((.local_addr != $peer.local_addr) or "
+        "(.peer_addr != $peer.peer_addr))) + [$peer]); "
+        f"{peer_upserts}"
+    )
+    stamp_transit_community_program = (
+        ".policies.bgp_policy_statements |= map("
+        f'if .name == "{_POLICY_IN}" then '
+        ".policy_entries[0].policy_action_entries |= ("
+        "map(select(((.community_action.communities // []) | "
+        f'index("{_RDSW_EDSW_TRANSIT_COMMUNITY}")) == null)) + '
+        '[{"community_action": {"action_type": 1, '
+        f'"communities": ["{_RDSW_EDSW_TRANSIT_COMMUNITY}"], '
+        '"description": "", "name": ""}, "type": 2}]) '
+        "else . end)"
+    )
+    return [
+        create_coop_register_patcher_task(
+            hostname=_DUT,
+            config_name="bgpcpp",
+            patcher_name="zy_taac_rdsw_edsw_ten_peer_upsert",
+            jq_program=upsert_peers_program,
+        ),
+        # Runs after the Python policy/prefix patchers by lexical name.
+        create_coop_register_patcher_task(
+            hostname=_DUT,
+            config_name="bgpcpp",
+            patcher_name="zz_taac_ixia_add_rdsw_edsw_transit_community",
+            jq_program=stamp_transit_community_program,
+        ),
+    ]
+
+
 _SETUP_TASKS = [
+    *_edsw_min_link_tasks(),
     create_coop_unregister_patchers_task(_DUT, config_names=["bgpcpp"]),
     # Safe mode is persisted across bgpd restarts. A previous capped scale run
     # may leave this marker behind and make the next run drop every non-golden
@@ -535,6 +690,7 @@ _SETUP_TASKS = [
         ),
     ),
     *_path_scale_peer_group_tasks(),
+    *_rdsw_edsw_peer_and_policy_tasks(),
     create_coop_register_patcher_task(
         hostname=_DUT,
         config_name="bgpcpp",
@@ -591,6 +747,17 @@ RDSW004_C086_U001_ASH6_FSDB_PATH_SCALE = TestConfig(
     setup_tasks=_SETUP_TASKS,
     teardown_tasks=[
         create_coop_unregister_patchers_task(_DUT, config_names=["bgpcpp"]),
+        create_coop_apply_patchers_task(hostnames=[_DUT], config_name="bgpcpp"),
+        create_coop_unregister_patchers_task(
+            _EDSW,
+            config_names=["agent"],
+            regex=f"^{_EDSW_MIN_LINK_PATCHER}$",
+        ),
+        create_coop_apply_patchers_task(
+            hostnames=[_EDSW],
+            config_name="agent",
+        ),
+        create_wait_for_agent_convergence_task(_EDSW),
     ],
     basic_port_configs=[
         _downlink_port_config(),
@@ -645,6 +812,17 @@ RDSW004_C086_U001_ASH6_FSDB_PATH_SCALE_CONTROL_PLANE = TestConfig(
     setup_tasks=_SETUP_TASKS,
     teardown_tasks=[
         create_coop_unregister_patchers_task(_DUT, config_names=["bgpcpp"]),
+        create_coop_apply_patchers_task(hostnames=[_DUT], config_name="bgpcpp"),
+        create_coop_unregister_patchers_task(
+            _EDSW,
+            config_names=["agent"],
+            regex=f"^{_EDSW_MIN_LINK_PATCHER}$",
+        ),
+        create_coop_apply_patchers_task(
+            hostnames=[_EDSW],
+            config_name="agent",
+        ),
+        create_wait_for_agent_convergence_task(_EDSW),
     ],
     basic_port_configs=[_uplink_port_config()],
     skip_ixia_protocol_verification=True,

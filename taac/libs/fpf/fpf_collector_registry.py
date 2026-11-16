@@ -36,6 +36,7 @@ Two responsibilities:
 """
 
 import asyncio
+import copy
 import time
 import typing as t
 
@@ -487,6 +488,58 @@ def validate_restart_tolerant_tuple(
         True,
         f"recovered at {eligible_valid[0][0]:.3f} after eligibility "
         f"{eligibility_ts:.3f}; final={eligible_valid[-1][1]}",
+    )
+
+
+def restart_tolerant_collector_view(
+    collector: t.Any,
+    *,
+    host: str,
+    restart_ts: float,
+    restart_completion_ts: float,
+    row_is_error: t.Callable[[t.Any], bool],
+) -> t.Tuple[t.Optional[t.Any], str]:
+    """Hide only the restarted host's bounded outage rows from a collector.
+
+    A valid sample after restart completion is mandatory. Error rows before
+    that first recovery sample are removed from a shallow collector copy;
+    pre-restart errors, later errors, every valid row, and every other host
+    remain visible to the original health-check contract.
+    """
+    if restart_ts <= 0 or restart_completion_ts <= 0:
+        return None, "missing recorded HRT restart boundary"
+    rows = list(getattr(collector, "rows", []))
+    timestamped: t.List[t.Tuple[float, t.Any]] = []
+    for row in rows:
+        if getattr(row, "host", None) != host:
+            continue
+        try:
+            timestamped.append((_parse_ts(row.timestamp).timestamp(), row))
+        except (ValueError, AttributeError):
+            continue
+    timestamped.sort(key=lambda item: item[0])
+    recovery = next(
+        (
+            (row_ts, row)
+            for row_ts, row in timestamped
+            if row_ts > restart_completion_ts and not row_is_error(row)
+        ),
+        None,
+    )
+    if recovery is None:
+        return None, "no valid recovery sample after restart completion"
+    recovery_ts, _ = recovery
+    tolerated_ids = {
+        id(row)
+        for row_ts, row in timestamped
+        if restart_ts <= row_ts < recovery_ts and row_is_error(row)
+    }
+    view = copy.copy(collector)
+    view.rows = [row for row in rows if id(row) not in tolerated_ids]
+    return (
+        view,
+        f"ignored {len(tolerated_ids)} bounded outage row(s); "
+        f"recovered at {recovery_ts:.3f}",
     )
 
 

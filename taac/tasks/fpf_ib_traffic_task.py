@@ -372,6 +372,46 @@ def to_fqdn(host: str) -> str:
     return host if host.endswith(".facebook.com") else f"{host}.facebook.com"
 
 
+def _is_twshared_host(host: str) -> bool:
+    """Return whether ``host`` is a Foundation Labs twshared endpoint."""
+    return host.split(".", 1)[0].startswith("twshared")
+
+
+async def _async_sush2_run(
+    host: str,
+    cmd: str,
+    timeout_sec: int = 30,
+) -> t.Tuple[int, str, str]:
+    """Run a root command through noninteractive sush2 on twshared hosts."""
+    proc = await asyncio.create_subprocess_exec(
+        "sush2",
+        "--stdin-null",
+        f"root@{to_fqdn(host)}",
+        "--",
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.communicate()
+        return (124, "", f"sush2 timed out after {timeout_sec}s")
+    except asyncio.CancelledError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.communicate()
+        raise
+    rc = proc.returncode if proc.returncode is not None else -1
+    return (rc, out_b.decode(errors="replace"), err_b.decode(errors="replace"))
+
+
 # These GPU/RTP lab hosts are reached as root via the caller's SSH cert/agent
 # (Meta SSH CA), exactly like scripts/pavanpatil/fpf_host_signal_test.py. The
 # asyncssh keyfile path (AsyncSSHClient) does NOT carry that cert and fails with
@@ -396,9 +436,11 @@ async def async_ssh_run(
 ) -> t.Tuple[int, str, str]:
     """Run ``cmd`` on ``host`` as root. Returns (rc, out, err).
 
-    Two modes (mirrors the FbossSwitch driver, but with the correct non-agent
-    fallback for GPU/RTP hosts):
-      * Agent invocation with a live lab-ssh socket, or explicit
+    Three modes (mirrors the FbossSwitch driver, but with the correct host
+    transports for GPU/RTP hosts):
+      * twshared hosts -> direct noninteractive ``sush2``. Foundation Labs
+        twshared endpoints are not reachable through lab-ssh or raw SSH.
+      * Other agent invocations with a live lab-ssh socket, or explicit
         ``TAAC_SSH_VIA_LAB_SSH=1`` -> route through the lab-ssh daemon
         (CoreSSH, runs outside the agent sandbox), where the sush2 gate cannot
         block it.
@@ -414,6 +456,8 @@ async def async_ssh_run(
     Module-level (not a method) so it is an easy monkeypatch seam for tests.
     """
     _validate_hostname(host)
+    if _is_twshared_host(host):
+        return await _async_sush2_run(host, cmd, timeout_sec=timeout_sec)
     if lab_ssh_transport_enabled():
         try:
             res = await lab_ssh_async_exec(

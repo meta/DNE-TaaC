@@ -76,6 +76,33 @@ class FpfIbTrafficProcessValidationTest(unittest.IsolatedAsyncioTestCase):
             username="root",
         )
 
+    async def test_twshared_hosts_use_sush2_before_lab_ssh(self) -> None:
+        sush_exec = AsyncMock(return_value=(0, "OK\n", ""))
+        lab_exec = AsyncMock()
+        with (
+            patch.object(task_module, "lab_ssh_transport_enabled", return_value=True),
+            patch.object(task_module, "lab_ssh_async_exec", new=lab_exec),
+            patch.object(
+                task_module,
+                "_async_sush2_run",
+                new=sush_exec,
+                create=True,
+            ),
+        ):
+            result = await task_module.async_ssh_run(
+                "twshared1354.03.mwg2",
+                "systemctl is-active metalos.wds.hostreachtracker",
+                timeout_sec=120,
+            )
+
+        self.assertEqual(result, (0, "OK\n", ""))
+        sush_exec.assert_awaited_once_with(
+            "twshared1354.03.mwg2",
+            "systemctl is-active metalos.wds.hostreachtracker",
+            timeout_sec=120,
+        )
+        lab_exec.assert_not_awaited()
+
     def test_custom_binary_is_used_by_command_and_process_inventory(self) -> None:
         binary_path = "/root/ib_write_bw"
         command = build_ib_write_bw_cmd(

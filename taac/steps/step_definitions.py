@@ -5004,6 +5004,61 @@ def create_fpf_restart_hrt_step(
     )
 
 
+def create_fpf_wait_hrt_warmboot_step(
+    host: str,
+    phase: str = "complete",
+    timeout_sec: float = 180.0,
+    poll_interval_sec: float = 0.5,
+    expected_devices: int = 8,
+    expected_subscribers: int = 32,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Poll HRT counters until a specific warmboot phase is proven."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or f"Wait for HRT warmboot phase {phase} on {host}",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_wait_hrt_warmboot",
+                    "host": host,
+                    "phase": phase,
+                    "timeout_sec": timeout_sec,
+                    "poll_interval_sec": poll_interval_sec,
+                    "expected_devices": expected_devices,
+                    "expected_subscribers": expected_subscribers,
+                }
+            )
+        ),
+    )
+
+
+def create_fpf_restart_hrt_and_link_drain_step(
+    host: str,
+    target_device: str,
+    interfaces: t.List[str],
+    mutation_token: str,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Start HRT restart and link drain concurrently for WB-14."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or f"Restart HRT on {host} and drain {target_device} {interfaces} concurrently",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_restart_hrt_and_link_drain",
+                    "host": host,
+                    "target_device": target_device,
+                    "interfaces": interfaces,
+                    "mutation_token": mutation_token,
+                }
+            )
+        ),
+    )
+
+
 def create_fpf_up_port_baseline_step(
     *,
     action: str,

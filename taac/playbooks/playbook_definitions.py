@@ -28967,7 +28967,9 @@ def create_fpf_hardening_playbook_v2(
     prod_prefix_recovery: bool = False,
     local_prod_prefixes: list[str] | None = None,
     prod_prefixes_by_host: dict[str, list[str]] | None = None,
+    affected_prod_prefixes_by_host: dict[str, list[str]] | None = None,
     impacted_planes_by_host: dict | None = None,
+    prod_impacted_planes_by_host: dict | None = None,
     impacted_lanes_drained: list[int] | None = None,
     impacted_spray_max_gbps: float = 10.0,
     spray_recovering_by_host: dict | None = None,
@@ -29219,6 +29221,9 @@ def create_fpf_hardening_playbook_v2(
         {resolved_prod_prefix_host: list(prod_prefixes)}
         if resolved_prod_prefix_host and prod_prefixes
         else None
+    )
+    resolved_affected_prod_prefixes_by_host = (
+        affected_prod_prefixes_by_host or resolved_prod_prefixes_by_host
     )
     recovered_device_planes_by_host: dict[str, dict[str, list[int]]] = {}
     recovered_prod_expectations_by_host: dict[
@@ -29639,8 +29644,10 @@ def create_fpf_hardening_playbook_v2(
                 mode="local_undrain",
                 local_prefixes=local_prod_prefixes,
                 prefixes_by_host=resolved_prod_prefixes_by_host,
-                affected_prefixes_by_host=resolved_prod_prefixes_by_host,
-                impacted_planes_by_host=impacted_planes_by_host or {},
+                affected_prefixes_by_host=resolved_affected_prod_prefixes_by_host,
+                impacted_planes_by_host=(
+                    prod_impacted_planes_by_host or impacted_planes_by_host or {}
+                ),
                 max_drain_sec=FPF_ACTIVE_THRESHOLDS.prod_prefix_recovery_sla_sec,
                 check_id="fpf_prod_hrt_prefix_recovery",
             )
@@ -29822,6 +29829,8 @@ def create_fpf_link_event_disrupt_playbook(
     impacted_planes_by_host: dict,
     prod_prefixes: list[str] | None = None,
     prod_prefixes_by_host: dict[str, list[str]] | None = None,
+    affected_prod_prefixes_by_host: dict[str, list[str]] | None = None,
+    prod_impacted_planes_by_host: dict[str, list[int]] | None = None,
     hrt_memory_hosts: list[str] | None = None,
     hrt_driver_hosts: list[str] | None = None,
     spray_hosts: list[str] | None = None,
@@ -29841,6 +29850,7 @@ def create_fpf_link_event_disrupt_playbook(
     gtsw_convergence_settle_sec: int = 0,
     gtsw_rib_unavailable_lanes: list[int] | None = None,
     prod_prefix_precheck_lookback_sec: int | None = None,
+    prod_switch_route_namespace: str | None = None,
     hrt_device_ids: list[int] | None = None,
     ib_traffic_config: t.Mapping[str, t.Any] | None = None,
     additional_postchecks: list | None = None,
@@ -29922,6 +29932,7 @@ def create_fpf_link_event_disrupt_playbook(
         create_fpf_hrt_system_memory_check,
         create_fpf_ods_counter_check,
         create_fpf_prod_hrt_prefix_stability_check,
+        create_fpf_remote_prefix_lifecycle_check,
     )
     from taac.libs.fpf.fpf_thresholds import (
         ACTIVE as FPF_ACTIVE_THRESHOLDS,
@@ -29948,6 +29959,9 @@ def create_fpf_link_event_disrupt_playbook(
         else list(resolved_hrt_device_ids)
     )
     resolved_prod_prefixes_by_host = prod_prefixes_by_host
+    resolved_affected_prod_prefixes_by_host = (
+        affected_prod_prefixes_by_host or resolved_prod_prefixes_by_host
+    )
 
     # ---- Prechecks: assert healthy/stable BEFORE the disruption ----
     prechecks = [
@@ -29973,6 +29987,23 @@ def create_fpf_link_event_disrupt_playbook(
                 check_id="fpf_prod_hrt_prefix_stability_precheck",
             )
         prechecks.append(prod_prefix_precheck)
+    if prod_switch_route_namespace:
+        prechecks.append(
+            create_fpf_remote_prefix_lifecycle_check(
+                mode="present",
+                runner_device=gtsws[0],
+                scalar_expectations=[
+                    [collector, gtsw, 1]
+                    for gtsw in gtsws
+                    for collector in (
+                        f"bgp_{prod_switch_route_namespace}",
+                        f"fsdb_{prod_switch_route_namespace}",
+                    )
+                ],
+                deadline_sec=transition_sla_sec,
+                check_id="fpf_prod_switch_route_present",
+            )
+        )
     if hrt_memory_hosts:
         prechecks.append(
             create_fpf_hrt_system_memory_check(
@@ -30311,9 +30342,29 @@ def create_fpf_link_event_disrupt_playbook(
             create_fpf_prod_hrt_prefix_stability_check(
                 mode="transition",
                 prefixes_by_host=resolved_prod_prefixes_by_host,
-                impacted_planes_by_host=impacted_planes_by_host,
+                affected_prefixes_by_host=resolved_affected_prod_prefixes_by_host,
+                impacted_planes_by_host=(
+                    prod_impacted_planes_by_host or impacted_planes_by_host
+                ),
                 max_transition_sec=float(transition_sla_sec),
                 check_id="fpf_prod_hrt_prefix_transition",
+            )
+        )
+    if prod_switch_route_namespace:
+        postchecks.append(
+            create_fpf_remote_prefix_lifecycle_check(
+                mode="disruption",
+                runner_device=gtsws[0],
+                scalar_expectations=[
+                    [collector, gtsw, 0]
+                    for gtsw in gtsws
+                    for collector in (
+                        f"bgp_{prod_switch_route_namespace}",
+                        f"fsdb_{prod_switch_route_namespace}",
+                    )
+                ],
+                deadline_sec=transition_sla_sec,
+                check_id="fpf_prod_switch_route_withdrawal",
             )
         )
 

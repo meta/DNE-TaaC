@@ -1,7 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
-
 """Consolidated FPF "shared-injection" umbrella suite.
 
 Today every per-disruption FPF config re-injects the 8-plane VF-group prefixes at
@@ -59,14 +57,17 @@ from taac.steps.step_definitions import (
     create_fpf_record_restart_time_step,
     create_fpf_repeated_service_crash_step,
     create_fpf_repeated_sw_hw_agent_crash_step,
+    create_fpf_restart_hrt_and_link_drain_step,
     create_fpf_restart_hrt_step,
     create_fpf_set_interface_admin_step,
     create_fpf_up_port_baseline_step,
     create_fpf_verify_disruption_step,
+    create_fpf_wait_hrt_warmboot_step,
     create_longevity_step,
     create_service_convergence_step,
     create_service_interruption_step,
     create_system_reboot_step,
+    create_validation_step,
 )
 from taac.task_definitions import (
     create_fpf_ensure_interfaces_enabled_task,
@@ -84,6 +85,8 @@ from taac.testconfigs.fpf.fpf_hardening_common import (
     DEFAULT_COMMUNITY_LIST,
     disable_interfaces_by_device,
     EXPECTED_FSDB_SESSION_COUNT,
+    external_ib_traffic,
+    fpf_collector_baseline_sec,
     fpf_device_drain_gtsw,
     fpf_hrt_device_ids,
     fpf_hrt_lanes,
@@ -100,6 +103,7 @@ from taac.testconfigs.fpf.fpf_hardening_common import (
     impacted_lanes_by_host_gpu,
     num_disrupted_circuits,
     OBSERVER_GTSWS,
+    preinjected_prefixes,
     skip_ib_traffic,
     skip_ssh_dependencies,
     skip_twshared_ssh,
@@ -120,8 +124,9 @@ from taac.testconfigs.fpf.fpf_tc36_stsw_all_connections_down import (
 from taac.testconfigs.fpf.fpf_tc54_stsw_device_drain import (
     create_fpf_tc54_test_config,
 )
+from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
-from taac.test_as_a_config.types import TestConfig
+from taac.test_as_a_config.types import StepName, TestConfig
 
 # ---------------------------------------------------------------------------
 # Shared module constants (identical to the per-disruption source configs).
@@ -147,12 +152,21 @@ RF_VF_GROUPS = fpf_rf_vf_groups(
     active_lanes=INJECTED_LANES,
     device_ids_by_vf=(HRT_VF_DEVICE_IDS if HRT_DEVICE_IDS != [0] else None),
 )
+WARMBOOT_HOST = GPU_HOSTS[0]
+WARMBOOT_COMPLETE_TIMEOUT_SEC = 180.0
+WARMBOOT_POLL_INTERVAL_SEC = 0.5
+WB_ODS_GTSWS = [
+    f"gtsw{gtsw:03d}.{pod}.c087.mwg2"
+    for pod in ("l1002", "l1001")
+    for gtsw in range(1, 5)
+]
 
 _TWSHARED_SSH_CUSTOM_STEPS = frozenset(
     {
         "fpf_ensure_traffic",
         "fpf_restart_ib_traffic",
         "fpf_restart_hrt",
+        "fpf_restart_hrt_and_link_drain",
         "fpf_nic_mstreg_paos",
         "fpf_nic_mstreg_verify_link",
         "fpf_nic_mstreg_flap",
@@ -168,6 +182,15 @@ def _custom_step_name(step) -> str | None:
         return json.loads(params.json_params).get("custom_step_name")
     except (json.JSONDecodeError, TypeError):
         return None
+
+
+def _step_params(step) -> dict:
+    if step.step_params is None or step.step_params.json_params is None:
+        return {}
+    try:
+        return json.loads(step.step_params.json_params)
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 def _strip_twshared_ssh_steps(playbooks: list) -> list[str]:
@@ -194,6 +217,40 @@ def _strip_twshared_ssh_steps(playbooks: list) -> list[str]:
             for step in steps:
                 custom_name = _custom_step_name(step)
                 if custom_name in _TWSHARED_SSH_CUSTOM_STEPS:
+                    removed.append(f"{playbook.name}:{custom_name}")
+                else:
+                    retained.append(step)
+            replacements[field_name] = retained
+        filtered_playbooks.append(playbook(**replacements))
+    playbooks[:] = filtered_playbooks
+    return removed
+
+
+def _strip_external_ib_traffic_steps(playbooks: list) -> list[str]:
+    """Remove TAAC traffic lifecycle actions while retaining ODS spray checks."""
+    removed: list[str] = []
+    filtered_playbooks = []
+    traffic_steps = {"fpf_ensure_traffic", "fpf_restart_ib_traffic"}
+    for playbook in playbooks:
+        filtered_stages = []
+        for stage in playbook.stages:
+            retained = []
+            for step in stage.steps or []:
+                custom_name = _custom_step_name(step)
+                if custom_name in traffic_steps:
+                    removed.append(f"{playbook.name}:{custom_name}")
+                else:
+                    retained.append(step)
+            filtered_stages.append(stage(steps=retained))
+        replacements = {"stages": filtered_stages}
+        for field_name in ("setup_steps", "cleanup_steps"):
+            steps = getattr(playbook, field_name, None)
+            if steps is None:
+                continue
+            retained = []
+            for step in steps:
+                custom_name = _custom_step_name(step)
+                if custom_name in traffic_steps:
                     removed.append(f"{playbook.name}:{custom_name}")
                 else:
                     retained.append(step)
@@ -240,6 +297,35 @@ def _use_recent_baseline_for_prod_prefix_prechecks(playbooks: list) -> None:
     playbooks[:] = rewritten
 
 
+def _require_cross_host_prod_prefix_checks(playbooks: list) -> None:
+    """Make every assembled prod-prefix check consume the full route matrix."""
+    rewritten = []
+    for playbook in playbooks:
+        replacements = {}
+        for field_name in ("prechecks", "postchecks"):
+            checks = []
+            for check in getattr(playbook, field_name, None) or []:
+                if check.name != hc_types.CheckName.FPF_PROD_HRT_PREFIX_STABILITY_CHECK:
+                    checks.append(check)
+                    continue
+                if check.check_params is None or check.check_params.json_params is None:
+                    raise ValueError(
+                        f"Prod-prefix check {check.check_id!r} has no params"
+                    )
+                params = json.loads(check.check_params.json_params)
+                params["prefixes_by_host"] = PROD_PREFIXES_BY_HOST
+                checks.append(
+                    check(
+                        check_params=check.check_params(
+                            json_params=json.dumps(params, sort_keys=True)
+                        )
+                    )
+                )
+            replacements[field_name] = checks
+        rewritten.append(playbook(**replacements))
+    playbooks[:] = rewritten
+
+
 def _ib_readiness_config(
     spray: list[str] | None,
 ) -> FpfIbTrafficConfig | None:
@@ -276,7 +362,21 @@ def _prod_target_prefix() -> str:
 
 PROD_TARGET_PREFIX = _prod_target_prefix()
 PROD_PREFIXES = [PROD_TARGET_PREFIX]
-PROD_PREFIXES_BY_HOST = {host: PROD_PREFIXES for host in GPU_HOSTS}
+
+
+def _prod_observation_prefixes() -> list[str]:
+    """Production dev0 canaries required from every HRT observer."""
+    if os.environ.get("TAAC_FPF_PROD_PREFIX", "").strip():
+        return list(PROD_PREFIXES)
+    return list(
+        dict.fromkeys(get_prefix(host, PROD_PREFIX_DEVICE_ID) for host in GPU_HOSTS)
+    )
+
+
+PROD_OBSERVATION_PREFIXES: list[str] = _prod_observation_prefixes()
+PROD_PREFIXES_BY_HOST: dict[str, list[str]] = {
+    host: list(PROD_OBSERVATION_PREFIXES) for host in GPU_HOSTS
+}
 
 # The legacy DUT GTSW (gtsw001) owns lane 0 and remains the TC17 link target.
 # TC19 selects its whole-device drain target independently so a known ambient
@@ -360,7 +460,29 @@ def _conditional_route_impacted_planes_by_host(
 def _conditional_route_prefixes_by_host(
     observers: list[str],
 ) -> dict[str, list[str]]:
-    return {host: [PROD_TARGET_PREFIX] for host in observers}
+    """Routes expected to react per observer during a host-link event.
+
+    The directly attached source observes every peer-owned route through its
+    disrupted plane. Each peer observes the source-owned route through that
+    same plane. Self-owned rows remain stable and are still required by the
+    full ``PROD_PREFIXES_BY_HOST`` observation contract.
+    """
+    if not observers:
+        return {}
+    if os.environ.get("TAAC_FPF_PROD_PREFIX", "").strip() or len(observers) == 1:
+        return {host: [PROD_TARGET_PREFIX] for host in observers}
+    source = observers[0]
+    prefix_by_owner = {
+        host: get_prefix(host, PROD_PREFIX_DEVICE_ID) for host in observers
+    }
+    return {
+        observer: (
+            [prefix for owner, prefix in prefix_by_owner.items() if owner != source]
+            if observer == source
+            else [prefix_by_owner[source]]
+        )
+        for observer in observers
+    }
 
 
 # ===========================================================================
@@ -1148,6 +1270,345 @@ def _tc52(*, spray, skip_ssh) -> list:
     return [disrupt_playbook, longevity_playbook]
 
 
+def _warmboot_restart_steps() -> list:
+    return [
+        create_fpf_record_restart_time_step(
+            description="Record HRT warmboot trigger time"
+        ),
+        create_fpf_restart_hrt_step(
+            hosts=[WARMBOOT_HOST],
+            description=f"Warm restart HRT on {WARMBOOT_HOST}",
+        ),
+        create_fpf_record_restart_completion_time_step(
+            description="Record completion of the systemctl HRT restart command"
+        ),
+    ]
+
+
+def _wait_warmboot_complete_step(
+    expected_subscribers: int = EXPECTED_FSDB_SESSION_COUNT,
+):
+    return create_fpf_wait_hrt_warmboot_step(
+        host=WARMBOOT_HOST,
+        phase="complete",
+        timeout_sec=WARMBOOT_COMPLETE_TIMEOUT_SEC,
+        poll_interval_sec=WARMBOOT_POLL_INTERVAL_SEC,
+        expected_devices=8,
+        expected_subscribers=expected_subscribers,
+        description=(
+            "Condition gate: HRT ready, converged, 8/8 handover, and "
+            f"{expected_subscribers}/{EXPECTED_FSDB_SESSION_COUNT} subscribers"
+        ),
+    )
+
+
+def _with_stage_steps(playbook, *, name: str, steps: list):
+    """Clone a single-stage control playbook while preserving every check."""
+    if len(playbook.stages) != 1:
+        raise ValueError(
+            f"Warmboot control {playbook.name!r} must have exactly one stage"
+        )
+    return playbook(
+        name=name,
+        stages=[playbook.stages[0](steps=steps)],
+    )
+
+
+def _with_wb_restart_tolerance(playbook):
+    """Scope expected HRT collector gaps to the intentional WB restart host."""
+    tolerant_names = {
+        hc_types.CheckName.FPF_HRT_BULK_CONVERGENCE_CHECK,
+        hc_types.CheckName.FPF_HRT_REMOTE_FAILURE_CONVERGENCE_CHECK,
+        hc_types.CheckName.FPF_PROD_HRT_PREFIX_STABILITY_CHECK,
+        hc_types.CheckName.FPF_HRT_PLANE_STATUS_CHECK,
+    }
+    postchecks = []
+    for check in playbook.postchecks or []:
+        if check.name not in tolerant_names:
+            postchecks.append(check)
+            continue
+        if check.check_params is None or check.check_params.json_params is None:
+            raise ValueError(
+                f"WB restart-tolerant check {check.check_id!r} has no params"
+            )
+        params = json.loads(check.check_params.json_params)
+        params["restart_tolerant_hosts"] = [WARMBOOT_HOST]
+        postchecks.append(
+            check(
+                check_params=check.check_params(json_params=json.dumps(params)),
+            )
+        )
+    return playbook(postchecks=postchecks)
+
+
+def _with_wb_ods_scope(playbook):
+    """Scope WB discard/congestion checks to GTSW001-004 in both pods."""
+    entity_desc = ",".join(WB_ODS_GTSWS)
+    postchecks = []
+    for check in playbook.postchecks or []:
+        if check.name != hc_types.CheckName.GENERIC_ODS_CHECK:
+            postchecks.append(check)
+            continue
+        if check.check_params is None or check.check_params.json_params is None:
+            raise ValueError(f"WB ODS check {check.check_id!r} has no params")
+        params = json.loads(check.check_params.json_params)
+        params["entity_desc"] = entity_desc
+        postchecks.append(
+            check(check_params=check.check_params(json_params=json.dumps(params)))
+        )
+    return playbook(postchecks=postchecks)
+
+
+def _insert_before_first_longevity(steps: list, additions: list) -> list:
+    for index, step in enumerate(steps):
+        if step.name == StepName.LONGEVITY_STEP:
+            return [*steps[:index], *additions, *steps[index:]]
+    raise ValueError("Warmboot control has no longevity step")
+
+
+def _insert_after_custom_step(
+    steps: list,
+    custom_step_name: str,
+    additions: list,
+    *,
+    occurrence: int = -1,
+) -> list:
+    matches = [
+        index
+        for index, step in enumerate(steps)
+        if _custom_step_name(step) == custom_step_name
+    ]
+    if not matches:
+        raise ValueError(f"Warmboot control has no custom step {custom_step_name!r}")
+    index = matches[occurrence]
+    return [*steps[: index + 1], *additions, *steps[index + 1 :]]
+
+
+def _insert_before_custom_step(
+    steps: list,
+    custom_step_name: str,
+    additions: list,
+    *,
+    occurrence: int = 0,
+) -> list:
+    matches = [
+        index
+        for index, step in enumerate(steps)
+        if _custom_step_name(step) == custom_step_name
+    ]
+    if not matches:
+        raise ValueError(f"Warmboot control has no custom step {custom_step_name!r}")
+    index = matches[occurrence]
+    return [*steps[:index], *additions, *steps[index:]]
+
+
+def _wb10(*, circuits: list[Circuit], spray, skip_ssh) -> list:
+    """WB-10: TC15's exact disable/restore contract plus HRT warmboot."""
+    control_disrupt, control_restore = _tc15(
+        circuits=circuits,
+        spray=spray,
+        skip_ssh=skip_ssh,
+    )
+    control_disrupt = _with_wb_restart_tolerance(_with_wb_ods_scope(control_disrupt))
+    control_restore = _with_wb_ods_scope(control_restore)
+    disrupt_steps = list(control_disrupt.stages[0].steps or [])
+    disrupt_steps.extend(
+        [
+            *_warmboot_restart_steps(),
+            _wait_warmboot_complete_step(
+                EXPECTED_FSDB_SESSION_COUNT - num_disrupted_circuits(circuits)
+            ),
+        ]
+    )
+    restore_steps = _insert_after_custom_step(
+        list(control_restore.stages[0].steps or []),
+        "fpf_set_interface_admin",
+        [_wait_warmboot_complete_step()],
+    )
+    return [
+        _with_stage_steps(
+            control_disrupt,
+            name="fpf_wb10_interface_disable_warmboot_disrupt",
+            steps=disrupt_steps,
+        ),
+        _with_stage_steps(
+            control_restore,
+            name="fpf_wb10_interface_disable_warmboot_restore",
+            steps=restore_steps,
+        ),
+    ]
+
+
+def _wb11(*, spray, skip_ssh) -> list:
+    """WB-11: one atomic STSW drain -> HRT warmboot -> undrain lifecycle."""
+    control_disrupt, control_restore = _tc54_tc35_stsw_drain_undrain_pair()
+    control_disrupt = _with_wb_restart_tolerance(_with_wb_ods_scope(control_disrupt))
+    control_restore = _with_wb_ods_scope(control_restore)
+    disrupt_steps = _insert_before_first_longevity(
+        list(control_disrupt.stages[0].steps or []),
+        [*_warmboot_restart_steps(), _wait_warmboot_complete_step()],
+    )
+    disrupt_steps.insert(
+        0,
+        create_fpf_verify_disruption_step(
+            interfaces=[fpf_link_drain_interface(GPU_HOSTS)],
+            mode="drain",
+            expect_drained=False,
+            fail_if_ineffective=True,
+            target_device=DUT_GTSW,
+            description=(
+                "WB-11 precondition: GTSW host-facing lane is not independently drained"
+            ),
+        ),
+    )
+    mid_validation = create_validation_step(
+        point_in_time_checks=list(control_disrupt.postchecks or []),
+        stage=taac_types.ValidationStage.MID_TEST,
+        description=(
+            "WB-11 drained-state contract after HRT warmboot and before undrain"
+        ),
+        start_traffic=False,
+        fail_on_failure=True,
+    )
+    restore_steps = list(control_restore.stages[0].steps or [])
+    undrain_index = next(
+        index
+        for index, step in enumerate(restore_steps)
+        if _custom_step_name(step) == "fpf_drain_interface"
+        and not bool(_step_params(step).get("is_drain"))
+    )
+    atomic_steps = [
+        *disrupt_steps,
+        mid_validation,
+        *restore_steps[undrain_index:],
+    ]
+    return [
+        _with_stage_steps(
+            control_restore,
+            name="fpf_wb11_stsw_drain_warmboot",
+            steps=atomic_steps,
+        )(
+            prechecks=control_disrupt.prechecks,
+            snapshot_checks=control_disrupt.snapshot_checks,
+        ),
+    ]
+
+
+def _link_drain_warmboot_playbooks(
+    *,
+    name: str,
+    circuits: list[Circuit],
+    timing: str,
+    spray,
+    skip_ssh: bool,
+):
+    control_disrupt, control_restore = _tc17(
+        circuits=circuits,
+        spray=spray,
+        skip_ssh=skip_ssh,
+    )
+    control_disrupt = _with_wb_restart_tolerance(_with_wb_ods_scope(control_disrupt))
+    control_restore = _with_wb_ods_scope(control_restore)
+    event_steps = list(control_disrupt.stages[0].steps or [])
+    if timing == "before_restart":
+        event_steps = _insert_before_first_longevity(
+            event_steps,
+            [*_warmboot_restart_steps(), _wait_warmboot_complete_step()],
+        )
+    elif timing == "during_handover":
+        pre_handover = create_fpf_wait_hrt_warmboot_step(
+            host=WARMBOOT_HOST,
+            phase="converged_pre_handover",
+            timeout_sec=WARMBOOT_COMPLETE_TIMEOUT_SEC,
+            poll_interval_sec=0.1,
+            expected_devices=8,
+            expected_subscribers=EXPECTED_FSDB_SESSION_COUNT,
+            description=(
+                "WB-13 gate: convergence reached while handover is incomplete"
+            ),
+        )
+        event_steps = _insert_before_custom_step(
+            event_steps,
+            "fpf_drain_interface",
+            [*_warmboot_restart_steps(), pre_handover],
+        )
+        event_steps = _insert_before_first_longevity(
+            event_steps,
+            [_wait_warmboot_complete_step()],
+        )
+    elif timing == "simultaneous":
+        drain_index = next(
+            index
+            for index, step in enumerate(event_steps)
+            if _custom_step_name(step) == "fpf_drain_interface"
+        )
+        drain_params = _step_params(event_steps[drain_index])
+        simultaneous = [
+            create_fpf_record_restart_time_step(
+                description="Record WB-14 simultaneous restart/drain trigger"
+            ),
+            create_fpf_restart_hrt_and_link_drain_step(
+                host=WARMBOOT_HOST,
+                target_device=drain_params["target_device"],
+                interfaces=drain_params["interfaces"],
+                mutation_token=drain_params["mutation_token"],
+                description="WB-14: launch HRT restart and link drain together",
+            ),
+            create_fpf_record_restart_completion_time_step(
+                description="Record completion of WB-14 concurrent actions"
+            ),
+        ]
+        event_steps = [
+            *event_steps[:drain_index],
+            *simultaneous,
+            *event_steps[drain_index + 1 :],
+        ]
+        event_steps = _insert_before_first_longevity(
+            event_steps,
+            [_wait_warmboot_complete_step()],
+        )
+    else:
+        raise ValueError(f"unknown link-drain warmboot timing: {timing!r}")
+    return [
+        _with_stage_steps(
+            control_disrupt,
+            name=f"{name}_disrupt",
+            steps=event_steps,
+        ),
+        _with_stage_steps(
+            control_restore,
+            name=f"{name}_restore",
+            steps=list(control_restore.stages[0].steps or []),
+        ),
+    ]
+
+
+def _wb12_to_wb14(*, circuits: list[Circuit], spray, skip_ssh) -> list:
+    return [
+        *_link_drain_warmboot_playbooks(
+            name="fpf_wb12_link_drain_warmboot",
+            circuits=circuits,
+            timing="before_restart",
+            spray=spray,
+            skip_ssh=skip_ssh,
+        ),
+        *_link_drain_warmboot_playbooks(
+            name="fpf_wb13_warmboot_then_link_drain",
+            circuits=circuits,
+            timing="during_handover",
+            spray=spray,
+            skip_ssh=skip_ssh,
+        ),
+        *_link_drain_warmboot_playbooks(
+            name="fpf_wb14_simultaneous_link_drain_warmboot",
+            circuits=circuits,
+            timing="simultaneous",
+            spray=spray,
+            skip_ssh=skip_ssh,
+        ),
+    ]
+
+
 def _tc38(*, spray, skip_ssh) -> list:
     """tc38: persistent NDP clear (disrupt + stable v2)."""
     from taac.health_checks.healthcheck_definitions import (
@@ -1355,13 +1816,17 @@ def _tc15(*, circuits: list[Circuit], spray, skip_ssh) -> list:
         # circuit/session/bulk/RF scopes above target-only.
         impacted_planes_by_host=conditional_route_impacted_planes_by_host,
         prod_prefixes=PROD_PREFIXES,
-        prod_prefixes_by_host=conditional_route_prefixes_by_host,
+        prod_prefixes_by_host=PROD_PREFIXES_BY_HOST,
+        affected_prod_prefixes_by_host=conditional_route_prefixes_by_host,
         hrt_memory_hosts=HRT_MEMORY_HOSTS,
         hrt_driver_hosts=HRT_MEMORY_HOSTS,
         spray_hosts=spray,
         ib_traffic_config=_ib_readiness_config(spray),
         flip_fsdb_session=True,
         flip_discards=True,
+        remote_failure_sla_sec=10,
+        transition_sla_sec=10,
+        prod_switch_route_namespace="prod_route",
         fsdb_expected_total=EXPECTED_FSDB_SESSION_COUNT,
         include_ssh_checks=not skip_ssh,
         skip_injection=True,
@@ -1388,7 +1853,8 @@ def _tc15(*, circuits: list[Circuit], spray, skip_ssh) -> list:
         rf_vf_groups=RF_VF_GROUPS,
         playbook_name="fpf_tc15_interface_disable_restore",
         prod_prefixes=PROD_PREFIXES,
-        prod_prefixes_by_host=conditional_route_prefixes_by_host,
+        prod_prefixes_by_host=PROD_PREFIXES_BY_HOST,
+        affected_prod_prefixes_by_host=conditional_route_prefixes_by_host,
         skip_ssh_dependent_checks=skip_ssh,
         use_bgp_snapshot=True,
         prod_prefix_settle_sec=120,
@@ -1480,11 +1946,11 @@ def _drain_playbooks(
     """tc17 (link drain) / tc19 (device drain): disrupt + restore."""
     impacted_lanes = sorted({c.lane for c in circuits})
     impacted_planes = _impacted_planes_by_host(circuits)
-    affected_prod_prefixes_by_host = {
-        host: PROD_PREFIXES_BY_HOST[host]
-        for host in impacted_planes
-        if host in PROD_PREFIXES_BY_HOST
-    }
+    affected_prod_prefixes_by_host = _conditional_route_prefixes_by_host(GPU_HOSTS)
+    prod_impacted_planes = _conditional_route_impacted_planes_by_host(
+        circuits,
+        GPU_HOSTS,
+    )
     stabilization_delay_sec = 300
     # Host-spray samples use a one-minute ODS average.  Two minutes can still
     # return a lagging bucket that straddles the drain transition (observed as
@@ -1554,7 +2020,9 @@ def _drain_playbooks(
         # host.  The shared collector still observes both GPU hosts, but a
         # single GTSW link/device drain is modeled only on the host(s) carried
         # by ``circuits``; do not manufacture a failure on an untouched host.
-        prod_prefixes_by_host=affected_prod_prefixes_by_host,
+        prod_prefixes_by_host=PROD_PREFIXES_BY_HOST,
+        affected_prod_prefixes_by_host=affected_prod_prefixes_by_host,
+        prod_impacted_planes_by_host=prod_impacted_planes,
         hrt_memory_hosts=HRT_MEMORY_HOSTS,
         hrt_driver_hosts=HRT_MEMORY_HOSTS,
         spray_hosts=spray,
@@ -1608,7 +2076,8 @@ def _drain_playbooks(
         rf_vf_groups=RF_VF_GROUPS,
         playbook_name=restore_name,
         prod_prefixes=PROD_PREFIXES,
-        prod_prefixes_by_host=affected_prod_prefixes_by_host,
+        prod_prefixes_by_host=PROD_PREFIXES_BY_HOST,
+        affected_prod_prefixes_by_host=affected_prod_prefixes_by_host,
         skip_ssh_dependent_checks=skip_ssh,
         use_bgp_snapshot=True,
         prod_prefix_settle_sec=120,
@@ -1628,6 +2097,7 @@ def _drain_playbooks(
         prod_prefix_recovery=True,
         local_prod_prefixes=PROD_PREFIXES,
         impacted_planes_by_host=impacted_planes,
+        prod_impacted_planes_by_host=prod_impacted_planes,
         cleanup_steps=[cleanup_step],
     )
     return [disrupt_playbook, restore_playbook]
@@ -1825,15 +2295,16 @@ def create_fpf_shared_injection_suite_test_config() -> TestConfig:
     skip_ssh = skip_ssh_dependencies()
     skip_ib = skip_ib_traffic()
     skip_gpu_ssh = skip_twshared_ssh()
+    external_ib = external_ib_traffic()
+    prefixes_preinjected = preinjected_prefixes()
     ib_setup, ib_teardown = fpf_ib_traffic_tasks(
         skip_ssh,
-        skip_ib or skip_gpu_ssh,
+        skip_ib or skip_gpu_ssh or external_ib,
         traffic_config=IB_TRAFFIC_CONFIG,
     )
     spray = None if skip_ssh or skip_ib else SPRAY_HOSTS
     link_event_circuits = _link_drain_circuits()
     device_drain_circuits = _device_drain_circuits(DEVICE_DRAIN_GTSW)
-    conditional_route_prefixes_by_host = _conditional_route_prefixes_by_host(GPU_HOSTS)
 
     # Ordered least-destructive -> most-destructive. Each entry contributes one or
     # more playbooks; all share the single setup-time injection (skip_injection).
@@ -1891,51 +2362,93 @@ def create_fpf_shared_injection_suite_test_config() -> TestConfig:
     # and TC35 first establishes a fail-closed drained baseline.
     playbooks += _tc54_tc35_stsw_drain_undrain_pair()
     playbooks += list(create_fpf_tc36_test_config().playbooks)
+    # HRT warmboot network-event cases. The already-present TC15, TC17 and
+    # TC54/TC35 playbooks are their control runs. Omit the warmboot variants
+    # entirely when GPU-host SSH is unavailable; never execute a partial case
+    # with only its network mutation.
+    if not skip_gpu_ssh:
+        playbooks += _wb10(
+            circuits=link_event_circuits,
+            spray=spray,
+            skip_ssh=skip_ssh,
+        )
+        playbooks += _wb11(spray=spray, skip_ssh=skip_ssh)
+        playbooks += _wb12_to_wb14(
+            circuits=link_event_circuits,
+            spray=spray,
+            skip_ssh=skip_ssh,
+        )
     # Coldboot.
     playbooks += _tc27(spray=spray, skip_ssh=skip_ssh)
     # Full device reboot (most destructive) — last.
     playbooks += _tc55(spray=spray, skip_ssh=skip_ssh)
 
+    _require_cross_host_prod_prefix_checks(playbooks)
     _use_recent_baseline_for_prod_prefix_prechecks(playbooks)
 
     if skip_gpu_ssh:
         _strip_twshared_ssh_steps(playbooks)
+    elif external_ib:
+        _strip_external_ib_traffic_steps(playbooks)
+
+    collector_task = create_fpf_start_collectors_task(
+        gtsws=COLLECTOR_GTSWS,
+        hosts=GPU_HOSTS,
+        hrt_device_ids=HRT_DEVICE_IDS,
+        hrt_plane_ids=INJECTED_LANES,
+        subnet_prefix=VF_COLLECTOR_SUBNET,
+        baseline_collection_sec=fpf_collector_baseline_sec(),
+        prod_prefixes_by_host=PROD_PREFIXES_BY_HOST,
+        prod_prefix_device_id=PROD_PREFIX_DEVICE_ID,
+        fsdb_mode=FSDB_COLLECTOR_MODE,
+        allow_baseline_failures=ALLOW_BASELINE_FAILURES,
+        enable_fsdb_session_collector=True,
+        fsdb_session_hosts=GPU_HOSTS,
+        fsdb_session_poll_interval_sec=2.0,
+        fsdb_session_expected=EXPECTED_FSDB_SESSION_COUNT,
+        rf_vf_groups=RF_VF_GROUPS,
+        additional_namespaces=[
+            {
+                "name": "prod_route",
+                "subnet_prefix": PROD_TARGET_PREFIX,
+                "bgp_gtsws": OBSERVER_GTSWS,
+                "fsdb_gtsws": OBSERVER_GTSWS,
+                "poll_interval_sec": 1.0,
+            }
+        ],
+    )
+    prefix_setup = (
+        []
+        if prefixes_preinjected
+        else [
+            create_fpf_inject_vf_groups_task(
+                groups=INJECTION_GROUPS,
+                settle_sec=INJECT_SETTLE_SEC,
+            )
+        ]
+    )
+    prefix_teardown = (
+        []
+        if prefixes_preinjected
+        else [
+            create_fpf_withdraw_vf_groups_task(groups=INJECTION_GROUPS),
+            create_fpf_restart_service_task(devices=ALL_STSWS, service="BGP"),
+        ]
+    )
 
     return TestConfig(
         name="fpf_shared_injection_suite",
         endpoints=create_fpf_endpoints(stsws=ALL_STSWS),
         setup_tasks=[
             *ib_setup,
-            create_fpf_start_collectors_task(
-                gtsws=COLLECTOR_GTSWS,
-                hosts=GPU_HOSTS,
-                hrt_device_ids=HRT_DEVICE_IDS,
-                hrt_plane_ids=INJECTED_LANES,
-                subnet_prefix=VF_COLLECTOR_SUBNET,
-                prod_prefixes_by_host=conditional_route_prefixes_by_host,
-                prod_prefix_device_id=PROD_PREFIX_DEVICE_ID,
-                fsdb_mode=FSDB_COLLECTOR_MODE,
-                allow_baseline_failures=ALLOW_BASELINE_FAILURES,
-                # Enable the FSDB-session collector: the kill/reboot/hrt playbooks
-                # (tc28/39/49/50/51/52/55) assert against it. Superset of tc41's
-                # collectors task — harmless for the playbooks that don't use it.
-                enable_fsdb_session_collector=True,
-                fsdb_session_hosts=GPU_HOSTS,
-                fsdb_session_poll_interval_sec=2.0,
-                fsdb_session_expected=EXPECTED_FSDB_SESSION_COUNT,
-                rf_vf_groups=RF_VF_GROUPS,
-            ),
-            create_fpf_inject_vf_groups_task(
-                groups=INJECTION_GROUPS,
-                settle_sec=INJECT_SETTLE_SEC,
-            ),
+            collector_task,
+            *prefix_setup,
         ],
         teardown_tasks=[
             create_fpf_ensure_interfaces_enabled_task(
                 disable_interfaces_by_device(link_event_circuits)
             ),
-            create_fpf_withdraw_vf_groups_task(groups=INJECTION_GROUPS),
-            create_fpf_restart_service_task(devices=ALL_STSWS, service="BGP"),
+            *prefix_teardown,
             create_fpf_stop_collectors_task(
                 trigger_stsws=TRIGGER_STSWS,
                 withdraw=False,
@@ -1946,6 +2459,8 @@ def create_fpf_shared_injection_suite_test_config() -> TestConfig:
         playbooks=playbooks,
         tags=[
             "fpf",
+            *(["external_ib_traffic"] if external_ib else []),
+            *(["preinjected_prefixes"] if prefixes_preinjected else []),
             *(["external_twshared_traffic"] if skip_gpu_ssh else []),
         ],
     )

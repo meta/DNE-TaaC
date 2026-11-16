@@ -151,7 +151,13 @@ class FpfReplacementClientTest(unittest.TestCase):
                 self.assertNotIn("prod_prefixes", shared_params)
                 self.assertEqual(
                     shared_params["prod_prefixes_by_host"],
-                    {host: ["2401:db00:292a:a27c::/64"] for host in HOSTS},
+                    {
+                        host: [
+                            "2401:db00:292a:a27c::/64",
+                            "2401:db00:292a:a150::/64",
+                        ]
+                        for host in HOSTS
+                    },
                 )
 
                 self.assertEqual(

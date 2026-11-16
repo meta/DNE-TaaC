@@ -118,7 +118,6 @@ from taac.steps.all_steps import (  # oss-rewrite (force ShipIt re-export to taa
 from neteng.test_infra.dne.taac.steps.step import Step, TestbedError
 from taac.steps.step_definitions import ValidationStep
 from taac.tasks.utils import run_task
-from taac.test_configs import get_test_config
 from taac.utils.common import (
     async_everpaste_str,
     async_write_test_result,
@@ -471,11 +470,14 @@ class TaacRunner:
         ixia_use_tx_rx_sync: bool = True,
         campaign_control: CampaignControl | NoopCampaignControl | None = None,
     ) -> None:
-        self.test_config = (
-            get_test_config(test_config)
-            if isinstance(test_config, str)
-            else test_config
-        )
+        if isinstance(test_config, str):
+            # Registry discovery imports hardware-specific configs and can do
+            # network I/O. A supplied TestConfig must not discover other DUTs.
+            from taac.test_configs import get_test_config
+
+            self.test_config = get_test_config(test_config)
+        else:
+            self.test_config = test_config
         self._validate_no_test_config_level_checks()
         self.campaign_control = campaign_control or CampaignControl.from_environment()
         if (

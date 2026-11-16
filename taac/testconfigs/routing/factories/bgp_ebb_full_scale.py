@@ -174,7 +174,6 @@ _FY26_ONLY_PLAYBOOKS: t.Mapping[str, str] = {
         "RouteStorm requires exactly 10,500 storm paths, and RouteStormRuntime "
         "62 peers, 750 routes, rows 0-61 and 21/21/20 shards"
     ),
-    "bgp_ebb_fauu_drain_undrain_playbook": _FY26_DRAIN_PNH_REASON,
     "bgp_ebb_plane_drain_undrain_playbook": _FY26_DRAIN_PNH_REASON,
     "bgp_ebb_nexthop_group_count_threshold_playbook": (
         "its NHG storm and restoration staging are calibrated to the FY26 FEC baseline"
@@ -1130,6 +1129,47 @@ def _openr_helper_kv_link(physical_inventory: PhysicalInventory) -> dict:
     return link.kv_link(link.helper)
 
 
+def _ebb_ibgp_capture_interfaces(bound: BoundTopology) -> tuple[str, ...]:
+    """Return every bound internal link's physical capture interface in port order."""
+    interfaces_by_port: dict[int, str] = {}
+    for group in bound.device_groups:
+        if group.peer_relationship is not PeerRelationship.INTERNAL:
+            continue
+        assignment = group.port_assignment
+        if assignment is None or not assignment.dut_interface.strip():
+            raise ValueError(
+                f"bound iBGP link {group.name!r} has no physical capture interface"
+            )
+        port_index = bound.port_map.get(assignment.logical_role)
+        if port_index is None or port_index != assignment.physical_inventory_index:
+            raise ValueError(f"bound iBGP link {group.name!r} contradicts its port map")
+        interface = assignment.dut_interface
+        previous = interfaces_by_port.setdefault(port_index, interface)
+        if previous != interface:
+            raise ValueError(
+                f"bound iBGP port {port_index} has contradictory capture interfaces"
+            )
+    interfaces = tuple(
+        interfaces_by_port[index] for index in sorted(interfaces_by_port)
+    )
+    if not interfaces:
+        raise ValueError("bound topology has no iBGP capture interfaces")
+    if len(set(interfaces)) != len(interfaces):
+        raise ValueError("distinct bound iBGP links have duplicate capture interfaces")
+    return interfaces
+
+
+def _ebb_fauu_capture_kwargs(
+    bound: BoundTopology, scale: EbbScaleProfile
+) -> dict[str, t.Any]:
+    interfaces = _ebb_ibgp_capture_interfaces(bound)
+    if scale != EBB_FY26_SCALE:
+        return {"tcp_dump_capture_interfaces_ibgp": interfaces}
+    if len(interfaces) != 1:
+        raise ValueError("FY26 FAUU capture requires exactly one bound iBGP link")
+    return {"tcp_dump_capture_interface_ibgp": interfaces[0]}
+
+
 def _characterization_gates(
     playbook_name: str,
     enable_update_group: bool,
@@ -1491,7 +1531,16 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             profile=profile,
             precheck_thresholds=full_scale_precheck_thresholds,
             tcp_dump_capture_interface_ebgp=ixia_interface_mimic_ebgp,
-            tcp_dump_capture_interface_ibgp=ixia_interface_mimic_ibgp,
+            **_ebb_fauu_capture_kwargs(bound, scale),
+            # FY26's frozen readiness payload omits the optional range fields.
+            ibgp_pnh_start_ipv4s=None
+            if scale == EBB_FY26_SCALE
+            else ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=None
+            if scale == EBB_FY26_SCALE
+            else ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=None if scale == EBB_FY26_SCALE else openr_pnh_count,
+            ibgp_pnh_step=None if scale == EBB_FY26_SCALE else openr_pnh_step,
             bgp_mon_parent_network=bound_bgp_mon_network,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(

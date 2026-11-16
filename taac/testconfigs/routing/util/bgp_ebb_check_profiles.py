@@ -143,8 +143,8 @@ class CheckProfile(enum.Enum):
     # BGP route/session oscillation & multipath churn: convergence OFF; which
     # snapshot sub-checks to skip varies by sub-shape (carried in the context).
     OSCILLATION = "oscillation"
-    # FA/plane drain-undrain: convergence OFF, iBGP-PNH precheck off, snapshot
-    # skips flap only (uptime still checked).
+    # FA/plane drain-undrain: convergence OFF; PNH readiness opts in with a
+    # resolved range; snapshot skips flap only (uptime still checked).
     DRAIN_UNDRAIN = "drain_undrain"
     # CICD-EBB-11 route storm: convergence OFF, expected established-session count
     # enforced, and a context-selected snapshot shape. The custom steps own
@@ -484,9 +484,9 @@ def _oscillation(ctx: ProfileContext) -> ProfileChecks:
 
 
 def _drain_undrain(ctx: ProfileContext) -> ProfileChecks:
-    """FA/plane drain-undrain: standard prechecks with the iBGP-PNH check OFF
-    (drain tests don't assert PNH metric), postchecks with convergence OFF, and
-    a snapshot that skips only the flap check (uptime is still validated).
+    """Drain profiles retain legacy checks unless a PNH range is explicitly supplied.
+
+    Postchecks keep convergence off; snapshots skip only flap checks.
     """
     return ProfileChecks(
         prechecks=create_standard_prechecks(
@@ -494,7 +494,20 @@ def _drain_undrain(ctx: ProfileContext) -> ProfileChecks:
             peergroup_ibgp_v4=ctx.peergroup_ibgp_v4,
             precheck_thresholds=ctx.precheck_thresholds,
             expected_established_sessions=ctx.expected_established_sessions,
-            check_ibgp_pnh=False,
+            check_ibgp_pnh=ctx.check_ibgp_pnh
+            and any(
+                value is not None
+                for value in (
+                    ctx.ibgp_pnh_start_ipv4s,
+                    ctx.ibgp_pnh_start_ipv6s,
+                    ctx.ibgp_pnh_count,
+                    ctx.ibgp_pnh_step,
+                )
+            ),
+            ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(

@@ -245,6 +245,11 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
             mock.patch.multiple(factory, **builders),
             mock.patch.object(
                 factory,
+                "_ebb_fauu_capture_kwargs",
+                return_value={"tcp_dump_capture_interface_ibgp": "Ethernet2"},
+            ),
+            mock.patch.object(
+                factory,
                 "_ebb_route_count_histogram_by_afi",
                 return_value={"ipv4": {}, "ipv6": {}},
             ),
@@ -341,6 +346,11 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
                 }
                 with (
                     mock.patch.multiple(factory, **builders),
+                    mock.patch.object(
+                        factory,
+                        "_ebb_fauu_capture_kwargs",
+                        return_value={"tcp_dump_capture_interface_ibgp": "Ethernet2"},
+                    ),
                     mock.patch.object(
                         factory,
                         "_ebb_route_count_histogram_by_afi",
@@ -1496,6 +1506,138 @@ class EbbInjectionRangeAnchorWithRuntimeAdvertisementsTest(unittest.TestCase):
                     injected["start_ipv4s"],
                     payload["start_ipv4s"][: len(injected["start_ipv4s"])],
                 )
+
+
+class EbbFauuDualScaleFactoryTest(unittest.TestCase):
+    @staticmethod
+    def _config(scale: EbbScaleProfile) -> taac_types.TestConfig:
+        return factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB008_ASH6,
+            name=f"FAUU_{scale.name}",
+            playbooks_selected=["bgp_ebb_fauu_drain_undrain_playbook"],
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            enable_update_group=False,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            scale=scale,
+        )
+
+    def test_fy27_factory_threads_pnh_inventory_and_every_capture_link(self) -> None:
+        builder = factory.get_bgp_ebb_fauu_drain_undrain_playbook
+        with mock.patch.object(factory, builder.__name__, wraps=builder) as wrapped:
+            config = self._config(EBB_FY27_SCALE)
+        (playbook,) = config.playbooks or []
+        self.assertEqual("bgp_ebb_fauu_drain_undrain_playbook", playbook.name)
+        expected_interfaces = tuple(port[0] for port in NRQEB008_ASH6.ixia_ports[1:3])
+        self.assertEqual(
+            expected_interfaces,
+            wrapped.call_args.kwargs["tcp_dump_capture_interfaces_ibgp"],
+        )
+        self.assertNotIn("tcp_dump_capture_interface_ibgp", wrapped.call_args.kwargs)
+        injected = EbbInjectionScaleReachesEveryPnhCheckTest._injection_task_params(
+            config
+        )
+        (pnh,) = EbbInjectionScaleReachesEveryPnhCheckTest._pnh_payloads(config)
+        self.assertEqual(100, pnh["count"])
+        self.assertEqual(2, pnh["step"])
+        self.assertEqual(injected["start_ipv4s"], pnh["start_ipv4s"])
+        self.assertEqual(injected["start_ipv6s"], pnh["start_ipv6s"])
+        steps = [step for stage in playbook.stages or [] for step in stage.steps or []]
+        captures = [
+            json.loads(json.loads(step.input_json)["task"]["params"]["json_params"])
+            for step in steps
+            if step.name == taac_types.StepName.RUN_TASK_STEP
+            and step.input_json is not None
+            and json.loads(step.input_json)["task"]["task_name"]
+            == "ixia_packet_capture"
+        ]
+        verifiers = [
+            json.loads(step.step_params.json_params)
+            for step in steps
+            if step.step_params is not None
+            and step.step_params.json_params is not None
+            and json.loads(step.step_params.json_params).get("custom_step_name")
+            == "verify_drain_convergence"
+            and json.loads(step.step_params.json_params)["use_pcap_analysis"]
+        ]
+        self.assertEqual(18, len(captures))
+        self.assertEqual(6, len(verifiers))
+        for phase in ("drain", "undrain"):
+            for index, interface in enumerate(expected_interfaces, start=1):
+                capture_id = f"fauu_{phase}_ibgp_{index}"
+                matching = [p for p in captures if p["capture_id"] == capture_id]
+                self.assertEqual(
+                    ["start", "stop", "save"], [p["mode"] for p in matching]
+                )
+                self.assertEqual({interface}, {p["interface"] for p in matching})
+                self.assertIn(
+                    f"bgp_{capture_id}.pcap", [p["pcap_filename"] for p in verifiers]
+                )
+
+    def test_fy26_factory_passes_only_legacy_capture_and_omits_pnh_fields(self) -> None:
+        builder = factory.get_bgp_ebb_fauu_drain_undrain_playbook
+        with mock.patch.object(factory, builder.__name__, wraps=builder) as wrapped:
+            config = self._config(EBB_FY26_SCALE)
+        kwargs = wrapped.call_args.kwargs
+        self.assertEqual(
+            NRQEB008_ASH6.ixia_ports[1][0], kwargs["tcp_dump_capture_interface_ibgp"]
+        )
+        self.assertNotIn("tcp_dump_capture_interfaces_ibgp", kwargs)
+        self.assertEqual(
+            [], EbbInjectionScaleReachesEveryPnhCheckTest._pnh_payloads(config)
+        )
+
+    def test_capture_interfaces_follow_bound_port_mapping(self) -> None:
+        port_map = factory.ebb_port_map(EBB_FY27_SCALE)
+        port_map["ibgp"], port_map["ibgp_b"] = port_map["ibgp_b"], port_map["ibgp"]
+        bound = ebb_topology(
+            scale=EBB_FY27_SCALE, openr_mode=OpenRMode.NONE
+        ).bind_to_inventory(
+            NRQEB008_ASH6,
+            port_map=port_map,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            peer_groups=EBB_PEER_GROUPS,
+            as_numbers=EBB_AS_NUMBERS,
+        )
+        self.assertEqual(
+            tuple(port[0] for port in NRQEB008_ASH6.ixia_ports[1:3]),
+            factory._ebb_ibgp_capture_interfaces(bound),
+        )
+        self.assertEqual(
+            {
+                "tcp_dump_capture_interfaces_ibgp": factory._ebb_ibgp_capture_interfaces(
+                    bound
+                )
+            },
+            factory._ebb_fauu_capture_kwargs(bound, EBB_FY27_SCALE),
+        )
+        with self.assertRaisesRegex(ValueError, "exactly one bound iBGP link"):
+            factory._ebb_fauu_capture_kwargs(bound, EBB_FY26_SCALE)
+
+    def test_missing_bound_capture_interface_fails_closed(self) -> None:
+        bound = ebb_topology(
+            scale=EBB_FY27_SCALE, openr_mode=OpenRMode.NONE
+        ).bind_to_inventory(
+            NRQEB008_ASH6,
+            port_map=factory.ebb_port_map(EBB_FY27_SCALE),
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            peer_groups=EBB_PEER_GROUPS,
+            as_numbers=EBB_AS_NUMBERS,
+        )
+        (target, *_) = [
+            group
+            for group in bound.device_groups
+            if group.peer_relationship is factory.PeerRelationship.INTERNAL
+        ]
+        damaged = replace(
+            bound,
+            device_groups=tuple(
+                replace(group, port_assignment=None) if group is target else group
+                for group in bound.device_groups
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "has no physical capture interface"):
+            factory._ebb_fauu_capture_kwargs(damaged, EBB_FY27_SCALE)
 
 
 class EbbFy27AttributeChurnFactoryTest(unittest.TestCase):

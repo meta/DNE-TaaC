@@ -1697,12 +1697,17 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
     prefix_end_index: int = 96,
     tcp_dump_capture_interface_ebgp: str = "",
     tcp_dump_capture_interface_bgpmon: str | None = None,
-    tcp_dump_capture_interface_ibgp: str = "",
+    tcp_dump_capture_interface_ibgp: str | None = None,
     soak_time_seconds: int = 300,
     exclude_bgp_mon: bool = True,
     bgp_mon_parent_network: str | None = None,
     characterization: CharacterizationConfig = DISABLED,
     characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    tcp_dump_capture_interfaces_ibgp: t.Sequence[str] | None = None,
+    ibgp_pnh_start_ipv4s: t.Sequence[str] | None = None,
+    ibgp_pnh_start_ipv6s: t.Sequence[str] | None = None,
+    ibgp_pnh_count: int | None = None,
+    ibgp_pnh_step: int | None = None,
 ) -> Playbook:
     """
     Build CICD-EBB-13: FAUU drain and undrain.
@@ -1727,7 +1732,12 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
         prefix_end_index: Ending prefix index (default: 96)
         tcp_dump_capture_interface_ebgp: eBGP interface for PCAP capture
         tcp_dump_capture_interface_bgpmon: Legacy auxiliary interface input; accepted but ignored
-        tcp_dump_capture_interface_ibgp: iBGP interface for PCAP capture
+        tcp_dump_capture_interface_ibgp: Legacy single iBGP capture interface; mutually exclusive with the plural input.
+        tcp_dump_capture_interfaces_ibgp: All iBGP capture interfaces; one preserves legacy capture identities, multiple use ordered suffixes.
+        ibgp_pnh_start_ipv4s: Optional topology-resolved IPv4 PNH range starts.
+        ibgp_pnh_start_ipv6s: Optional topology-resolved IPv6 PNH range starts.
+        ibgp_pnh_count: Optional PNH count per range.
+        ibgp_pnh_step: Optional PNH address stride.
         soak_time_seconds: Soak time in seconds (default: 300)
 
     Returns:
@@ -1748,6 +1758,10 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
                 parent_network=bgp_mon_parent_network,
             ),
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             cpu_characterization=cpu_characterization,
             rss_delta=rss_delta,
         ),
@@ -1772,6 +1786,7 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
                     prefix_end_index=prefix_end_index,
                     tcp_dump_capture_interface_ebgp=tcp_dump_capture_interface_ebgp,
                     tcp_dump_capture_interface_ibgp=tcp_dump_capture_interface_ibgp,
+                    tcp_dump_capture_interfaces_ibgp=tcp_dump_capture_interfaces_ibgp,
                     soak_time_seconds=soak_time_seconds,
                     drained_prefix_descriptors=_ebb_drained_prefix_descriptors(
                         prefix_end_index, prefix_pool_regex=prefix_pool_regex

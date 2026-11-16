@@ -382,6 +382,24 @@ class CheckProfileRegistryTest(unittest.TestCase):
             ),
         )
 
+    def test_drain_pnh_readiness_requires_both_profile_and_explicit_range(self) -> None:
+        for enabled, count, expected in (
+            (True, None, False),
+            (False, 100, False),
+            (True, 100, True),
+        ):
+            with self.subTest(enabled=enabled, count=count):
+                checks = get_profile_checks(
+                    CheckProfile.DRAIN_UNDRAIN,
+                    ProfileContext(check_ibgp_pnh=enabled, ibgp_pnh_count=count),
+                )
+                pnh = [
+                    check
+                    for check in checks.prechecks
+                    if check.check_id == "startup_ibgp_pnh_verification"
+                ]
+                self.assertEqual(expected, bool(pnh))
+
     def test_churn_storm_route_storm_matches_factory(self):
         """CICD-EBB-11 uses final session checks and in-workflow stability gates."""
         precheck_thresholds = HardwareCapacityThresholds(fec_threshold=15_000)

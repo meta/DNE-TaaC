@@ -2587,6 +2587,30 @@ def create_attribute_churn_stage(
     return Stage(steps=steps)
 
 
+def _fauu_ibgp_capture_interfaces(
+    singular: str | None, plural: Sequence[str] | None
+) -> tuple[str, ...]:
+    """Resolve legacy or plural capture inputs without silently dropping a link."""
+    if singular is not None and plural is not None:
+        raise ValueError("provide singular or plural iBGP capture interfaces, not both")
+    if plural is None:
+        interfaces = () if singular is None else (singular,)
+    else:
+        if isinstance(plural, str) or not plural:
+            raise ValueError(
+                "plural iBGP capture interfaces must be a nonempty sequence"
+            )
+        interfaces = tuple(plural)
+    if any(
+        not isinstance(interface, str) or not interface.strip()
+        for interface in interfaces
+    ):
+        raise ValueError("iBGP capture interfaces must be nonempty strings")
+    if len({interface.strip() for interface in interfaces}) != len(interfaces):
+        raise ValueError("duplicate iBGP capture interfaces")
+    return interfaces
+
+
 def create_fauu_drain_undrain_stage(  # noqa: C901
     device_name: str,
     prefix_pool_regex: str,
@@ -2604,6 +2628,7 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     verify_restoration: bool = True,
     restoration_settle_timeout_seconds: int = 300,
     drained_prefix_descriptors: Sequence[dict] | None = None,
+    tcp_dump_capture_interfaces_ibgp: Sequence[str] | None = None,
 ) -> Stage:
     """
     Create a test stage to verify BGP FAUU drain/undrain behavior on specific peers.
@@ -2626,9 +2651,9 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     14. Verify the final peer views, policy names and route count match the
         step-0 baseline exactly
 
-    Captures on two core interfaces:
-    - bgp_fauu_drain_ebgp.pcap / bgp_fauu_undrain_ebgp.pcap (eBGP SOURCE - where attributes originate)
-    - bgp_fauu_drain_ibgp.pcap / bgp_fauu_undrain_ibgp.pcap (iBGP RECEIVER - attribute propagation)
+    Captures on the eBGP source and every configured iBGP receiver. A single
+    receiver retains bgp_fauu_*drain_ibgp.pcap; multiple receivers use ordered
+    _1, _2, ... suffixes for capture identities, files, phases, and report keys.
 
     Args:
         device_name: Name of the device under test
@@ -2637,7 +2662,8 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         prefix_end_index: Ending index within the network group multiplier. If None, use all.
         tcp_dump_capture_interface_ebgp: Optional interface for IXIA packet capture on eBGP (SOURCE) (default: None)
         tcp_dump_capture_interface_bgpmon: Legacy auxiliary interface input; accepted but intentionally excluded from the stage
-        tcp_dump_capture_interface_ibgp: Optional interface for IXIA packet capture on iBGP (RECEIVER) (default: None)
+        tcp_dump_capture_interface_ibgp: Legacy single iBGP receiver interface; None omits capture.
+        tcp_dump_capture_interfaces_ibgp: Nonempty sequence of distinct iBGP receiver interfaces, mutually exclusive with the singular input.
         soak_time_seconds: Soak duration after drain and undrain (default: 1800 / 30 minutes)
         convergence_mode: "counter", "pcap", or "hybrid" (default); see below.
         counter_convergence_soak_seconds: Settle soak used in counter/hybrid mode
@@ -2692,6 +2718,17 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         raise ValueError(f"invalid convergence_mode: {convergence_mode!r}")
     do_pcap = convergence_mode in ("pcap", "hybrid")
     do_counter_poll = convergence_mode in ("counter", "hybrid")
+    ibgp_interfaces = _fauu_ibgp_capture_interfaces(
+        tcp_dump_capture_interface_ibgp, tcp_dump_capture_interfaces_ibgp
+    )
+    ibgp_captures = (
+        tuple(
+            (interface, "" if len(ibgp_interfaces) == 1 else f"_{index}")
+            for index, interface in enumerate(ibgp_interfaces, start=1)
+        )
+        if do_pcap
+        else ()
+    )
     # Every pcap step below sets an attribute expectation, and an expectation
     # without a prefix window is rejected at verification time as a
     # misconfiguration. Fail at construction instead: a caller that enables
@@ -2699,7 +2736,7 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     # the whole drain has already run on hardware.
     if (
         do_pcap
-        and (tcp_dump_capture_interface_ebgp or tcp_dump_capture_interface_ibgp)
+        and (tcp_dump_capture_interface_ebgp or ibgp_interfaces)
         and not drained_prefix_descriptors
     ):
         raise ValueError(
@@ -2768,14 +2805,14 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
             )
 
     # Step 3: Start IXIA packet capture on iBGP interface for drain (if provided)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="start",
-                capture_id="fauu_drain_ibgp",
-                description="Start IXIA packet capture for drain phase (iBGP RECEIVER)",
+                capture_id=f"fauu_drain_ibgp{suffix}",
+                description=f"Start IXIA packet capture for drain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -2849,14 +2886,14 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 10: Stop IXIA packet capture for drain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="stop",
-                capture_id="fauu_drain_ibgp",
-                description="Stop IXIA packet capture for drain phase (iBGP RECEIVER)",
+                capture_id=f"fauu_drain_ibgp{suffix}",
+                description=f"Stop IXIA packet capture for drain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -2874,15 +2911,15 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 13: Save IXIA packet capture for drain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="save",
-                pcap_filename="bgp_fauu_drain_ibgp.pcap",
-                capture_id="fauu_drain_ibgp",
-                description="Save IXIA packet capture for drain phase (iBGP RECEIVER)",
+                pcap_filename=f"bgp_fauu_drain_ibgp{suffix}.pcap",
+                capture_id=f"fauu_drain_ibgp{suffix}",
+                description=f"Save IXIA packet capture for drain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -2912,13 +2949,13 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     # applied) and the iBGP leg expects the DUT's own default 100 (proof the DUT
     # ignored the eBGP-supplied 120 rather than leaking it into the iBGP mesh).
     # Expecting 120 here failed a run against a correctly behaving DUT.
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for _, suffix in ibgp_captures:
         steps.append(
             create_drain_convergence_verification_step(
-                pcap_filename="bgp_fauu_drain_ibgp.pcap",
+                pcap_filename=f"bgp_fauu_drain_ibgp{suffix}.pcap",
                 max_convergence_time_seconds=300,  # 5 minutes for FAUU
                 expected_as_path_asn=None,
-                phase="drain (iBGP RECEIVER)",
+                phase=f"drain (iBGP RECEIVER{suffix})",
                 use_pcap_analysis=True,
                 expected_origin="incomplete",
                 expected_local_pref=100,
@@ -2930,8 +2967,8 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     pcap_files_drain: dict[str, str] = {}
     if tcp_dump_capture_interface_ebgp:
         pcap_files_drain["ebgp_source"] = "bgp_fauu_drain_ebgp.pcap"
-    if tcp_dump_capture_interface_ibgp:
-        pcap_files_drain["ibgp_receiver"] = "bgp_fauu_drain_ibgp.pcap"
+    for _, suffix in ibgp_captures:
+        pcap_files_drain[f"ibgp_receiver{suffix}"] = f"bgp_fauu_drain_ibgp{suffix}.pcap"
 
     if do_pcap:
         steps.append(
@@ -2964,14 +3001,14 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 19: Start new IXIA packet capture for undrain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="start",
-                capture_id="fauu_undrain_ibgp",
-                description="Start IXIA packet capture for undrain phase (iBGP RECEIVER)",
+                capture_id=f"fauu_undrain_ibgp{suffix}",
+                description=f"Start IXIA packet capture for undrain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -3043,14 +3080,14 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 26: Stop IXIA packet capture for undrain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="stop",
-                capture_id="fauu_undrain_ibgp",
-                description="Stop IXIA packet capture for undrain phase (iBGP RECEIVER)",
+                capture_id=f"fauu_undrain_ibgp{suffix}",
+                description=f"Stop IXIA packet capture for undrain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -3068,15 +3105,15 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 29: Save IXIA packet capture for undrain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="save",
-                pcap_filename="bgp_fauu_undrain_ibgp.pcap",
-                capture_id="fauu_undrain_ibgp",
-                description="Save IXIA packet capture for undrain phase (iBGP RECEIVER)",
+                pcap_filename=f"bgp_fauu_undrain_ibgp{suffix}.pcap",
+                capture_id=f"fauu_undrain_ibgp{suffix}",
+                description=f"Save IXIA packet capture for undrain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -3102,13 +3139,13 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     # always originates its own LOCAL_PREF (see the drain iBGP note above). The
     # iBGP LOCAL_PREF is therefore identical in both phases and only ORIGIN
     # discriminates drain from undrain on this leg.
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for _, suffix in ibgp_captures:
         steps.append(
             create_drain_convergence_verification_step(
-                pcap_filename="bgp_fauu_undrain_ibgp.pcap",
+                pcap_filename=f"bgp_fauu_undrain_ibgp{suffix}.pcap",
                 max_convergence_time_seconds=300,  # 5 minutes for FAUU
                 expected_as_path_asn=None,
-                phase="undrain (iBGP RECEIVER)",
+                phase=f"undrain (iBGP RECEIVER{suffix})",
                 use_pcap_analysis=True,
                 expected_origin="igp",
                 expected_local_pref=100,
@@ -3120,8 +3157,10 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     pcap_files_undrain: dict[str, str] = {}
     if tcp_dump_capture_interface_ebgp:
         pcap_files_undrain["ebgp_source"] = "bgp_fauu_undrain_ebgp.pcap"
-    if tcp_dump_capture_interface_ibgp:
-        pcap_files_undrain["ibgp_receiver"] = "bgp_fauu_undrain_ibgp.pcap"
+    for _, suffix in ibgp_captures:
+        pcap_files_undrain[f"ibgp_receiver{suffix}"] = (
+            f"bgp_fauu_undrain_ibgp{suffix}.pcap"
+        )
 
     if do_pcap:
         steps.append(

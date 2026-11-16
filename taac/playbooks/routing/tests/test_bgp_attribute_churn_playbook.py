@@ -379,6 +379,27 @@ def _full_scale_bound() -> BoundTopology:
     )
     bound.parent_networks = dict(_TEST_PARENT_NETWORKS)
     bound.resolve_openr_injection_plan.return_value = _FULL_SCALE_INJECTION
+    capture_bound = ebb_topology(
+        scale=EBB_FY26_SCALE, openr_mode=OpenRMode.NONE, include_bgpmon=False
+    ).bind_to_inventory(
+        NRQEB008_ASH6,
+        port_map={"uplink": 0, "ibgp": 1},
+        parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+        peer_groups=EBB_PEER_GROUPS,
+        as_numbers=EBB_AS_NUMBERS,
+    )
+    bound.port_map = capture_bound.port_map
+    bound.device_groups = tuple(
+        dataclasses.replace(
+            group,
+            port_assignment=dataclasses.replace(
+                group.port_assignment, dut_interface="Ethernet2"
+            ),
+        )
+        for group in capture_bound.device_groups
+        if group.port_assignment is not None
+        and group.port_assignment.logical_role == "ibgp"
+    )
     return t.cast(BoundTopology, bound)
 
 
@@ -494,7 +515,243 @@ def _convergence_contract(
     return verifier_pcaps, report_interfaces
 
 
+class FauuDualScaleCaptureTest(unittest.TestCase):
+    def test_optional_pnh_range_reaches_readiness_without_changing_legacy_default(
+        self,
+    ) -> None:
+        playbook = get_bgp_ebb_fauu_drain_undrain_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="IBGP_V6",
+            peergroup_ibgp_v4="IBGP_V4",
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            ibgp_pnh_start_ipv4s=["10.2.0.0"],
+            ibgp_pnh_start_ipv6s=["2001:db8:2::"],
+            ibgp_pnh_count=100,
+            ibgp_pnh_step=2,
+        )
+        (check,) = [
+            check
+            for check in playbook.prechecks or []
+            if check.check_id == "startup_ibgp_pnh_verification"
+        ]
+        params = check.check_params
+        if params is None or params.json_params is None:
+            raise AssertionError("PNH readiness check has no serialized parameters")
+        self.assertEqual(
+            {
+                "expected_openr_metric": 10,
+                "expected_openr_ad": 10,
+                "start_ipv4s": ["10.2.0.0"],
+                "start_ipv6s": ["2001:db8:2::"],
+                "count": 100,
+                "step": 2,
+            },
+            json.loads(params.json_params),
+        )
+
+    def test_single_plural_interface_preserves_legacy_serialization(self) -> None:
+        kwargs: dict[str, t.Any] = {
+            "device_name": "dut.example.com",
+            "peergroup_ibgp_v6": "IBGP_V6",
+            "peergroup_ibgp_v4": "IBGP_V4",
+            "tcp_dump_capture_interface_ebgp": "Ethernet1",
+        }
+        singular = get_bgp_ebb_fauu_drain_undrain_playbook(
+            **kwargs, tcp_dump_capture_interface_ibgp="Ethernet2"
+        )
+        plural = get_bgp_ebb_fauu_drain_undrain_playbook(
+            **kwargs, tcp_dump_capture_interfaces_ibgp=["Ethernet2"]
+        )
+        self.assertEqual(thrift_to_json(singular), thrift_to_json(plural))
+
+    def test_two_receivers_are_captured_and_verified_in_both_phases(self) -> None:
+        stage = _fauu_stage_with_window(
+            device_name="dut.example.com",
+            prefix_pool_regex=".*EBGP.*",
+            tcp_dump_capture_interface_ebgp="Ethernet1",
+            tcp_dump_capture_interfaces_ibgp=["Ethernet2", "Ethernet3"],
+        )
+        captures = [
+            _task_params(step)
+            for step in stage.steps
+            if step.name == taac_types.StepName.RUN_TASK_STEP
+            and step.input_json is not None
+            and json.loads(step.input_json)["task"]["task_name"]
+            == "ixia_packet_capture"
+        ]
+        payloads = [
+            _step_payload(step)
+            for step in stage.steps
+            if step.name == taac_types.StepName.CUSTOM_STEP
+        ]
+        verifiers = [
+            payload
+            for payload in payloads
+            if payload.get("custom_step_name") == "verify_drain_convergence"
+            and payload["use_pcap_analysis"]
+        ]
+        reports = [
+            payload
+            for payload in payloads
+            if payload.get("custom_step_name")
+            == "generate_consolidated_convergence_report"
+        ]
+        self.assertEqual(18, len(captures))
+        self.assertEqual(6, len(verifiers))
+        self.assertEqual(6, len({payload["phase"] for payload in verifiers}))
+        self.assertEqual(2, len(reports))
+        for phase, origin in (("drain", "incomplete"), ("undrain", "igp")):
+            for index, interface in enumerate(("Ethernet2", "Ethernet3"), start=1):
+                with self.subTest(phase=phase, interface=interface):
+                    capture_id = f"fauu_{phase}_ibgp_{index}"
+                    filename = f"bgp_{capture_id}.pcap"
+                    matching = [p for p in captures if p["capture_id"] == capture_id]
+                    self.assertEqual(
+                        ["start", "stop", "save"], [p["mode"] for p in matching]
+                    )
+                    self.assertEqual({interface}, {p["interface"] for p in matching})
+                    self.assertEqual(filename, matching[-1]["pcap_filename"])
+                    (verifier,) = [
+                        p for p in verifiers if p["pcap_filename"] == filename
+                    ]
+                    self.assertEqual(origin, verifier["expected_origin"])
+                    self.assertEqual(100, verifier["expected_local_pref"])
+                    self.assertTrue(verifier["require_updates"])
+                    self.assertEqual(
+                        _DRAINED_WINDOW, verifier["expected_attribute_prefixes"]
+                    )
+            (report,) = [p for p in reports if p["phase"] == phase]
+            self.assertEqual(
+                {"ebgp_source", "ibgp_receiver_1", "ibgp_receiver_2"},
+                set(report["pcap_files"]),
+            )
+            self.assertEqual(3, len(set(report["pcap_files"].values())))
+        saves = [p for p in captures if p["mode"] == "save"]
+        self.assertEqual(6, len({p["capture_id"] for p in saves}))
+        self.assertEqual(6, len({p["pcap_filename"] for p in saves}))
+        self.assertEqual(
+            {p["pcap_filename"] for p in saves},
+            {p["pcap_filename"] for p in verifiers},
+        )
+
+    def test_invalid_receiver_inputs_fail_at_stage_and_playbook_boundaries(
+        self,
+    ) -> None:
+        invalid_inputs: tuple[dict[str, t.Any], ...] = (
+            {"tcp_dump_capture_interfaces_ibgp": []},
+            {"tcp_dump_capture_interfaces_ibgp": [""]},
+            {"tcp_dump_capture_interfaces_ibgp": [" "]},
+            {"tcp_dump_capture_interfaces_ibgp": ["Ethernet2", "Ethernet2"]},
+            {"tcp_dump_capture_interfaces_ibgp": "Ethernet2"},
+            {"tcp_dump_capture_interface_ibgp": ""},
+            {
+                "tcp_dump_capture_interface_ibgp": "Ethernet2",
+                "tcp_dump_capture_interfaces_ibgp": ["Ethernet3"],
+            },
+        )
+        for inputs in invalid_inputs:
+            with self.subTest(inputs=inputs):
+                with self.assertRaisesRegex(ValueError, "iBGP capture interfaces"):
+                    _fauu_stage_with_window(
+                        device_name="dut.example.com",
+                        prefix_pool_regex=".*EBGP.*",
+                        **inputs,
+                    )
+                with self.assertRaisesRegex(ValueError, "iBGP capture interfaces"):
+                    get_bgp_ebb_fauu_drain_undrain_playbook(
+                        device_name="dut.example.com",
+                        peergroup_ibgp_v6="IBGP_V6",
+                        peergroup_ibgp_v4="IBGP_V4",
+                        **inputs,
+                    )
+
+    def test_plural_captures_still_require_a_drained_prefix_window(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "drained_prefix_descriptors is required"
+        ):
+            create_fauu_drain_undrain_stage(
+                device_name="dut.example.com",
+                prefix_pool_regex=".*EBGP.*",
+                tcp_dump_capture_interfaces_ibgp=["Ethernet2", "Ethernet3"],
+            )
+        stage = create_fauu_drain_undrain_stage(
+            device_name="dut.example.com",
+            prefix_pool_regex=".*EBGP.*",
+            tcp_dump_capture_interfaces_ibgp=["Ethernet2", "Ethernet3"],
+            convergence_mode="counter",
+        )
+        self.assertEqual((2, 0), _count_convergence_verifiers(self, stage))
+        self.assertFalse(
+            any(
+                step.name == taac_types.StepName.RUN_TASK_STEP
+                and step.input_json is not None
+                and json.loads(step.input_json)["task"]["task_name"]
+                == "ixia_packet_capture"
+                for step in stage.steps
+            )
+        )
+
+
 class BgpAttributeChurnPlaybookTest(unittest.TestCase):
+    def test_fauu_singular_capture_contract_matches_fy26(self) -> None:
+        playbook = get_bgp_ebb_fauu_drain_undrain_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="IBGP_V6",
+            peergroup_ibgp_v4="IBGP_V4",
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            tcp_dump_capture_interface_ebgp="Ethernet1",
+            tcp_dump_capture_interface_ibgp="Ethernet2",
+        )
+        captures = [
+            _task_params(step)
+            for step in _sequential_steps(playbook)
+            if step.name == taac_types.StepName.RUN_TASK_STEP
+            and step.input_json is not None
+            and json.loads(step.input_json)["task"]["task_name"]
+            == "ixia_packet_capture"
+        ]
+        expected_interfaces = {
+            "fauu_drain_ebgp": "Ethernet1",
+            "fauu_drain_ibgp": "Ethernet2",
+            "fauu_undrain_ebgp": "Ethernet1",
+            "fauu_undrain_ibgp": "Ethernet2",
+        }
+        self.assertEqual(
+            expected_interfaces,
+            {
+                capture["capture_id"]: capture["interface"]
+                for capture in captures
+                if capture["mode"] == "start"
+            },
+        )
+        for capture_id in expected_interfaces:
+            with self.subTest(capture_id=capture_id):
+                self.assertEqual(
+                    ["start", "stop", "save"],
+                    [
+                        capture["mode"]
+                        for capture in captures
+                        if capture["capture_id"] == capture_id
+                    ],
+                )
+        verifier_pcaps, report_interfaces = _convergence_contract(playbook)
+        self.assertEqual(
+            {
+                "bgp_fauu_drain_ebgp.pcap",
+                "bgp_fauu_drain_ibgp.pcap",
+                "bgp_fauu_undrain_ebgp.pcap",
+                "bgp_fauu_undrain_ibgp.pcap",
+            },
+            verifier_pcaps,
+        )
+        self.assertEqual(
+            {
+                "drain": {"ebgp_source", "ibgp_receiver"},
+                "undrain": {"ebgp_source", "ibgp_receiver"},
+            },
+            report_interfaces,
+        )
+
     def test_drain_playbooks_keep_core_verdicts_without_auxiliary_monitor(
         self,
     ) -> None:

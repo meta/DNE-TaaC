@@ -32,14 +32,15 @@ _PARAMS = {
 
 
 class AllocateCgroupSliceMemoryTest(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, step, oss):
+    async def _run(self, step, oss, meta_internal=False, params=None):
         ods = AsyncMock(return_value=4 * _GIB)
         with (
             patch.object(module, "async_get_memory_current_pct", ods),
             patch.object(module, "run_in_thread", MagicMock()) as run_in_thread,
             patch.object(module, "TAAC_OSS", oss),
+            patch.object(module, "TAAC_OSS_META_INTERNAL", meta_internal),
         ):
-            await step.run(MagicMock(), _PARAMS)
+            await step.run(MagicMock(), params or _PARAMS)
         return run_in_thread, ods
 
     async def test_oss_reads_memory_current_from_the_dut_not_ods(self) -> None:
@@ -67,6 +68,72 @@ class AllocateCgroupSliceMemoryTest(unittest.IsolatedAsyncioTestCase):
         for call in step.driver.async_run_cmd_on_shell.await_args_list:
             self.assertNotIn("memory.current", call.args[0])
         run_in_thread.assert_called_once()
+
+    async def test_pure_oss_pushes_the_allocator_over_any_existing_copy(self) -> None:
+        # The mock says the file exists, but the step still writes it.
+        step = _step("0")
+        await self._run(step, oss=True)
+
+        step.driver.async_write_file_on_device.assert_awaited_once()
+        script_source, remote_path = (
+            step.driver.async_write_file_on_device.await_args.args
+        )
+        self.assertEqual(remote_path, module.OSS_MEMORY_PRESSURE_PATH)
+        self.assertIn("child_cgroup_path", script_source)
+        step.driver.async_check_if_file_exists.assert_not_awaited()
+
+    async def test_pure_oss_ignores_an_executable_path_from_the_caller(self) -> None:
+        step = _step("0")
+        params = dict(_PARAMS, executable_path="/opt/memory_pressure")
+        run_in_thread, _ods = await self._run(step, oss=True, params=params)
+
+        _source, remote_path = step.driver.async_write_file_on_device.await_args.args
+        self.assertEqual(remote_path, module.OSS_MEMORY_PRESSURE_PATH)
+        self.assertNotIn("/opt/memory_pressure", run_in_thread.call_args.kwargs["cmd"])
+
+    async def test_pure_oss_runs_the_allocator_with_python3_and_keeps_its_output(
+        self,
+    ) -> None:
+        step = _step("0")
+        run_in_thread, _ods = await self._run(step, oss=True)
+
+        cmd = run_in_thread.call_args.kwargs["cmd"]
+        self.assertTrue(cmd.startswith(f"python3 {module.OSS_MEMORY_PRESSURE_PATH} "))
+        self.assertIn(f"> {module.OSS_MEMORY_PRESSURE_LOG} 2>&1", cmd)
+        self.assertNotIn(">>", cmd)
+
+    async def test_meta_internal_keeps_the_meta_binary(self) -> None:
+        step = _step("0")
+        params = dict(_PARAMS, executable_path="/opt/custom_pressure")
+        run_in_thread, ods = await self._run(
+            step, oss=True, meta_internal=True, params=params
+        )
+
+        step.driver.async_write_file_on_device.assert_not_awaited()
+        step.driver.async_check_if_file_exists.assert_awaited_once_with(
+            "/opt/custom_pressure"
+        )
+        ods.assert_not_awaited()
+        cmd = run_in_thread.call_args.kwargs["cmd"]
+        self.assertTrue(cmd.startswith("/opt/custom_pressure -c system.slice "))
+        self.assertNotIn(module.OSS_MEMORY_PRESSURE_LOG, cmd)
+
+    async def test_meta_internal_raises_when_the_meta_binary_is_missing(self) -> None:
+        step = _step("0")
+        step.driver.async_check_if_file_exists.return_value = False
+        with self.assertRaises(Exception):
+            await self._run(step, oss=True, meta_internal=True)
+
+        step.driver.async_write_file_on_device.assert_not_awaited()
+
+    async def test_without_oss_the_step_does_not_push_or_redirect(self) -> None:
+        step = _step("")
+        run_in_thread, _ods = await self._run(step, oss=False)
+
+        step.driver.async_write_file_on_device.assert_not_awaited()
+        cmd = run_in_thread.call_args.kwargs["cmd"]
+        self.assertTrue(cmd.startswith("/opt/memory_pressure "))
+        self.assertNotIn(module.OSS_MEMORY_PRESSURE_LOG, cmd)
 
 
 if __name__ == "__main__":

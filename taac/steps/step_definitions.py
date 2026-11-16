@@ -12,6 +12,7 @@ import itertools
 import json
 import math
 import os
+import pathlib
 import re
 import time
 import typing as t
@@ -175,11 +176,16 @@ from taac.utils.json_thrift_utils import (
     try_json_loads,
     try_json_to_thrift,
 )
+from taac.utils.oss_taac_constants import (
+    OSS_MEMORY_PRESSURE_LOG,
+    OSS_MEMORY_PRESSURE_PATH,
+)
 from taac.utils.oss_taac_lib_utils import (
     async_retryable,
     none_throws,
     oss_agent_restart_paths_enabled,
     oss_config_patcher_enabled,
+    TAAC_OSS_META_INTERNAL,
 )
 from taac.utils.system_stress_utils import (
     async_get_memory_current_pct,
@@ -12229,7 +12235,14 @@ class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
         input: taac_types.BaseInput,
         params: t.Dict[str, t.Any],
     ) -> None:
-        executable_path = params.get("executable_path", "/opt/memory_pressure")
+        # A Meta lab device has /opt/memory_pressure. A pure OSS DUT does not.
+        pure_oss = TAAC_OSS and not TAAC_OSS_META_INTERNAL
+        # Ignore executable_path in pure OSS, so a push cannot overwrite a Meta binary.
+        executable_path = (
+            OSS_MEMORY_PRESSURE_PATH
+            if pure_oss
+            else params.get("executable_path", "/opt/memory_pressure")
+        )
         slice_name = params["slice_name"]
         keep_alive = params.get("keep_alive", False)
         initial_memory_allocation = params.get("initial_memory_allocation")
@@ -12238,8 +12251,20 @@ class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
         minimum_memory_allocation = params.get("minimum_memory_allocation", 0)
         oom_score_adj = params.get("oom_score_adj", 0)
 
-        # pyre-ignore
-        if not await self.driver.async_check_if_file_exists(executable_path):
+        if pure_oss:
+            from taac.driver import oss_memory_pressure_dut_script
+
+            # Write on every run, so an old copy on the DUT cannot run.
+            script_source = pathlib.Path(
+                oss_memory_pressure_dut_script.__file__
+            ).read_text()
+            # pyre-ignore
+            await self.driver.async_write_file_on_device(
+                script_source, executable_path
+            )
+        elif not await self.driver.async_check_if_file_exists(  # pyre-ignore
+            executable_path
+        ):
             raise Exception(
                 f"Memory pressure script does not exist at {executable_path} on {self.hostname}"
             )
@@ -12306,7 +12331,8 @@ class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
             )
             return
         allocate_memory_cmds = [
-            f"{executable_path}",
+            # /tmp can be mounted noexec, so a pure OSS run uses python3.
+            f"python3 {executable_path}" if pure_oss else f"{executable_path}",
             "-c",
             f"{slice_name}.slice",
             "-m",
@@ -12321,9 +12347,11 @@ class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
         if oom_score_adj:
             allocate_memory_cmds.extend(["-s", oom_score_adj])
         allocate_memory_cmds = [str(cmd) for cmd in allocate_memory_cmds]
-        run_in_thread(
-            self.driver.async_run_cmd_on_shell, cmd=" ".join(allocate_memory_cmds)
-        )
+        allocate_memory_cmd = " ".join(allocate_memory_cmds)
+        if pure_oss:
+            # run_in_thread does not wait. Keep the output to find a failed start.
+            allocate_memory_cmd += f" > {OSS_MEMORY_PRESSURE_LOG} 2>&1"
+        run_in_thread(self.driver.async_run_cmd_on_shell, cmd=allocate_memory_cmd)
 
 
 class ChronosNode(StepBase[taac_types.BaseInput]):

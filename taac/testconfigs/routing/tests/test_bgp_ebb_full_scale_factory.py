@@ -1078,6 +1078,40 @@ class GatewayGateScopeTest(unittest.TestCase):
                 self.assertNotEqual(self.gateless[name], config)
                 self.assertEqual(self.gateless[name], _without_gateway_gates(config))
 
+    def test_fy26_configs_carry_no_state_guard(self) -> None:
+        for name, config in self.gated.items():
+            with self.subTest(config=name):
+                self.assertEqual([], _state_guard_tasks(config))
+
+
+_STATE_GUARD_ACTIONS = frozenset(
+    {
+        "routing_component_snapshot",
+        "routing_config_snapshot",
+        "interface_config_snapshot",
+        "state_guard_arm",
+        "routing_component_restore",
+        "interface_config_restore",
+    }
+)
+
+
+def _state_guard_tasks(config: taac_types.TestConfig) -> list[tuple[str, str]]:
+    found = []
+    for phase, tasks in (
+        ("setup", config.setup_tasks or []),
+        ("teardown", config.teardown_tasks or []),
+    ):
+        for task in tasks:
+            if task.task_name != "eos_compiler_lifecycle":
+                continue
+            params = json.loads(
+                t.cast(taac_types.Params, task.params).json_params or "{}"
+            )
+            if params["action"] in _STATE_GUARD_ACTIONS or "preserve_symlink" in params:
+                found.append((phase, params["action"]))
+    return found
+
 
 # The state D129805999 validated on NRQEB008: an 80-node FY27-era injection
 # over the unchanged 62-peer FY26 fleet. It keeps 18 rows of injected
@@ -1813,6 +1847,27 @@ class EbbFy27SupportedNonUgFactoryTest(unittest.TestCase):
             scale=EBB_FY27_SCALE,
         )
         cls.serialized = json.loads(thrift_to_json(cls.config))
+
+    def test_state_guard_arms_before_any_mutation_and_restores_last(self) -> None:
+        def action(task: taac_types.Task) -> str | None:
+            if task.task_name != "eos_compiler_lifecycle":
+                return None
+            return json.loads(t.cast(str, task.params.json_params))["action"]
+
+        setup = [
+            phase_action
+            for phase, phase_action in _state_guard_tasks(self.config)
+            if phase == "setup"
+        ]
+        self.assertEqual("state_guard_arm", setup[-1])
+        pre_ixia = [
+            task for task in self.config.setup_tasks or [] if not task.ixia_needed
+        ]
+        self.assertEqual(setup, [action(task) for task in pre_ixia[: len(setup)]])
+        self.assertEqual(
+            ["interface_config_restore", "routing_component_restore"],
+            [action(task) for task in (self.config.teardown_tasks or [])[-2:]],
+        )
 
     def test_cases_build_in_non_ug_selection_order(self) -> None:
         self.assertEqual(

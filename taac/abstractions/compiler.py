@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import typing as t
 from collections import Counter
@@ -174,6 +175,11 @@ _EBB_STATE_GUARD_FILES = (
     ("tls_openr", "/mnt/fb/certs/fb-openr_server.pem"),
     ("peer_input_base64", "/tmp/peers.b64"),
     ("peer_input_json", "/tmp/experiment_peers.json"),
+)
+# EBB full-scale teardown deletes the Open/R config setup installs.
+_EBB_FULL_SCALE_STATE_GUARD_FILES = (
+    ("openr_config", "/mnt/flash/openr_config"),
+    ("openr_config_link", "/etc/openr_config"),
 )
 _EBB_STATE_GUARD_FIREWALL_CHAINS = (
     {"family": "ipv4", "chain": "EOS_BGP"},
@@ -648,6 +654,7 @@ class _EbbFullScaleSetupArgs:
     fibagent_bgp_nhg_watermark_high: int | None = None
     fibagent_bgp_nhg_watermark_low: int | None = None
     bgp_total_path_limit: int | None = None
+    device_state_guard_namespace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -5127,6 +5134,12 @@ def _eos_bgpcpp_teardown_plan(
     if openr_tasks is not None:
         tasks.extend(openr_tasks.link_cleanup)
     tasks.append(_teardown_cleanup_task(hostname))
+    _, state_guard_restores = _ebb_full_scale_state_guard_tasks(
+        device_name=hostname,
+        operation_namespace=_ebb_full_scale_state_guard_namespace(bound),
+        openr_inputs=openr_inputs,
+    )
+    tasks.extend(state_guard_restores)
     return TeardownPlan(
         tasks=tuple(tasks),
         cleaned_interfaces=tuple(reversed(configured_interfaces)),
@@ -5490,7 +5503,15 @@ class EosBgpCppCompiler(TopologyCompiler):
 
         args = _ebb_full_scale_setup_args(bound)
         openr_inputs = _eos_bgpcpp_openr_inputs(bound)
-        native_pre_ixia_tasks = _ebb_full_scale_pre_ixia_setup_tasks(args.interfaces)
+        state_guard_snapshots, _ = _ebb_full_scale_state_guard_tasks(
+            device_name=args.interfaces.device_name,
+            operation_namespace=args.device_state_guard_namespace,
+            openr_inputs=openr_inputs,
+        )
+        native_pre_ixia_tasks = [
+            *state_guard_snapshots,
+            *_ebb_full_scale_pre_ixia_setup_tasks(args.interfaces),
+        ]
         if component_runtime_plan is None:
             raise TopologyValidationError(
                 bound.logical_topology.name,
@@ -6412,11 +6433,16 @@ def _ebb_device_state_guard_tasks(
     *,
     device_name: str,
     operation_namespace: str,
+    symlink_aware_files: t.Sequence[tuple[str, str]] = (),
 ) -> tuple[list[t.Any], list[t.Any]]:
     component_operation_id = f"{operation_namespace}:routing_component"
     guarded_files = [
-        (f"{operation_namespace}:{suffix}", destination)
-        for suffix, destination in _EBB_STATE_GUARD_FILES
+        (f"{operation_namespace}:{suffix}", destination, preserve_symlink)
+        for files, preserve_symlink in (
+            (_EBB_STATE_GUARD_FILES, False),
+            (symlink_aware_files, True),
+        )
+        for suffix, destination in files
     ]
     setup_tasks = [
         create_eos_compiler_lifecycle_task(
@@ -6434,8 +6460,9 @@ def _ebb_device_state_guard_tasks(
                 action="routing_config_snapshot",
                 operation_id=operation_id,
                 destination=destination,
+                **({"preserve_symlink": True} if preserve_symlink else {}),
             )
-            for operation_id, destination in guarded_files
+            for operation_id, destination, preserve_symlink in guarded_files
         ),
     ]
     teardown_tasks = [
@@ -6446,12 +6473,120 @@ def _ebb_device_state_guard_tasks(
             startup_path=_EBB_BGPCPP_STARTUP_PATH,
             file_restores=[
                 {"operation_id": operation_id, "destination": destination}
-                for operation_id, destination in guarded_files
+                for operation_id, destination, _ in guarded_files
             ],
             force_restart_daemons=["Bgpcpp"],
         )
     ]
     return setup_tasks, teardown_tasks
+
+
+def _openr_helper_state_guard_tasks(
+    *,
+    link: OpenRStandaloneLink,
+    operation_namespace: str,
+) -> tuple[t.Any, t.Any]:
+    """Guard only the helper's end of the link.
+
+    The helper is another binding's DUT, so restoring its whole running
+    config would also revert that device's own pre-existing test state. This
+    scoping does not make reciprocal bindings safe to run concurrently: each
+    DUT guard still restores the whole DUT running config.
+    """
+    helper = link.helper
+    operation_id = (
+        f"{operation_namespace}:openr_helper_link:{helper.hostname}:"
+        f"{link.interface_name}"
+    )
+    return (
+        create_eos_compiler_lifecycle_task(
+            hostname=helper.hostname,
+            action="interface_config_snapshot",
+            operation_id=operation_id,
+            interfaces=[
+                {"name": helper.member_interface, "kind": "physical"},
+                {"name": link.interface_name, "kind": "port_channel"},
+            ],
+        ),
+        create_eos_compiler_lifecycle_task(
+            hostname=helper.hostname,
+            action="interface_config_restore",
+            operation_id=operation_id,
+        ),
+    )
+
+
+_STATE_GUARD_SNAPSHOT_KINDS = {
+    "routing_component_snapshot": "routing_component",
+    "routing_config_snapshot": "routing_config",
+    "interface_config_snapshot": "interface_config",
+}
+
+
+def _state_guard_arm_task(
+    *,
+    device_name: str,
+    operation_namespace: str,
+    snapshots: t.Sequence[t.Any],
+) -> t.Any:
+    snapshot_params = [json.loads(task.params.json_params) for task in snapshots]
+    return create_eos_compiler_lifecycle_task(
+        hostname=device_name,
+        action="state_guard_arm",
+        operation_id=f"{operation_namespace}:armed",
+        snapshots=[
+            {
+                "kind": _STATE_GUARD_SNAPSHOT_KINDS[params["action"]],
+                "operation_id": params["operation_id"],
+                **(
+                    {"destination": params["destination"]}
+                    if params["action"] == "routing_config_snapshot"
+                    else {}
+                ),
+            }
+            for params in snapshot_params
+        ],
+    )
+
+
+def _ebb_full_scale_state_guard_namespace(bound: BoundTopology) -> str | None:
+    if (
+        bound.logical_topology.legacy_profile != _EBB_FULL_SCALE_PROFILE
+        or bound.device_config is None
+        or _primary_dut_endpoint(bound).setup_mode != "full"
+    ):
+        return None
+    return bound.device_config.device_state_guard_namespace
+
+
+def _ebb_full_scale_state_guard_tasks(
+    *,
+    device_name: str,
+    operation_namespace: str | None,
+    openr_inputs: _EosBgpCppOpenRInputs,
+) -> tuple[list[t.Any], list[t.Any]]:
+    if operation_namespace is None:
+        return [], []
+    snapshots, restores = _ebb_device_state_guard_tasks(
+        device_name=device_name,
+        operation_namespace=operation_namespace,
+        symlink_aware_files=_EBB_FULL_SCALE_STATE_GUARD_FILES,
+    )
+    if openr_inputs.mode is OpenRMode.STANDALONE:
+        assert openr_inputs.standalone_link is not None
+        helper_snapshot, helper_restore = _openr_helper_state_guard_tasks(
+            link=openr_inputs.standalone_link,
+            operation_namespace=operation_namespace,
+        )
+        snapshots = [*snapshots, helper_snapshot]
+        restores = [helper_restore, *restores]
+    # Teardown may mutate the devices only once every snapshot exists.
+    arm = _state_guard_arm_task(
+        device_name=device_name,
+        operation_namespace=operation_namespace,
+        snapshots=snapshots,
+    )
+    return [*snapshots, arm], restores
 
 
 def _compile_ingress_peer_scale_artifacts(
@@ -7798,6 +7933,7 @@ def _ebb_full_scale_setup_args(bound: BoundTopology) -> _EbbFullScaleSetupArgs:
         fibagent_bgp_nhg_watermark_high=(device_config.fibagent_bgp_nhg_watermark_high),
         fibagent_bgp_nhg_watermark_low=(device_config.fibagent_bgp_nhg_watermark_low),
         bgp_total_path_limit=device_config.bgp_total_path_limit,
+        device_state_guard_namespace=_ebb_full_scale_state_guard_namespace(bound),
     )
 
 

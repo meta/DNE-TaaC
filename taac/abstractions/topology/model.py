@@ -723,6 +723,10 @@ class RoutingDeviceConfig:
     # BGP++ switch_limit_config.total_path_limit to write into the deployed
     # bgpcpp_config before BGP++ starts. None keeps the deployed value.
     bgp_total_path_limit: int | None = None
+    # Operation-id namespace of the EBB full-scale DUT and Open/R helper state
+    # snapshot taken before setup mutates them and restored after teardown.
+    # None emits no snapshot or restore.
+    device_state_guard_namespace: str | None = None
     _taac_overridden_fields: tuple[str, ...] = field(
         default=(),
         repr=False,

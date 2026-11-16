@@ -11,10 +11,13 @@
 # ~40 markers without meaningful safety gain.
 
 import asyncio
+import contextlib
+import json
 import logging
 import os
 import sys
 import types
+import typing as t
 import unittest
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -166,6 +169,37 @@ class TaacRunnerFailurePrecedenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((primary, teardown), context.exception.exceptions)
         runner.async_test_case_tearDown.assert_awaited_once()
         runner._publish_npi_result.assert_awaited_once()
+
+
+def _routing_component_restore(hostname: str) -> taac_types.Task:
+    return taac_types.Task(
+        task_name="eos_compiler_lifecycle",
+        hostname=hostname,
+        params=taac_types.Params(
+            json_params=json.dumps(
+                {
+                    "action": "routing_component_restore",
+                    "hostname": hostname,
+                    "operation_id": f"guard:{hostname}",
+                }
+            )
+        ),
+    )
+
+
+def _attempt_name(task: taac_types.Task) -> str:
+    return task.hostname or task.task_name
+
+
+@contextlib.contextmanager
+def _short_cleanup_bounds() -> t.Iterator[None]:
+    with (
+        patch.object(_taac_runner, "_CLEANUP_CANCELLATION_GRACE_SECONDS", 0.05),
+        patch.object(_taac_runner, "_CLEANUP_DRAIN_SECONDS", 0.2),
+        patch.object(_taac_runner, "_TERMINAL_RESTORE_GRACE_SECONDS", 0.05),
+        patch.object(_taac_runner, "_TERMINAL_RESTORE_DRAIN_SECONDS", 0.2),
+    ):
+        yield
 
 
 class TaacRunnerTeardownTaskExecutionTest(AsyncTestCase):
@@ -536,6 +570,635 @@ class TaacRunnerTeardownTaskExecutionTest(AsyncTestCase):
             (first_failure,),
             raised.exception.__cause__.exceptions,
         )
+
+
+class TaacRunnerTerminalRestoreTest(AsyncTestCase):
+    """Trailing routing-component restores run after every cleanup retry."""
+
+    def _runner(self) -> TaacRunner:
+        logger = logging.getLogger("taac-runner-terminal-restore-test")
+        logger.setLevel(logging.INFO)
+        return TaacRunner(_config(), logger=logger)
+
+    @staticmethod
+    def _tasks() -> tuple[taac_types.Task, ...]:
+        return (
+            taac_types.Task(task_name="interface-cleanup", params=taac_types.Params()),
+            taac_types.Task(task_name="link-cleanup", params=taac_types.Params()),
+            _routing_component_restore("helper"),
+            _routing_component_restore("dut"),
+        )
+
+    async def test_failed_cleanup_retries_before_terminal_restores(self) -> None:
+        runner = self._runner()
+        tasks = self._tasks()
+        attempted = []
+        indices = []
+        first_attempt = True
+
+        async def run_one(task, *, index, total) -> None:
+            nonlocal first_attempt
+            attempted.append(_attempt_name(task))
+            indices.append((index, total))
+            if task is tasks[1] and first_attempt:
+                first_attempt = False
+                raise RuntimeError("transient link cleanup failure")
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+        sleep = AsyncMock()
+
+        with patch.object(asyncio, "sleep", sleep):
+            await runner.run_teardown_tasks(tasks)
+
+        self.assertEqual(
+            ["interface-cleanup", "link-cleanup", "link-cleanup", "helper", "dut"],
+            attempted,
+        )
+        self.assertEqual([(1, 4), (2, 4), (2, 4), (3, 4), (4, 4)], indices)
+        sleep.assert_awaited_once_with(_taac_runner._TASK_RETRY_SLEEP_SECONDS)
+
+    async def test_failed_terminal_restore_retries_only_itself(self) -> None:
+        runner = self._runner()
+        tasks = self._tasks()
+        attempted = []
+        first_attempt = True
+
+        async def run_one(task, *, index, total) -> None:
+            nonlocal first_attempt
+            attempted.append(_attempt_name(task))
+            if task is tasks[2] and first_attempt:
+                first_attempt = False
+                raise RuntimeError("transient helper restore failure")
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+        sleep = AsyncMock()
+
+        with patch.object(asyncio, "sleep", sleep):
+            await runner.run_teardown_tasks(tasks)
+
+        self.assertEqual(
+            ["interface-cleanup", "link-cleanup", "helper", "dut", "helper"],
+            attempted,
+        )
+        sleep.assert_awaited_once_with(_taac_runner._TASK_RETRY_SLEEP_SECONDS)
+
+    async def test_persistent_failures_report_in_task_order(self) -> None:
+        runner = self._runner()
+        tasks = self._tasks()
+        attempted = []
+        cleanup_failure = RuntimeError("link cleanup failed")
+        restore_failure = ValueError("dut restore failed")
+
+        async def run_one(task, *, index, total) -> None:
+            attempted.append(_attempt_name(task))
+            if task is tasks[1]:
+                raise cleanup_failure
+            if task is tasks[3]:
+                raise restore_failure
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+
+        with patch.object(asyncio, "sleep", AsyncMock()):
+            with self.assertRaises(ExceptionGroup) as raised:
+                await runner.run_teardown_tasks(tasks)
+
+        self.assertEqual(
+            [
+                "interface-cleanup",
+                "link-cleanup",
+                "link-cleanup",
+                "helper",
+                "dut",
+                "dut",
+            ],
+            attempted,
+        )
+        self.assertEqual(
+            (cleanup_failure, restore_failure), raised.exception.exceptions
+        )
+
+    async def test_cancelled_cleanup_still_restores_once(self) -> None:
+        runner = self._runner()
+        tasks = self._tasks()
+        attempted = []
+        cancellation = asyncio.CancelledError()
+        restore_failure = RuntimeError("dut restore failed")
+
+        async def run_one(task, *, index, total) -> None:
+            attempted.append(_attempt_name(task))
+            if task is tasks[0]:
+                raise cancellation
+            if task is tasks[3]:
+                raise restore_failure
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+        sleep = AsyncMock()
+
+        with patch.object(asyncio, "sleep", sleep):
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                await runner.run_teardown_tasks(tasks)
+
+        self.assertEqual(
+            ["interface-cleanup", "link-cleanup", "helper", "dut"], attempted
+        )
+        sleep.assert_not_awaited()
+        self.assertEqual((restore_failure,), raised.exception.__cause__.exceptions)
+
+    async def test_cancelled_retry_sleep_still_restores_once(self) -> None:
+        runner = self._runner()
+        tasks = self._tasks()
+        attempted = []
+        cleanup_failure = RuntimeError("link cleanup failed")
+        cancellation = asyncio.CancelledError()
+
+        async def run_one(task, *, index, total) -> None:
+            attempted.append(_attempt_name(task))
+            if task is tasks[1]:
+                raise cleanup_failure
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+
+        with patch.object(asyncio, "sleep", AsyncMock(side_effect=cancellation)):
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                await runner.run_teardown_tasks(tasks)
+
+        self.assertIs(cancellation, raised.exception)
+        self.assertEqual(
+            ["interface-cleanup", "link-cleanup", "helper", "dut"], attempted
+        )
+        self.assertEqual((cleanup_failure,), raised.exception.__cause__.exceptions)
+
+    async def test_exhausted_cancellation_grace_still_attempts_each_restore(
+        self,
+    ) -> None:
+        """A cleanup that hangs through the cancellation grace, and a restore
+        that hangs through its own, must not cancel the next restore unrun."""
+        runner = self._runner()
+        hung_cleanup = taac_types.Task(
+            task_name="hung-cleanup", params=taac_types.Params()
+        )
+        helper_restore = _routing_component_restore("helper")
+        dut_restore = _routing_component_restore("dut")
+        attempted = []
+        completed = []
+
+        async def run_one(task, *, index, total) -> None:
+            attempted.append(_attempt_name(task))
+            if task is not dut_restore:
+                await asyncio.Event().wait()
+            completed.append(_attempt_name(task))
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+        budget = _CleanupCancellationBudget()
+        budget.arm(0.05)
+        sleep = AsyncMock()
+
+        with (
+            _short_cleanup_bounds(),
+            patch.object(asyncio, "sleep", sleep),
+        ):
+            with self.assertRaises(ExceptionGroup) as raised:
+                await runner.run_teardown_tasks(
+                    [hung_cleanup, helper_restore, dut_restore],
+                    cancellation_budget=budget,
+                )
+
+        self.assertEqual(["hung-cleanup", "helper", "dut"], attempted)
+        self.assertEqual(["dut"], completed)
+        self.assertEqual(
+            [TimeoutError, TimeoutError],
+            [type(error) for error in raised.exception.exceptions],
+        )
+        sleep.assert_not_awaited()
+
+    async def test_cancelled_cleanup_unwinds_before_any_restore_starts(
+        self,
+    ) -> None:
+        runner = self._runner()
+        hung_cleanup = taac_types.Task(
+            task_name="hung-cleanup", params=taac_types.Params()
+        )
+        events = []
+
+        async def run_one(task, *, index, total) -> None:
+            if task is not hung_cleanup:
+                events.append(_attempt_name(task))
+                return
+            events.append("hung-cleanup")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                # A finalizer that still talks to the device after cancel.
+                await asyncio.shield(asyncio.sleep(0.02))
+                events.append("late-cleanup-mutation")
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+        budget = _CleanupCancellationBudget()
+        budget.arm(0.05)
+
+        with _short_cleanup_bounds():
+            with self.assertRaises(TimeoutError):
+                await runner.run_teardown_tasks(
+                    [
+                        hung_cleanup,
+                        _routing_component_restore("helper"),
+                        _routing_component_restore("dut"),
+                    ],
+                    cancellation_budget=budget,
+                )
+
+        self.assertEqual(
+            ["hung-cleanup", "late-cleanup-mutation", "helper", "dut"], events
+        )
+
+    async def test_cleanup_that_never_unwinds_blocks_every_restore(self) -> None:
+        runner = self._runner()
+        stubborn_cleanup = taac_types.Task(
+            task_name="stubborn-cleanup", params=taac_types.Params()
+        )
+        release = asyncio.Event()
+        restores = []
+
+        async def run_one(task, *, index, total) -> None:
+            if task is not stubborn_cleanup:
+                restores.append(_attempt_name(task))
+                return
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    continue
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+        budget = _CleanupCancellationBudget()
+        budget.arm(0.05)
+
+        with _short_cleanup_bounds():
+            with self.assertRaises(ExceptionGroup) as raised:
+                await runner.run_teardown_tasks(
+                    [
+                        stubborn_cleanup,
+                        _routing_component_restore("helper"),
+                        _routing_component_restore("dut"),
+                    ],
+                    cancellation_budget=budget,
+                )
+        release.set()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual([], restores)
+        errors = raised.exception.exceptions
+        self.assertIsInstance(errors[0], TimeoutError)
+        self.assertEqual(
+            ["not attempted", "not attempted"],
+            [
+                "not attempted" if "not attempted" in str(error) else str(error)
+                for error in errors[1:]
+            ],
+        )
+
+    async def test_undrained_cleanup_blocks_only_its_target_restore(self) -> None:
+        runner = self._runner()
+        stubborn_cleanup = taac_types.Task(
+            task_name="stubborn-cleanup",
+            hostname="helper",
+            params=taac_types.Params(),
+        )
+        release = asyncio.Event()
+        restores = []
+
+        async def run_one(task, *, index, total) -> None:
+            if task is not stubborn_cleanup:
+                restores.append(_attempt_name(task))
+                return
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    continue
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+        budget = _CleanupCancellationBudget()
+        budget.arm(0.05)
+
+        with _short_cleanup_bounds():
+            with self.assertRaises(ExceptionGroup) as raised:
+                await runner.run_teardown_tasks(
+                    [
+                        stubborn_cleanup,
+                        _routing_component_restore("helper"),
+                        _routing_component_restore("dut"),
+                    ],
+                    cancellation_budget=budget,
+                )
+        release.set()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(["dut"], restores)
+        self.assertTrue(
+            any("not attempted" in str(error) for error in raised.exception.exceptions)
+        )
+
+    async def test_only_the_trailing_restore_run_is_terminal(self) -> None:
+        runner = self._runner()
+        early_restore = _routing_component_restore("early")
+        cleanup = taac_types.Task(task_name="cleanup", params=taac_types.Params())
+        unparsable = taac_types.Task(
+            task_name="eos_compiler_lifecycle",
+            hostname="unparsable",
+            params=taac_types.Params(json_params="{"),
+        )
+        attempted = []
+        first_attempt = True
+
+        async def run_one(task, *, index, total) -> None:
+            nonlocal first_attempt
+            attempted.append(_attempt_name(task))
+            if task is early_restore and first_attempt:
+                first_attempt = False
+                raise RuntimeError("transient early restore failure")
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+
+        with patch.object(asyncio, "sleep", AsyncMock()):
+            await runner.run_teardown_tasks(
+                [early_restore, cleanup, unparsable, _routing_component_restore("dut")]
+            )
+
+        self.assertEqual(["early", "cleanup", "unparsable", "early", "dut"], attempted)
+
+    async def test_restore_only_teardown_keeps_bounded_retry(self) -> None:
+        runner = self._runner()
+        restore = _routing_component_restore("dut")
+        failure = RuntimeError("dut restore failed")
+        runner._run_task_once = AsyncMock(side_effect=failure)
+        sleep = AsyncMock()
+
+        with patch.object(asyncio, "sleep", sleep):
+            with self.assertRaises(RuntimeError) as raised:
+                await runner.run_teardown_tasks([restore])
+
+        self.assertIs(failure, raised.exception)
+        self.assertEqual(_taac_runner._TASK_ATTEMPTS, runner._run_task_once.await_count)
+        sleep.assert_awaited_once_with(_taac_runner._TASK_RETRY_SLEEP_SECONDS)
+
+
+def _lifecycle_task(hostname: str, action: str, operation_id: str) -> taac_types.Task:
+    return taac_types.Task(
+        task_name="eos_compiler_lifecycle",
+        hostname=hostname,
+        params=taac_types.Params(
+            json_params=json.dumps(
+                {"action": action, "hostname": hostname, "operation_id": operation_id}
+            )
+        ),
+    )
+
+
+class TaacRunnerLifecycleMetadataTest(AsyncTestCase):
+    """Runner classification must read the metadata the task executes with."""
+
+    def _runner(self) -> TaacRunner:
+        return TaacRunner(_config(), logger=logging.getLogger("taac-metadata-test"))
+
+    async def test_nonliteral_lifecycle_metadata_never_runs(self) -> None:
+        literal = _routing_component_restore("dut")
+        overridden = (
+            literal(
+                params=literal.params(
+                    jq_params={"action": '"routing_component_restore"'}
+                )
+            ),
+            literal(
+                params=literal.params(
+                    static_params={
+                        "operation_id": taac_types.ParamValue(string_value="x")
+                    }
+                )
+            ),
+        )
+        runner = self._runner()
+        run_task = AsyncMock()
+        runner.parameter_evaluator.evaluate = MagicMock(
+            side_effect=lambda params: json.loads(params.json_params)
+        )
+
+        with patch.object(_taac_runner, "run_task", run_task):
+            await runner._run_task_once(literal, index=1, total=1)
+            for task in overridden:
+                with self.subTest(params=task.params):
+                    self.assertFalse(_taac_runner._is_terminal_restore(task))
+                    with self.assertRaisesRegex(ValueError, "must be literal"):
+                        await runner._run_task_once(task, index=1, total=1)
+
+        run_task.assert_awaited_once()
+
+    async def test_evaluated_metadata_must_match_the_literal(self) -> None:
+        literal = _routing_component_restore("dut")
+        runner = self._runner()
+        run_task = AsyncMock()
+        runner.parameter_evaluator.evaluate = MagicMock(
+            return_value={
+                **json.loads(literal.params.json_params),
+                "action": "routing_config_restore",
+            }
+        )
+
+        with patch.object(_taac_runner, "run_task", run_task):
+            with self.assertRaisesRegex(ValueError, "mismatched=\\['action'\\]"):
+                await runner._run_task_once(literal, index=1, total=1)
+
+        run_task.assert_not_awaited()
+
+    def test_classification_type_checks_the_action(self) -> None:
+        unhashable = taac_types.Task(
+            task_name="eos_compiler_lifecycle",
+            params=taac_types.Params(
+                json_params=json.dumps({"action": ["routing_component_restore"]})
+            ),
+        )
+        self.assertFalse(_taac_runner._is_terminal_restore(unhashable))
+
+    def test_overridden_arm_is_still_declared(self) -> None:
+        arm = _lifecycle_task("dut", "state_guard_arm", "ns:armed")
+        overridden = arm(params=arm.params(jq_params={"operation_id": '"other"'}))
+        self.assertEqual(
+            {"ns:armed"}, _taac_runner._state_guard_arm_operation_ids([overridden])
+        )
+
+
+class TaacRunnerStateGuardArmTest(AsyncTestCase):
+    """TestConfig teardown runs only once setup armed every declared guard."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.dut_snapshot = _lifecycle_task(
+            "dut", "routing_component_snapshot", "ns:routing_component"
+        )
+        self.helper_snapshot = _lifecycle_task(
+            "helper", "interface_config_snapshot", "ns:helper_link"
+        )
+        self.arm = _lifecycle_task("dut", "state_guard_arm", "ns:armed")
+        self.mutation = taac_types.Task(
+            task_name="first-mutation", params=taac_types.Params()
+        )
+        self.teardown_tasks = [
+            taac_types.Task(task_name="link-cleanup", params=taac_types.Params()),
+            _routing_component_restore("helper"),
+            _routing_component_restore("dut"),
+        ]
+
+    def _runner(self, setup_tasks: list[taac_types.Task]) -> TaacRunner:
+        runner = TaacRunner(
+            _config(
+                primary_setup_tasks=setup_tasks,
+                primary_teardown_tasks=self.teardown_tasks,
+            ),
+            logger=logging.getLogger("taac-state-guard-arm-test"),
+        )
+        runner.selected_ixia_candidate = runner.ixia_candidates[0]
+        runner.run_teardown_tasks = AsyncMock()
+        runner.test_setup_orchestrator.async_tearDown = AsyncMock()
+        summary = MagicMock()
+        summary.start_section.return_value = MagicMock()
+        summary.sections = []
+        summary.async_upload_and_log_summary = AsyncMock()
+        runner.test_summary = summary
+        return runner
+
+    def _guarded_setup(self) -> list[taac_types.Task]:
+        return [self.dut_snapshot, self.helper_snapshot, self.arm, self.mutation]
+
+    async def _setup_then_teardown(
+        self,
+        runner: TaacRunner,
+        failing_task: taac_types.Task | None,
+        error: BaseException,
+    ) -> list[str]:
+        attempted = []
+
+        async def run_one(task, *, index, total) -> None:
+            attempted.append(task.task_name)
+            if task == failing_task:
+                raise error
+
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+        with patch.object(asyncio, "sleep", AsyncMock()):
+            with self.assertRaises(type(error)):
+                await runner.run_tasks(runner.ixia_candidates[0].setup_tasks)
+        await runner.async_test_tearDown()
+        return attempted
+
+    def _teardown_tasks_run(self, runner: TaacRunner) -> list[taac_types.Task]:
+        runner.run_teardown_tasks.assert_awaited_once()
+        runner.test_setup_orchestrator.async_tearDown.assert_awaited_once()
+        return list(runner.run_teardown_tasks.await_args.args[0])
+
+    async def test_first_snapshot_failure_skips_device_teardown(self) -> None:
+        runner = self._runner(self._guarded_setup())
+
+        attempted = await self._setup_then_teardown(
+            runner, self.dut_snapshot, RuntimeError("snapshot failed")
+        )
+
+        self.assertNotIn("first-mutation", attempted)
+        self.assertEqual([], self._teardown_tasks_run(runner))
+
+    async def test_helper_snapshot_failure_after_first_skips_device_teardown(
+        self,
+    ) -> None:
+        runner = self._runner(self._guarded_setup())
+
+        attempted = await self._setup_then_teardown(
+            runner, self.helper_snapshot, RuntimeError("helper snapshot failed")
+        )
+
+        self.assertNotIn("first-mutation", attempted)
+        self.assertIn("eos_compiler_lifecycle", attempted)
+        self.assertEqual([], self._teardown_tasks_run(runner))
+
+    async def test_failed_arm_skips_device_teardown(self) -> None:
+        runner = self._runner(self._guarded_setup())
+
+        await self._setup_then_teardown(
+            runner, self.arm, RuntimeError("cannot arm without snapshots")
+        )
+
+        self.assertEqual([], self._teardown_tasks_run(runner))
+
+    async def test_mutation_failure_after_arm_runs_full_teardown(self) -> None:
+        runner = self._runner(self._guarded_setup())
+
+        await self._setup_then_teardown(
+            runner, self.mutation, RuntimeError("first mutation failed")
+        )
+
+        self.assertEqual(self.teardown_tasks, self._teardown_tasks_run(runner))
+
+    async def test_cancellation_after_arm_runs_full_teardown(self) -> None:
+        runner = self._runner(self._guarded_setup())
+
+        await self._setup_then_teardown(runner, self.mutation, asyncio.CancelledError())
+
+        self.assertEqual(self.teardown_tasks, self._teardown_tasks_run(runner))
+
+    async def test_guards_come_from_the_setup_that_ran(self) -> None:
+        """A fallback candidate's never-run guard must not suppress teardown
+        after the first candidate's pre-IXIA setup armed and mutated."""
+        secondary_arm = _lifecycle_task("dut", "state_guard_arm", "secondary:armed")
+        runner = TaacRunner(
+            _config(
+                secondary_endpoint=_endpoint("eth1/1/1", "2/1"),
+                primary_setup_tasks=self._guarded_setup(),
+                primary_teardown_tasks=self.teardown_tasks,
+                secondary_setup_tasks=[
+                    self.dut_snapshot,
+                    self.helper_snapshot,
+                    secondary_arm,
+                    self.mutation,
+                ],
+                secondary_teardown_tasks=self.teardown_tasks,
+            ),
+            logger=logging.getLogger("taac-state-guard-fallback-test"),
+        )
+        runner._run_task_once = AsyncMock()
+        primary = runner.test_setup_orchestrator.ixia_candidates_to_try[0]
+
+        self.assertEqual(["ns:armed"], runner._unarmed_state_guards())
+        await runner.run_tasks(
+            [task for task in primary.setup_tasks if not task.ixia_needed]
+        )
+
+        self.assertEqual([], runner._unarmed_state_guards())
+
+    def test_unarmed_guards_follow_the_pre_ixia_candidate(self) -> None:
+        secondary_arm = _lifecycle_task("dut", "state_guard_arm", "secondary:armed")
+        runner = TaacRunner(
+            _config(
+                secondary_endpoint=_endpoint("eth1/1/1", "2/1"),
+                primary_setup_tasks=self._guarded_setup(),
+                primary_teardown_tasks=self.teardown_tasks,
+                secondary_setup_tasks=[
+                    self.dut_snapshot,
+                    self.helper_snapshot,
+                    secondary_arm,
+                    self.mutation,
+                ],
+                secondary_teardown_tasks=self.teardown_tasks,
+            ),
+            logger=logging.getLogger("taac-selected-state-guard-fallback-test"),
+        )
+        runner.selected_ixia_candidate = runner.ixia_candidates[1]
+
+        self.assertEqual(["ns:armed"], runner._unarmed_state_guards())
+
+    async def test_unguarded_setup_failure_keeps_teardown(self) -> None:
+        first = taac_types.Task(task_name="first-setup", params=taac_types.Params())
+        runner = self._runner([first, self.mutation])
+
+        await self._setup_then_teardown(runner, first, RuntimeError("setup failed"))
+
+        self.assertEqual(self.teardown_tasks, self._teardown_tasks_run(runner))
 
 
 class IxiaCandidateTest(unittest.TestCase):
@@ -1746,6 +2409,47 @@ class SelectedCandidateTaskTest(unittest.IsolatedAsyncioTestCase):
             "TAAC test-config teardown was cancelled",
             summary.end_section.call_args.args[2],
         )
+
+    async def test_early_cancellation_still_runs_terminal_restore(self) -> None:
+        cleanup = taac_types.Task(task_name="link-cleanup", params=taac_types.Params())
+        restore = _routing_component_restore("dut")
+        runner = TaacRunner(
+            _config(primary_teardown_tasks=[cleanup, restore]),
+            logger=logging.getLogger("taac-cancelled-terminal-restore-test"),
+        )
+        runner.selected_ixia_candidate = runner.ixia_candidates[0]
+
+        async def cancel_during_initial_phase(_executor) -> None:
+            current_task = asyncio.current_task()
+            if current_task is None:
+                self.fail("teardown must run in an asyncio task")
+            current_task.cancel()
+            await asyncio.sleep(0)
+
+        attempted = []
+
+        async def run_one(task, *, index, total) -> None:
+            attempted.append(_attempt_name(task))
+            if task is cleanup:
+                raise RuntimeError("link cleanup failed")
+
+        runner.teardown_period_task_executor_if_exists = AsyncMock(
+            side_effect=cancel_during_initial_phase
+        )
+        runner._run_task_once = AsyncMock(side_effect=run_one)
+        runner.test_setup_orchestrator.async_tearDown = AsyncMock()
+        summary = MagicMock()
+        summary.start_section.return_value = MagicMock()
+        summary.sections = []
+        summary.async_upload_and_log_summary = AsyncMock()
+        runner.test_summary = summary
+
+        teardown = asyncio.create_task(runner.async_test_tearDown())
+        with self.assertRaises(asyncio.CancelledError):
+            await teardown
+
+        self.assertEqual(["link-cleanup", "dut"], attempted)
+        runner.test_setup_orchestrator.async_tearDown.assert_awaited_once()
 
     async def test_retry_sleep_cancellation_still_releases_resources(self) -> None:
         teardown_task = taac_types.Task(

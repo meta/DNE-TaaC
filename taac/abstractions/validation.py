@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import typing as t
 from dataclasses import dataclass
 
@@ -51,6 +52,7 @@ if t.TYPE_CHECKING:
 
 
 VALID_AFIS = frozenset({"v4", "v6"})
+_DEVICE_STATE_GUARD_NAMESPACE = re.compile(r"[A-Za-z0-9_.-]+")
 VALID_ENDPOINT_REQUIRED_OS = frozenset({"eos", "fboss", "ixia"})
 VALID_ENDPOINT_SETUP_MODES = frozenset({"full", "preloaded", "skip", "verify_only"})
 VALID_ENDPOINT_KINDS = frozenset({"dut", "ixia", "traffic", "trafficgen"})
@@ -2609,6 +2611,31 @@ def _validate_bgp_total_path_limit(
         )
 
 
+def is_valid_device_state_guard_namespace(value: object) -> bool:
+    """Whether ``value`` can prefix ``:``-joined lifecycle operation ids."""
+    return isinstance(value, str) and (
+        _DEVICE_STATE_GUARD_NAMESPACE.fullmatch(value) is not None
+    )
+
+
+def _validate_device_state_guard_namespace(
+    config: RoutingDeviceConfig,
+    path: str,
+    issues: list[ValidationIssue],
+) -> None:
+    namespace = config.device_state_guard_namespace
+    if namespace is None or is_valid_device_state_guard_namespace(namespace):
+        return
+    issues.append(
+        _issue(
+            f"{path}.device_state_guard_namespace",
+            "invalid_device_state_guard_namespace",
+            "device_state_guard_namespace must be None or a nonempty string of "
+            "ASCII letters, digits, '_', '.' or '-'",
+        )
+    )
+
+
 def _validate_routing_device_config(
     config: RoutingDeviceConfig,
     path: str,
@@ -2653,6 +2680,7 @@ def _validate_routing_device_config(
         )
     _validate_fibagent_bgp_nhg_watermarks(config, path, issues)
     _validate_bgp_total_path_limit(config, path, issues)
+    _validate_device_state_guard_namespace(config, path, issues)
     for attr in ("route_limit", "prefix_limit", "per_peer_max_route_limit"):
         value = getattr(config, attr)
         if isinstance(value, bool):

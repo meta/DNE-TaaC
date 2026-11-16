@@ -109,6 +109,7 @@ from taac.abstractions.topology import (
     TaskCompatibilityProfile,
 )
 from taac.abstractions.validation import (
+    is_valid_device_state_guard_namespace,
     TopologyValidationError,
     ValidationIssue,
 )
@@ -178,6 +179,10 @@ class EbbScaleProfile:
             to configure before BGP++ starts, or None to keep the limit the
             deployed EBB BGP++ config carries. BGP++ counts received and
             advertised paths against it and drops prefixes past it.
+        device_state_guard_namespace: Operation-id namespace under which
+            delegated setup snapshots the DUT, and in Open/R STANDALONE mode
+            the helper, before mutating them, and teardown restores them last.
+            None emits no snapshot or restore.
     """
 
     name: str
@@ -193,10 +198,19 @@ class EbbScaleProfile:
     fa_diverse_nhg_memberships: bool
     next_hop_step: int = 2
     bgp_total_path_limit: int | None = None
+    device_state_guard_namespace: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("EBB scale profile requires a name")
+        if self.device_state_guard_namespace is not None and (
+            not is_valid_device_state_guard_namespace(self.device_state_guard_namespace)
+        ):
+            raise ValueError(
+                f"{self.name}: device_state_guard_namespace must be None or a "
+                "nonempty string of ASCII letters, digits, '_', '.' or '-'; got "
+                f"{self.device_state_guard_namespace!r}"
+            )
         # Resolve once at construction so an invalid site count or stride is
         # rejected here rather than at the first bind. Discarding the result
         # is the point: OpenRInjectionScale owns the validation.
@@ -307,6 +321,7 @@ EBB_FY27_SCALE = EbbScaleProfile(
     # The sheet's 1.08M received plus 29.6M advertised paths exceed the
     # 30,000,000 total-path limit the EBB BGP++ config deploys.
     bgp_total_path_limit=32_000_000,
+    device_state_guard_namespace="ebb_fy27_stage1",
     allows_bgp_monitor=False,
     allows_dense_unvetted_route_tail=True,
     ibgp_planes_by_link=((1, 2), (3, 4)),
@@ -1952,6 +1967,7 @@ def _with_ebb_route_intent(
                 else None
             ),
             bgp_total_path_limit=scale.bgp_total_path_limit,
+            device_state_guard_namespace=scale.device_state_guard_namespace,
         ),
         policies=(EBB_ACCEPT_POLICY,),
         prefix_sets=(*prefix_sets, *extra_prefix_sets),

@@ -12,10 +12,14 @@ from unittest import mock
 from taac.abstractions.compatibility.legacy_ebb_topology import (
     IBGP_PEER_SCALE_PER_PLANE,
 )
-from taac.abstractions.physical_inventory import NRQEB009_ASH6
+from taac.abstractions.physical_inventory import (
+    NRQEB008_ASH6,
+    NRQEB009_ASH6,
+)
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
     EBB_FY26_SCALE,
+    EBB_FY27_SCALE,
     EBB_NEXT_HOPS_IXIA03,
     EBB_OPENR_INJECTED_START_IPV4S,
     EBB_OPENR_INJECTED_START_IPV4S_IXIA03,
@@ -1491,3 +1495,40 @@ class EbbInjectionRangeAnchorWithRuntimeAdvertisementsTest(unittest.TestCase):
                     injected["start_ipv4s"],
                     payload["start_ipv4s"][: len(injected["start_ipv4s"])],
                 )
+
+
+class EbbFy27AttributeChurnFactoryTest(unittest.TestCase):
+    def test_factory_carries_bound_prefix_inventory_into_ebb10(self) -> None:
+        config = factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB008_ASH6,
+            name="FY27_EBB10_FACTORY_TEST",
+            playbooks_selected=["bgp_ebb_attribute_churn_playbook"],
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            enable_update_group=False,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            scale=EBB_FY27_SCALE,
+        )
+
+        (payload,) = [
+            json.loads(step.step_params.json_params)
+            for playbook in config.playbooks or []
+            for stage in playbook.stages or []
+            for step in stage.steps or []
+            if step.step_params is not None
+            and step.step_params.json_params is not None
+            and json.loads(step.step_params.json_params).get("custom_step_name")
+            == "bgp_attribute_churn"
+        ]
+        self.assertEqual(100, payload["peer_count_per_plane"])
+        self.assertEqual(1_000, payload["routes_per_block"])
+        self.assertEqual(100_000, payload["prefix_sources"]["ipv4"]["count"])
+        self.assertEqual(100_000, payload["prefix_sources"]["ipv6"]["count"])
+        self.assertEqual(
+            factory.NO_CHARACTERIZATION_GATES,
+            factory._characterization_gates(
+                "bgp_ebb_attribute_churn_playbook",
+                enable_update_group=False,
+                scale=EBB_FY27_SCALE,
+            ),
+        )

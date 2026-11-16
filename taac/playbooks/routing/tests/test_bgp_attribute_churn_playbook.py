@@ -16,6 +16,10 @@ from taac.abstractions.churn.attribute import (
     BaselineExpectation,
     BlockGeometryExpectation,
 )
+from taac.abstractions.churn.geometry import (
+    sample_prefix_range,
+    select_uniform_rows,
+)
 from taac.abstractions.churn.policies import (
     ExecutionPolicy,
     PreparationPolicy,
@@ -37,6 +41,7 @@ from taac.abstractions.physical_inventory import (
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
     EBB_FY26_SCALE,
+    EBB_FY27_SCALE,
     ebb_ibgp_route_next_hops,
     EBB_NEXT_HOPS,
     EBB_NEXT_HOPS_IXIA03,
@@ -966,6 +971,47 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             _FROZEN_CHURN_PAYLOAD, _step_payload(playbook.stages[0].steps[0])
         )
 
+    def test_fy27_block_geometry_is_derived_from_the_profile(self) -> None:
+        """The builder and runtime accept profile-sized rows and route blocks."""
+        prefix_sources = {
+            "ipv4": {
+                "start_prefix": "11.0.0.0",
+                "prefix_step": 256,
+                "count": 100_000,
+                "prefix_length": 24,
+                "excluded_indices": [],
+            },
+            "ipv6": {
+                "start_prefix": "2001:db8::",
+                "prefix_step": 1 << 64,
+                "count": 100_000,
+                "prefix_length": 64,
+                "excluded_indices": [],
+            },
+        }
+        playbook = get_bgp_ebb_attribute_churn_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="IBGP_V6",
+            peergroup_ibgp_v4="IBGP_V4",
+            total_session_count=1880,
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            ibgp_route_next_hop_starts=_ROUTE_NEXT_HOP_STARTS,
+            scale=EBB_FY27_SCALE,
+            ibgp_prefix_sources=prefix_sources,
+        )
+        payload = _step_payload(playbook.stages[0].steps[0])
+        self.assertEqual(100, payload["peer_count_per_plane"])
+        self.assertEqual(1_000, payload["routes_per_block"])
+        self.assertEqual(prefix_sources, payload["prefix_sources"])
+        self.assertEqual(
+            prefix_sources, AttributeChurn.from_step_params(payload).prefix_sources
+        )
+        self.assertEqual((0, 16, 33, 49, 66, 82, 99), select_uniform_rows(100, 7))
+        self.assertEqual(
+            ("11.0.0.0/24", "11.3.231.0/24"),
+            sample_prefix_range("11.0.0.0", 24, route_count=1_000, sample_count=2),
+        )
+
     def test_playbook_passes_typed_attribute_churn_to_stage(self) -> None:
         target = (
             "neteng.test_infra.dne.taac.playbooks.routing."
@@ -1029,6 +1075,21 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         decoded = AttributeChurn.from_step_params(attribute_churn.to_step_params())
 
         self.assertEqual(attribute_churn, decoded)
+
+    def test_attribute_churn_prefix_sources_require_both_families(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly ipv4 and ipv6"):
+            dataclasses.replace(
+                _locked_attribute_churn(),
+                prefix_sources={
+                    "ipv4": {
+                        "start_prefix": "11.0.0.0",
+                        "prefix_step": 256,
+                        "count": 100_000,
+                        "prefix_length": 24,
+                        "excluded_indices": [],
+                    }
+                },
+            )
 
     def test_step_factory_rejects_incomplete_pool_geometry(self) -> None:
         kwargs = _locked_step_kwargs()

@@ -1317,6 +1317,14 @@ def create_bgp_attribute_churn_step(
         },
         **numeric_params,
     }
+    if "prefix_sources" in churn_params:
+        params["prefix_sources"] = {
+            afi: dict(source)
+            for afi, source in t.cast(
+                t.Mapping[str, t.Mapping[str, object]],
+                churn_params["prefix_sources"],
+            ).items()
+        }
     if transient_observation_logging == "extended":
         params["transient_observation_logging"] = transient_observation_logging
     return create_custom_step(

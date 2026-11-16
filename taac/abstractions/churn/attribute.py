@@ -63,9 +63,31 @@ class AttributeChurn:
     scenario: ChurnScenario
     selector: AttributeTargetSelector
     baseline_expectation: BaselineExpectation
+    prefix_sources: t.Mapping[str, t.Mapping[str, object]] = dataclasses.field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         self._attribute_families()
+        if self.prefix_sources:
+            expected_afis = {"ipv4", "ipv6"}
+            if set(self.prefix_sources) != expected_afis:
+                raise ValueError(
+                    "attribute churn prefix sources must define exactly ipv4 and ipv6"
+                )
+            required = {
+                "start_prefix",
+                "prefix_step",
+                "count",
+                "prefix_length",
+                "excluded_indices",
+            }
+            for afi, source in self.prefix_sources.items():
+                missing = sorted(required - source.keys())
+                if missing:
+                    raise ValueError(
+                        f"attribute churn {afi} prefix source is missing {missing}"
+                    )
 
     def _attribute_families(self) -> tuple[AttributeFamily, ...]:
         families: list[AttributeFamily] = []
@@ -86,7 +108,7 @@ class AttributeChurn:
             for family in self._attribute_families()
         }
         geometry = self.baseline_expectation.block_geometry
-        return {
+        params: dict[str, t.Any] = {
             "scenario_id": self.scenario.scenario_id,
             "prefix_pool_names": prefix_pool_names,
             "attribute_matrix": attribute_matrix,
@@ -115,6 +137,11 @@ class AttributeChurn:
                 self.scenario.recovery.cancellation_grace_seconds
             ),
         }
+        if self.prefix_sources:
+            params["prefix_sources"] = {
+                afi: dict(source) for afi, source in self.prefix_sources.items()
+            }
+        return params
 
     @classmethod
     def from_step_params(cls, params: t.Mapping[str, t.Any]) -> AttributeChurn:
@@ -219,4 +246,11 @@ class AttributeChurn:
                     samples_per_block=int(params["samples_per_block"]),
                 )
             ),
+            prefix_sources={
+                str(afi): t.cast(t.Mapping[str, object], source)
+                for afi, source in t.cast(
+                    t.Mapping[str, t.Mapping[str, object]],
+                    params.get("prefix_sources", {}),
+                ).items()
+            },
         )

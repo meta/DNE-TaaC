@@ -22,6 +22,8 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_FIBAGENT_BGP_NHG_WATERMARK_LOW,
     EBB_FY26_SCALE,
     ebb_ibgp_route_next_hop_starts,
+    EBB_IBGP_V4_PREFIX_SET,
+    EBB_IBGP_V6_PREFIX_SET,
     EBB_NEXT_HOPS,
     EBB_PARENT_NETWORKS,
     EBB_PEER_GROUPS,
@@ -168,9 +170,6 @@ _FY26_DRAIN_PNH_REASON = (
 # build only at EBB_FY26_SCALE until that pin moves; selecting one at another
 # scale fails with the reason rather than emitting FY26 numbers.
 _FY26_ONLY_PLAYBOOKS: t.Mapping[str, str] = {
-    "bgp_ebb_attribute_churn_playbook": (
-        "its runtime samples only 750-route blocks (abstractions/churn/geometry.py)"
-    ),
     "bgp_ebb_route_storm_playbook": (
         "RouteStorm requires exactly 10,500 storm paths, and RouteStormRuntime "
         "62 peers, 750 routes, rows 0-61 and 21/21/20 shards"
@@ -326,6 +325,31 @@ def _ebb_automation_contract(bound: BoundTopology) -> _EbbAutomationContract:
         ebgp_peer_counts_by_afi=peer_counts,
         ebgp_route_item_names_by_afi=route_item_names,
     )
+
+
+def _attribute_prefix_sources(
+    bound: BoundTopology,
+) -> dict[str, dict[str, object]]:
+    names = {
+        "ipv4": EBB_IBGP_V4_PREFIX_SET.name,
+        "ipv6": EBB_IBGP_V6_PREFIX_SET.name,
+    }
+    prefix_sets = {
+        prefix_set.name: prefix_set for prefix_set in bound.logical_topology.prefix_sets
+    }
+    missing = sorted(set(names.values()) - prefix_sets.keys())
+    if missing:
+        raise ValueError(f"bound EBB topology is missing prefix sets: {missing}")
+    return {
+        afi: {
+            "start_prefix": prefix_sets[name].source.start_prefix,
+            "prefix_step": prefix_sets[name].source.prefix_step,
+            "count": prefix_sets[name].source.count,
+            "prefix_length": prefix_sets[name].source.prefix_length,
+            "excluded_indices": list(prefix_sets[name].source.excluded_indices),
+        }
+        for afi, name in names.items()
+    }
 
 
 def _ebb_route_count_histogram_by_afi(
@@ -1294,6 +1318,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
             ibgp_pnh_count=openr_pnh_count,
             ibgp_pnh_step=openr_pnh_step,
+            scale=scale,
+            ibgp_prefix_sources=(
+                None if scale == EBB_FY26_SCALE else _attribute_prefix_sources(bound)
+            ),
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
                 "bgp_ebb_attribute_churn_playbook", enable_update_group, scale

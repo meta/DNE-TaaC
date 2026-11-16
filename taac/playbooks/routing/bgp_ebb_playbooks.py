@@ -161,6 +161,11 @@ from taac.test_as_a_config.types import (
 )
 
 
+if t.TYPE_CHECKING:
+    from taac.abstractions.topologies.ebb_full_scale import (
+        EbbScaleProfile,
+    )
+
 __all__ = [
     "get_bgp_ebb_daemon_restart_playbook",
     "get_bgp_ebb_cold_start_playbook",
@@ -619,7 +624,25 @@ def get_bgp_ebb_cold_start_playbook(
     )
 
 
-def _bgp_ebb_attribute_churn(duration_seconds: int) -> AttributeChurn:
+def _ebb_scale(scale: "EbbScaleProfile | None") -> "EbbScaleProfile":
+    """The given EBB scale, or the scheduled FY26 one.
+
+    Local import keeps the topology constants off this module's import path.
+    """
+    if scale is not None:
+        return scale
+    from taac.abstractions.topologies.ebb_full_scale import (
+        EBB_FY26_SCALE,
+    )
+
+    return EBB_FY26_SCALE
+
+
+def _bgp_ebb_attribute_churn(
+    duration_seconds: int,
+    scale: "EbbScaleProfile",
+    prefix_sources: t.Mapping[str, t.Mapping[str, object]] | None = None,
+) -> AttributeChurn:
     return AttributeChurn(
         scenario=ChurnScenario(
             scenario_id="bgp_ebb_attribute_churn",
@@ -692,15 +715,16 @@ def _bgp_ebb_attribute_churn(duration_seconds: int) -> AttributeChurn:
                 for afi in ("ipv4", "ipv6")
                 for plane in range(1, 5)
             ),
-            peer_count_per_pool=62,
+            peer_count_per_pool=scale.ibgp_peers_per_group,
             row_selection=UniformRowSelection(rows_per_pool=7),
         ),
         baseline_expectation=BaselineExpectation(
             block_geometry=BlockGeometryExpectation(
-                routes_per_block=750,
+                routes_per_block=scale.routes_per_he_peer,
                 samples_per_block=2,
             )
         ),
+        prefix_sources=prefix_sources or {},
     )
 
 
@@ -722,6 +746,8 @@ def get_bgp_ebb_attribute_churn_playbook(
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_count: t.Optional[int] = None,
     ibgp_pnh_step: t.Optional[int] = None,
+    scale: "EbbScaleProfile | None" = None,
+    ibgp_prefix_sources: t.Mapping[str, t.Mapping[str, object]] | None = None,
 ) -> Playbook:
     """Build CICD-EBB-10: BGP attribute churn.
 
@@ -751,6 +777,8 @@ def get_bgp_ebb_attribute_churn_playbook(
             across MED, origin, and local-pref.
         transient_observation_logging: `off` suppresses retryable convergence
             warnings; `extended` logs each retry with its stack trace.
+        scale: EBB fleet profile the per-pool peer rows and route blocks come
+            from; the scheduled FY26 profile when omitted.
 
     Returns:
         A `Playbook` named `bgp_ebb_attribute_churn_playbook` with standard
@@ -805,7 +833,11 @@ def get_bgp_ebb_attribute_churn_playbook(
                 [
                     create_bgp_ebb_attribute_churn_stage(
                         hostname=device_name,
-                        attribute_churn=_bgp_ebb_attribute_churn(duration_seconds),
+                        attribute_churn=_bgp_ebb_attribute_churn(
+                            duration_seconds,
+                            _ebb_scale(scale),
+                            ibgp_prefix_sources,
+                        ),
                         poll_interval_seconds=5,
                         transition_timeout_seconds=60,
                         reference_setup_timeout_seconds=120,

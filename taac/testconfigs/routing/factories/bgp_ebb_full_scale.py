@@ -174,9 +174,6 @@ _FY26_ONLY_PLAYBOOKS: t.Mapping[str, str] = {
         "RouteStorm requires exactly 10,500 storm paths, and RouteStormRuntime "
         "62 peers, 750 routes, rows 0-61 and 21/21/20 shards"
     ),
-    "bgp_ebb_route_registry_runtime_update_playbook": (
-        "its route-registry prefix-list policies are the checked-in 750/850-route files"
-    ),
     "bgp_ebb_fauu_drain_undrain_playbook": _FY26_DRAIN_PNH_REASON,
     "bgp_ebb_plane_drain_undrain_playbook": _FY26_DRAIN_PNH_REASON,
     "bgp_ebb_nexthop_group_count_threshold_playbook": (
@@ -350,6 +347,41 @@ def _attribute_prefix_sources(
         }
         for afi, name in names.items()
     }
+
+
+def _route_filter_prefix_sources(
+    bound: BoundTopology,
+    count: int,
+) -> dict[str, dict[str, object]]:
+    names = {
+        "EB-FA-V4": EBB_EBGP_V4_PREFIX_SET.name,
+        "EB-FA-V6": EBB_EBGP_V6_PREFIX_SET.name,
+    }
+    prefix_sets = {
+        prefix_set.name: prefix_set for prefix_set in bound.logical_topology.prefix_sets
+    }
+    missing = sorted(set(names.values()) - prefix_sets.keys())
+    if missing:
+        raise ValueError(f"bound EBB topology is missing prefix sets: {missing}")
+    sources: dict[str, dict[str, object]] = {}
+    for statement, name in names.items():
+        source = prefix_sets[name].source
+        if count > source.count:
+            raise ValueError(
+                f"route-filter policy needs {count} prefixes from {name}, but the "
+                f"bound source has {source.count}"
+            )
+        sources[statement] = {
+            "start_prefix": source.start_prefix,
+            "prefix_step": source.prefix_step,
+            "count": count,
+            "prefix_length": source.prefix_length,
+            "parent_networks": [
+                source.parent_network,
+                *source.extension_parent_networks,
+            ],
+        }
+    return sources
 
 
 def _ebb_route_count_histogram_by_afi(
@@ -1120,6 +1152,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
     bound: BoundTopology,
     ebgp_prefix_count: int,
     selected_tc7_playbooks: set[str],
+    playbooks_selected: t.Sequence[str] | None = None,
     scale: EbbScaleProfile = EBB_FY26_SCALE,
     port_map: t.Mapping[str, int] | None = None,
     enable_update_group: bool = True,
@@ -1363,6 +1396,19 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             runtime_prefix_start_index=scale.fa_routes_per_peer,
             runtime_prefix_end_index=(
                 scale.fa_routes_per_peer + _RUNTIME_UPDATE_EBGP_PREFIX_DELTA
+            ),
+            baseline_policy_prefix_sources=(
+                None
+                if scale == EBB_FY26_SCALE
+                else _route_filter_prefix_sources(bound, scale.fa_routes_per_peer)
+            ),
+            expanded_policy_prefix_sources=(
+                None
+                if scale == EBB_FY26_SCALE
+                else _route_filter_prefix_sources(
+                    bound,
+                    scale.fa_routes_per_peer + _RUNTIME_UPDATE_EBGP_PREFIX_DELTA,
+                )
             ),
             expected_route_count_histogram_by_afi=(
                 baseline_route_count_histogram_by_afi
@@ -1685,8 +1731,18 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ),
         ),
     }
+    unknown = sorted(set(playbooks_selected or ()) - builders.keys())
+    if unknown:
+        raise ValueError(f"Unrecognized BGP EBB playbook selections: {unknown}")
     skipped = set() if scale == EBB_FY26_SCALE else set(_FY26_ONLY_PLAYBOOKS)
-    return [build() for name, build in builders.items() if name not in skipped]
+    names = (
+        tuple(builders)
+        if playbooks_selected is None
+        else tuple(
+            name for name in playbooks_selected if name not in _TC7_PLAYBOOK_NAMES
+        )
+    )
+    return [builders[name]() for name in names if name not in skipped]
 
 
 _EBB_IXIA_BGP_PEER_REGEX = r"^BGP_PEER_"
@@ -1946,6 +2002,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
             bound=bound,
             ebgp_prefix_count=ebgp_prefix_count,
             selected_tc7_playbooks=selected_tc7_playbooks,
+            playbooks_selected=(playbooks_selected or None),
             scale=scale,
             port_map=resolved_port_map,
             enable_update_group=enable_update_group,

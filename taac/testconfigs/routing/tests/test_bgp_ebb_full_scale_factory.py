@@ -1532,3 +1532,96 @@ class EbbFy27AttributeChurnFactoryTest(unittest.TestCase):
                 scale=EBB_FY27_SCALE,
             ),
         )
+
+
+class EbbFy27RouteRegistryFactoryTest(unittest.TestCase):
+    @staticmethod
+    def _task(step: taac_types.Step) -> tuple[str, dict[str, t.Any]] | None:
+        if step.input_json is None:
+            return None
+        outer = json.loads(step.input_json)
+        task = outer.get("task")
+        if not isinstance(task, dict):
+            return None
+        return (
+            str(task["task_name"]),
+            json.loads(task["params"]["json_params"]),
+        )
+
+    def test_factory_builds_generic_n_plus_100_ebb12(self) -> None:
+        config = factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB008_ASH6,
+            name="FY27_EBB12_FACTORY_TEST",
+            playbooks_selected=["bgp_ebb_route_registry_runtime_update_playbook"],
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            enable_update_group=False,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            scale=EBB_FY27_SCALE,
+        )
+        (playbook,) = config.playbooks or []
+        tasks = [
+            parsed
+            for step in (
+                *(playbook.setup_steps or []),
+                *(
+                    step
+                    for stage in playbook.stages or []
+                    for step in stage.steps or []
+                ),
+                *(playbook.cleanup_steps or []),
+            )
+            if (parsed := self._task(step)) is not None
+        ]
+        policy_params = [
+            params for name, params in tasks if name == "bgp_set_route_filter"
+        ]
+        self.assertEqual(
+            [1_000, 1_100, 1_000, 1_100],
+            [
+                params["formulaic_prefix_sources"]["EB-FA-V4"]["count"]
+                for params in policy_params
+            ],
+        )
+        self.assertEqual(
+            ["120.0.0.0/14", "120.4.0.0/17"],
+            policy_params[0]["formulaic_prefix_sources"]["EB-FA-V4"]["parent_networks"],
+        )
+        cleanup = next(
+            params for name, params in tasks if name == "bgp_route_registry_cleanup"
+        )
+        self.assertEqual(
+            1_100,
+            cleanup["expanded_policy_prefix_sources"]["EB-FA-V4"]["count"],
+        )
+        toggles = [
+            params
+            for name, params in tasks
+            if name == "ixia_enable_disable_bgp_prefixes"
+        ]
+        self.assertTrue(toggles)
+        self.assertTrue(
+            all(
+                params["prefix_start_index"] == 1_000
+                and params["prefix_end_index"] == 1_100
+                for params in toggles
+            )
+        )
+
+    def test_factory_rejects_unrecognized_playbook_selection(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "Unrecognized BGP EBB playbook selections.*typo"
+        ):
+            factory.create_bgp_ebb_full_scale_test_config(
+                NRQEB008_ASH6,
+                name="FY27_UNKNOWN_PLAYBOOK_FACTORY_TEST",
+                playbooks_selected=[
+                    "bgp_ebb_route_registry_runtime_update_playbook",
+                    "typo",
+                ],
+                profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                enable_update_group=False,
+                parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+                next_hops=EBB_NEXT_HOPS_IXIA03,
+                scale=EBB_FY27_SCALE,
+            )

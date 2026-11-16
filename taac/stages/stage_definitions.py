@@ -3971,6 +3971,8 @@ def create_route_registry_runtime_update_stage(
     convergence_poll_interval_seconds: float | None = None,
     expanded_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_750.json",
     baseline_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_650.json",
+    expanded_policy_prefix_sources: Mapping[str, Mapping[str, object]] | None = None,
+    baseline_policy_prefix_sources: Mapping[str, Mapping[str, object]] | None = None,
     exact_peer_group_names: list[str] | None = None,
     verify_trigger_readback: bool = False,
     verify_policy_readback: bool = False,
@@ -4120,6 +4122,7 @@ def create_route_registry_runtime_update_stage(
         create_set_route_filter_step(
             device_name=device_name,
             config_path=expanded_policy_path,
+            formulaic_prefix_sources=expanded_policy_prefix_sources,
             verify_readback=verify_policy_readback,
             description=f"Add {prefix_end_index - prefix_start_index} prefixes to prefix-list using setRouteFilterPolicy ({added_route_count} config)",
         ),
@@ -4187,6 +4190,7 @@ def create_route_registry_runtime_update_stage(
         create_set_route_filter_step(
             device_name=device_name,
             config_path=baseline_policy_path,
+            formulaic_prefix_sources=baseline_policy_prefix_sources,
             verify_readback=verify_policy_readback,
             description=f"Remove {prefix_end_index - prefix_start_index} prefixes from prefix-list using setRouteFilterPolicy ({baseline_route_count} config)",
         ),
@@ -4262,6 +4266,7 @@ def create_route_registry_runtime_update_stage(
         create_set_route_filter_step(
             device_name=device_name,
             config_path=expanded_policy_path,
+            formulaic_prefix_sources=expanded_policy_prefix_sources,
             verify_readback=verify_policy_readback,
             description="Restore and verify the permissive route filter policy",
         )

@@ -659,12 +659,16 @@ def _ebb_route_inventory_issues(
     return issues
 
 
-# Adjacent space an iBGP progression continues into once its demand outgrows
-# the FY26 parent. Neither widens to a supernet: the only aligned /7 holding
-# 11/8 is 10.0.0.0/7, which also holds the iBGP session networks.
+# Adjacent spaces formulaic progressions continue into once demand outgrows
+# their FY26 parents. Neither iBGP parent widens to a supernet: the only
+# aligned /7 holding 11/8 is 10.0.0.0/7, which also holds session networks.
 _EBB_IBGP_EXTENSION_PARENT_NETWORKS: dict[str, str] = {
     EBB_IBGP_V4_PREFIX_SET.name: "12.0.0.0/8",
     EBB_IBGP_V6_PREFIX_SET.name: "2001:db8:1::/48",
+}
+_EBB_PREFIX_EXTENSION_PARENT_NETWORKS: dict[str, str] = {
+    **_EBB_IBGP_EXTENSION_PARENT_NETWORKS,
+    EBB_EBGP_V4_PREFIX_SET.name: "120.4.0.0/17",
 }
 
 
@@ -730,7 +734,7 @@ def _ebb_sized_prefix_set(
         )
     parents = (source.parent_network,)
     step = int(source.prefix_step)
-    extension = _EBB_IBGP_EXTENSION_PARENT_NETWORKS.get(prefix_set.name)
+    extension = _EBB_PREFIX_EXTENSION_PARENT_NETWORKS.get(prefix_set.name)
     if extension and span > _formulaic_candidate_capacity(
         source.start_prefix, step, parents
     ):

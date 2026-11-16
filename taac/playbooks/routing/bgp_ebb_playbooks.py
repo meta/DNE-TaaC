@@ -1181,6 +1181,49 @@ def get_bgp_ebb_igp_pnh_metric_oscillation_playbook(
     )
 
 
+def _validate_route_registry_policy_sources(
+    *,
+    baseline: t.Mapping[str, t.Mapping[str, object]] | None,
+    expanded: t.Mapping[str, t.Mapping[str, object]] | None,
+    expected_route_count: int,
+    runtime_prefix_start_index: int,
+    runtime_prefix_end_index: int,
+) -> None:
+    if baseline is None and expanded is None:
+        return
+    if baseline is None or expanded is None:
+        raise ValueError(
+            "baseline and expanded formulaic policy sources must be provided together"
+        )
+    if runtime_prefix_start_index != expected_route_count:
+        raise ValueError("formulaic policy baseline must start at N")
+    delta = runtime_prefix_end_index - runtime_prefix_start_index
+    if delta != 100:
+        raise ValueError("formulaic policy workload must use the N+100 window")
+    if not baseline or set(baseline) != set(expanded):
+        raise ValueError("baseline and expanded formulaic policy statements must match")
+    geometry_fields = {
+        "start_prefix",
+        "prefix_step",
+        "prefix_length",
+        "parent_networks",
+    }
+    for statement in baseline:
+        baseline_source = baseline[statement]
+        expanded_source = expanded[statement]
+        if any(
+            baseline_source.get(field) != expanded_source.get(field)
+            for field in geometry_fields
+        ):
+            raise ValueError(
+                f"formulaic policy geometry differs for statement {statement}"
+            )
+        if baseline_source.get("count") != expected_route_count:
+            raise ValueError(f"formulaic baseline count is not N for {statement}")
+        if expanded_source.get("count") != expected_route_count + delta:
+            raise ValueError(f"formulaic expanded count is not N+100 for {statement}")
+
+
 def get_bgp_ebb_route_registry_runtime_update_playbook(
     device_name: str,
     peergroup_ibgp_v6: str,
@@ -1215,6 +1258,10 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
     runtime_prefix_end_index: int = 850,
     baseline_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_750.json",
     expanded_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_850.json",
+    baseline_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
+    expanded_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     exclude_bgp_mon: bool = True,
@@ -1270,6 +1317,13 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
     Returns:
         Playbook configured for BGP route registry prefix-list runtime update testing
     """
+    _validate_route_registry_policy_sources(
+        baseline=baseline_policy_prefix_sources,
+        expanded=expanded_policy_prefix_sources,
+        expected_route_count=expected_route_count,
+        runtime_prefix_start_index=runtime_prefix_start_index,
+        runtime_prefix_end_index=runtime_prefix_end_index,
+    )
     if precheck_thresholds is None:
         precheck_thresholds = get_precheck_thresholds()
 
@@ -1337,6 +1391,7 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
             prefix_pool_regex=prefix_pool_regex,
             expected_prefix_pool_names=expected_prefix_pool_names,
             baseline_policy_path=baseline_policy_path,
+            baseline_policy_prefix_sources=baseline_policy_prefix_sources,
             verify_trigger_readback=True,
             verify_policy_readback=True,
             expected_route_count=(
@@ -1385,6 +1440,8 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
                     convergence_poll_interval_seconds=5,
                     expanded_policy_path=expanded_policy_path,
                     baseline_policy_path=baseline_policy_path,
+                    expanded_policy_prefix_sources=expanded_policy_prefix_sources,
+                    baseline_policy_prefix_sources=baseline_policy_prefix_sources,
                     verify_trigger_readback=True,
                     verify_policy_readback=True,
                     expected_established_sessions=expected_established_sessions,
@@ -1403,6 +1460,7 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
                 prefix_start_index=runtime_prefix_start_index,
                 prefix_end_index=runtime_prefix_end_index,
                 expanded_policy_path=expanded_policy_path,
+                expanded_policy_prefix_sources=expanded_policy_prefix_sources,
                 expected_route_count=(
                     None
                     if expanded_route_count_histogram_by_afi is not None

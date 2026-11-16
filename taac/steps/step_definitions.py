@@ -6993,6 +6993,7 @@ def create_set_route_filter_step(
     config_path: t.Optional[str] = None,
     source: str = "configerator",
     json_file_path: t.Optional[str] = None,
+    formulaic_prefix_sources: t.Mapping[str, t.Mapping[str, object]] | None = None,
     description: t.Optional[str] = None,
     verify_readback: bool = False,
 ) -> Step:
@@ -7036,6 +7037,11 @@ def create_set_route_filter_step(
 
     if json_file_path is not None:
         params_dict["json_file_path"] = json_file_path
+    if formulaic_prefix_sources is not None:
+        params_dict["formulaic_prefix_sources"] = {
+            statement: dict(prefix_source)
+            for statement, prefix_source in formulaic_prefix_sources.items()
+        }
     if verify_readback:
         params_dict["verify_readback"] = True
 
@@ -7815,6 +7821,8 @@ def create_route_registry_cleanup_step(
     ebgp_peer_description: str,
     expected_established_sessions: int | None,
     parent_prefixes_to_ignore: t.Sequence[str],
+    expanded_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
     exact_peer_group_names: t.Sequence[str] | None = None,
     convergence_soft_threshold_seconds: float = 60,
     convergence_hard_timeout_seconds: float = 300,
@@ -7870,6 +7878,11 @@ def create_route_registry_cleanup_step(
             "session_poll_interval_seconds": convergence_poll_interval_seconds,
         }
     )
+    if expanded_policy_prefix_sources is not None:
+        params_dict["expanded_policy_prefix_sources"] = {
+            statement: dict(prefix_source)
+            for statement, prefix_source in expanded_policy_prefix_sources.items()
+        }
     if peer_prefix_exclusion_blocks_by_pool is not None:
         params_dict["peer_prefix_exclusion_blocks_by_pool"] = {
             pool_name: [dict(block) for block in blocks]
@@ -9088,6 +9101,8 @@ def create_route_registry_prefix_list_setup_steps(
     prefix_start_index: int = 0,
     prefix_end_index: int = 100,
     baseline_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_650.json",
+    baseline_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
     expected_route_count: int | None = None,
     expected_route_count_histogram_by_afi: t.Optional[
         t.Mapping[str, t.Mapping[int, int]]
@@ -9196,6 +9211,7 @@ def create_route_registry_prefix_list_setup_steps(
     baseline_policy_step = create_set_route_filter_step(
         device_name=device_name,
         config_path=baseline_policy_path,
+        formulaic_prefix_sources=baseline_policy_prefix_sources,
         verify_readback=verify_policy_readback,
         description=policy_description,
     )

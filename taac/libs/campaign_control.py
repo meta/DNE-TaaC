@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import math
 import os
@@ -11,7 +12,7 @@ import stat
 import time
 import uuid
 from collections.abc import Mapping, Set
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -84,14 +85,22 @@ class HostActionSpec:
     max_hold_seconds: float = 60.0
     verify_hrt_recovery: bool = True
     continue_on_failure: bool = False
+    interfaces: tuple[str, ...] = ()
+    host_patterns: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:  # noqa: C901
         if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", self.action_id) is None:
             raise CampaignProtocolError("host action_id is invalid")
-        if self.kind not in {"restart_hrt", "hrt_status", "hrt_logs", "link_disable"}:
+        if self.kind not in {
+            "restart_hrt",
+            "kill_hrt",
+            "hrt_status",
+            "hrt_logs",
+            "link_disable",
+            "nic_flap",
+        }:
             raise CampaignProtocolError(f"unsupported host action kind {self.kind!r}")
-        if re.fullmatch(r"[A-Za-z0-9.-]+", self.host) is None:
-            raise CampaignProtocolError("host action hostname is invalid")
+        self._validate_host()
         if type(self.expected_sessions) is not int or self.expected_sessions < 1:
             raise CampaignProtocolError("expected_sessions must be a positive integer")
         if (
@@ -110,11 +119,11 @@ class HostActionSpec:
             or type(self.continue_on_failure) is not bool
         ):
             raise CampaignProtocolError("restart policy flags must be boolean")
-        if self.kind != "restart_hrt" and (
+        if self.kind not in {"restart_hrt", "kill_hrt"} and (
             not self.verify_hrt_recovery or self.continue_on_failure
         ):
             raise CampaignProtocolError(
-                "restart policy flags apply only to restart_hrt"
+                "restart policy flags apply only to restart_hrt and kill_hrt"
             )
         if (
             not isinstance(self.min_interval_seconds, (int, float))
@@ -133,12 +142,65 @@ class HostActionSpec:
                 raise CampaignProtocolError("link action requires an exact interface")
         elif self.interface is not None:
             raise CampaignProtocolError("interface is only valid for link actions")
+        self._validate_interfaces()
         if (
             type(self.max_hold_seconds) not in (int, float)
             or not math.isfinite(self.max_hold_seconds)
             or self.max_hold_seconds <= 0
         ):
             raise CampaignProtocolError("max_hold_seconds must be finite and positive")
+
+    def _validate_interfaces(self) -> None:
+        if not isinstance(self.interfaces, (list, tuple)):
+            raise CampaignProtocolError("interfaces must be an exact interface list")
+        if any(
+            not isinstance(interface, str)
+            or re.fullmatch(r"beth[0-9]+", interface) is None
+            for interface in self.interfaces
+        ):
+            raise CampaignProtocolError("NIC actions require exact beth interfaces")
+        if len(set(self.interfaces)) != len(self.interfaces):
+            raise CampaignProtocolError("interfaces must be unique")
+        if (self.kind == "nic_flap") != bool(self.interfaces):
+            raise CampaignProtocolError(
+                "only nic_flap requires a non-empty interface list"
+            )
+        object.__setattr__(self, "interfaces", tuple(self.interfaces))
+
+    def _validate_host(self) -> None:
+        if not isinstance(self.host_patterns, (list, tuple)) or any(
+            not isinstance(pattern, str)
+            or re.fullmatch(r"[a-z0-9.*-]+", pattern) is None
+            for pattern in self.host_patterns
+        ):
+            raise CampaignProtocolError("host_patterns must be hostname glob strings")
+        object.__setattr__(self, "host_patterns", tuple(self.host_patterns))
+        if self.host_patterns:
+            if self.host != "":
+                raise CampaignProtocolError("host_patterns requires an empty host")
+        elif (
+            not isinstance(self.host, str)
+            or re.fullmatch(r"[A-Za-z0-9.-]+", self.host) is None
+        ):
+            raise CampaignProtocolError("host action hostname is invalid")
+
+    def authorizes_host(self, host: str) -> bool:
+        if not isinstance(host, str) or re.fullmatch(r"[A-Za-z0-9.-]+", host) is None:
+            return False
+        canonical = host.lower().removesuffix(".facebook.com")
+        if self.host_patterns:
+            return any(fnmatch.fnmatchcase(canonical, p) for p in self.host_patterns)
+        return canonical == self.host.lower().removesuffix(".facebook.com")
+
+    def resolve_host(self, host: str | None = None) -> HostActionSpec:
+        if self.host_patterns and host is None:
+            raise CampaignProtocolError("this action requires --host")
+        target = self.host if host is None else host
+        if not self.authorizes_host(target):
+            raise CampaignProtocolError("host is not authorized for this action")
+        return replace(
+            self, host=target.lower().removesuffix(".facebook.com"), host_patterns=()
+        )
 
     @classmethod
     def from_payload(cls, payload: object) -> HostActionSpec:
@@ -153,6 +215,8 @@ class HostActionSpec:
             "max_hold_seconds": 60.0,
             "verify_hrt_recovery": True,
             "continue_on_failure": False,
+            "interfaces": (),
+            "host_patterns": (),
         }
         missing = expected - set(payload)
         unexpected = set(payload) - expected

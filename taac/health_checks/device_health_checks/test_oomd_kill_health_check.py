@@ -35,9 +35,10 @@ class TestOomdKillHealthCheck(unittest.IsolatedAsyncioTestCase):
             check = module.OomdKillHealthCheck(logger=MagicMock())
             check.driver = MagicMock()
             check.driver.async_run_cmd_on_shell = AsyncMock(side_effect=run_command)
-            with patch.object(module, "FB_OOMD_LOG_PATH", str(log)), patch.object(
-                module.time, "time", return_value=now
-            ):
+            # These tests cover the fb-oomd log path, so they turn off TAAC_OSS.
+            with patch.object(module, "TAAC_OSS", False), patch.object(
+                module, "FB_OOMD_LOG_PATH", str(log)
+            ), patch.object(module.time, "time", return_value=now):
                 return await check._run(
                     MagicMock(),
                     hc_types.BaseHealthCheckIn(),

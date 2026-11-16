@@ -1496,6 +1496,9 @@ def get_common_setup_tasks(
 
 def build_expected_peer_identity(
     parent_networks: t.Optional[t.Dict[str, str]] = None,
+    *,
+    ibgp_peers_per_plane: int = IBGP_PEER_SCALE_PER_PLANE,
+    include_bgp_mon: bool = True,
 ) -> t.Dict[str, str]:
     """
     Build expected {peer_addr: local_addr} mapping for full-scale EBB tests.
@@ -1515,6 +1518,9 @@ def build_expected_peer_identity(
             the peers really do come up on that chassis' subnets, so leaving
             this at the default marks every session as unexpected and fails
             the snapshot check on an otherwise healthy run.
+        ibgp_peers_per_plane: Peers in each HE and MP iBGP device group, from
+            the scale profile the topology was built at.
+        include_bgp_mon: Whether the BGP-monitor peers are expected at all.
 
     Returns:
         Mapping of peer address to the DUT-local address facing it.
@@ -1530,7 +1536,7 @@ def build_expected_peer_identity(
     for base, count in [
         (_net("ebgp_v6", IXIA_EBGP_IC_PARENT_NETWORK_V6), EBGP_PEER_COUNT_V6),
         *(
-            (_net(f"ibgp_{tier}_p{plane}_v6", default), IBGP_PEER_SCALE_PER_PLANE)
+            (_net(f"ibgp_{tier}_p{plane}_v6", default), ibgp_peers_per_plane)
             for tier, defaults in (
                 (
                     "dc",
@@ -1553,7 +1559,11 @@ def build_expected_peer_identity(
             )
             for plane, default in enumerate(defaults, start=1)
         ),
-        (_net("bgpmon_v6", IXIA_BGP_MON_IC_PARENT_NETWORK), BGP_MON_PEER_COUNT),
+        *(
+            ((_net("bgpmon_v6", IXIA_BGP_MON_IC_PARENT_NETWORK), BGP_MON_PEER_COUNT),)
+            if include_bgp_mon
+            else ()
+        ),
     ]:
         for entry in _generate_ixia_v6_peer_entries_for_bgpcpp(
             remote_as=0,
@@ -1567,7 +1577,7 @@ def build_expected_peer_identity(
     for base, count in [
         (_net("ebgp_v4", IXIA_EBGP_IC_PARENT_NETWORK_V4), EBGP_PEER_COUNT_V4),
         *(
-            (_net(f"ibgp_{tier}_p{plane}_v4", default), IBGP_PEER_SCALE_PER_PLANE)
+            (_net(f"ibgp_{tier}_p{plane}_v4", default), ibgp_peers_per_plane)
             for tier, defaults in (
                 (
                     "dc",

@@ -173,6 +173,7 @@ _FY26_INJECTION = OpenRInjectionPlan(
 class BgpEbbFullScaleFactoryTest(unittest.TestCase):
     _AUTOMATION = factory._EbbAutomationContract(
         non_monitor_established_session_count=1272,
+        has_bgp_monitor=True,
         internal_peer_group_names_by_afi={"ipv4": "IBGP-V4", "ipv6": "IBGP-V6"},
         ebgp_peer_group_names_by_afi={"ipv4": "EBGP-V4", "ipv6": "EBGP-V6"},
         ebgp_peer_item_names_by_afi={"ipv4": "PEER-V4", "ipv6": "PEER-V6"},

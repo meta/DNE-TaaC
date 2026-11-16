@@ -82,7 +82,6 @@ from taac.testconfigs.routing.cicd_ebb_int_tc import (
     NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
 )
 from taac.testconfigs.routing.factories.bgp_ebb_full_scale import (
-    _DEFAULT_EBGP_PREFIX_COUNT,
     _ebb_automation_contract,
     _EbbAutomationContract,
     _get_bgp_ebb_full_scale_playbooks,
@@ -164,6 +163,7 @@ _AUTOMATION_CONTRACT_TARGET = (
 )
 _CANONICAL_AUTOMATION_CONTRACT = _EbbAutomationContract(
     non_monitor_established_session_count=1272,
+    has_bgp_monitor=True,
     internal_peer_group_names_by_afi={
         "ipv4": "EB-EB-V4",
         "ipv6": "EB-EB-V6",
@@ -194,7 +194,7 @@ def _bound_full_scale_automation_artifact(
         scale=EBB_FY26_SCALE,
         openr_mode=OpenRMode.STANDALONE,
         include_bgpmon=True,
-        ebgp_prefix_count=_DEFAULT_EBGP_PREFIX_COUNT,
+        ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
         next_hops=next_hops,
     )
     return topology.bind_to_inventory(
@@ -1421,7 +1421,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                 inventory,
                 BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
                 bound=_full_scale_bound(),
-                ebgp_prefix_count=_DEFAULT_EBGP_PREFIX_COUNT,
+                ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
                 selected_tc7_playbooks=set(),
             )
 
@@ -1494,7 +1494,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                     inventory,
                     BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
                     bound=MagicMock(),
-                    ebgp_prefix_count=_DEFAULT_EBGP_PREFIX_COUNT,
+                    ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
                     selected_tc7_playbooks=set(),
                     port_map=port_map,
                 )
@@ -1522,7 +1522,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                     inventory,
                     BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
                     bound=MagicMock(),
-                    ebgp_prefix_count=_DEFAULT_EBGP_PREFIX_COUNT,
+                    ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
                     selected_tc7_playbooks=set(),
                     port_map=port_map,
                 )
@@ -1554,7 +1554,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                 inventory,
                 BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
                 bound=_full_scale_bound(),
-                ebgp_prefix_count=_DEFAULT_EBGP_PREFIX_COUNT,
+                ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
                 selected_tc7_playbooks=set(),
                 enable_update_group=False,
             )
@@ -1794,7 +1794,8 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             )
 
         items = _nhg_storm_ixia_items(
-            t.cast(BoundTopology, SimpleNamespace(device_groups=groups))
+            t.cast(BoundTopology, SimpleNamespace(device_groups=groups)),
+            target_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
         )
 
         self.assertEqual({"ipv4", "ipv6"}, set(items))
@@ -2330,7 +2331,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                     inventory,
                     BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
                     bound=_full_scale_bound(),
-                    ebgp_prefix_count=_DEFAULT_EBGP_PREFIX_COUNT,
+                    ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
                     selected_tc7_playbooks=set(),
                 )
 
@@ -2379,7 +2380,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                 inventory,
                 BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
                 bound=_full_scale_bound(),
-                ebgp_prefix_count=_DEFAULT_EBGP_PREFIX_COUNT,
+                ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
                 selected_tc7_playbooks=set(),
                 multipath_min_peers_to_stop=3,
                 multipath_max_peers_to_stop=7,

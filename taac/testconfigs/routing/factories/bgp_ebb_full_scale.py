@@ -25,15 +25,16 @@ from taac.abstractions.topologies.ebb_full_scale import (
     EBB_NEXT_HOPS,
     EBB_PARENT_NETWORKS,
     EBB_PEER_GROUPS,
-    EBB_PORT_MAP,
-    EBB_PORT_MAP_WITH_BGPMON,
+    ebb_port_map,
     ebb_topology,
     EbbNextHopScheme,
+    EbbScaleProfile,
 )
 from taac.abstractions.topology import (
     BgpPeerGroup,
     BoundDeviceGroup,
     BoundTopology,
+    DeviceGroupSpec,
     FormulaicPrefixSource,
     LogicalTopology,
     NextHopIntent,
@@ -133,8 +134,8 @@ _NHG_STORM_PLAYBOOK_NAME = "bgp_ebb_nexthop_group_count_threshold_playbook"
 # Five 30-prefix blocks per AFI per stage keep the restoration transient under
 # the 104,856-entry Jericho2 FecLevel2 table; a one-shot restore overflowed it.
 _NHG_STORM_RESTORATION_STAGE_PREFIX_COUNT = 150
-_DEFAULT_EBGP_PREFIX_COUNT = 750
-_RUNTIME_UPDATE_EBGP_PREFIX_COUNT = 850
+# CICD-EBB-12 advertises this many FA prefixes past the scale's baseline.
+_RUNTIME_UPDATE_EBGP_PREFIX_DELTA = 100
 _TC7_STATIC_EBGP_PREFIX_COUNT = 650
 _TC7_EXPECTED_SESSION_COUNT = 1272
 _TC7_PLAYBOOK_NAMES = (
@@ -159,12 +160,41 @@ _UG_2_7_2_EBGP_POOLS = (
     rf"^{_TC7_SHARED_EBGP_RUNTIME_POOL_V4}$",
     rf"^{_TC7_SHARED_EBGP_RUNTIME_POOL_V6}$",
 )
+_FY26_DRAIN_PNH_REASON = (
+    "its Open/R PNH readiness check is passed no range inventory, so it runs on "
+    "the runtime's FY26 defaults rather than the resolved injection"
+)
+# Playbooks whose contract still pins FY26 geometry outside this factory. They
+# build only at EBB_FY26_SCALE until that pin moves; selecting one at another
+# scale fails with the reason rather than emitting FY26 numbers.
+_FY26_ONLY_PLAYBOOKS: t.Mapping[str, str] = {
+    "bgp_ebb_attribute_churn_playbook": (
+        "its runtime samples only 750-route blocks (abstractions/churn/geometry.py)"
+    ),
+    "bgp_ebb_route_storm_playbook": (
+        "RouteStorm requires exactly 10,500 storm paths, and RouteStormRuntime "
+        "62 peers, 750 routes, rows 0-61 and 21/21/20 shards"
+    ),
+    "bgp_ebb_route_registry_runtime_update_playbook": (
+        "its route-registry prefix-list policies are the checked-in 750/850-route files"
+    ),
+    "bgp_ebb_fauu_drain_undrain_playbook": _FY26_DRAIN_PNH_REASON,
+    "bgp_ebb_plane_drain_undrain_playbook": _FY26_DRAIN_PNH_REASON,
+    "bgp_ebb_nexthop_group_count_threshold_playbook": (
+        "its NHG storm and restoration staging are calibrated to the FY26 FEC baseline"
+    ),
+    **dict.fromkeys(
+        _TC7_PLAYBOOK_NAMES,
+        "the UG 2.7 runtime steps pin the FY26 two-port 1,272-session contract",
+    ),
+}
 
 
 class _EbbAutomationContract(t.NamedTuple):
     """Runtime selectors derived from one bound full-scale topology."""
 
     non_monitor_established_session_count: int
+    has_bgp_monitor: bool
     internal_peer_group_names_by_afi: t.Mapping[str, str]
     ebgp_peer_group_names_by_afi: t.Mapping[str, str]
     ebgp_peer_item_names_by_afi: t.Mapping[str, str]
@@ -180,6 +210,18 @@ class _EbbAutomationContract(t.NamedTuple):
             self.ebgp_route_item_names_by_afi["ipv6"],
         )
         return rf"^(?:{'|'.join(re.escape(name) for name in names)})$"
+
+
+def _is_bgp_monitor(group: BoundDeviceGroup | DeviceGroupSpec) -> bool:
+    return group.peer_relationship is PeerRelationship.MONITOR
+
+
+def _ebb_session_groups(bound: BoundTopology) -> tuple[BoundDeviceGroup, ...]:
+    return tuple(
+        group
+        for group in bound.device_groups
+        if not _is_bgp_monitor(group) and not group.dut_neighbor_absent
+    )
 
 
 def _bound_peer_group_name(group: BoundDeviceGroup) -> str:
@@ -220,13 +262,7 @@ def _unique_peer_group_names_by_afi(
 def _ebb_automation_contract(bound: BoundTopology) -> _EbbAutomationContract:
     """Resolve every shared BGP/IXIA runtime handle from ``bound``."""
     groups = tuple(bound.device_groups)
-    session_groups = tuple(
-        group
-        for group in groups
-        if group.peer_relationship is not PeerRelationship.MONITOR
-        and not group.dut_neighbor_absent
-    )
-    session_count = sum(group.peer_count for group in session_groups)
+    session_count = sum(group.peer_count for group in _ebb_session_groups(bound))
     if session_count <= 0:
         raise ValueError("BGP EBB full-scale topology has no non-monitor sessions")
 
@@ -277,6 +313,7 @@ def _ebb_automation_contract(bound: BoundTopology) -> _EbbAutomationContract:
 
     return _EbbAutomationContract(
         non_monitor_established_session_count=session_count,
+        has_bgp_monitor=any(_is_bgp_monitor(group) for group in groups),
         internal_peer_group_names_by_afi=_unique_peer_group_names_by_afi(
             groups,
             relationship=PeerRelationship.INTERNAL,
@@ -414,6 +451,8 @@ def _validate_ebb12_automation_oracles(
 def _nhg_storm_ixia_items(
     bound: BoundTopology,
     automation: _EbbAutomationContract | None = None,
+    *,
+    target_prefix_count: int,
 ) -> dict[str, dict[str, t.Any]]:
     """Lower every topology-authored eBGP IXIA item into the C16 contract."""
     groups = [group for group in bound.device_groups if group.role == "uplink"]
@@ -464,10 +503,10 @@ def _nhg_storm_ixia_items(
                 f"CICD-EBB-16 group {group.name!r} has inconsistent peer/route rows"
             )
         routes_per_peer = route_counts.pop()
-        if routes_per_peer < _DEFAULT_EBGP_PREFIX_COUNT:
+        if routes_per_peer < target_prefix_count:
             raise ValueError(
                 f"CICD-EBB-16 group {group.name!r} exposes {routes_per_peer} "
-                f"prefixes per peer; requires at least {_DEFAULT_EBGP_PREFIX_COUNT}"
+                f"prefixes per peer; requires at least {target_prefix_count}"
             )
         items[afi] = {
             "logical_device_group": group.name,
@@ -481,7 +520,7 @@ def _nhg_storm_ixia_items(
                 else group.peer_count
             ),
             "expected_routes_per_peer": routes_per_peer,
-            "target_prefix_count": _DEFAULT_EBGP_PREFIX_COUNT,
+            "target_prefix_count": target_prefix_count,
         }
     return items
 
@@ -1036,8 +1075,12 @@ def _openr_helper_kv_link(physical_inventory: PhysicalInventory) -> dict:
 
 
 def _characterization_gates(
-    playbook_name: str, enable_update_group: bool
+    playbook_name: str,
+    enable_update_group: bool,
+    scale: EbbScaleProfile,
 ) -> CharacterizationGates:
+    if scale != EBB_FY26_SCALE:
+        return NO_CHARACTERIZATION_GATES
     gates_by_playbook = (
         _UG_CHARACTERIZATION_GATES
         if enable_update_group
@@ -1053,6 +1096,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
     bound: BoundTopology,
     ebgp_prefix_count: int,
     selected_tc7_playbooks: set[str],
+    scale: EbbScaleProfile = EBB_FY26_SCALE,
     port_map: t.Mapping[str, int] | None = None,
     enable_update_group: bool = True,
     multipath_test_duration_seconds: int = 1800,
@@ -1122,8 +1166,9 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
         return playbooks
 
     device_name = physical_inventory.device_name
-    resolved_port_map = EBB_PORT_MAP if port_map is None else port_map
-    missing_port_roles = sorted({"uplink", "ibgp"} - resolved_port_map.keys())
+    required_port_map = ebb_port_map(scale, include_bgpmon=False)
+    resolved_port_map = required_port_map if port_map is None else port_map
+    missing_port_roles = sorted(required_port_map.keys() - resolved_port_map.keys())
     if missing_port_roles:
         raise ValueError(
             "BGP EBB full-scale port_map is missing required roles: "
@@ -1162,7 +1207,11 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             "BGP EBB full-scale topology is missing required bgpmon_v6 network"
         ) from error
     bgp_mon_parent_prefix = f"{bound_bgp_mon_network}::/80"
-    expected_peer_identity = build_expected_peer_identity(bound_parent_networks)
+    expected_peer_identity = build_expected_peer_identity(
+        bound_parent_networks,
+        ibgp_peers_per_plane=scale.ibgp_peers_per_group,
+        include_bgp_mon=automation.has_bgp_monitor,
+    )
     # One resolved plan feeds setup, the health checks, the churn steps, and
     # teardown. Reading it back from the bound topology -- rather than from a
     # chassis constant -- is what keeps the PNH inventory the checks assert
@@ -1207,7 +1256,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
     full_scale_precheck_thresholds = get_precheck_thresholds()
     full_scale_precheck_thresholds.fec_threshold = _FULL_SCALE_FEC_PRECHECK_THRESHOLD
     baseline_route_count_histogram_by_afi = _ebb_route_count_histogram_by_afi(
-        bound, _DEFAULT_EBGP_PREFIX_COUNT
+        bound, scale.fa_routes_per_peer
     )
     full_route_count_histogram_by_afi = _ebb_route_count_histogram_by_afi(
         bound, ebgp_prefix_count
@@ -1229,8 +1278,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
         automation.ebgp_peer_group_names_by_afi["ipv6"],
         automation.ebgp_peer_group_names_by_afi["ipv4"],
     )
-    playbooks = [
-        get_bgp_ebb_attribute_churn_playbook(
+    # Built lazily so a playbook pinned to FY26 geometry is never constructed
+    # with another scale's numbers.
+    builders: dict[str, t.Callable[[], Playbook]] = {
+        "bgp_ebb_attribute_churn_playbook": lambda: get_bgp_ebb_attribute_churn_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1245,10 +1296,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
-                "bgp_ebb_attribute_churn_playbook", enable_update_group
+                "bgp_ebb_attribute_churn_playbook", enable_update_group, scale
             ),
         ),
-        get_bgp_ebb_route_storm_playbook(
+        "bgp_ebb_route_storm_playbook": lambda: get_bgp_ebb_route_storm_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1267,10 +1318,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             bounded_validation=route_storm_bounded_validation,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
-                "bgp_ebb_route_storm_playbook", enable_update_group
+                "bgp_ebb_route_storm_playbook", enable_update_group, scale
             ),
         ),
-        get_bgp_ebb_route_registry_runtime_update_playbook(
+        "bgp_ebb_route_registry_runtime_update_playbook": lambda: get_bgp_ebb_route_registry_runtime_update_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1280,6 +1331,11 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             prefix_pool_regex=automation.exact_ebgp_route_regex(),
             expected_prefix_pool_names=exact_ebgp_route_pool_names,
             exact_ebgp_peer_group_names=exact_ebgp_peer_group_names,
+            expected_route_count=scale.fa_routes_per_peer,
+            runtime_prefix_start_index=scale.fa_routes_per_peer,
+            runtime_prefix_end_index=(
+                scale.fa_routes_per_peer + _RUNTIME_UPDATE_EBGP_PREFIX_DELTA
+            ),
             expected_route_count_histogram_by_afi=(
                 baseline_route_count_histogram_by_afi
             ),
@@ -1294,9 +1350,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             characterization_gates=_characterization_gates(
                 "bgp_ebb_route_registry_runtime_update_playbook",
                 enable_update_group,
+                scale,
             ),
         ),
-        get_bgp_ebb_multipath_group_oscillation_playbook(
+        "bgp_ebb_multipath_group_oscillation_playbook": lambda: get_bgp_ebb_multipath_group_oscillation_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1321,9 +1378,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             characterization_gates=_characterization_gates(
                 "bgp_ebb_multipath_group_oscillation_playbook",
                 enable_update_group,
+                scale,
             ),
         ),
-        get_bgp_ebb_igp_pnh_metric_oscillation_playbook(
+        "bgp_ebb_igp_pnh_metric_oscillation_playbook": lambda: get_bgp_ebb_igp_pnh_metric_oscillation_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1348,9 +1406,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             characterization_gates=_characterization_gates(
                 "bgp_ebb_igp_pnh_metric_oscillation_playbook",
                 enable_update_group,
+                scale,
             ),
         ),
-        get_bgp_ebb_fauu_drain_undrain_playbook(
+        "bgp_ebb_fauu_drain_undrain_playbook": lambda: get_bgp_ebb_fauu_drain_undrain_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1362,10 +1421,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             bgp_mon_parent_network=bound_bgp_mon_network,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
-                "bgp_ebb_fauu_drain_undrain_playbook", enable_update_group
+                "bgp_ebb_fauu_drain_undrain_playbook", enable_update_group, scale
             ),
         ),
-        get_bgp_ebb_plane_drain_undrain_playbook(
+        "bgp_ebb_plane_drain_undrain_playbook": lambda: get_bgp_ebb_plane_drain_undrain_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1377,19 +1436,19 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             bgp_mon_parent_network=bound_bgp_mon_network,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
-                "bgp_ebb_plane_drain_undrain_playbook", enable_update_group
+                "bgp_ebb_plane_drain_undrain_playbook", enable_update_group, scale
             ),
         ),
-        get_bgp_ebb_longevity_playbook(
+        "bgp_ebb_longevity_playbook": lambda: get_bgp_ebb_longevity_playbook(
             device_name=device_name,
             duration=_LONGEVITY_DURATION_SECONDS,
             bgp_mon_parent_network=bound_bgp_mon_network,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
-                "bgp_ebb_longevity_playbook", enable_update_group
+                "bgp_ebb_longevity_playbook", enable_update_group, scale
             ),
         ),
-        get_bgp_ebb_daemon_restart_playbook(
+        "bgp_ebb_daemon_restart_playbook": lambda: get_bgp_ebb_daemon_restart_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1413,7 +1472,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             # different processes rather than one workload.
             characterization=DISABLED,
         ),
-        get_bgp_ebb_cold_start_playbook(
+        "bgp_ebb_cold_start_playbook": lambda: get_bgp_ebb_cold_start_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1428,12 +1487,12 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ibgp_pnh_step=openr_pnh_step,
             gateway_resolution_device_group_names=gateway_device_group_names,
         ),
-        get_bgp_ebb_ebgp_session_oscillation_playbook(
+        "bgp_ebb_ebgp_session_oscillation_playbook": lambda: get_bgp_ebb_ebgp_session_oscillation_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
-            ipv4_session_count=EBGP_PEER_COUNT_V4,
-            ipv6_session_count=EBGP_PEER_COUNT_V6,
+            ipv4_session_count=automation.ebgp_peer_counts_by_afi["ipv4"],
+            ipv6_session_count=automation.ebgp_peer_counts_by_afi["ipv6"],
             expected_established_sessions=session_count,
             profile=profile,
             precheck_thresholds=full_scale_precheck_thresholds,
@@ -1445,10 +1504,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
-                "bgp_ebb_ebgp_session_oscillation_playbook", enable_update_group
+                "bgp_ebb_ebgp_session_oscillation_playbook", enable_update_group, scale
             ),
         ),
-        get_bgp_ebb_ebgp_route_oscillation_playbook(
+        "bgp_ebb_ebgp_route_oscillation_playbook": lambda: get_bgp_ebb_ebgp_route_oscillation_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1461,6 +1520,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
                 automation.ebgp_route_item_names_by_afi["ipv6"],
             ),
             prefix_pool_names_by_afi=automation.ebgp_route_item_names_by_afi,
+            prefix_end_index=scale.fa_routes_per_peer,
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
@@ -1468,15 +1528,15 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
-                "bgp_ebb_ebgp_route_oscillation_playbook", enable_update_group
+                "bgp_ebb_ebgp_route_oscillation_playbook", enable_update_group, scale
             ),
         ),
-        get_bgp_ebb_ibgp_plane_session_oscillation_playbook(
+        "bgp_ebb_ibgp_plane_session_oscillation_playbook": lambda: get_bgp_ebb_ibgp_plane_session_oscillation_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
-            ipv4_sessions_per_plane=IBGP_PEER_SCALE_PER_PLANE,
-            ipv6_sessions_per_plane=IBGP_PEER_SCALE_PER_PLANE,
+            ipv4_sessions_per_plane=scale.ibgp_peers_per_group,
+            ipv6_sessions_per_plane=scale.ibgp_peers_per_group,
             expected_established_sessions=session_count,
             profile=profile,
             precheck_thresholds=full_scale_precheck_thresholds,
@@ -1490,10 +1550,12 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             characterization_gates=_characterization_gates(
                 "bgp_ebb_ibgp_plane_session_oscillation_playbook",
                 enable_update_group,
+                scale,
             ),
         ),
-        get_bgp_ebb_ibgp_route_oscillation_playbook(
+        "bgp_ebb_ibgp_route_oscillation_playbook": lambda: get_bgp_ebb_ibgp_route_oscillation_playbook(
             device_name=device_name,
+            prefix_end_index=scale.routes_per_he_peer,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
             expected_established_sessions=session_count,
@@ -1507,10 +1569,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
-                "bgp_ebb_ibgp_route_oscillation_playbook", enable_update_group
+                "bgp_ebb_ibgp_route_oscillation_playbook", enable_update_group, scale
             ),
         ),
-        get_bgp_ebb_igp_unresolvable_pnh_playbook(
+        "bgp_ebb_igp_unresolvable_pnh_playbook": lambda: get_bgp_ebb_igp_unresolvable_pnh_playbook(
             device_name=device_name,
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
@@ -1543,10 +1605,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ibgp_pnh_step=openr_pnh_step,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
-                "bgp_ebb_igp_unresolvable_pnh_playbook", enable_update_group
+                "bgp_ebb_igp_unresolvable_pnh_playbook", enable_update_group, scale
             ),
         ),
-        get_bgp_ebb_nexthop_group_count_threshold_playbook(
+        "bgp_ebb_nexthop_group_count_threshold_playbook": lambda: get_bgp_ebb_nexthop_group_count_threshold_playbook(
             device_name=device_name,
             expected_established_sessions=session_count,
             route_count_expected=ebgp_prefix_count,
@@ -1555,7 +1617,9 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
                 automation.ebgp_peer_group_names_by_afi["ipv4"],
             ),
             route_count_histogram_by_afi=full_route_count_histogram_by_afi,
-            ixia_items_by_afi=_nhg_storm_ixia_items(bound, automation),
+            ixia_items_by_afi=_nhg_storm_ixia_items(
+                bound, automation, target_prefix_count=scale.fa_routes_per_peer
+            ),
             prefix_pool_scope_regex=automation.exact_ebgp_route_regex(),
             nexthop_group_threshold=_NEXTHOP_GROUP_AGGREGATE_GUARDRAIL,
             epoch_count=nhg_storm_epoch_count,
@@ -1589,13 +1653,42 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             characterization_gates=_characterization_gates(
                 _NHG_STORM_PLAYBOOK_NAME,
                 enable_update_group,
+                scale,
             ),
         ),
-    ]
-    return playbooks
+    }
+    skipped = set() if scale == EBB_FY26_SCALE else set(_FY26_ONLY_PLAYBOOKS)
+    return [build() for name, build in builders.items() if name not in skipped]
 
 
 _EBB_IXIA_BGP_PEER_REGEX = r"^BGP_PEER_"
+
+
+def _validate_non_fy26_selection(
+    scale: EbbScaleProfile,
+    profile: BgpPlusPlusProfile,
+    playbooks_selected: list[str] | None,
+    setup_only: bool,
+) -> None:
+    if profile != BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R:
+        raise ValueError(
+            f"{scale.name} couples its HE peers to an Open/R injection of "
+            f"{scale.he_sites_per_range} sites per range; build it with "
+            "BGP_PLUS_PLUS_WITH_OPEN_R"
+        )
+    if setup_only:
+        return
+    blocked = (
+        list(_FY26_ONLY_PLAYBOOKS)
+        if not playbooks_selected
+        else [name for name in playbooks_selected if name in _FY26_ONLY_PLAYBOOKS]
+    )
+    if blocked:
+        reasons = "; ".join(f"{name}: {_FY26_ONLY_PLAYBOOKS[name]}" for name in blocked)
+        raise ValueError(
+            f"{scale.name} cannot build playbooks still pinned to FY26 geometry, "
+            f"so it needs an explicit selection without them. {reasons}"
+        )
 
 
 def _setup_enables_all_ixia_device_groups(playbook: Playbook) -> bool:
@@ -1666,6 +1759,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
     fibagent_bgp_nhg_watermark_low: int = EBB_FIBAGENT_BGP_NHG_WATERMARK_LOW,
     setup_only: bool = False,
     topology_override: LogicalTopology | None = None,
+    scale: EbbScaleProfile = EBB_FY26_SCALE,
 ) -> TestConfig:
     """Build one selectable test suite on the canonical EBB full-scale topology.
 
@@ -1699,6 +1793,11 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
             selector behavior unchanged.
         topology_override: Optional already-authored topology for an ad-hoc
             lifecycle binding. The standard EBB topology remains the default.
+        scale: Fleet profile the topology, port map, prefix windows, session
+            counts and playbook geometry are derived from. Every scheduled
+            binding uses ``EBB_FY26_SCALE``. Any other scale must use the
+            Open/R profile and name its playbooks, none of which may be one
+            still pinned to FY26 geometry.
     """
     if setup_only and playbooks_selected is not None:
         raise ValueError("setup_only requires playbooks_selected=None")
@@ -1724,6 +1823,8 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
         raise ValueError("BGP Update Group 2.7 requires the WITH_OPEN_R profile")
     if selected_tc7_playbooks and not enable_update_group:
         raise ValueError("BGP Update Group 2.7 requires Update Group enabled")
+    if scale != EBB_FY26_SCALE:
+        _validate_non_fy26_selection(scale, profile, playbooks_selected, setup_only)
 
     openr_mode = (
         OpenRMode.STANDALONE
@@ -1740,20 +1841,32 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
     runtime_prefix_sets, runtime_advertisements = _tc7_runtime_intents(
         selected_tc7_playbooks
     )
+    # Whether the run carries a BGP monitor is decided once: the port map and
+    # topology follow it here, and the session counts and peer identity read
+    # it back from the bound topology. An authored topology decides for
+    # itself. Otherwise the monitor rides a spare port only where the scale
+    # allows one, so a scale without a monitor never gains it from an
+    # inventory with extra ports.
     include_auxiliary_observers = (
-        not selected_tc7_playbooks and len(physical_inventory.ixia_ports) > 2
+        any(_is_bgp_monitor(group) for group in topology_override.device_groups)
+        if topology_override is not None
+        else scale.allows_bgp_monitor
+        and not selected_tc7_playbooks
+        and len(physical_inventory.ixia_ports)
+        > len(ebb_port_map(scale, include_bgpmon=False))
     )
-    default_port_map = (
-        EBB_PORT_MAP_WITH_BGPMON if include_auxiliary_observers else EBB_PORT_MAP
-    )
+    if include_auxiliary_observers and not scale.allows_bgp_monitor:
+        raise ValueError(
+            f"{scale.name} models no BGP monitor, but topology_override carries "
+            "one; drop its monitor group"
+        )
+    default_port_map = ebb_port_map(scale, include_bgpmon=include_auxiliary_observers)
     resolved_port_map = dict(default_port_map if port_map is None else port_map)
-    ebgp_prefix_count = (
-        _RUNTIME_UPDATE_EBGP_PREFIX_COUNT
-        if enable_runtime_update
-        else _DEFAULT_EBGP_PREFIX_COUNT
+    ebgp_prefix_count = scale.fa_routes_per_peer + (
+        _RUNTIME_UPDATE_EBGP_PREFIX_DELTA if enable_runtime_update else 0
     )
     topology = topology_override or ebb_topology(
-        scale=EBB_FY26_SCALE,
+        scale=scale,
         next_hops=next_hops,
         openr_mode=openr_mode,
         include_bgpmon=include_auxiliary_observers,
@@ -1805,6 +1918,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
             bound=bound,
             ebgp_prefix_count=ebgp_prefix_count,
             selected_tc7_playbooks=selected_tc7_playbooks,
+            scale=scale,
             port_map=resolved_port_map,
             enable_update_group=enable_update_group,
             multipath_test_duration_seconds=multipath_test_duration_seconds,

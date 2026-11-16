@@ -12330,8 +12330,14 @@ def create_longevity_no_prefix_no_session_flap_playbook(
 def create_longevity_continuous_toggle_device_group_playbook(
     cycles: int = 12,
     state_duration_s: int = 120,
+    device_group_name_regex: str = "ROGUE|NO_PACKET_LOSS_EXPECTED|ECMP_1|ARP|NDP",
 ) -> Playbook:
-    """BGP_DC longevity playbook: continuously toggle rogue device groups."""
+    """BGP_DC longevity playbook: continuously toggle rogue device groups.
+
+    Args:
+        device_group_name_regex: IXIA device groups to toggle. Override it when a
+            port carries an `NDP_HANDLER` group, which the default `NDP` matches.
+    """
     return Playbook(
         name="test_longevity_continuous_toggle_device_group",
         postchecks=[
@@ -12343,7 +12349,7 @@ def create_longevity_continuous_toggle_device_group_playbook(
                 api_name="toggle_device_groups",
                 args_dict={
                     "enable": True,
-                    "device_group_name_regex": "ROGUE|NO_PACKET_LOSS_EXPECTED|ECMP_1|ARP|NDP",
+                    "device_group_name_regex": device_group_name_regex,
                 },
             ),
         ],
@@ -12357,7 +12363,7 @@ def create_longevity_continuous_toggle_device_group_playbook(
                             api_name="toggle_device_groups",
                             args_dict={
                                 "enable": True,
-                                "device_group_name_regex": "ROGUE|NO_PACKET_LOSS_EXPECTED|ECMP_1|ARP|NDP",
+                                "device_group_name_regex": device_group_name_regex,
                             },
                         ),
                         create_longevity_step(duration=state_duration_s),
@@ -12365,7 +12371,7 @@ def create_longevity_continuous_toggle_device_group_playbook(
                             api_name="toggle_device_groups",
                             args_dict={
                                 "enable": False,
-                                "device_group_name_regex": "ROGUE|NO_PACKET_LOSS_EXPECTED|ECMP_1|ARP|NDP",
+                                "device_group_name_regex": device_group_name_regex,
                             },
                         ),
                         create_longevity_step(duration=state_duration_s),

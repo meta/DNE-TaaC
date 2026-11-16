@@ -201,6 +201,91 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
             with self.subTest(config=config.name):
                 self.assertEqual("routing.qual", config.basset_pool)
 
+    def test_non_fy26_forces_ebb_platform_before_bgpcpp_enable(self) -> None:
+        topology = _compiled_topology()
+        with mock.patch.object(factory, "ebb_topology", return_value=topology):
+            config = factory.create_bgp_ebb_full_scale_test_config(
+                _inventory(),
+                name="FY27_PLATFORM_TEST",
+                profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                scale=EBB_FY27_SCALE,
+                setup_only=True,
+            )
+
+        setup_tasks = list(config.setup_tasks or [])
+        params = [json.loads(task.params.json_params or "{}") for task in setup_tasks]
+        platform_indices = [
+            index
+            for index, (task, task_params) in enumerate(zip(setup_tasks, params))
+            if task.task_name == "configure_bgpcpp_startup"
+            and task_params.get("flags") == {"platform": "ebb"}
+        ]
+        bgpcpp_enable_indices = [
+            index
+            for index, (task, task_params) in enumerate(zip(setup_tasks, params))
+            if task.task_name == "arista_daemon_control"
+            and task_params.get("daemon_name") == "Bgpcpp"
+            and task_params.get("action") == "enable"
+        ]
+
+        self.assertEqual(1, len(platform_indices))
+        self.assertEqual(1, len(bgpcpp_enable_indices))
+        self.assertEqual(platform_indices[0] + 1, bgpcpp_enable_indices[0])
+        self.assertTrue(params[platform_indices[0]]["use_managed_shell"])
+
+    def test_non_fy26_cpu_and_rss_periodics_are_observe_only(self) -> None:
+        def periodic(key: str) -> taac_types.PeriodicTask:
+            return taac_types.PeriodicTask(
+                name=key,
+                interval=60,
+                task=taac_types.Task(
+                    task_name="counter_utilization",
+                    params=taac_types.Params(
+                        json_params=json.dumps(
+                            {"hostname": "bag012.ash6", "key": key, "threshold": 1}
+                        )
+                    ),
+                ),
+                retryable=False,
+                terminate_on_error=False,
+            )
+
+        playbook = taac_types.Playbook(
+            name="OBSERVE_ONLY_TEST",
+            periodic_tasks=[
+                periodic("bgpd.process.cpu.percent"),
+                periodic("bgpd.process.memory.rss.bytes"),
+                periodic("other.counter"),
+            ],
+        )
+        updated = factory._observe_only_cpu_rss_periodic_tasks(playbook)
+        params = [
+            json.loads(periodic_task.task.params.json_params or "{}")
+            for periodic_task in updated.periodic_tasks or []
+        ]
+
+        self.assertTrue(params[0]["observe_only"])
+        self.assertTrue(params[1]["observe_only"])
+        self.assertNotIn("observe_only", params[2])
+
+    def test_fy26_does_not_add_platform_startup_task(self) -> None:
+        topology = _compiled_topology()
+        with mock.patch.object(factory, "ebb_topology", return_value=topology):
+            config = factory.create_bgp_ebb_full_scale_test_config(
+                _inventory(),
+                name="FY26_PLATFORM_COMPATIBILITY_TEST",
+                setup_only=True,
+            )
+
+        platform_tasks = [
+            task
+            for task in config.setup_tasks or []
+            if task.task_name == "configure_bgpcpp_startup"
+            and json.loads(task.params.json_params or "{}").get("flags")
+            == {"platform": "ebb"}
+        ]
+        self.assertEqual([], platform_tasks)
+
     def test_openr_mode_owns_testbed_isolation_policy(self) -> None:
         for profile, expected_bypass in (
             (BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R, True),

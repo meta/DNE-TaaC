@@ -93,7 +93,7 @@ BGPCPP_CONFIG_PATH = "/mnt/flash/bgpcpp_config"
 BGPCPP_STARTUP_PATH = "/usr/sbin/run_bgpcpp.sh"
 # patternlint-disable-next-line no-dev-shm-usage
 BGP_RP_STATE_PATH = "/dev/shm/bgp_rp_state.txt"
-_STATE_GUARD_DAEMONS = (*BGPCPP_DAEMONS, "BgpTcpdump")
+_STATE_GUARD_DAEMONS = (*BGPCPP_DAEMONS, "bgpcpp", "BgpTcpdump")
 _STATE_GUARD_DIRECTORIES = (
     "/usr/facebook/thrift_acls",
     "/mnt/fb/agent_configs",

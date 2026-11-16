@@ -84,6 +84,9 @@ from taac.playbooks.routing.factories.qual_bgp_update_group.tc7_cases.sustained_
 from taac.steps.step_definitions import (
     create_bgp_ixia_session_recovery_step,
 )
+from taac.task_definitions import (
+    create_configure_bgpcpp_startup_task,
+)
 from taac.testconfigs.routing.factories.bgp_ug_2_7_suite import (
     build_bgp_ug_2_7_playbook,
 )
@@ -121,6 +124,7 @@ from taac.utils.hardware_capacity_utils import (
 )
 from taac.test_as_a_config.types import (
     BasicPortConfig,
+    Params,
     Playbook,
     PointInTimeHealthCheck,
     SnapshotHealthCheck,
@@ -1170,6 +1174,27 @@ def _ebb_fauu_capture_kwargs(
     return {"tcp_dump_capture_interface_ibgp": interfaces[0]}
 
 
+def _observe_only_cpu_rss_periodic_tasks(playbook: Playbook) -> Playbook:
+    periodic_tasks = []
+    for periodic_task in playbook.periodic_tasks or []:
+        task = periodic_task.task
+        if task is None or task.task_name != "counter_utilization":
+            periodic_tasks.append(periodic_task)
+            continue
+        params = json.loads(task.params.json_params or "{}")
+        if params.get("key") not in {
+            "bgpd.process.cpu.percent",
+            "bgpd.process.memory.rss.bytes",
+        }:
+            periodic_tasks.append(periodic_task)
+            continue
+        params["observe_only"] = True
+        periodic_tasks.append(
+            periodic_task(task=task(params=Params(json_params=json.dumps(params))))
+        )
+    return playbook(periodic_tasks=periodic_tasks)
+
+
 def _characterization_gates(
     playbook_name: str,
     enable_update_group: bool,
@@ -2032,6 +2057,37 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
     gateway_device_group_names = _enabled_ixia_device_group_names(
         compiled.basic_port_configs or []
     )
+    compiled_setup_tasks = (
+        insert_gateway_resolution_gate(
+            list(compiled.setup_tasks), gateway_device_group_names
+        )
+        if gateway_device_group_names
+        else list(compiled.setup_tasks)
+    )
+    if scale != EBB_FY26_SCALE:
+        bgpcpp_enable_indices = [
+            index
+            for index, task in enumerate(compiled_setup_tasks)
+            if task.task_name == "arista_daemon_control"
+            and json.loads(task.params.json_params or "{}").get("daemon_name")
+            == "Bgpcpp"
+            and json.loads(task.params.json_params or "{}").get("action") == "enable"
+        ]
+        if len(bgpcpp_enable_indices) != 1:
+            raise ValueError(
+                f"{scale.name} requires exactly one Bgpcpp enable task, found "
+                f"{len(bgpcpp_enable_indices)}"
+            )
+        compiled_setup_tasks.insert(
+            bgpcpp_enable_indices[0],
+            create_configure_bgpcpp_startup_task(
+                hostname=physical_inventory.device_name,
+                flags={"platform": "ebb"},
+                use_managed_shell=True,
+                set_outer_hostname=True,
+                ixia_needed=True,
+            ),
+        )
     # Auxiliary observation peers stay out of testcase triggers and verdicts.
     monitor_device_group_names = {
         group.legacy_ixia_device_group_name or group.name
@@ -2114,6 +2170,11 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
             )
         playbooks = [playbooks_by_name[name] for name in playbooks_selected]
 
+    if scale != EBB_FY26_SCALE:
+        playbooks = [
+            _observe_only_cpu_rss_periodic_tasks(playbook) for playbook in playbooks
+        ]
+
     # ixia03 peers intermittently stall after OPEN and never retry; one stuck
     # static peer (BGP-MON included) holds back End-of-RIB until the EoR timer
     # fires and fails convergence, so recover or name them before each case.
@@ -2142,13 +2203,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
         host_os_type_map=compiled.host_os_type_map,
         startup_checks=[],
         # A compile without an enabled IXIA device group has no gateway to check.
-        setup_tasks=(
-            insert_gateway_resolution_gate(
-                compiled.setup_tasks, gateway_device_group_names
-            )
-            if gateway_device_group_names
-            else compiled.setup_tasks
-        ),
+        setup_tasks=compiled_setup_tasks,
         teardown_tasks=compiled.teardown_tasks,
         basic_port_configs=compiled.basic_port_configs,
         basic_traffic_item_configs=(

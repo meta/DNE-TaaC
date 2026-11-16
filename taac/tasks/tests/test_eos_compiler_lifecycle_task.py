@@ -40,7 +40,13 @@ from taac.internal.tasks.eos_compiler_lifecycle_task import (
 
 
 _MODULE = "neteng.test_infra.dne.taac.internal.tasks.eos_compiler_lifecycle_task"
-_STATE_GUARD_DAEMONS = ["FibGrpc", "FibAgent", "Bgpcpp", "BgpTcpdump"]
+_STATE_GUARD_DAEMONS = [
+    "FibGrpc",
+    "FibAgent",
+    "Bgpcpp",
+    "bgpcpp",
+    "BgpTcpdump",
+]
 # patternlint-disable-next-line no-dev-shm-usage
 _RIB_POLICY_STATE_PATH = "/dev/shm/bgp_rp_state.txt"
 
@@ -1135,6 +1141,7 @@ class EosRoutingComponentCancellationTest(TestCase):
 class EosVerifiedConfigureReplaceTest(TestCase):
     def test_verify_script_compares_statements_with_the_backup(self) -> None:
         running = (
+            "> show running-config\n"
             "! Command: show running-config\n! device: dut\nhostname dut\n!\nend\n"
         )
         for backup, expected in (
@@ -2389,7 +2396,8 @@ class EosCompilerLifecycleTaskTest(TestCase):
         daemon_states: dict[str, bool] = {
             "FibGrpc": True,
             "FibAgent": False,
-            "Bgpcpp": True,
+            "Bgpcpp": False,
+            "bgpcpp": True,
             "BgpTcpdump": True,
         }
         driver = MagicMock()
@@ -2429,7 +2437,7 @@ class EosCompilerLifecycleTaskTest(TestCase):
         ):
             params = _state_guard_component_params("routing_component_snapshot")
             await task.run(params)
-            daemon_states["Bgpcpp"] = False
+            daemon_states["bgpcpp"] = False
             driver.async_read_file.return_value = "changed startup"
             await task.run(params)
 
@@ -2468,7 +2476,8 @@ class EosCompilerLifecycleTaskTest(TestCase):
         daemon_states: dict[str, bool] = {
             "FibGrpc": True,
             "FibAgent": False,
-            "Bgpcpp": True,
+            "Bgpcpp": False,
+            "bgpcpp": True,
             "BgpTcpdump": True,
         }
         transitions: list[tuple[str, bool]] = []
@@ -2577,6 +2586,7 @@ class EosCompilerLifecycleTaskTest(TestCase):
                     "FibGrpc": False,
                     "FibAgent": True,
                     "Bgpcpp": True,
+                    "bgpcpp": False,
                     "BgpTcpdump": False,
                 }
             )
@@ -2589,7 +2599,7 @@ class EosCompilerLifecycleTaskTest(TestCase):
                 ("Bgpcpp", False),
                 ("FibAgent", False),
                 ("FibGrpc", True),
-                ("Bgpcpp", True),
+                ("bgpcpp", True),
                 ("BgpTcpdump", True),
             ],
             transitions,
@@ -2598,7 +2608,8 @@ class EosCompilerLifecycleTaskTest(TestCase):
             {
                 "FibGrpc": True,
                 "FibAgent": False,
-                "Bgpcpp": True,
+                "Bgpcpp": False,
+                "bgpcpp": True,
                 "BgpTcpdump": True,
             },
             daemon_states,
@@ -2619,7 +2630,7 @@ class EosCompilerLifecycleTaskTest(TestCase):
             events.index("file:/usr/sbin/run_bgpcpp.sh"), events.index("running-config")
         )
         self.assertLess(
-            events.index("running-config"), events.index("daemon:Bgpcpp:True")
+            events.index("running-config"), events.index("daemon:bgpcpp:True")
         )
 
         commands = tuple(

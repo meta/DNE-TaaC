@@ -336,12 +336,12 @@ IXIA_LLDP_PEERS: t.Dict[str, str] = {
 #############################################################
 
 # EOS daemon names that were renamed, mapped to the names they replace. The
-# bgpcpp daemon was "Bgp" in TAAC but "Bgpcpp" in production (eb* routers), and
-# "Bgp" also collides with Arista's native multi-agent BGP process. Enabling the
-# new name removes the old stanza first, otherwise both daemons would run
-# bgpcpp against the same config and ports.
+# bgpcpp daemon used "Bgp" in older TAAC configs and "bgpcpp" on some lab
+# devices before standardizing on the production "Bgpcpp" spelling. Enabling
+# the canonical name removes either old stanza first, otherwise two copies can
+# run against the same config and ports.
 RENAMED_ARISTA_DAEMONS: t.Dict[str, t.Tuple[str, ...]] = {
-    "Bgpcpp": ("Bgp",),
+    "Bgpcpp": ("Bgp", "bgpcpp"),
 }
 
 # Default execution scripts for Arista daemon control

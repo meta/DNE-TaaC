@@ -44,7 +44,7 @@ class ConfigureBgpcppStartupManagedShellTest(later.unittest.TestCase):
     @patch(f"{_STARTUP_MODULE}.async_get_device_driver", new_callable=AsyncMock)
     async def test_managed_shell_runs_seds_via_driver(self, mock_get_driver) -> None:
         mock_driver = MagicMock()
-        mock_driver.async_run_cmd_on_shell = AsyncMock(
+        mock_driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
             side_effect=[_FLAG_NOT_EXACT_SENTINEL, "", "", _FLAG_VERIFIED_SENTINEL]
         )
         mock_get_driver.return_value = mock_driver
@@ -58,7 +58,10 @@ class ConfigureBgpcppStartupManagedShellTest(later.unittest.TestCase):
         )
 
         mock_get_driver.assert_awaited_once_with("bag010.ash6")
-        sent = [c.args[0] for c in mock_driver.async_run_cmd_on_shell.await_args_list]
+        sent = [
+            c.args[0]
+            for c in mock_driver.async_execute_show_or_configure_cmd_on_shell.await_args_list
+        ]
         self.assertEqual(
             sent,
             [
@@ -79,7 +82,7 @@ class ConfigureBgpcppStartupManagedShellTest(later.unittest.TestCase):
         self, mock_get_driver
     ) -> None:
         mock_driver = MagicMock()
-        mock_driver.async_run_cmd_on_shell = AsyncMock(
+        mock_driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
             side_effect=[
                 _FLAG_NOT_EXACT_SENTINEL,
                 "",
@@ -104,7 +107,10 @@ class ConfigureBgpcppStartupManagedShellTest(later.unittest.TestCase):
             }
         )
 
-        sent = [c.args[0] for c in mock_driver.async_run_cmd_on_shell.await_args_list]
+        sent = [
+            c.args[0]
+            for c in mock_driver.async_execute_show_or_configure_cmd_on_shell.await_args_list
+        ]
         self.assertEqual(
             sent,
             [
@@ -143,7 +149,7 @@ class ConfigureBgpcppStartupManagedShellTest(later.unittest.TestCase):
         """Managed mode passes no SSH credentials, so it must never construct
         the raw-SSH helper."""
         mock_driver = MagicMock()
-        mock_driver.async_run_cmd_on_shell = AsyncMock(
+        mock_driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
             side_effect=[_FLAG_NOT_EXACT_SENTINEL, "", "", _FLAG_VERIFIED_SENTINEL]
         )
         mock_get_driver.return_value = mock_driver
@@ -163,7 +169,7 @@ class ConfigureBgpcppStartupManagedShellTest(later.unittest.TestCase):
         self, mock_get_driver
     ) -> None:
         mock_driver = MagicMock()
-        mock_driver.async_run_cmd_on_shell = AsyncMock(
+        mock_driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
             return_value=_FLAG_VERIFIED_SENTINEL
         )
         mock_get_driver.return_value = mock_driver
@@ -176,7 +182,7 @@ class ConfigureBgpcppStartupManagedShellTest(later.unittest.TestCase):
             }
         )
 
-        mock_driver.async_run_cmd_on_shell.assert_awaited_once_with(
+        mock_driver.async_execute_show_or_configure_cmd_on_shell.assert_awaited_once_with(
             _build_flag_exact_command(
                 "bgp_resolve_nexthops_from_interface_state", "true"
             )
@@ -203,7 +209,7 @@ class ConfigureBgpcppStartupManagedShellTest(later.unittest.TestCase):
         self, mock_get_driver
     ) -> None:
         mock_driver = MagicMock()
-        mock_driver.async_run_cmd_on_shell = AsyncMock(
+        mock_driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
             side_effect=[_FLAG_NOT_EXACT_SENTINEL, "", "", ""]
         )
         mock_get_driver.return_value = mock_driver
@@ -222,7 +228,7 @@ class ConfigureBgpcppStartupManagedShellTest(later.unittest.TestCase):
         self, mock_get_driver
     ) -> None:
         mock_driver = MagicMock()
-        mock_driver.async_run_cmd_on_shell = AsyncMock(
+        mock_driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
             side_effect=ConnectionError("transport failed")
         )
         mock_get_driver.return_value = mock_driver

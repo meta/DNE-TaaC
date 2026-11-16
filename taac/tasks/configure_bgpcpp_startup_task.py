@@ -46,6 +46,12 @@ _FLAG_VERIFIED_SENTINEL = "TAAC_BGPCPP_FLAG_VERIFIED"
 _FLAG_NOT_EXACT_SENTINEL = "TAAC_BGPCPP_FLAG_NOT_EXACT"
 
 
+class _ManagedEosShell(t.Protocol):
+    async def async_execute_show_or_configure_cmd_on_shell(
+        self, command: str
+    ) -> str: ...
+
+
 def _build_flag_sed_commands(flag_name: str, flag_value: str) -> t.List[str]:
     """
     Build the idempotent seds that add/update one bgpcpp gflag in
@@ -81,7 +87,7 @@ def _build_flag_verify_command(flag_name: str, flag_value: str) -> str:
     return (
         f"bash grep -F -- {shlex.quote(expected)} "
         f"{shlex.quote(RUN_BGPCPP_SCRIPT_PATH)} >/dev/null && "
-        f"printf %s {shlex.quote(_FLAG_VERIFIED_SENTINEL)}"
+        f"printf '%s\\n' {shlex.quote(_FLAG_VERIFIED_SENTINEL)}"
     )
 
 
@@ -94,8 +100,8 @@ def _build_flag_exact_command(flag_name: str, flag_value: str) -> str:
         "bash "
         f'test "$(grep -Fxc -- {shlex.quote(expected_line)} {path})" -eq 1 && '
         f'test "$(grep -c -E -- {shlex.quote(assignment_pattern)} {path})" -eq 1 '
-        f"&& printf %s {shlex.quote(_FLAG_VERIFIED_SENTINEL)} "
-        f"|| printf %s {shlex.quote(_FLAG_NOT_EXACT_SENTINEL)}"
+        f"&& printf '%s\\n' {shlex.quote(_FLAG_VERIFIED_SENTINEL)} "
+        f"|| printf '%s\\n' {shlex.quote(_FLAG_NOT_EXACT_SENTINEL)}"
     )
 
 
@@ -166,10 +172,10 @@ class ConfigureBgpcppStartupTask(BaseTask):
                 "enable or add an explicit daemon-control task after it."
             )
 
-        driver = await async_get_device_driver(hostname)
+        driver = t.cast(_ManagedEosShell, await async_get_device_driver(hostname))
         for flag_name, flag_value in flags.items():
             self.logger.info(f"  Setting --{flag_name}={flag_value}")
-            current = await driver.async_run_cmd_on_shell(
+            current = await driver.async_execute_show_or_configure_cmd_on_shell(
                 _build_flag_exact_command(flag_name, flag_value)
             )
             if _FLAG_VERIFIED_SENTINEL in str(current):
@@ -181,9 +187,9 @@ class ConfigureBgpcppStartupTask(BaseTask):
                     f"{RUN_BGPCPP_SCRIPT_PATH}: unexpected probe output"
                 )
             for cmd in _build_flag_sed_commands(flag_name, flag_value):
-                await driver.async_run_cmd_on_shell(cmd)
+                await driver.async_execute_show_or_configure_cmd_on_shell(cmd)
             try:
-                output = await driver.async_run_cmd_on_shell(
+                output = await driver.async_execute_show_or_configure_cmd_on_shell(
                     _build_flag_verify_command(flag_name, flag_value)
                 )
             except Exception as error:

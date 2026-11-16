@@ -56,7 +56,7 @@ class BgpEbbStateGuardTasksTest(unittest.TestCase):
         component_snapshot = _params(setup_tasks[0])
         self.assertEqual(BGPCPP_STARTUP_PATH, component_snapshot["startup_path"])
         self.assertEqual(
-            [*BGPCPP_DAEMONS, "BgpTcpdump"],
+            [*BGPCPP_DAEMONS, "bgpcpp", "BgpTcpdump"],
             component_snapshot["daemon_names"],
         )
         self.assertEqual(

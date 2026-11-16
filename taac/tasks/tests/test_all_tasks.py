@@ -110,7 +110,7 @@ class AristaDaemonControlTaskTest(later.unittest.TestCase):
             driver.async_execute_show_or_configure_cmd_on_shell.await_args_list[2],
         )
 
-    async def test_enable_removes_stanza_left_under_renamed_daemon(self) -> None:
+    async def test_enable_removes_stanzas_left_under_renamed_daemons(self) -> None:
         driver = MagicMock()
         driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock()
         task = AristaDaemonControlTask(logger=MagicMock())
@@ -118,9 +118,16 @@ class AristaDaemonControlTaskTest(later.unittest.TestCase):
 
         await task._remove_renamed_daemons(driver, "Bgpcpp")
 
-        task._check_daemon_exists.assert_awaited_once_with(driver, "Bgp")
-        driver.async_execute_show_or_configure_cmd_on_shell.assert_awaited_once_with(
-            "no daemon Bgp", configure=True
+        self.assertEqual(
+            [call(driver, "Bgp"), call(driver, "bgpcpp")],
+            task._check_daemon_exists.await_args_list,
+        )
+        self.assertEqual(
+            [
+                call("no daemon Bgp", configure=True),
+                call("no daemon bgpcpp", configure=True),
+            ],
+            driver.async_execute_show_or_configure_cmd_on_shell.await_args_list,
         )
 
     async def test_enable_skips_removal_when_old_stanza_is_absent(self) -> None:
@@ -132,7 +139,10 @@ class AristaDaemonControlTaskTest(later.unittest.TestCase):
         await task._remove_renamed_daemons(driver, "Bgpcpp")
         await task._remove_renamed_daemons(driver, "FibAgent")
 
-        task._check_daemon_exists.assert_awaited_once_with(driver, "Bgp")
+        self.assertEqual(
+            [call(driver, "Bgp"), call(driver, "bgpcpp")],
+            task._check_daemon_exists.await_args_list,
+        )
         driver.async_execute_show_or_configure_cmd_on_shell.assert_not_awaited()
 
     async def test_enable_is_noop_when_daemon_is_already_healthy(self) -> None:

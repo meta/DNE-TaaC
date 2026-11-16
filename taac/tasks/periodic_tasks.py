@@ -339,14 +339,18 @@ class CounterThresholdTask(PeriodicTask):
                 - fail_on_breach: When True, raise ``CounterThresholdBreach``
                     the moment a sample exceeds ``threshold`` so the
                     PeriodicTaskWorker (with ``terminate_on_error=True``) fails
-                    the test mid-run. When False (default), a breach only warns
-                    and is left to the non-gating final check. Default: False.
+                    the test mid-run. When False (default), a breach is left to
+                    the final check. Default: False.
+                - observe_only: When True, retain threshold warnings and plots
+                    but report the final check as PASS for calibration. Default:
+                    False.
         """
         hostname = params["hostname"]
         key = params["key"]
         threshold = params["threshold"]
         cpu_count = params.get("cpu_count", None)
         fail_on_breach = params.get("fail_on_breach", False)
+        observe_only = params.get("observe_only", False)
 
         counter = None
         try:
@@ -377,14 +381,17 @@ class CounterThresholdTask(PeriodicTask):
         # try/except: a fail_on_breach raise must propagate to the worker (which
         # terminates the test) rather than being swallowed as a collection error.
         if counter > threshold:
-            if fail_on_breach:
+            if fail_on_breach and not observe_only:
                 raise CounterThresholdBreach(
                     f"{key} value {counter} exceeded threshold {threshold} "
                     f"mid-run on {hostname}; failing test (fail_on_breach=True)."
                 )
 
+            verdict = (
+                "observe-only reference" if observe_only else "will check max at end"
+            )
             self.logger.warning(
-                f"{key} value {counter} exceeds threshold {threshold} (will check max at end)"
+                f"{key} value {counter} exceeds threshold {threshold} ({verdict})"
             )
         else:
             self.logger.info(f"{key} value {counter} is within threshold {threshold}")
@@ -425,9 +432,16 @@ class CounterThresholdTask(PeriodicTask):
             )
 
         key = self._params.get("key", "counter")
+        observe_only = self._params.get("observe_only", False)
 
         # Determine status and base message
-        if max_counter > threshold:
+        if observe_only:
+            status = hc_types.HealthCheckStatus.PASS
+            message = (
+                f"Observed max {key} value {max_counter} against reference "
+                f"threshold {threshold} (observe-only)"
+            )
+        elif max_counter > threshold:
             status = hc_types.HealthCheckStatus.FAIL
             message = f"Max {key} value {max_counter} exceeded threshold {threshold}"
         else:

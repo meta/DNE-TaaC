@@ -1500,6 +1500,7 @@ def create_counter_utilization_task(
     enable_plotting: bool = True,
     cpu_count: t.Optional[int] = None,
     fail_on_breach: bool = False,
+    observe_only: bool = False,
 ) -> Task:
     """
     Create a task to check counter utilization.
@@ -1513,8 +1514,11 @@ def create_counter_utilization_task(
         fail_on_breach: When True, the task raises the moment a sampled value
             exceeds ``threshold`` mid-run. Combined with the PeriodicTask's
             ``terminate_on_error=True`` this fails the test immediately instead
-            of only recording a non-gating final-check result. Left out of the
-            serialized params when False to preserve golden byte-equivalence.
+            of only recording a final-check result. Left out of the serialized
+            params when False to preserve golden byte-equivalence.
+        observe_only: Collect and plot samples against ``threshold`` without
+            failing the final check when the reference is exceeded. Mutually
+            exclusive with ``fail_on_breach`` and omitted when False.
 
     Returns:
         Task object to check counter utilization
@@ -1527,8 +1531,12 @@ def create_counter_utilization_task(
     }
     if cpu_count is not None:
         params["cpu_count"] = cpu_count
+    if fail_on_breach and observe_only:
+        raise ValueError("fail_on_breach and observe_only are mutually exclusive")
     if fail_on_breach:
         params["fail_on_breach"] = fail_on_breach
+    if observe_only:
+        params["observe_only"] = observe_only
 
     return Task(
         task_name="counter_utilization",

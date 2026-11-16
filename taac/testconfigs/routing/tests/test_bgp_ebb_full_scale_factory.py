@@ -50,6 +50,7 @@ from taac.testconfigs.routing import (
 from taac.testconfigs.routing.factories import (
     bgp_ebb_full_scale as factory,
 )
+from taac.utils.json_thrift_utils import thrift_to_json
 from taac.test_as_a_config import types as taac_types
 
 
@@ -1625,3 +1626,134 @@ class EbbFy27RouteRegistryFactoryTest(unittest.TestCase):
                 next_hops=EBB_NEXT_HOPS_IXIA03,
                 scale=EBB_FY27_SCALE,
             )
+
+
+_SUPPORTED_NON_UG_FY27_PLAYBOOKS = [
+    "bgp_ebb_daemon_restart_playbook",
+    "bgp_ebb_ebgp_session_oscillation_playbook",
+    "bgp_ebb_cold_start_playbook",
+    "bgp_ebb_ebgp_route_oscillation_playbook",
+    "bgp_ebb_igp_unresolvable_pnh_playbook",
+]
+_STALE_FY26_COUNTS = frozenset({62, 63, 248, 252, 496, 504, 992, 1_272, 1_274, 46_500})
+
+
+def _integer_leaves(
+    value: t.Any, path: tuple[t.Any, ...] = ()
+) -> t.Iterator[tuple[tuple[t.Any, ...], int]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield from _integer_leaves(child, (*path, key))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _integer_leaves(child, (*path, index))
+    elif isinstance(value, str) and value[:1] in "{[":
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return
+        yield from _integer_leaves(decoded, (*path, "<json>"))
+    elif isinstance(value, int) and not isinstance(value, bool):
+        yield path, value
+
+
+class EbbFy27SupportedNonUgFactoryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.config = factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB008_ASH6,
+            name="FY27_SUPPORTED_NON_UG_FACTORY_TEST",
+            playbooks_selected=_SUPPORTED_NON_UG_FY27_PLAYBOOKS,
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            enable_update_group=False,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            scale=EBB_FY27_SCALE,
+        )
+        cls.serialized = json.loads(thrift_to_json(cls.config))
+
+    def test_cases_build_in_non_ug_selection_order(self) -> None:
+        self.assertEqual(
+            [
+                "bgp_ebb_daemon_restart_playbook",
+                "bgp_ebb_ebgp_session_oscillation_playbook",
+                "bgp_ebb_cold_start_playbook",
+                "bgp_ebb_ebgp_route_oscillation_playbook",
+                "bgp_ebb_igp_unresolvable_pnh_playbook",
+            ],
+            [playbook.name for playbook in self.config.playbooks or []],
+        )
+
+    def test_cases_contain_no_stale_fy26_scale_counts(self) -> None:
+        stale = [
+            (path, value)
+            for path, value in _integer_leaves(self.serialized)
+            if value in _STALE_FY26_COUNTS
+        ]
+        self.assertEqual([], stale)
+
+    def _playbook_leaves(self, name: str, key: str) -> set[int]:
+        (playbook,) = [
+            playbook
+            for playbook in self.serialized["playbooks"]
+            if playbook["name"] == name
+        ]
+        return {value for path, value in _integer_leaves(playbook) if path[-1] == key}
+
+    def test_case_specific_session_and_route_geometry(self) -> None:
+        self.assertEqual(
+            {140},
+            self._playbook_leaves(
+                "bgp_ebb_ebgp_session_oscillation_playbook", "session_count"
+            ),
+        )
+        self.assertEqual(
+            {1_000},
+            self._playbook_leaves(
+                "bgp_ebb_ebgp_route_oscillation_playbook", "prefix_end_index"
+            ),
+        )
+        session_totals = {
+            value
+            for path, value in _integer_leaves(self.serialized)
+            if path[-1]
+            in {
+                "expected_established_sessions",
+                "expected_established_session_count",
+                "expected_in_scope_sessions",
+            }
+        }
+        self.assertEqual({1_880}, session_totals)
+
+    def test_monitor_free_three_port_binding(self) -> None:
+        (endpoint,) = self.config.endpoints or []
+        self.assertEqual(
+            ["Ethernet3/35/1", "Ethernet3/35/2", "Ethernet3/35/3"],
+            list(endpoint.ixia_ports or ()),
+        )
+        names = {
+            str(group.device_group_name)
+            for port in self.config.basic_port_configs or []
+            for group in port.device_group_configs or []
+        }
+        self.assertFalse(any("BGP_MON" in name for name in names))
+        self.assertEqual(18, len(names))
+
+    def test_restart_and_cold_start_peer_identity_is_fy27(self) -> None:
+        for name in ("bgp_ebb_daemon_restart_playbook", "bgp_ebb_cold_start_playbook"):
+            with self.subTest(playbook=name):
+                (playbook,) = [
+                    playbook
+                    for playbook in self.config.playbooks or []
+                    if playbook.name == name
+                ]
+                identities = [
+                    params["expected_peer_identity"]
+                    for check in playbook.snapshot_checks or []
+                    if check.check_params is not None
+                    and check.check_params.json_params is not None
+                    for params in [json.loads(check.check_params.json_params)]
+                    if "expected_peer_identity" in params
+                ]
+                self.assertTrue(identities)
+                self.assertTrue(all(len(identity) == 1_880 for identity in identities))

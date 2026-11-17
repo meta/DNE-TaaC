@@ -4281,6 +4281,8 @@ def create_fpf_start_collectors_task(
     hrt_device_ids: t.Optional[t.List[int]] = None,
     hrt_plane_ids: t.Optional[t.List[int]] = None,
     additional_namespaces: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
+    prod_prefix_gtsws: t.Optional[t.List[str]] = None,
+    prod_prefix_poll_interval_sec: t.Optional[float] = None,
 ) -> Task:
     """Create a setup task that starts long-lived FPF collectors.
 
@@ -4344,6 +4346,10 @@ def create_fpf_start_collectors_task(
         params["hrt_device_ids"] = hrt_device_ids
     if hrt_plane_ids and hrt_plane_ids != list(range(8)):
         params["hrt_plane_ids"] = hrt_plane_ids
+    if prod_prefix_gtsws is not None:
+        params["prod_prefix_gtsws"] = prod_prefix_gtsws
+    if prod_prefix_poll_interval_sec is not None:
+        params["prod_prefix_poll_interval_sec"] = prod_prefix_poll_interval_sec
     if additional_namespaces:
         params["additional_namespaces"] = additional_namespaces
     if fsdb_session_hosts:

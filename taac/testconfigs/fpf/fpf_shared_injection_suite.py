@@ -40,6 +40,7 @@ import os
 from taac.health_checks.healthcheck_definitions import (
     create_drain_state_check,
     create_fpf_host_spray_check,
+    create_fpf_prod_switch_prefix_check,
 )
 from taac.libs.fpf.fpf_prod_prefix_map import get_prefix
 from taac.playbooks.playbook_definitions import (
@@ -324,6 +325,26 @@ def _require_cross_host_prod_prefix_checks(playbooks: list) -> None:
             replacements[field_name] = checks
         rewritten.append(playbook(**replacements))
     playbooks[:] = rewritten
+
+
+def _add_production_switch_prefix_checks(playbooks: list) -> None:
+    """Observe baseline routes on both pods; disruptive stages own their expected state."""
+    replacements = []
+    for playbook in playbooks:
+        prechecks = list(playbook.prechecks or [])
+        postchecks = list(playbook.postchecks or [])
+        for protocol in ("bgp", "fsdb"):
+            prechecks.append(
+                create_fpf_prod_switch_prefix_check(
+                    protocol,
+                    use_test_case_start_time=False,
+                    check_id=f"fpf_prod_{protocol}_prefix_precheck",
+                )
+            )
+            if playbook.name == "fpf_tc41_longevity_pristine":
+                postchecks.append(create_fpf_prod_switch_prefix_check(protocol))
+        replacements.append(playbook(prechecks=prechecks, postchecks=postchecks))
+    playbooks[:] = replacements
 
 
 def _ib_readiness_config(
@@ -2383,6 +2404,7 @@ def create_fpf_shared_injection_suite_test_config() -> TestConfig:
     # Full device reboot (most destructive) — last.
     playbooks += _tc55(spray=spray, skip_ssh=skip_ssh)
 
+    _add_production_switch_prefix_checks(playbooks)
     _require_cross_host_prod_prefix_checks(playbooks)
     _use_recent_baseline_for_prod_prefix_prechecks(playbooks)
 
@@ -2400,6 +2422,7 @@ def create_fpf_shared_injection_suite_test_config() -> TestConfig:
         baseline_collection_sec=fpf_collector_baseline_sec(),
         prod_prefixes_by_host=PROD_PREFIXES_BY_HOST,
         prod_prefix_device_id=PROD_PREFIX_DEVICE_ID,
+        prod_prefix_poll_interval_sec=2.0,
         fsdb_mode=FSDB_COLLECTOR_MODE,
         allow_baseline_failures=ALLOW_BASELINE_FAILURES,
         enable_fsdb_session_collector=True,

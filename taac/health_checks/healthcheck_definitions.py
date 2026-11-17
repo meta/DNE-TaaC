@@ -4349,3 +4349,46 @@ def create_in_congestion_discard_check(
         name=hc_types.CheckName.IN_CONGESTION_DISCARD_CHECK,
         check_params=check_params,
     )
+
+
+def create_fpf_prod_switch_prefix_check(
+    protocol: str,
+    expected_by_gtsw: dict[str, dict[str, bool]] | None = None,
+    mode: str = "stability",
+    trigger: str = "disruption",
+    lookback_sec: float = 300,
+    use_test_case_start_time: bool = True,
+    max_convergence_sec: float = 10,
+    max_sample_age_sec: float = 60,
+    check_id: str | None = None,
+) -> PointInTimeHealthCheck:
+    """Exact native/remote production routes, with NULL and timing evidence.
+
+    Expected maps explicitly select each switch/prefix state for withdrawal or
+    restoration. Omit the map to require every monitored route to have a best
+    path. Convergence windows must be anchored to the verified trigger through
+    the normal registry observation window.
+    """
+    if protocol not in {"bgp", "fsdb"} or mode not in {"stability", "convergence"}:
+        raise ValueError("Unsupported production route check protocol or mode")
+    params: dict[str, t.Any] = {
+        "production_prefixes": True,
+        "production_mode": mode,
+        "trigger": trigger,
+        "lookback_sec": lookback_sec,
+        "use_test_case_start_time": use_test_case_start_time,
+        "max_convergence_sec": max_convergence_sec,
+        "max_sample_age_sec": max_sample_age_sec,
+    }
+    if expected_by_gtsw is not None:
+        params["expected_by_gtsw"] = expected_by_gtsw
+    name = (
+        hc_types.CheckName.FPF_BGP_RIB_CONVERGENCE_CHECK
+        if protocol == "bgp"
+        else hc_types.CheckName.FPF_FSDB_RIBMAP_CONVERGENCE_CHECK
+    )
+    return PointInTimeHealthCheck(
+        name=name,
+        check_params=Params(json_params=json.dumps(params)),
+        check_id=check_id or f"fpf_prod_{protocol}_prefix",
+    )

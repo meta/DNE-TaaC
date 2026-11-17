@@ -24,6 +24,9 @@ from taac.libs.fpf.fpf_collector_registry import (
     get_test_case_start_time,
     wait_for_restart_reconverge,
 )
+from taac.libs.fpf.fpf_prod_switch_prefix_health import (
+    check_production_routes,
+)
 from taac.libs.fpf.fpf_stress_checks import _parse_ts
 from taac.libs.fpf.fpf_thresholds import (
     ACTIVE as FPF_ACTIVE_THRESHOLDS,
@@ -55,6 +58,9 @@ class FpfFsdbRibmapConvergenceHealthCheck(
         input: hc_types.BaseHealthCheckIn,
         check_params: t.Dict[str, t.Any],
     ) -> hc_types.HealthCheckResult:
+        if check_params.get("production_prefixes"):
+            return check_production_routes("fsdb", check_params)
+
         lane_map: t.Dict[int, str] = {
             int(k): v for k, v in check_params.get("lane_map", {}).items()
         }

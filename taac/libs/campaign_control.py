@@ -98,6 +98,14 @@ class HostActionSpec:
             "hrt_logs",
             "link_disable",
             "nic_flap",
+            "host_status",
+            "dls_logs",
+            "start_dls",
+            "restart_dls",
+            "kill_dls",
+            "stop_dls",
+            "coldboot_via_dls",
+            "reboot_host",
         }:
             raise CampaignProtocolError(f"unsupported host action kind {self.kind!r}")
         self._validate_host()

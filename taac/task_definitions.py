@@ -4631,3 +4631,102 @@ def create_setup_base_configs_task(
         hostname=hostname,
         params=Params(json_params=json.dumps({"restart_bgp": restart_bgp})),
     )
+
+
+# =============================================================================
+# RBB SRv6 QUALIFICATION TASKS (see taac/testconfigs/routing/qual_rbb.py)
+# =============================================================================
+
+
+def create_rbb_srv6_verify_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = False,
+) -> Task:
+    """Build an ``rbb_srv6_verify`` Task.
+
+    ``params_dict`` is the gate spec (``show_cmd`` plus one of
+    ``expect_contains`` / ``interfaces_up`` / ``bgp_peers_established`` /
+    ``fib_prefixes``); see the ``verify_*_spec`` builders in
+    ``bgp_rbb_scenario_profiles``.
+    """
+    return create_run_task(
+        task_name="rbb_srv6_verify",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
+    )
+
+
+def create_rbb_srv6_counter_delta_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = True,
+) -> Task:
+    """Build an ``rbb_srv6_counter_delta`` Task.
+
+    ``params_dict`` is the counter spec (``action``, ``counter_cmd``,
+    ``counter_regex``, ``direction``); see ``srv6_encap_counter_spec`` and
+    ``srv6_decap_counter_spec`` in ``bgp_rbb_scenario_profiles``.
+    """
+    return create_run_task(
+        task_name="rbb_srv6_counter_delta",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
+    )
+
+
+def create_rbb_srv6_direct_route_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = False,
+) -> Task:
+    """Build an ``rbb_srv6_direct_route`` Task.
+
+    ``params_dict`` carries ``action`` (``"install"`` / ``"delete"``),
+    ``prefix``, and the install-time ``client`` / ``srv6_segments`` /
+    ``srv6_tunnel_id`` fields.
+    """
+    return create_run_task(
+        task_name="rbb_srv6_direct_route",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
+    )
+
+
+def create_rbb_edge_ebgp_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = False,
+) -> Task:
+    """Build an ``rbb_edge_ebgp`` Task.
+
+    ``params_dict`` carries ``action`` (``"apply"`` / ``"restore"``) and the
+    edge peer / local-address fields the playbook and test config build.
+    """
+    return create_run_task(
+        task_name="rbb_edge_ebgp",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
+    )
+
+
+def create_rbb_dut_bootstrap_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = False,
+) -> Task:
+    """Build an ``rbb_dut_bootstrap`` Task.
+
+    ``params_dict`` carries ``action`` (``"apply"`` / ``"restore"``) and, for
+    ``"apply"``, ``role`` and the other bootstrap-document fields.
+    """
+    return create_run_task(
+        task_name="rbb_dut_bootstrap",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
+    )

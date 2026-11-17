@@ -181,13 +181,23 @@ from taac.tasks.periodic_tasks import (
     ProcessMonitorTask,
     ThriftStressPeriodicTask,
 )
+
+# RBB SRv6 qualification tasks (see taac/testconfigs/routing/qual_rbb.py).
+from taac.tasks.rbb_dut_bootstrap_task import RbbDutBootstrapTask
+from taac.tasks.rbb_edge_ebgp_task import RbbEdgeEbgpTask
+from taac.tasks.rbb_srv6_counter_delta_task import (
+    RbbSrv6CounterDeltaTask,
+)
+from taac.tasks.rbb_srv6_direct_route_task import (
+    RbbSrv6DirectRouteTask,
+)
+from taac.tasks.rbb_srv6_verify_task import RbbSrv6VerifyTask
 from taac.tasks.setup_base_configs_task import (
     SetupBaseConfigsTask,
 )
 from taac.tasks.verify_best_path_changes_task import (
     VerifyBestPathChangesTask,
 )
-
 
 TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     AristaDaemonControlTask,
@@ -246,6 +256,11 @@ TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     VerifyBestPathChangesTask,
     SetPortChannelMinLinkPatcherTask,
     SetupBaseConfigsTask,
+    RbbDutBootstrapTask,
+    RbbEdgeEbgpTask,
+    RbbSrv6CounterDeltaTask,
+    RbbSrv6DirectRouteTask,
+    RbbSrv6VerifyTask,
 ]
 
 # Add internal tasks only when not in OSS mode

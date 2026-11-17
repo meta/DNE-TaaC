@@ -30,18 +30,25 @@ When migrating an inline `Stage(...)` site:
 """
 
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
 from taac.abstractions.churn.attribute import AttributeChurn
-from neteng.test_infra.dne.taac.abstractions.churn.route import RouteChurn, RouteStorm
 from taac.abstractions.churn.session import SessionChurn
 from taac.abstractions.churn.workloads import (
     IgpUnresolvableChurn,
     LongevityCommunityChurn,
     MultipathChurn,
+)
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+from taac.abstractions.churn.route import (  # oss-rewrite (force ShipIt re-export to taac.* root)
+    RouteChurn,
+    RouteStorm,
 )
 from taac.constants import (
     DEFAULT_LOCAL_LINK,

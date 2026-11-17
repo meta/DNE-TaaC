@@ -18,6 +18,7 @@ from datetime import datetime
 
 if t.TYPE_CHECKING:
     from confucius.analects.base.agentic_function import Function
+    from pydantic import BaseModel
 
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
@@ -78,11 +79,25 @@ from taac.libs.campaign_control import (
     NoopCampaignControl,
 )
 from taac.libs.collectors.registry import set_test_case_start_time
-from taac.libs.investigation_report import (
-    InvestigationReport,
-    render_headline,
-    render_report_lines,
-)
+
+if not TAAC_OSS:
+    from taac.libs.investigation_report import (
+        InvestigationReport,
+        render_headline,
+        render_report_lines,
+    )
+else:
+    # The investigation agent is unavailable in OSS. Keep its optional type
+    # annotations import-free so OSS does not need the agent's pydantic stack.
+    InvestigationReport = t.Any
+
+    def render_headline(_report: t.Any) -> str:
+        return ""
+
+    def render_report_lines(_report: t.Any) -> list[str]:
+        return []
+
+
 from taac.libs.ixia_candidate import (
     IxiaCandidate,
     normalize_ixia_candidates,
@@ -207,6 +222,15 @@ if not TAAC_OSS:
     from taac.internal.utils import ondevice_sampler
     from taac.internal.utils.manifold_utils import (
         async_upload_file_to_manifold,
+    )
+else:
+    # OSS binding for the mock-device registration helper. ``_add_oss_mock_device_data``
+    # (called from ``async_test_setUp`` for any config that populates
+    # ``oss_mock_device_data``) invokes this unconditionally, so it must resolve
+    # under TAAC_OSS too — the OSS-safe implementation lives in taac.utils, not
+    # taac.internal. Without this the runner NameErrors before setup for such configs.
+    from taac.utils.netwhoami_utils import (
+        add_oss_mock_device_data,
     )
 
 DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID: str = "test_case_start"
@@ -711,9 +735,13 @@ class TaacRunner:
         self._test_case_cleanup_pending = False
         self._test_case_handlers_pending_cleanup: t.List[BaseCustomTestHandler] = []
         self._test_case_rsyslog_created = False
-        # Shared data dictionary that persists across all tasks (setup, test, teardown)
-        # This allows tasks to share information (e.g., backup filenames) across execution
+        # TestConfig-lifecycle task state. Setup/teardown tasks may use this to
+        # exchange recovery information across the outer config lifecycle.
         self.shared_task_data: t.Dict[t.Any, t.Any] = {}
+        # Registered steps use a narrower store. It is reset before every
+        # playbook execution so state can cross that playbook's iterations,
+        # setup, stages, and cleanup, but can never leak into another playbook.
+        self._playbook_shared_task_data: t.Dict[t.Any, t.Any] = {}
         self.test_summary = TaacTestSummary(self.logger)
         # The latest investigation, retained for the legacy Netcastle test-case
         # link integration. Reset per test case so a prior result is not reused.
@@ -792,6 +820,31 @@ class TaacRunner:
             pass
         return " | ".join(desc_parts)
 
+    @async_retryable(
+        retries=_TASK_ATTEMPTS,
+        sleep_time=_TASK_RETRY_SLEEP_SECONDS,
+        exceptions=(Exception,),
+    )
+    async def _run_task_with_retry(self, task: taac_types.Task) -> ValueError | None:
+        """Retry one task without replaying already completed stateful tasks.
+
+        A lifecycle-metadata refusal is returned rather than raised so it is
+        never retried.
+        """
+        dict_params = self.parameter_evaluator.evaluate(task.params)
+        try:
+            _check_lifecycle_metadata(task, dict_params)
+        except ValueError as refusal:
+            return refusal
+        await run_task(
+            task,
+            dict_params,
+            t.cast(TaacIxia, self.ixia),
+            self.logger,
+            self.shared_task_data,
+        )
+        return None
+
     async def _run_task_once(
         self,
         task: taac_types.Task,
@@ -804,25 +857,14 @@ class TaacRunner:
             f"[Task {index}/{total}] Running: {task_desc} (host: {task.hostname})"
         )
         start = time.time()
-        dict_params = self.parameter_evaluator.evaluate(task.params)
-        _check_lifecycle_metadata(task, dict_params)
-        await run_task(
-            task,
-            dict_params,
-            t.cast(TaacIxia, self.ixia),
-            self.logger,
-            self.shared_task_data,
-        )
+        refusal = await self._run_task_with_retry(task)
+        if refusal is not None:
+            raise refusal
         elapsed = time.time() - start
         self.logger.warning(
             f"[Task {index}/{total}] Completed: {task_desc} ({elapsed:.1f}s)"
         )
 
-    @async_retryable(
-        retries=_TASK_ATTEMPTS,
-        sleep_time=_TASK_RETRY_SLEEP_SECONDS,
-        exceptions=(Exception,),
-    )
     async def run_tasks(self, tasks: t.Sequence[taac_types.Task]) -> None:
         self._declared_state_guards.update(_state_guard_arm_operation_ids(tasks))
         total = len(tasks)
@@ -1304,6 +1346,33 @@ class TaacRunner:
                 errors,
             )
 
+    async def _run_teardown_tasks_best_effort(
+        self, tasks: t.Sequence[taac_types.Task]
+    ) -> None:
+        """Run every teardown task even when an earlier cleanup fails.
+
+        Setup tasks intentionally fail fast, but teardown owns restoration of
+        independent DUTs and nested config snapshots.  Stopping at the first
+        error can strand later devices in the test configuration.  Keep the
+        existing per-task retry behavior by invoking ``run_tasks`` with one
+        task at a time, then surface all failures after every cleanup was
+        attempted.
+        """
+        errors: list[Exception] = []
+        for task in tasks:
+            try:
+                await self.run_tasks((task,))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+                self.logger.error(
+                    "Teardown task failed; continuing remaining cleanup: "
+                    f"{self._get_task_description(task)}: {exc}"
+                )
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("Multiple TAAC teardown tasks failed", errors)
+
     async def _async_run_oss_setup_tasks(self) -> None:
         """Run the OSS setup-task stage.
 
@@ -1639,6 +1708,10 @@ class TaacRunner:
             topology=self.topology,
             step=step,
         )
+        # Set after construction so third-party Step subclasses with explicit
+        # constructor signatures do not have to accept a new keyword merely to
+        # benefit from runner-owned registered-task state.
+        step_obj.shared_data = self._playbook_shared_task_data
         step_obj._input = (
             json_to_thrift(step.input_json, STEP_NAME_TO_INPUT[step.name])
             if step.input_json
@@ -1807,6 +1880,7 @@ class TaacRunner:
         test_case_results: t.List[trr_types.CheckResult] = []
         test_case_start_time = int(time.time())
         iteration_count = self._get_test_case_iteration_count(playbook)
+        self._playbook_shared_task_data = {}
 
         try:
             for _ in range(iteration_count):
@@ -3895,7 +3969,10 @@ class TaacRunner:
                 task=task,
                 prompt=prompt,
                 tools=tools,
-                output_format=InvestigationReport,
+                # InvestigationReport is a real pydantic model
+                # internally; in OSS it is the Any placeholder, which the
+                # generic run_agent bound cannot accept unchecked.
+                output_format=t.cast("type[BaseModel]", InvestigationReport),
                 on_event=self._log_investigation_event,
                 config=AgentConfig(stats_label=INVESTIGATION_STATS_LABEL),
                 timeout_sec=timeout_sec,

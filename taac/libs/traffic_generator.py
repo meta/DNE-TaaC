@@ -34,6 +34,7 @@ from taac.utils.ixia_utils import (
     async_create_optical_switch_ixia_connection_assets,
     async_get_ixia_logical_port,
     fetch_ixia_password,
+    fetch_ixia_username,
     get_attr_value,
     get_next_available_ipv6_address,
 )
@@ -284,6 +285,7 @@ class TrafficGenerator:
                 use_tx_rx_sync=self.use_tx_rx_sync,
                 session_id=self.session_id,
                 password=fetch_ixia_password(),
+                username=fetch_ixia_username(),
                 chassis_ip=(
                     await self.async_get_ixia_api_server() if self.session_id else None
                 ),

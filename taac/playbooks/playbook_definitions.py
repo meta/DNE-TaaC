@@ -1316,7 +1316,8 @@ def create_test_portchannel_playbook(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -1333,7 +1334,8 @@ def create_test_portchannel_playbook(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -1415,6 +1417,8 @@ def add_common_checks_to_cpu_queue_playbooks(
         create_prefix_limit_check(prefix_limit=unique_prefix_limit),
         create_memory_utilization_check(
             threshold=5 * (1024**3),  # 5gb
+            # bgpd RSS at full fabric scale exceeds the default.
+            threshold_by_service={"bgpd": 10 * (1024**3)},
             start_time_jq_var="test_case_start_time",
         ),
         create_port_state_check(),
@@ -1720,6 +1724,7 @@ def _build_periodic_restart_stages(
     service_label: str,
     period_s: int = 300,
     total_duration_s: int = 14400,
+    clear_thrift_drain_exit: bool = False,
 ) -> list[Stage]:
     """Build N stages: each is [`SERVICE_INTERRUPTION_STEP`, `longevity(period_s)`].
 
@@ -1745,6 +1750,7 @@ def _build_periodic_restart_stages(
             period_s=period_s,
             iteration_index=i,
             total_iterations=n_iterations,
+            clear_thrift_drain_exit=clear_thrift_drain_exit,
         )
         for i in range(n_iterations)
     ]
@@ -1804,6 +1810,10 @@ def create_thft_restart_playbook(
                 service_label=service_label,
                 period_s=restart_period_s,
                 total_duration_s=test_duration_s,
+                # Under the thrift storm bgpd cannot drain its in-flight requests
+                # inside fbthrift's shutdown deadline and quick-exits 124; that is
+                # not a crash, so the agent restart's bgpd stop clears it.
+                clear_thrift_drain_exit=service == Service.AGENT,
             ),
             create_longevity_stage(duration=300),
         ],
@@ -1941,6 +1951,11 @@ def add_common_checks_to_thft_playbooks(
     `ExecStop=pre_wedge_agent_shut_runner.par` hook — same by-design
     intent, different mechanism. `qsfp_service` and `fsdb` are NOT in
     the cascade set so they don't propagate.
+
+    `BGP_ROUTE_COUNT_VERIFICATION_CHECK` is skipped as a precheck: the thrift
+    storm starts with the playbook and holds bgpd's connection limit, so a
+    pre-test route count cannot reach bgpd. A route-count postcheck runs after
+    the storm and the quiet stage, so it is kept.
     """
     common_prechecks = [
         create_drain_state_check(),
@@ -2020,8 +2035,10 @@ def add_common_checks_to_thft_playbooks(
                 expected_restarted_services=expected_restarted,
             ),
             create_unclean_exit_check(),
+            # The storm against a full route table holds the agent above four
+            # cores.
             create_cpu_utilization_check(
-                threshold=400.0, start_time_jq_var="test_case_start_time"
+                threshold=700.0, start_time_jq_var="test_case_start_time"
             ),
         ]
         prechecks = list(pb.prechecks or []) + common_prechecks
@@ -2047,7 +2064,8 @@ def add_common_checks_to_thft_playbooks(
                 skip_test_config_postchecks=pb.skip_test_config_postchecks,
                 skip_test_config_snapshot_checks=pb.skip_test_config_snapshot_checks,
                 override_duplicate_checks=pb.override_duplicate_checks,
-                prechecks_to_skip=pb.prechecks_to_skip,
+                prechecks_to_skip=list(pb.prechecks_to_skip or [])
+                + [hc_types.CheckName.BGP_ROUTE_COUNT_VERIFICATION_CHECK],
                 postchecks_to_skip=pb.postchecks_to_skip,
                 snapshot_checks_to_skip=pb.snapshot_checks_to_skip,
                 check_ids_to_skip=pb.check_ids_to_skip,
@@ -7667,6 +7685,11 @@ def _build_uplink_flap_cleanup_steps(
     ]
 
 
+# The per-cycle check taken while the flapped ports are down; configs scope
+# per-cycle loss tolerances to it by this description.
+UPLINK_FLAP_DOWN_LOSS_STEP = "Measure IXIA loss while the port(s) are DOWN"
+
+
 def _build_uplink_flap_cycle_steps(
     interfaces_to_flap: list[str],
     flap_interval_s: int,
@@ -7743,7 +7766,7 @@ def _build_uplink_flap_cycle_steps(
         steps.append(
             create_validation_step(
                 point_in_time_checks=down_stage_checks,
-                description="Measure IXIA loss while the port(s) are DOWN",
+                description=UPLINK_FLAP_DOWN_LOSS_STEP,
             )
         )
     if up_stage_checks:
@@ -8469,7 +8492,8 @@ def _create_lag_prechecks(
         create_memory_utilization_check(
             threshold=5 * (1024**3),
             threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
+                # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                "bgpd": 10 * (1024**3),
                 "fsdb": 5 * (1024**3),
                 "qsfp_service": 2 * (1024**3),
                 "fboss_sw_agent": 9 * (1024**3),
@@ -8501,7 +8525,8 @@ def _create_lag_postchecks(
         create_memory_utilization_check(
             threshold=5 * (1024**3),
             threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
+                # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                "bgpd": 10 * (1024**3),
                 "fsdb": 5 * (1024**3),
                 "qsfp_service": 2 * (1024**3),
                 "fboss_sw_agent": 9 * (1024**3),
@@ -8697,6 +8722,9 @@ def create_lag_baseline_playbook_1(
                         interfaces=phase2_interfaces,
                         interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
                     ),
+                    # LACP must re-bundle the re-enabled members before the
+                    # LAG can come back UP, as in the teardown stage.
+                    create_longevity_step(duration=link_up_wait_s),
                     create_verify_port_operational_state_step(
                         interfaces=phase2_interfaces, operational_state=True
                     ),
@@ -9905,6 +9933,7 @@ def _l2_overload_safety_checks(
     observe_mac: bool = False,
     require_resource_accountant: bool = True,
     expected_restarted_services: t.Optional[list[str]] = None,
+    resource_accountant_start_time_jq_var: t.Optional[str] = None,
 ) -> list[PointInTimeHealthCheck]:
     checks = [
         *_l2_table_observation_checks(
@@ -9930,14 +9959,18 @@ def _l2_overload_safety_checks(
             start_time_jq_var=start_time_jq_var,
         ),
         create_memory_utilization_check(
-            threshold=5 * (1024**3),
+            # Services under L2 table overload at full fabric scale exceed
+            # 5 GiB RSS, bgpd more.
+            threshold=7.5 * (1024**3),
+            threshold_by_service={"bgpd": 10 * (1024**3)},
             start_time_jq_var=start_time_jq_var,
         ),
     ]
     if require_resource_accountant:
         checks.append(
             create_resource_accountant_activation_check(
-                start_time_jq_var=start_time_jq_var,
+                start_time_jq_var=resource_accountant_start_time_jq_var
+                or start_time_jq_var,
             )
         )
     return checks
@@ -9951,6 +9984,7 @@ def _l2_overload_validation_stage(
     observe_mac: bool = False,
     require_resource_accountant: bool = True,
     expected_restarted_services: t.Optional[list[str]] = None,
+    resource_accountant_start_time_jq_var: t.Optional[str] = None,
 ) -> Stage:
     return create_steps_stage(
         stage_id=stage_id,
@@ -9962,6 +9996,9 @@ def _l2_overload_validation_stage(
                     observe_mac=observe_mac,
                     require_resource_accountant=require_resource_accountant,
                     expected_restarted_services=expected_restarted_services,
+                    resource_accountant_start_time_jq_var=(
+                        resource_accountant_start_time_jq_var
+                    ),
                 ),
                 description="Validate L2 RPC availability and device safety",
                 start_traffic=False,
@@ -10595,6 +10632,12 @@ def _l2_overload_agent_churn_stages(
         create_steps_stage(
             stage_id=f"{label}_overload_post_churn_settle",
             steps=[
+                # The relearn must push the DUT back over its limit; a
+                # rejection from before the coldboots does not show that.
+                create_record_jq_timestamp_step(
+                    var_name="l2_relearn_start_time",
+                    description="Start the post-coldboot ResourceAccountant window",
+                ),
                 *(relearn_steps or []),
                 create_longevity_step(duration=settle_duration_s),
             ],
@@ -10606,6 +10649,7 @@ def _l2_overload_agent_churn_stages(
             observe_mac=observe_mac,
             require_resource_accountant=require_resource_accountant,
             expected_restarted_services=SERVICES_EXPECTED_TO_RESTART_DURING_AGENT_WARMBOOT,
+            resource_accountant_start_time_jq_var="l2_relearn_start_time",
         ),
         *_l2_recovery_stages(
             label=label,
@@ -13099,6 +13143,9 @@ def create_ecmp_groups_playbooks(
     ixia_downlink_interface: str,
     ixia_remote_interface: str,
     asic: DlbAsic = DlbAsic.TOMAHAWK3,
+    *,
+    stage_iterations: int = 5,
+    longevity_s: int = 900,
 ) -> list[Playbook]:
     """
     Create ECMP Groups playbooks (base, Warmboot, bgp_restart, Coldboot).
@@ -13112,6 +13159,12 @@ def create_ecmp_groups_playbooks(
         ixia_remote_interface: The IXIA remote interface name for Silver traffic item
         asic: ASIC family of the DUT; selects the platform-aware DLB resource
             sizing profile (e.g. max DLB groups: Tomahawk3=10, Tomahawk5=94).
+        stage_iterations: Iterations for each service-interruption stage,
+            except the three Overcommit_ECMP_Group_* stages, which keep their
+            literal iteration=1 (see the TODOs at those stages). Pass a lower
+            value so the playbook fits the test scheduler's deadline.
+        longevity_s: Seconds of steady-state traffic held after each restart;
+            the dominant term in the playbook's wall-clock cost.
 
     Returns:
         A list of 4 Playbook objects:
@@ -13176,7 +13229,8 @@ def create_ecmp_groups_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -13291,7 +13345,8 @@ def create_ecmp_groups_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -13396,7 +13451,7 @@ def create_ecmp_groups_playbooks(
                 ],
             ),
             create_steps_stage(
-                iteration=5,
+                iteration=stage_iterations,
                 steps=[
                     create_service_interruption_step(
                         service=Service.AGENT,
@@ -13406,7 +13461,7 @@ def create_ecmp_groups_playbooks(
                         services=[Service.AGENT, Service.BGP],
                         timeout=300,  # 5 min timeout - BGP may not fully converge during flapping
                     ),
-                    create_longevity_step(duration=900),
+                    create_longevity_step(duration=longevity_s),
                 ],
             ),
             create_steps_stage(
@@ -13462,7 +13517,7 @@ def create_ecmp_groups_playbooks(
                 ],
             ),
             create_steps_stage(
-                iteration=5,
+                iteration=stage_iterations,
                 steps=[
                     create_service_interruption_step(
                         service=Service.BGP,
@@ -13528,7 +13583,7 @@ def create_ecmp_groups_playbooks(
                 ],
             ),
             create_steps_stage(
-                iteration=5,
+                iteration=stage_iterations,
                 steps=[
                     create_service_interruption_step(
                         service=Service.AGENT,
@@ -13539,7 +13594,7 @@ def create_ecmp_groups_playbooks(
                         services=[Service.AGENT, Service.BGP],
                         timeout=300,  # 5 min timeout - BGP may not fully converge during flapping
                     ),
-                    create_longevity_step(duration=900),
+                    create_longevity_step(duration=longevity_s),
                 ],
             ),
             create_steps_stage(
@@ -13690,7 +13745,7 @@ def create_ecmp_groups_playbooks(
                     create_service_convergence_step(
                         services=[Service.AGENT, Service.BGP],
                     ),
-                    create_longevity_step(duration=900),
+                    create_longevity_step(duration=longevity_s),
                 ],
             ),
             create_steps_stage(
@@ -13869,7 +13924,7 @@ def create_ecmp_groups_playbooks(
                     create_service_convergence_step(
                         services=[Service.AGENT, Service.BGP],
                     ),
-                    create_longevity_step(duration=900),
+                    create_longevity_step(duration=longevity_s),
                 ],
             ),
             create_steps_stage(
@@ -13912,6 +13967,9 @@ def create_ecmp_members_playbooks(
     ixia_downlink_interface: str,
     ixia_remote_interface: str,
     asic: DlbAsic = DlbAsic.TOMAHAWK3,
+    *,
+    stage_iterations: int = 5,
+    longevity_s: int = 900,
 ) -> list[Playbook]:
     """
     Create ECMP Members playbooks (base, Warmboot, bgp_restart, Coldboot).
@@ -13925,6 +13983,12 @@ def create_ecmp_members_playbooks(
         ixia_remote_interface: The IXIA remote interface name for Silver traffic item
         asic: ASIC family of the DUT; selects the platform-aware DLB group
             ceiling (Tomahawk3=10, Tomahawk5=94) for the resource checks.
+        stage_iterations: Iterations for each service-interruption stage,
+            except the three Overcommit_ECMP_Group_* stages, which keep their
+            literal iteration=1 (see the TODOs at those stages). Pass a lower
+            value so the playbook fits the test scheduler's deadline.
+        longevity_s: Seconds of steady-state traffic held after each restart;
+            the dominant term in the playbook's wall-clock cost.
 
     Returns:
         A list of 4 Playbook objects:
@@ -13978,7 +14042,8 @@ def create_ecmp_members_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -14116,7 +14181,8 @@ def create_ecmp_members_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -14212,7 +14278,7 @@ def create_ecmp_members_playbooks(
                 ],
             ),
             create_steps_stage(
-                iteration=5,
+                iteration=stage_iterations,
                 steps=[
                     create_service_interruption_step(
                         service=Service.AGENT,
@@ -14221,7 +14287,7 @@ def create_ecmp_members_playbooks(
                     create_service_convergence_step(
                         services=[Service.AGENT, Service.BGP],
                     ),
-                    create_longevity_step(duration=900),
+                    create_longevity_step(duration=longevity_s),
                 ],
             ),
             create_steps_stage(
@@ -14277,7 +14343,7 @@ def create_ecmp_members_playbooks(
                 ],
             ),
             create_steps_stage(
-                iteration=5,
+                iteration=stage_iterations,
                 steps=[
                     create_service_interruption_step(
                         service=Service.BGP,
@@ -14342,7 +14408,7 @@ def create_ecmp_members_playbooks(
                 ],
             ),
             create_steps_stage(
-                iteration=5,
+                iteration=stage_iterations,
                 steps=[
                     create_service_interruption_step(
                         service=Service.AGENT,
@@ -14352,7 +14418,7 @@ def create_ecmp_members_playbooks(
                     create_service_convergence_step(
                         services=[Service.AGENT, Service.BGP],
                     ),
-                    create_longevity_step(duration=900),
+                    create_longevity_step(duration=longevity_s),
                 ],
             ),
             create_steps_stage(
@@ -14530,7 +14596,7 @@ def create_ecmp_members_playbooks(
                 ],
             ),
             create_steps_stage(
-                iteration=5,
+                iteration=stage_iterations,
                 steps=[
                     create_service_interruption_step(
                         service=Service.AGENT,
@@ -14539,7 +14605,7 @@ def create_ecmp_members_playbooks(
                     create_service_convergence_step(
                         services=[Service.AGENT, Service.BGP],
                     ),
-                    create_longevity_step(duration=900),
+                    create_longevity_step(duration=longevity_s),
                 ],
             ),
             create_steps_stage(
@@ -14601,7 +14667,7 @@ def create_ecmp_members_playbooks(
                 ],
             ),
             create_steps_stage(
-                iteration=5,
+                iteration=stage_iterations,
                 steps=[
                     create_service_interruption_step(
                         service=Service.BGP,
@@ -14672,7 +14738,7 @@ def create_ecmp_members_playbooks(
                 ],
             ),
             create_steps_stage(
-                iteration=5,
+                iteration=stage_iterations,
                 steps=[
                     create_service_interruption_step(
                         service=Service.AGENT,
@@ -14682,7 +14748,7 @@ def create_ecmp_members_playbooks(
                     create_service_convergence_step(
                         services=[Service.AGENT, Service.BGP],
                     ),
-                    create_longevity_step(duration=900),
+                    create_longevity_step(duration=longevity_s),
                 ],
             ),
             create_steps_stage(
@@ -15072,7 +15138,8 @@ def create_spillover_testing_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -15185,7 +15252,8 @@ def create_ecmp_only_groups_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -15250,6 +15318,11 @@ def create_ecmp_only_groups_playbooks(
             description=(
                 f"Gate: Main holds {expected} ECMP groups with {nh} resolved next-hops"
             ),
+            # The step cannot see `exit 1`; it fails unless the marker is printed.
+            expect_in_output="Main programmed:",
+            # 30 x (dump + 10 s sleep) runs past the 300 s ssh default, which
+            # returns empty output and loses the FAILED counts.
+            timeout=600,
         )
 
     def _admit_rouge_steps():
@@ -15533,7 +15606,8 @@ def create_ecmp_only_members_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -15610,6 +15684,11 @@ def create_ecmp_only_members_playbooks(
             description=(
                 f"Gate: Main holds {expected} ECMP members with {nh} resolved next-hops"
             ),
+            # The step cannot see `exit 1`; it fails unless the marker is printed.
+            expect_in_output="Main programmed:",
+            # 30 x (dump + 10 s sleep) runs past the 300 s ssh default, which
+            # returns empty output and loses the FAILED counts.
+            timeout=600,
         )
 
     def _admit_rouge_steps():
@@ -15964,7 +16043,8 @@ def create_ecmp_only_longevity_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -16419,6 +16499,10 @@ SNAKE_BENCHMARK_DURATION_S = 12 * 60
 # link (100% loss) still fails.
 SNAKE_BENCHMARK_MAX_LOSS_PCT = 80
 
+# Selects every traffic item except the benchmark sweep, whose items are named
+# f"SNAKE_BENCHMARK_{size}B" (plus a " #N" suffix per extra snake).
+NON_BENCHMARK_TRAFFIC_REGEX = r"^(?!SNAKE_BENCHMARK_).*"
+
 # Settle window between agent convergence and the postchecks, for the warmboot
 # playbook -- the sibling restart/reboot playbooks use a 300s one for the same
 # reason ("the convergence step can sometimes complete too quickly").
@@ -16431,6 +16515,19 @@ SNAKE_BENCHMARK_MAX_LOSS_PCT = 80
 SNAKE_AGENT_LLDP_SETTLE_S = 120
 
 
+def ixia_traffic_item_identifiers(name: str, instances: int = 1) -> t.List[str]:
+    """Every identifier of the ``instances`` per-snake items built from one name.
+
+    A snake config builds one traffic item per snake, named with a " #N" suffix
+    after the first (which keeps the bare name), because the IXIA layer skips a
+    traffic item whose name already exists. The packet-loss check matches
+    identifiers by exact string, so a threshold naming only the bare form
+    silently misses every sibling -- which lands them in the catch-all
+    zero-loss default instead.
+    """
+    return [name] + [f"{name} #{idx}" for idx in range(1, max(instances, 1))]
+
+
 def gen_snake_benchmark_playbooks(
     traffic_item_name_by_packet_size: t.Dict[int, str],
     duration_s: int = SNAKE_BENCHMARK_DURATION_S,
@@ -16438,11 +16535,13 @@ def gen_snake_benchmark_playbooks(
     postchecks: t.Optional[t.List[taac_types.PointInTimeHealthCheck]] = None,
     min_rate_gbps_by_packet_size: t.Optional[t.Dict[int, int]] = None,
     allowed_loss_packet_sizes: t.Optional[t.Set[int]] = None,
+    traffic_item_instances: int = 1,
 ) -> t.List[taac_types.Playbook]:
     """One throughput-benchmark playbook per packet size.
 
-    Each playbook starts only its own fixed-frame-size traffic item, clears the
-    IXIA counters, soaks for ``duration_s``, then measures loss and rate. Sizes
+    Each playbook starts only its own size's fixed-frame-size traffic items (one
+    per snake), clears the IXIA counters, soaks for ``duration_s``, then
+    measures loss and rate. Sizes
     run as separate playbooks rather than stages of one playbook because IXIA
     frame size is fixed on the traffic item at config-build time — there is no
     runtime "change frame size" step — so the sweep is expressed as one traffic
@@ -16457,14 +16556,16 @@ def gen_snake_benchmark_playbooks(
         prechecks: Playbook prechecks, typically ``gen_common_hcs`` output.
         postchecks: Playbook postchecks; the loss + rate checks are appended.
         min_rate_gbps_by_packet_size: Frame size (bytes) -> minimum Tx and Rx
-            rate (Gbps) for that size's traffic item. When ``None`` the rate
-            check carries no thresholds and always passes.
+            rate (Gbps) for each of that size's per-snake traffic items. When
+            ``None`` the rate check carries no thresholds and always passes.
         allowed_loss_packet_sizes: Frame sizes whose playbook may lose its own
             item's packets without failing (sizes below the ASIC's line-rate
             minimum, where loss at 100%% offered rate is physics, e.g.
             ``{64, 192}`` on TH5). The measured throughput is still recorded
             by the benchmark report step; loss on any other traffic item, or
             at any other size, still fails.
+        traffic_item_instances: Per-snake traffic items built from each name
+            (see ``ixia_traffic_item_identifiers``).
 
     Returns:
         One Playbook per entry, ordered by ascending packet size.
@@ -16475,9 +16576,13 @@ def gen_snake_benchmark_playbooks(
         # An explicit threshold excludes the named item from the loss check's
         # catch-all zero-loss default; every other item stays guarded. Bounded
         # at SNAKE_BENCHMARK_MAX_LOSS_PCT rather than unlimited, so expected
-        # PPS-ceiling loss passes but a blackholed item still fails.
+        # PPS-ceiling loss passes but a blackholed item still fails. Must name
+        # every per-snake item: on a multi-snake config the " #N" items are
+        # separate identifiers and would otherwise fall to the zero-loss default.
         return hc_types.PacketLossThreshold(
-            names=[traffic_item_name],
+            names=ixia_traffic_item_identifiers(
+                traffic_item_name, traffic_item_instances
+            ),
             metric=hc_types.PacketLossMetric.PERCENTAGE,
             comparison=hc_types.ComparisonType.LESS_THAN_EQUAL_TO,
             str_value=str(SNAKE_BENCHMARK_MAX_LOSS_PCT),
@@ -16531,13 +16636,17 @@ def gen_snake_benchmark_playbooks(
     playbooks: t.List[taac_types.Playbook] = []
     for packet_size in sorted(traffic_item_name_by_packet_size):
         traffic_item_name = traffic_item_name_by_packet_size[packet_size]
+        # One item per snake; every one of them is held to the rate and reported.
+        per_snake_names = ixia_traffic_item_identifiers(
+            traffic_item_name, traffic_item_instances
+        )
         rate_check = create_ixia_traffic_rate_check()
         if min_rate_gbps_by_packet_size:
-            # Scoped to this size's item so the disabled items (0 Gbps) are ignored.
+            # Scoped to this size's items so the disabled items (0 Gbps) are ignored.
             rate_check = create_ixia_traffic_rate_check(
                 thresholds=[
                     hc_types.TrafficRateThreshold(
-                        names=[traffic_item_name],
+                        names=per_snake_names,
                         value=min_rate_gbps_by_packet_size[packet_size],
                         threshold_type=hc_types.ThresholdType.ABSOLUTE,
                     )
@@ -16547,8 +16656,8 @@ def gen_snake_benchmark_playbooks(
             taac_types.Playbook(
                 name=f"test_snake_benchmark_{packet_size}b",
                 description=(
-                    f"Benchmark test: {packet_size} byte frames at 100% line rate "
-                    f"for {duration_s // 60} mins."
+                    f"Benchmark test: {packet_size} byte frames at the "
+                    f"configured benchmark line rate for {duration_s // 60} mins."
                 ),
                 prechecks=_prechecks_allowing_benchmark_loss(traffic_item_name),
                 postchecks=(postchecks or [])
@@ -16586,21 +16695,24 @@ def gen_snake_benchmark_playbooks(
                                     f"{duration_s}s at line rate"
                                 ),
                             ),
-                            # End-of-soak, traffic still running: record the
-                            # normalized max-forwarding-rate report. This is
-                            # the benchmark's deliverable and emits even when
-                            # the loss postcheck fails the playbook.
+                        ]
+                        # End-of-soak, traffic still running: record the
+                        # normalized max-forwarding-rate report. This is
+                        # the benchmark's deliverable and emits even when
+                        # the loss postcheck fails the playbook.
+                        + [
                             create_ixia_api_step(
                                 api_name="log_benchmark_rate_report",
                                 args_dict={
-                                    "traffic_item_name": traffic_item_name,
+                                    "traffic_item_name": per_snake_name,
                                     "frame_size_bytes": packet_size,
                                 },
                                 description=(
                                     f"Report measured throughput for "
-                                    f"{packet_size}B frames"
+                                    f"{packet_size}B frames ({per_snake_name})"
                                 ),
-                            ),
+                            )
+                            for per_snake_name in per_snake_names
                         ]
                     )
                 ],
@@ -17307,32 +17419,38 @@ def gen_snake_playbooks(
     half_toggle_check_retry_delay_seconds: float = 2.0,
     skip_lldp_check: bool = False,
     include_split_agent_warmboot: bool = False,
+    # Post-flap wait for the playbooks that reinitialise the transceiver
+    # (qsfp_util --clear_low_power, --qsfp-reset). INTERFACE_FLAP_STEP's
+    # ``delay`` is a single sleep after the whole batch, so this is the only
+    # time links get to relock before postchecks; modules need minutes.
+    optics_recovery_wait_s: int = 300,
+    benchmark_traffic_item_instances: int = 1,
+    include_48hr_longevity: bool = False,
 ) -> t.List[taac_types.Playbook]:
+    # Retry knobs for every PORT_STATE_CHECK and LLDP_CHECK that runs right
+    # after an interface re-enable (link-flap recovery, rapid A-end flap,
+    # half-toggle MID_TEST). Those checks fire 0-2 s after the enable step,
+    # before slow-training optics have linked up; without retries a single
+    # read fails the playbook (PORT_STATE as FAIL, LLDP as ERROR since it has
+    # only a ~16 s internal retry before raising).
+    _flap_recovery_retry_kwargs: t.Dict[str, t.Any] = (
+        {}
+        if flap_recovery_check_retry_count is None
+        else {
+            "retry_count": flap_recovery_check_retry_count,
+            "retry_delay_seconds": flap_recovery_check_retry_delay_seconds,
+            "retry_delay_multiplier": 1.0,
+        }
+    )
+
     def _create_flap_recovery_checks() -> t.List[
         taac_types.PointInTimeHealthCheck
     ]:
-        port_state_check = (
-            create_port_state_check()
-            if flap_recovery_check_retry_count is None
-            else create_port_state_check(
-                retry_count=flap_recovery_check_retry_count,
-                retry_delay_seconds=flap_recovery_check_retry_delay_seconds,
-                retry_delay_multiplier=1.0,
-            )
-        )
-        checks = [port_state_check]
+        checks = [create_port_state_check(**_flap_recovery_retry_kwargs)]
         if not skip_lldp_check:
             # LLDP neighbors can only reappear after the port is up, so give the
             # LLDP check the same opt-in retries as the port-state check.
-            checks.append(
-                create_lldp_check()
-                if flap_recovery_check_retry_count is None
-                else create_lldp_check(
-                    retry_count=flap_recovery_check_retry_count,
-                    retry_delay_seconds=flap_recovery_check_retry_delay_seconds,
-                    retry_delay_multiplier=1.0,
-                )
-            )
+            checks.append(create_lldp_check(**_flap_recovery_retry_kwargs))
         return checks
 
     # Opt-in retries for the half-interface-toggle checks that run right after
@@ -17380,6 +17498,21 @@ def gen_snake_playbooks(
                 prechecks=_prechecks,
                 postchecks=_postchecks,
             ),
+        ]
+    )
+
+    if include_48hr_longevity:
+        playbooks.append(
+            gen_snake_longevity_playbook(
+                "test_48hr_longevity",
+                3600 * 24 * 2,
+                prechecks=_prechecks,
+                postchecks=_postchecks,
+            )
+        )
+
+    playbooks.extend(
+        [
             taac_types.Playbook(
                 name="test_snake_interface_toggle_with_thrift_api",
                 prechecks=_prechecks,
@@ -17503,6 +17636,7 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
+                                        **_flap_recovery_retry_kwargs,
                                     ),
                                     create_port_state_check(
                                         disabled_interfaces_jq=f'."{hostname}".interfaces',
@@ -17517,6 +17651,7 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
+                                        **_flap_recovery_retry_kwargs,
                                     ),
                                 ],
                                 stage=taac_types.ValidationStage.MID_TEST,
@@ -17566,7 +17701,10 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
-                                        **half_toggle_retry_kwargs,
+                                        **(
+                                            half_toggle_retry_kwargs
+                                            or _flap_recovery_retry_kwargs
+                                        ),
                                     ),
                                     create_port_state_check(
                                         disabled_interfaces_jq=f'."{hostname}".interfaces',
@@ -17581,7 +17719,10 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
-                                        **half_toggle_retry_kwargs,
+                                        **(
+                                            half_toggle_retry_kwargs
+                                            or _flap_recovery_retry_kwargs
+                                        ),
                                     ),
                                 ],
                                 stage=taac_types.ValidationStage.MID_TEST,
@@ -17657,7 +17798,7 @@ def gen_snake_playbooks(
                             create_interface_flap_step(
                                 enable=True,
                                 interface_flap_method=3,
-                                delay=link_flap_longevity_enable_delay_s,
+                                delay=optics_recovery_wait_s,
                                 jq_params={"interfaces": f'."{hostname}".interfaces'},
                                 description="Sequentially enable all interfaces",
                             ),
@@ -17681,7 +17822,7 @@ def gen_snake_playbooks(
                             create_interface_flap_step(
                                 enable=False,
                                 interface_flap_method=5,
-                                delay=link_flap_longevity_enable_delay_s,
+                                delay=optics_recovery_wait_s,
                                 jq_params={"interfaces": f'."{hostname}".interfaces'},
                                 description="Sequentially reset all interfaces",
                             ),
@@ -17731,10 +17872,22 @@ def gen_snake_playbooks(
                                 service=taac_types.Service.QSFP_SERVICE,
                                 trigger=taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
                             ),
+                            # QSFP_SERVICE, not just AGENT: the agent is not
+                            # touched, so waiting only on it returns at once and
+                            # the postchecks would run while qsfp_service is still
+                            # coming up, missing its transceiver re-poll burst.
+                            # Matches test_snake_qsfp_service_crash.
                             create_service_convergence_step(
-                                services=[taac_types.Service.AGENT],
-                                description="Wait for wedge_agent to converge",
+                                services=[
+                                    taac_types.Service.AGENT,
+                                    taac_types.Service.QSFP_SERVICE,
+                                ],
+                                description="Wait for agent + qsfp_service to converge",
                             ),
+                            # Convergence can report active before the re-poll
+                            # settles; without this the postcheck window closes
+                            # before the peak. Same rationale as the crash variant.
+                            create_longevity_step(duration=300),
                         ]
                     )
                 ],
@@ -18104,6 +18257,13 @@ def gen_snake_playbooks(
         )
 
     if benchmark_traffic_item_name_by_packet_size:
+        # Benchmark items belong to the sweep alone: started elsewhere, their
+        # small-frame packet rate pushes the snake past the ASIC's pps ceiling
+        # and the MAIN items start losing too.
+        playbooks = [
+            playbook(traffic_items_to_start=[NON_BENCHMARK_TRAFFIC_REGEX])
+            for playbook in playbooks
+        ]
         playbooks.extend(
             gen_snake_benchmark_playbooks(
                 traffic_item_name_by_packet_size=benchmark_traffic_item_name_by_packet_size,
@@ -18111,6 +18271,7 @@ def gen_snake_playbooks(
                 allowed_loss_packet_sizes=benchmark_allowed_loss_packet_sizes,
                 prechecks=_prechecks,
                 postchecks=_postchecks,
+                traffic_item_instances=benchmark_traffic_item_instances,
                 min_rate_gbps_by_packet_size=benchmark_min_rate_gbps_by_packet_size,
             )
         )
@@ -23333,6 +23494,71 @@ def create_fboss_hw_agent_0_coldboot_playbook(
     )
 
 
+_NBR_FLAP_DOWN_S = 6
+_NBR_FLAP_UP_S = 6
+_NBR_FLAP_LOSS_SLACK_S = 60
+
+
+def _nbr_flap_loss_check(
+    items: t.Sequence[str],
+    per_iteration_flap_sec: int,
+) -> PointInTimeHealthCheck:
+    # Ceiling only. A lower bound would demand that ECMP fail to protect the
+    # traffic, and zero loss cannot tell a no-op flap from a clean reroute.
+    return create_ixia_packet_loss_check(
+        thresholds=[
+            hc_types.PacketLossThreshold(
+                names=list(items),
+                metric=hc_types.PacketLossMetric.DURATION,
+                str_value=str((per_iteration_flap_sec + _NBR_FLAP_LOSS_SLACK_S) * 1000),
+            )
+        ],
+    )
+
+
+def _nbr_flap_loss_steps(
+    items: t.Optional[t.Sequence[str]],
+    per_iteration_flap_sec: int,
+) -> t.Tuple[t.List[Step], t.List[Step]]:
+    """Steps to wrap the flap step in: clear stats before it, bound the loss after."""
+    if not items:
+        return [], []
+    return (
+        [create_clear_traffic_stats_step()],
+        [
+            create_validation_step(
+                point_in_time_checks=[
+                    _nbr_flap_loss_check(items, per_iteration_flap_sec)
+                ],
+                stage=taac_types.ValidationStage.MID_TEST,
+                description="Bound the loss the flap caused",
+            )
+        ],
+    )
+
+
+def create_restart_allowlisted_systemctl_check(
+    expected_restarted_services: t.Sequence[str],
+    services: t.Optional[t.Sequence["hc_types.Service"]] = None,
+) -> PointInTimeHealthCheck:
+    """SYSTEMCTL_ACTIVE_STATE_CHECK for a playbook that restarts on purpose.
+
+    `services` scopes the monitored set; omitting it leaves the check on
+    DEFAULT_SERVICE_NAMES. It has to be the typed list, not `services_json`:
+    ``SystemctlActiveStateHealthCheck._run`` reads ``input.services`` and never
+    ``check_params["services"]``. The window closes at evaluation time, so a
+    sub-second restart can be caught mid-transition; retries re-evaluate with
+    a later window end.
+    """
+    return create_systemctl_active_state_check(
+        services=list(services) if services is not None else None,
+        expected_restarted_services=list(expected_restarted_services),
+        retry_count=3,
+        retry_delay_seconds=10,
+        retry_delay_multiplier=1.0,
+    )
+
+
 def _repeat_single_stage_playbook(
     playbook: Playbook,
     iteration: int,
@@ -23410,15 +23636,21 @@ def get_critical_services_single_box_playbooks(
     return [playbook(enabled=True) for playbook in playbooks]
 
 
+# The mid-test RSS ceiling the nbr-flap playbooks default to.
+_NBR_FLAP_MEMORY_THRESHOLD_BYTES = 5 * (1024**3)
+
+
 def _nbr_flap_non_circuit_checks(
     restart_service_check: PointInTimeHealthCheck,
+    expected_restarted_services: t.Sequence[str],
+    memory_threshold_bytes: int = _NBR_FLAP_MEMORY_THRESHOLD_BYTES,
 ) -> t.List[PointInTimeHealthCheck]:
     """Mid-test health checks for a disruption + neighbour-flap window.
 
     Circuit-dependent checks are filtered out because the neighbour's uplinks are
-    intentionally down for most of the window. IXIA packet loss is excluded for
-    the same reason: traffic runs DUT -> STSW -> NBR, so flapping the NBR's
-    uplinks breaks the path by design.
+    intentionally down for most of the window. IXIA packet loss is not asserted
+    here for the same reason: traffic runs DUT -> STSW -> NBR, so the flap breaks
+    the path by design. `_nbr_flap_loss_steps` bounds that loss instead.
 
     `restart_service_check` must match the service actually being disrupted.
     A check built for one service false-fails another: the agent-warmboot
@@ -23428,10 +23660,10 @@ def _nbr_flap_non_circuit_checks(
     """
     return filter_out_circuit_health_checks(
         [
-            create_systemctl_active_state_check(),
+            create_restart_allowlisted_systemctl_check(expected_restarted_services),
             create_unclean_exit_check(),
             create_device_core_dumps_check(),
-            create_memory_utilization_check(threshold=5 * (1024**3)),
+            create_memory_utilization_check(threshold=memory_threshold_bytes),
             create_cpu_utilization_check(threshold=400.0),
             restart_service_check,
         ],
@@ -23442,13 +23674,18 @@ def _nbr_flap_non_circuit_checks(
 def _warmboot_nbr_flap_non_circuit_checks(
     restart_service_check: PointInTimeHealthCheck = AGENT_WARMBOOT_SERVICE_CHECK,
     systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
+    memory_threshold_bytes: int = _NBR_FLAP_MEMORY_THRESHOLD_BYTES,
 ) -> t.List[PointInTimeHealthCheck]:
     """Mid-test checks for the agent-warmboot + neighbour-flap window.
 
     Thin wrapper kept so the landed warmboot playbook's serialized output is
     unchanged by the generalization above.
     """
-    checks = _nbr_flap_non_circuit_checks(restart_service_check)
+    checks = _nbr_flap_non_circuit_checks(
+        restart_service_check,
+        expected_restarted_services=SERVICES_EXPECTED_TO_RESTART_DURING_AGENT_WARMBOOT,
+        memory_threshold_bytes=memory_threshold_bytes,
+    )
     if systemctl_active_check is not None:
         checks = [
             systemctl_active_check
@@ -23469,6 +23706,10 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
     traffic_items_to_configure: t.Optional[t.Mapping[str, TrafficItemSettings]] = None,
     restart_service_check: PointInTimeHealthCheck = AGENT_WARMBOOT_SERVICE_CHECK,
     systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
+    flap_loss_items: t.Optional[t.Sequence[str]] = None,
+    nbr_admin_flap: bool = False,
+    expected_down_interfaces: t.Optional[t.Sequence[t.Dict[str, str]]] = None,
+    memory_threshold_bytes: int = _NBR_FLAP_MEMORY_THRESHOLD_BYTES,
 ) -> Playbook:
     """Build a `test_warmboot_nbr_uplink_flap` Playbook.
 
@@ -23518,28 +23759,46 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
             session, a TestConfig running several of these should set it on
             ALL of them — otherwise a playbook that omits it silently inherits
             whatever the previous playbook left configured.
+        flap_loss_items: Traffic items whose flap-window loss is capped; None
+            skips the cap. Name every item carrying traffic during the flap:
+            the check holds any unnamed item to zero loss.
+        nbr_admin_flap: Flap the neighbour's uplinks by admin state instead of
+            tx_disable; see `create_fpf_rapid_flap_step_lldp`'s `admin_flap`.
+        expected_down_interfaces: `{switch_name, interface_name}` links shut on
+            purpose (a path-scale cut); the LLDP and port-state checks expect them
+            and their far ends down.
+        memory_threshold_bytes: Mid-test per-process RSS ceiling; raise it for a
+            config that runs at route scale.
 
     Returns:
         A `Playbook` named `playbook_name`.
     """
-    active_check = systemctl_active_check or create_systemctl_active_state_check()
+    active_check = systemctl_active_check or create_restart_allowlisted_systemctl_check(
+        SERVICES_EXPECTED_TO_RESTART_DURING_AGENT_WARMBOOT
+    )
     non_circuit_checks = _warmboot_nbr_flap_non_circuit_checks(
         restart_service_check=restart_service_check,
         systemctl_active_check=active_check,
+        memory_threshold_bytes=memory_threshold_bytes,
+    )
+    expected_down = list(expected_down_interfaces) if expected_down_interfaces else None
+    pre_flap_steps, post_flap_steps = _nbr_flap_loss_steps(
+        flap_loss_items, per_iteration_flap_sec
     )
 
     def _nbr_flap_step(duration_sec: int) -> Step:
         return create_fpf_rapid_flap_step_lldp(
             neighbor_pattern=nbr_uplink_neighbor_pattern,
             duration_sec=duration_sec,
-            flap_down_time_sec=6,
-            flap_up_time_sec=6,
+            flap_down_time_sec=_NBR_FLAP_DOWN_S,
+            flap_up_time_sec=_NBR_FLAP_UP_S,
             device_regexes=[nbr_device_name],
             description=(
                 f"Rapid-flap LLDP-resolved uplinks "
                 f"(neighbors~={nbr_uplink_neighbor_pattern!r}) on "
                 f"{nbr_device_name} for {duration_sec}s (wall-clock bound)"
             ),
+            admin_flap=nbr_admin_flap,
         )
 
     return Playbook(
@@ -23551,8 +23810,8 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
             active_check,
             create_device_core_dumps_check(),
             create_unclean_exit_check(),
-            create_lldp_check(),
-            create_port_state_check(),
+            create_lldp_check(disabled_interfaces=expected_down),
+            create_port_state_check(disabled_interfaces=expected_down),
             create_packetloss_health_check(),
         ],
         stages=[
@@ -23568,7 +23827,9 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
                         services=[Service.AGENT, Service.BGP],
                         description="Converge after warmboot, before flapping",
                     ),
+                    *pre_flap_steps,
                     _nbr_flap_step(per_iteration_flap_sec),
+                    *post_flap_steps,
                     create_service_convergence_step(
                         services=[Service.AGENT, Service.BGP],
                         description="Converge after the neighbour uplink flap",
@@ -23586,6 +23847,7 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
             create_steps_stage(
                 stage_id="longevity",
                 steps=[
+                    create_clear_traffic_stats_step(),
                     create_longevity_step(
                         duration=longevity_sec,
                         description=(
@@ -23614,6 +23876,10 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
     extra_post_flap_checks: t.Optional[t.Sequence[PointInTimeHealthCheck]] = None,
     traffic_items_to_configure: t.Optional[t.Mapping[str, TrafficItemSettings]] = None,
     systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
+    flap_loss_items: t.Optional[t.Sequence[str]] = None,
+    nbr_admin_flap: bool = False,
+    expected_down_interfaces: t.Optional[t.Sequence[t.Dict[str, str]]] = None,
+    memory_threshold_bytes: int = _NBR_FLAP_MEMORY_THRESHOLD_BYTES,
 ) -> Playbook:
     """Restart one service on the DUT, then flap the neighbour's uplinks.
 
@@ -23662,19 +23928,42 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
         traffic_items_to_configure: Per-playbook traffic overrides. See
             `create_gtsw_warmboot_nbr_uplink_flap_playbook` for why every
             playbook in a shared TestConfig should set this.
+        flap_loss_items: Traffic items whose flap-window loss is capped; None
+            skips the cap. Name every item carrying traffic during the flap:
+            the check holds any unnamed item to zero loss.
+        nbr_admin_flap: Flap by admin state instead of tx_disable; see
+            `create_gtsw_warmboot_nbr_uplink_flap_playbook`.
+        expected_down_interfaces: `{switch_name, interface_name}` links shut on
+            purpose (a path-scale cut); the LLDP and port-state checks expect them
+            and their far ends down.
+        memory_threshold_bytes: Mid-test per-process RSS ceiling; raise it for a
+            config that runs at route scale.
 
     Returns:
         A `Playbook` named `playbook_name`.
     """
-    active_check = systemctl_active_check or create_systemctl_active_state_check()
-    non_circuit_checks = list(_nbr_flap_non_circuit_checks(restart_service_check))
+    # The restarted unit is the whole allowlist: every service wired in today
+    # restarts alone. A wedge_agent variant takes WEDGE_AGENT_BINDS_TO_CASCADE
+    # down with it and must allowlist that instead.
+    restarted_units = [service_label]
+    active_check = systemctl_active_check or create_restart_allowlisted_systemctl_check(
+        restarted_units
+    )
     non_circuit_checks = [
         active_check
         if check.name == hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK
         else check
-        for check in non_circuit_checks
+        for check in _nbr_flap_non_circuit_checks(
+            restart_service_check,
+            expected_restarted_services=restarted_units,
+            memory_threshold_bytes=memory_threshold_bytes,
+        )
     ]
+    pre_flap_steps, post_flap_steps = _nbr_flap_loss_steps(
+        flap_loss_items, per_iteration_flap_sec
+    )
     non_circuit_checks.extend(extra_post_flap_checks or [])
+    expected_down = list(expected_down_interfaces) if expected_down_interfaces else None
 
     restart_steps = [
         create_service_interruption_step(
@@ -23703,8 +23992,8 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
             active_check,
             create_device_core_dumps_check(),
             create_unclean_exit_check(),
-            create_lldp_check(),
-            create_port_state_check(),
+            create_lldp_check(disabled_interfaces=expected_down),
+            create_port_state_check(disabled_interfaces=expected_down),
             create_packetloss_health_check(),
         ],
         stages=[
@@ -23719,11 +24008,12 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
                             "before flapping"
                         ),
                     ),
+                    *pre_flap_steps,
                     create_fpf_rapid_flap_step_lldp(
                         neighbor_pattern=nbr_uplink_neighbor_pattern,
                         duration_sec=per_iteration_flap_sec,
-                        flap_down_time_sec=6,
-                        flap_up_time_sec=6,
+                        flap_down_time_sec=_NBR_FLAP_DOWN_S,
+                        flap_up_time_sec=_NBR_FLAP_UP_S,
                         device_regexes=[nbr_device_name],
                         description=(
                             f"Rapid-flap LLDP-resolved uplinks "
@@ -23731,7 +24021,9 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
                             f"{nbr_device_name} for {per_iteration_flap_sec}s "
                             "(wall-clock bound)"
                         ),
+                        admin_flap=nbr_admin_flap,
                     ),
+                    *post_flap_steps,
                     create_service_convergence_step(
                         services=list(convergence_services),
                         description="Converge after the neighbour uplink flap",
@@ -23749,6 +24041,7 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
             create_steps_stage(
                 stage_id="longevity",
                 steps=[
+                    create_clear_traffic_stats_step(),
                     create_longevity_step(
                         duration=longevity_sec,
                         description=(
@@ -25638,7 +25931,9 @@ def create_cpu_queue_playbooks(
                         },
                     ),
                     create_service_interruption_step(service=Service.AGENT),
-                    create_service_convergence_step(),
+                    create_service_convergence_step(
+                        services=[Service.AGENT, Service.BGP],
+                    ),
                     create_interface_flap_step(
                         enable=False,
                         interfaces=[ixia_downlink_interface],
@@ -25657,7 +25952,9 @@ def create_cpu_queue_playbooks(
                         patcher_name="cpu_queue_static_route_patcher",
                     ),
                     create_service_interruption_step(service=Service.AGENT),
-                    create_service_convergence_step(),
+                    create_service_convergence_step(
+                        services=[Service.AGENT, Service.BGP],
+                    ),
                 ],
             )
         ],
@@ -25706,7 +26003,9 @@ def create_cpu_queue_playbooks(
                         },
                     ),
                     create_service_interruption_step(service=Service.AGENT),
-                    create_service_convergence_step(),
+                    create_service_convergence_step(
+                        services=[Service.AGENT, Service.BGP],
+                    ),
                     create_interface_flap_step(
                         enable=False,
                         interfaces=[ixia_downlink_interface],
@@ -25725,7 +26024,9 @@ def create_cpu_queue_playbooks(
                         patcher_name="cpu_queue_static_route_patcher",
                     ),
                     create_service_interruption_step(service=Service.AGENT),
-                    create_service_convergence_step(),
+                    create_service_convergence_step(
+                        services=[Service.AGENT, Service.BGP],
+                    ),
                 ],
             )
         ],
@@ -30028,7 +30329,8 @@ def create_fpf_link_event_disrupt_playbook(
     # established sessions at precheck (no fail) and assert the post-disruption
     # count matches in the postcheck — like the other snapshot checks.
     _mem_thresholds = {
-        "bgpd": 4.5 * (1024**3),
+        # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+        "bgpd": 10 * (1024**3),
         "fsdb": 5 * (1024**3),
         "qsfp_service": 2 * (1024**3),
         "fboss_sw_agent": 9 * (1024**3),

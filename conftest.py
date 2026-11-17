@@ -65,6 +65,21 @@ _OSS_READY_TEST_FILES = [
     "taac/health_checks/tests/test_common_utils.py",
     "taac/health_checks/tests/test_convergence_observer.py",
     "taac/tasks/tests/test_oss_gating.py",
+    # Pure unit test: the OSS custom step and its mocks, no taac.internal
+    # import, so it runs in the OSS image while the rest of
+    # taac/steps/tests does not.
+    "taac/steps/tests/test_oss_custom_step.py",
+    "taac/steps/tests/test_oss_nds_device_drain.py",
+    "taac/steps/tests/test_run_ssh_command_step_factory.py",
+    # Pure unit test: RunSSHCmdStep with a mocked driver.
+    "taac/steps/tests/test_run_ssh_cmd_log_output.py",
+    # Pure unit test: LongevityStep with a mocked driver and a fake wall clock.
+    "taac/steps/tests/test_longevity_poll_timeout.py",
+    "taac/steps/tests/test_register_speed_flip_patcher_step.py",
+    "taac/steps/tests/test_system_reboot_step.py",
+    # wedge_qsfp_util platform-descriptor prefix: expands it with bash, no DUT needed.
+    "taac/steps/tests/test_flap_with_shell_cmd_descriptor.py",
+    "taac/tasks/tests/test_thrift_stress_burst_timeout.py",
     "taac/health_checks/snapshot_health_checks/test_cpu_queue_failure_window.py",
     # Pure unit test: Ixia via __new__, config element mocked.
     "taac/ixia/tests/test_ipv4_ecn_bits.py",

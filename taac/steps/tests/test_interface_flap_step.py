@@ -9,6 +9,7 @@ from taac.constants import (  # oss-rewrite (force ShipIt re-export to taac.* ro
     TestDevice,
     TestTopology,
 )
+from taac.driver.driver_constants import wedge_qsfp_util_cmd
 from taac.libs.parameter_evaluator import ParameterEvaluator
 from taac.steps.step_definitions import InterfaceFlapStep
 from taac.test_as_a_config.thrift_types import (
@@ -403,20 +404,24 @@ class InterfaceFlapStepTest(unittest.IsolatedAsyncioTestCase):
     # ──────────────────────────────────────────────
 
     async def test_flap_with_ssh(self):
+        # one batch call, not one SSH session per interface: many concurrent
+        # logins trip sshd MaxStartups and fail the step with ECONNRESET
         self.driver_mock.async_enable_ports_via_ssh = AsyncMock()
         await self.flap_step.flap_with_ssh(
             ["eth1/1/1", "eth1/2/1"], enable=True, sequential=False
         )
-        self.assertEqual(self.driver_mock.async_enable_ports_via_ssh.await_count, 2)
-        self.driver_mock.async_enable_ports_via_ssh.assert_any_await(["eth1/1/1"], True)
-        self.driver_mock.async_enable_ports_via_ssh.assert_any_await(["eth1/2/1"], True)
+        self.driver_mock.async_enable_ports_via_ssh.assert_awaited_once_with(
+            ["eth1/1/1", "eth1/2/1"], True
+        )
 
     async def test_flap_with_ssh_sequential(self):
         self.driver_mock.async_enable_ports_via_ssh = AsyncMock()
         await self.flap_step.flap_with_ssh(
             ["eth1/1/1", "eth1/2/1"], enable=False, sequential=True
         )
-        self.assertEqual(self.driver_mock.async_enable_ports_via_ssh.await_count, 2)
+        self.driver_mock.async_enable_ports_via_ssh.assert_awaited_once_with(
+            ["eth1/1/1", "eth1/2/1"], False
+        )
 
     # ──────────────────────────────────────────────
     # flap_with_shell_cmd
@@ -430,7 +435,7 @@ class InterfaceFlapStepTest(unittest.IsolatedAsyncioTestCase):
             sequential=False,
         )
         self.driver_mock.async_run_cmd_on_shell.assert_awaited_once_with(
-            "wedge_qsfp_util --tx_disable eth1/1/1 eth1/2/1 eth1/3/1"
+            f"{wedge_qsfp_util_cmd()} --tx_disable eth1/1/1 eth1/2/1 eth1/3/1"
         )
 
     async def test_shell_cmd_sequential_individual_commands(self):
@@ -442,13 +447,13 @@ class InterfaceFlapStepTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.driver_mock.async_run_cmd_on_shell.await_count, 3)
         self.driver_mock.async_run_cmd_on_shell.assert_any_await(
-            "wedge_qsfp_util --tx_enable eth1/1/1"
+            f"{wedge_qsfp_util_cmd()} --tx_enable eth1/1/1"
         )
         self.driver_mock.async_run_cmd_on_shell.assert_any_await(
-            "wedge_qsfp_util --tx_enable eth1/2/1"
+            f"{wedge_qsfp_util_cmd()} --tx_enable eth1/2/1"
         )
         self.driver_mock.async_run_cmd_on_shell.assert_any_await(
-            "wedge_qsfp_util --tx_enable eth1/3/1"
+            f"{wedge_qsfp_util_cmd()} --tx_enable eth1/3/1"
         )
 
     async def test_shell_cmd_parallel_single_interface(self):
@@ -457,7 +462,7 @@ class InterfaceFlapStepTest(unittest.IsolatedAsyncioTestCase):
             ["eth1/1/1"], "--set_low_power", sequential=False
         )
         self.driver_mock.async_run_cmd_on_shell.assert_awaited_once_with(
-            "wedge_qsfp_util --set_low_power eth1/1/1"
+            f"{wedge_qsfp_util_cmd()} --set_low_power eth1/1/1"
         )
 
     async def test_shell_cmd_error_propagates(self):

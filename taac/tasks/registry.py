@@ -187,6 +187,7 @@ from taac.tasks.setup_base_configs_task import (
 from taac.tasks.verify_best_path_changes_task import (
     VerifyBestPathChangesTask,
 )
+from taac.tasks.wait_for_bgp_fib_sync_task import WaitForBgpFibSyncTask
 
 
 TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
@@ -200,6 +201,7 @@ TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     InterfaceIpConfigurationTask,
     WaitForAgentConvergenceTask,
     WaitForBgpConvergenceTask,
+    WaitForBgpFibSyncTask,
     ConfigureParallelBgpPeers,
     CoopRegisterPatcherTask,
     CoopSetAccessPolicyTask,

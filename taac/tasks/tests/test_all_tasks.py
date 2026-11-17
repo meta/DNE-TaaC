@@ -2,8 +2,10 @@
 # pyre-unsafe
 import base64
 import contextlib
+import importlib
 import json
 import math
+import os
 import typing as t
 import unittest
 from types import SimpleNamespace
@@ -11,7 +13,6 @@ from unittest.mock import AsyncMock, call, MagicMock, patch
 
 import later.unittest
 from taac.task_definitions import create_coop_apply_patchers_task
-from neteng.test_infra.dne.taac.tasks import all as tasks_all
 from taac.tasks.all import (
     AristaCreateFileFromConfig,
     AristaDaemonControlTask,
@@ -27,6 +28,11 @@ from taac.tasks.all import (
     ValidateBgpcppUpdateGroupState,
 )
 from taac.utils import oss_taac_lib_utils
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+tasks_all = importlib.import_module(f"{_PACKAGE}.tasks.all")
 
 
 ALL_PATH = "neteng.test_infra.dne.taac.tasks.all"
@@ -408,6 +414,38 @@ class CoopUnregisterPatchersTaskTest(later.unittest.TestCase):
             {"agent": [], "bgpcpp": [], "bgpcpp_drain": [], "bgpcpp_softdrain": []},
             registered,
         )
+
+    async def test_unregisters_newest_first(self) -> None:
+        """The OSS patcher rebuilds the config after each removal, so a patcher
+        that builds on an earlier one (a term in a cloned policy) must go first."""
+        order = []
+
+        async def list_patchers(config_name: str) -> list:
+            return (
+                [SimpleNamespace(name=n, owner=None) for n in ("a_clone", "b_term")]
+                if config_name == "bgpcpp" and not order
+                else []
+            )
+
+        async def unregister(patcher_name: str, config_name: str, **kwargs) -> None:
+            order.append(patcher_name)
+
+        driver = MagicMock()
+        driver.async_coop_list_patchers = AsyncMock(side_effect=list_patchers)
+        driver.async_coop_unregister_patchers = AsyncMock(side_effect=unregister)
+        driver.async_restore_patched_configs = AsyncMock()
+        with (
+            _taac_env(taac_oss=True, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+        ):
+            await CoopUnregisterPatchersTask(logger=MagicMock()).run(
+                {"hostname": "fsw.example", "config_names": ["bgpcpp"]}
+            )
+        self.assertEqual(["b_term", "a_clone"], order)
 
     def test_default_configs_for_a_drainable_host(self) -> None:
         self.assertEqual(

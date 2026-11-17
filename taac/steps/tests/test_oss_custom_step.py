@@ -10,10 +10,13 @@ here. Mirrors the contract locked by the internal
 patcher kwargs, same suffix fallback, same descriptive errors.
 """
 
+import importlib
 import json
+import os
 import time
 import typing as t
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,8 +28,14 @@ from taac.constants import (
 from taac.driver.driver_constants import SwitchLldpData
 from taac.libs.parameter_evaluator import ParameterEvaluator
 from taac.steps.all_steps import NAME_TO_STEP
-from neteng.test_infra.dne.taac.steps.oss_custom_step import _HANDLERS, OssCustomStep
 from taac.test_as_a_config import types as taac_types
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+_oss_custom_step = importlib.import_module(f"{_PACKAGE}.steps.oss_custom_step")
+_HANDLERS = _oss_custom_step._HANDLERS
+OssCustomStep = _oss_custom_step.OssCustomStep
 
 
 class _FakeIxiaClass:
@@ -109,6 +118,22 @@ class TestDispatch(unittest.IsolatedAsyncioTestCase):
         msg = str(ctx.exception)
         self.assertIn("test_ndp_clear", msg)
         self.assertIn("register_cpu_queue_static_route_patcher", msg)
+
+    async def test_record_jq_timestamp_sets_a_top_level_jq_var(self):
+        step = _make_step({})
+        step.parameter_evaluator.jq_vars = {"test_case_start_time": 1}
+        before = int(time.time())
+        await step.run(MagicMock(), {"custom_step_name": "record_jq_timestamp", "var_name": "l2_recovery_start_time"})
+        got = step.parameter_evaluator.jq_vars["l2_recovery_start_time"]
+        self.assertIsInstance(got, int)
+        self.assertGreaterEqual(got, before)
+        self.assertEqual(step.parameter_evaluator.jq_vars["test_case_start_time"], 1)
+
+    async def test_record_jq_timestamp_needs_a_var_name(self):
+        step = _make_step({})
+        step.parameter_evaluator.jq_vars = {}
+        with self.assertRaises(ValueError):
+            await step.run(MagicMock(), {"custom_step_name": "record_jq_timestamp"})
 
     async def test_missing_name_is_rejected(self):
         step = _make_step({})
@@ -414,6 +439,36 @@ def _lldp_table() -> t.Dict[str, SwitchLldpData]:
     }
 
 
+def _admin_driver(step, names, admin_down=()):
+    """Wire step.driver for the admin flap: port IDs 1..n, one shared agent client.
+
+    Returns the client, whose setPortState awaits record (port_id, enable).
+    """
+    step.driver.async_get_all_port_info.return_value = {
+        port_id: SimpleNamespace(name=name) for port_id, name in enumerate(names, 1)
+    }
+    client = AsyncMock()
+    connection = MagicMock()
+    connection.__aenter__ = AsyncMock(return_value=client)
+    connection.__aexit__ = AsyncMock(return_value=False)
+    step.driver.async_agent_client = connection
+    step.driver.async_get_all_interfaces_admin_status.return_value = defaultdict(
+        bool, {name: name not in admin_down for name in names}
+    )
+    return client
+
+
+def _admin_phases(client, names) -> t.List[t.Tuple[bool, t.Set[str]]]:
+    """setPortState calls folded into phases: (enable, ports set in that phase)."""
+    phases: t.List[t.Tuple[bool, t.Set[str]]] = []
+    for call in client.setPortState.await_args_list:
+        port_id, enable = call.args
+        if not phases or phases[-1][0] != enable:
+            phases.append((enable, set()))
+        phases[-1][1].add(names[port_id - 1])
+    return phases
+
+
 class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
     """The LLDP-resolved rapid-flap handler used by the nbr-uplink-flap playbooks."""
 
@@ -422,7 +477,9 @@ class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
         step = _make_step({})
         step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
         # start=0.0, two checks under the 200s deadline, then one past it.
-        with patch("time.time", side_effect=[0.0, 1.0, 2.0, 500.0]):
+        with patch(
+            f"{_PACKAGE}.steps.oss_custom_step.time", **{"time.side_effect": [0.0, 1.0, 2.0, 500.0]}
+        ):
             await step.fpf_rapid_flap_lldp(
                 {
                     "neighbor_pattern": "nbr*",
@@ -449,7 +506,9 @@ class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
         """An exact host list narrows the scope a glob would widen."""
         step = _make_step({})
         step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
-        with patch("time.time", side_effect=[0.0, 1.0, 500.0]):
+        with patch(
+            f"{_PACKAGE}.steps.oss_custom_step.time", **{"time.side_effect": [0.0, 1.0, 500.0]}
+        ):
             await step.fpf_rapid_flap_lldp(
                 {
                     "neighbor_hosts": ["nbr001"],
@@ -464,7 +523,9 @@ class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
     async def test_up_time_defaults_to_down_time(self):
         step = _make_step({})
         step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
-        with patch("time.time", side_effect=[0.0, 1.0, 500.0]):
+        with patch(
+            f"{_PACKAGE}.steps.oss_custom_step.time", **{"time.side_effect": [0.0, 1.0, 500.0]}
+        ):
             await step.fpf_rapid_flap_lldp(
                 {
                     "neighbor_pattern": "nbr001*",
@@ -493,6 +554,109 @@ class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TestCaseFailure):
             await step.fpf_rapid_flap_lldp({"duration_sec": 200})
 
+    async def test_admin_flap_cycles_port_state_and_ends_enabled(self):
+        """flap_method=thrift runs the same enable/hold/disable/hold cycle through
+        setPortState, and leaves the ports enabled."""
+        step = _make_step({})
+        step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
+        names = ["eth1/1/1", "eth1/2/1", "eth1/3/1"]
+        client = _admin_driver(step, names)
+        sleep = AsyncMock()
+        with patch(
+            f"{_PACKAGE}.steps.oss_custom_step.time", **{"time.side_effect": [0.0, 1.0, 500.0]}
+        ), patch(
+            f"{_PACKAGE}.steps.oss_custom_step.asyncio.sleep", sleep
+        ):
+            await step.fpf_rapid_flap_lldp(
+                {
+                    "neighbor_pattern": "nbr001*",
+                    "duration_sec": 200,
+                    "down_time_sec": 6,
+                    "up_time_sec": 7,
+                    "flap_method": "thrift",
+                }
+            )
+        step.driver.async_do_rapid_interface_flaps.assert_not_awaited()
+        step.driver.async_get_all_port_info.assert_awaited_once()
+        flapped = {"eth1/1/1", "eth1/2/1"}
+        self.assertEqual(
+            _admin_phases(client, names), [(True, flapped), (False, flapped), (True, flapped)]
+        )
+        self.assertEqual([c.args[0] for c in sleep.await_args_list], [7.0, 6.0])
+
+    async def test_admin_flap_fails_on_a_port_the_agent_does_not_know(self):
+        """A name with no port ID must fail, not be skipped."""
+        step = _make_step({})
+        step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
+        client = _admin_driver(step, ["eth1/1/1"])
+        with self.assertRaises(TestCaseFailure) as ctx:
+            await step.fpf_rapid_flap_lldp(
+                {"neighbor_pattern": "nbr001*", "duration_sec": 200, "flap_method": "thrift"}
+            )
+        self.assertIn("eth1/2/1", str(ctx.exception))
+        client.setPortState.assert_not_awaited()
+
+    async def test_admin_flap_reenables_every_port_and_keeps_the_original_error(self):
+        """An admin-down port does not come back on its own, unlike a tx_disabled
+        optic; a failing re-enable must not replace the error that ended the window."""
+        step = _make_step({})
+        step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
+        names = ["eth1/1/1", "eth1/2/1"]
+        client = _admin_driver(step, names)
+
+        async def set_port_state(port_id, enable):
+            if port_id == 1:
+                raise RuntimeError("agent gone")
+
+        client.setPortState.side_effect = set_port_state
+        with patch(
+            f"{_PACKAGE}.steps.oss_custom_step.time", **{"time.side_effect": [0.0, 1.0, 500.0]}
+        ), patch(
+            f"{_PACKAGE}.steps.oss_custom_step.asyncio.sleep", AsyncMock()
+        ), self.assertRaises(TestCaseFailure) as ctx:
+            await step.fpf_rapid_flap_lldp(
+                {"neighbor_pattern": "nbr001*", "duration_sec": 200, "flap_method": "thrift"}
+            )
+        # The first phase (enable) failed on eth1/1/1; the restore failed on it too.
+        self.assertIn("enabling failed", str(ctx.exception))
+        self.assertIn("eth1/1/1", str(ctx.exception))
+        self.assertEqual(_admin_phases(client, names)[-1], (True, set(names)))
+        errors = " ".join(str(c.args[0]) for c in step.logger.error.call_args_list)
+        self.assertIn("eth1/1/1", errors)
+        self.assertIn("re-enable incomplete", errors)
+
+    async def test_admin_flap_fails_when_a_port_stays_admin_down(self):
+        """The read-back retries a port still down, then fails naming it."""
+        step = _make_step({})
+        step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
+        names = ["eth1/1/1", "eth1/2/1"]
+        client = _admin_driver(step, names, admin_down={"eth1/2/1"})
+        with patch(
+            f"{_PACKAGE}.steps.oss_custom_step.time", **{"time.side_effect": [0.0, 1.0, 500.0]}
+        ), patch(
+            f"{_PACKAGE}.steps.oss_custom_step.asyncio.sleep", AsyncMock()
+        ), self.assertRaises(TestCaseFailure) as ctx:
+            await step.fpf_rapid_flap_lldp(
+                {"neighbor_pattern": "nbr001*", "duration_sec": 200, "flap_method": "thrift"}
+            )
+        self.assertIn("still admin-down", str(ctx.exception))
+        self.assertIn("eth1/2/1", str(ctx.exception))
+        self.assertNotIn("eth1/1/1", str(ctx.exception))
+        # The restore enables both, then the retry enables only the port still down.
+        self.assertEqual(client.setPortState.await_args_list[-1].args, (2, True))
+        self.assertEqual(step.driver.async_get_all_interfaces_admin_status.await_count, 2)
+
+    async def test_admin_flap_spreads_a_large_bundle_over_concurrent_callers(self):
+        step = _make_step({})
+        names = [f"eth1/{n}/1" for n in range(1, 41)]
+        client = _admin_driver(step, names)
+        await step._set_admin_concurrently({n: i for i, n in enumerate(names, 1)}, False)
+        connections = step.driver.async_agent_client.__aenter__.await_count
+        self.assertLessEqual(connections, 16)
+        self.assertGreater(connections, 1)
+        self.assertEqual(_admin_phases(client, names), [(False, set(names))])
+        self.assertEqual(client.setPortState.await_count, len(names))
+
     async def test_fail_closed_mode_is_explicitly_unported(self):
         """No OSS playbook sets it; say so rather than silently ignoring it."""
         step = _make_step({})
@@ -504,3 +668,111 @@ class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
                     "fail_closed": True,
                 }
             )
+
+
+class TestFpfSetInterfaceAdmin(unittest.IsolatedAsyncioTestCase):
+    async def test_sets_present_ports_and_skips_a_removed_one(self):
+        step = _make_step()
+        step.driver.async_get_all_interfaces_admin_status.return_value = {"eth1/17/1": True}
+        await step.run(
+            MagicMock(),
+            {"custom_step_name": "fpf_set_interface_admin",
+             "interfaces": ["eth1/17/1", "eth1/17/5"], "is_enable": False,
+             "skip_missing": True},
+        )
+        step.driver.async_thrift_disable_enable_interfaces.assert_awaited_once_with(
+            interface_names=["eth1/17/1"], is_enable_port=False
+        )
+        self.assertIn("eth1/17/5", step.logger.warning.call_args.args[0])
+
+    async def test_best_effort_failure_is_logged_not_raised(self):
+        step = _make_step()
+        step.driver.async_get_all_interfaces_admin_status.return_value = {"eth1/17/1": True}
+        step.driver.async_thrift_disable_enable_interfaces.side_effect = RuntimeError("boom")
+        await step.run(
+            MagicMock(),
+            {"custom_step_name": "fpf_set_interface_admin", "interfaces": ["eth1/17/1"],
+             "is_enable": True, "best_effort": True, "record_event_time": False},
+        )
+        self.assertIn("best_effort", step.logger.error.call_args.args[0])
+
+    async def test_failure_without_best_effort_raises(self):
+        step = _make_step()
+        step.driver.async_get_all_interfaces_admin_status.return_value = {"eth1/17/1": True}
+        step.driver.async_thrift_disable_enable_interfaces.side_effect = RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            await step.run(
+                MagicMock(),
+                {"custom_step_name": "fpf_set_interface_admin", "interfaces": ["eth1/17/1"],
+                 "is_enable": False},
+            )
+
+    async def test_missing_port_fails_unless_skip_missing(self):
+        step = _make_step()
+        step.driver.async_get_all_interfaces_admin_status.return_value = {"eth1/17/1": True}
+        with self.assertRaisesRegex(TestCaseFailure, "eth1/17/5"):
+            await step.run(
+                MagicMock(),
+                {"custom_step_name": "fpf_set_interface_admin",
+                 "interfaces": ["eth1/17/5"], "is_enable": False},
+            )
+        step.driver.async_thrift_disable_enable_interfaces.assert_not_awaited()
+
+    async def test_best_effort_covers_an_unreachable_agent(self):
+        step = _make_step()
+        step.driver.async_get_all_interfaces_admin_status.side_effect = OSError("no route")
+        await step.run(
+            MagicMock(),
+            {"custom_step_name": "fpf_set_interface_admin", "interfaces": ["eth1/17/1"],
+             "is_enable": True, "best_effort": True},
+        )
+        self.assertIn("best_effort", step.logger.error.call_args.args[0])
+
+    async def test_recovery_start_is_anchored_on_enable_only(self):
+        import sys
+        import types
+
+        reg = types.ModuleType(f"{_PACKAGE}.libs.fpf.fpf_collector_registry")
+        reg.set_recovery_start_time = MagicMock()
+        for enable, expected in ((True, 1), (False, 0)):
+            reg.set_recovery_start_time.reset_mock()
+            step = _make_step()
+            step.driver.async_get_all_interfaces_admin_status.return_value = {"eth1/17/1": True}
+            with patch.dict(sys.modules, {f"{_PACKAGE}.libs.fpf.fpf_collector_registry": reg}):
+                await step.run(
+                    MagicMock(),
+                    {"custom_step_name": "fpf_set_interface_admin",
+                     "interfaces": ["eth1/17/1"], "is_enable": enable},
+                )
+            self.assertEqual(reg.set_recovery_start_time.call_count, expected, enable)
+
+    async def test_enable_does_not_need_the_internal_fpf_registry(self):
+        step = _make_step()
+        step.driver.async_get_all_interfaces_admin_status.return_value = {"eth1/17/1": True}
+        await step.run(
+            MagicMock(),
+            {"custom_step_name": "fpf_set_interface_admin",
+             "interfaces": ["eth1/17/1"], "is_enable": True},
+        )
+        step.driver.async_thrift_disable_enable_interfaces.assert_awaited_once()
+
+    async def test_skip_missing_enable_of_only_missing_ports_does_nothing(self):
+        import sys
+        import types
+
+        reg = types.ModuleType(f"{_PACKAGE}.libs.fpf.fpf_collector_registry")
+        reg.set_recovery_start_time = MagicMock()
+        step = _make_step()
+        step.driver.async_get_all_interfaces_admin_status.return_value = {"eth1/17/1": True}
+        with patch.dict(sys.modules, {f"{_PACKAGE}.libs.fpf.fpf_collector_registry": reg}):
+            await step.run(
+                MagicMock(),
+                {
+                    "custom_step_name": "fpf_set_interface_admin",
+                    "interfaces": ["eth1/17/5"],
+                    "is_enable": True,
+                    "skip_missing": True,
+                },
+            )
+        step.driver.async_thrift_disable_enable_interfaces.assert_not_awaited()
+        reg.set_recovery_start_time.assert_not_called()

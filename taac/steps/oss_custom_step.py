@@ -18,14 +18,24 @@ that needs a new handler gets it added here rather than silently running
 against an unconfigured DUT.
 """
 
+import asyncio
 import fnmatch
 import json
+import math
 import time
 import typing as t
 
 from taac.constants import TestCaseFailure
-from neteng.test_infra.dne.taac.steps.step import Step as StepBase
 from taac.test_as_a_config import types as taac_types
+from taac.utils.oss_taac_constants import TAAC_OSS
+
+if TAAC_OSS:
+    from taac.steps.step import Step as StepBase
+else:
+    from neteng.test_infra.dne.taac.steps.step import Step as StepBase
+
+# Parallel setPortState callers per admin-flap phase.
+_ADMIN_FLAP_CONCURRENCY = 16
 
 
 class OssCustomStep(StepBase[taac_types.CustomStepInput]):
@@ -293,11 +303,16 @@ class OssCustomStep(StepBase[taac_types.CustomStepInput]):
                 "make the playbook pass without testing anything."
             )
 
+        admin = params.get("flap_method") == "thrift"
         self.logger.warning(
             f"{self.hostname}: rapid-flapping {interfaces} (LLDP neighbour "
             f"{hosts or pattern!r}) for {duration_sec}s, "
             f"down {down_time_sec}s / up {up_time_sec}s per cycle"
+            f"{' by admin state' if admin else ''}"
         )
+        if admin:
+            await self._admin_rapid_flap(interfaces, duration_sec, down_time_sec, up_time_sec)
+            return
         start = time.time()
         flaps = 0
         while time.time() - start < duration_sec:
@@ -313,6 +328,117 @@ class OssCustomStep(StepBase[taac_types.CustomStepInput]):
         self.logger.warning(
             f"{self.hostname}: rapid flap done, {flaps} cycle(s) in {duration_sec}s"
         )
+
+    async def _admin_rapid_flap(
+        self,
+        interfaces: t.Tuple[str, ...],
+        duration_sec: int,
+        down_time_sec: float,
+        up_time_sec: float,
+    ) -> None:
+        """The tx_disable cycle (enable, hold up, disable, hold down) by admin state.
+
+        Unlike a tx_disabled optic, which qsfp_service brings back, an admin-down
+        port stays down, so the ports are re-enabled however the window ends.
+        """
+        port_ids = await self._admin_port_ids(interfaces)
+        start = time.time()
+        flaps = 0
+        try:
+            while time.time() - start < duration_sec:
+                for enable, hold in ((True, up_time_sec), (False, down_time_sec)):
+                    await self._set_admin_concurrently(port_ids, enable)
+                    await asyncio.sleep(hold)
+                flaps += 1
+        except BaseException:
+            # The error that ended the window wins over one from the restore.
+            await self._restore_admin_up(port_ids, raise_on_failure=False)
+            raise
+        await self._restore_admin_up(port_ids, raise_on_failure=True)
+        self.logger.warning(
+            f"{self.hostname}: admin rapid flap done, {flaps} cycle(s) in {duration_sec}s"
+        )
+
+    async def _admin_port_ids(self, interfaces: t.Sequence[str]) -> t.Dict[str, int]:
+        """Port name -> port ID from one getAllPortInfo; an unknown name fails."""
+        # pyre-fixme[16]
+        port_info = await self.driver.async_get_all_port_info()
+        by_name = {info.name: port_id for port_id, info in port_info.items()}
+        missing = [name for name in interfaces if name not in by_name]
+        if missing:
+            raise TestCaseFailure(
+                f"oss-custom-step: {self.hostname} agent has no port named {missing}, "
+                "so the admin flap would silently skip it."
+            )
+        return {name: by_name[name] for name in interfaces}
+
+    async def _set_admin_concurrently(
+        self, port_ids: t.Dict[str, int], enable: bool
+    ) -> None:
+        """setPortState on every port, from up to _ADMIN_FLAP_CONCURRENCY connections.
+
+        One setPortState at a time over a large bundle runs far longer than the
+        cycle's hold times. All callers finish before this returns, and every
+        failed caller is logged, not just the first.
+        """
+        state = "Enabling" if enable else "Disabling"
+        items = list(port_ids.items())
+        size = math.ceil(len(items) / _ADMIN_FLAP_CONCURRENCY)
+        chunks = [items[i : i + size] for i in range(0, len(items), size)]
+
+        async def set_chunk(chunk: t.List[t.Tuple[str, int]]) -> None:
+            # pyre-fixme[16]
+            async with self.driver.async_agent_client as client:
+                for name, port_id in chunk:
+                    await client.setPortState(port_id, enable)
+                    self.logger.info(f"{state} port {self.hostname}:{name}")
+
+        results = await asyncio.gather(
+            *(set_chunk(chunk) for chunk in chunks), return_exceptions=True
+        )
+        errors = [(c, r) for c, r in zip(chunks, results) if isinstance(r, Exception)]
+        if errors:
+            failed = sorted(name for chunk, _ in errors for name, _ in chunk)
+            self.logger.error(
+                f"{self.hostname}: setPortState({enable}) failed in "
+                f"{len(errors)} caller(s): "
+                + "; ".join(f"{[n for n, _ in c]}: {e!r}" for c, e in errors)
+            )
+            raise TestCaseFailure(
+                f"oss-custom-step: {state.lower()} failed on {self.hostname} "
+                f"for callers covering {failed}"
+            ) from errors[0][1]
+
+    async def _restore_admin_up(
+        self, port_ids: t.Dict[str, int], raise_on_failure: bool
+    ) -> None:
+        """Re-enable the ports, then read back that they are admin-up.
+
+        The read-back also catches a disable sent before a cancellation that lands
+        after the re-enable. Ports still down are named in the log either way.
+        """
+        try:
+            await self._set_admin_concurrently(port_ids, True)
+            # pyre-fixme[16]
+            admin_up = await self.driver.async_get_all_interfaces_admin_status()
+            down = sorted(name for name in port_ids if not admin_up.get(name))
+            if down:
+                await self._set_admin_concurrently({n: port_ids[n] for n in down}, True)
+                # pyre-fixme[16]
+                admin_up = await self.driver.async_get_all_interfaces_admin_status()
+                down = sorted(name for name in port_ids if not admin_up.get(name))
+            if down:
+                raise TestCaseFailure(
+                    f"oss-custom-step: {self.hostname} ports {down} are still "
+                    "admin-down after the admin flap's re-enable."
+                )
+        except Exception as e:
+            self.logger.error(
+                f"{self.hostname}: admin flap re-enable incomplete; later "
+                f"playbooks may run with these ports admin-down: {e}"
+            )
+            if raise_on_failure:
+                raise
 
     async def dump_traffic_item_stats(self, params: t.Dict[str, t.Any]) -> None:
         """Log IXIA Tx/Rx for named traffic items. Diagnostic only.
@@ -362,6 +488,63 @@ class OssCustomStep(StepBase[taac_types.CustomStepInput]):
                 "unclassified from this run"
             )
 
+    async def fpf_set_interface_admin(self, params: t.Dict[str, t.Any]) -> None:
+        """Set interface admin state on the live agent (thrift setPortState), held until changed.
+
+        A port the agent does not have fails the step, unless ``skip_missing``
+        (a removed subsumed mate) skips it with a warning. ``best_effort`` logs
+        any failure, including an unreachable agent, instead of raising.
+        """
+        interfaces = list(params["interfaces"])
+        enable = bool(params["is_enable"])
+        action = "enable" if enable else "disable"
+        try:
+            present = set(await self.driver.async_get_all_interfaces_admin_status())
+            missing = [i for i in interfaces if i not in present]
+            if missing and not params.get("skip_missing"):
+                raise TestCaseFailure(
+                    f"oss-custom-step: {self.hostname} has no port {missing} to {action}"
+                )
+            if missing:
+                self.logger.warning(
+                    f"oss-custom-step: {self.hostname} has no port {missing}; "
+                    f"skipping its admin {action}"
+                )
+            targets = [i for i in interfaces if i in present]
+            if targets:
+                # pyre-fixme[16]
+                await self.driver.async_thrift_disable_enable_interfaces(
+                    interface_names=targets, is_enable_port=enable
+                )
+        except Exception as e:
+            if not params.get("best_effort"):
+                raise
+            self.logger.error(
+                f"oss-custom-step: admin {action} of {interfaces} failed ({e}); "
+                "continuing cleanup (best_effort)"
+            )
+            return
+        if targets and enable and params.get("record_event_time", True):
+            try:
+                from taac.libs.fpf.fpf_collector_registry import set_recovery_start_time
+            except ImportError:
+                # The FPF collectors need Meta-internal modules; OSS has none to anchor.
+                return
+            set_recovery_start_time(time.time())
+
+
+async def _record_jq_timestamp(step: "OssCustomStep", params: t.Dict[str, t.Any]) -> None:
+    """Store now (epoch seconds) as a top-level jq var, like test_case_start_time.
+
+    Later checks read it through ``start_time_jq_var`` / ``jq_params``
+    (``.<var_name>``) as the start of their window.
+    """
+    var_name = params.get("var_name")
+    if not var_name:
+        raise ValueError("oss-custom-step: record_jq_timestamp needs a 'var_name'")
+    step.parameter_evaluator.jq_vars[var_name] = int(time.time())
+    step.logger.info(f"oss-custom-step: recorded jq var {var_name!r}")
+
 
 _HANDLERS: t.Dict[str, t.Callable[..., t.Awaitable[None]]] = {
     "register_cpu_queue_static_route_patcher": (
@@ -371,4 +554,6 @@ _HANDLERS: t.Dict[str, t.Callable[..., t.Awaitable[None]]] = {
     "verify_interface_mtu": OssCustomStep.verify_interface_mtu,
     "dump_traffic_item_stats": OssCustomStep.dump_traffic_item_stats,
     "fpf_rapid_flap_lldp": OssCustomStep.fpf_rapid_flap_lldp,
+    "fpf_set_interface_admin": OssCustomStep.fpf_set_interface_admin,
+    "record_jq_timestamp": _record_jq_timestamp,
 }

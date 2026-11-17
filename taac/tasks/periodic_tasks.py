@@ -52,6 +52,11 @@ try:
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
+try:
+    import asyncssh
+except ImportError:
+    asyncssh = None
+
 
 def _parse_memory_value(mem_str: str) -> int:
     """
@@ -2557,12 +2562,35 @@ class OpticsTemperatureTask(PeriodicTask):
         )
 
 
+_RAPID_FLAP_METHOD: str = "async_do_rapid_interface_flaps"
+
+
+def _is_single_flap(call: ThriftStressCall) -> bool:
+    """True when the rapid-flap call runs exactly one flap cycle. The legacy
+    argument shape is (interfaces, interval_to_link_up, total_flaps[, ...])."""
+    return len(call.args) >= 3 and call.args[2] == 1
+
+
+def _is_transport_error(error: BaseException) -> bool:
+    """True when the SSH connection to the switch failed, not the command.
+
+    A command that runs past its own timeout comes back as a result, and one
+    that hangs past the burst deadline is cancelled, so neither lands here: a
+    TimeoutError raised by the call itself comes from connecting.
+    """
+    if isinstance(error, TimeoutError):
+        return True
+    if asyncssh is not None and isinstance(error, asyncssh.Error):
+        return not isinstance(error, asyncssh.PermissionDenied)
+    return isinstance(error, (ConnectionError, EOFError))
+
+
 class ThriftStressPeriodicTask(PeriodicTask):
     """Sustained high-volume thrift workload against a FBOSS DUT.
 
     Each invocation fires every `ThriftStressCall` in the payload concurrently
-    (with `requests_per_burst` copies per call) via a single
-    `asyncio.gather(...)`. The wrapping `PeriodicTaskWorker` loops `run()`
+    (with `requests_per_burst` copies per call) under one `asyncio.wait(...)`
+    with the burst timeout. The wrapping `PeriodicTaskWorker` loops `run()`
     back-to-back with `time.sleep(interval)` between bursts, which together
     reproduces the `while True: gather(...); sleep(5)` shape of
     `scripts/pavanpatil/thrift_call_disruptive.py:async_thrift_stress_call`.
@@ -2580,23 +2608,28 @@ class ThriftStressPeriodicTask(PeriodicTask):
 
     For read-only workloads, `run_final_check()` treats rate-limit exceptions
     as forensic signal because the stress intentionally exceeds the configured
-    QPS. For dynamic flap workloads, an RPC failure/timeout or a target that is
-    still down after the stability stage fails the test.
+    QPS. For dynamic flap workloads, a flap that hangs past the burst, still
+    loses its SSH transport after its retries, or raises anything else, or a
+    target that is still down after the stability stage, fails the test. The
+    driver's flap path returns stdout only, so a non-zero exit of the flap
+    command on the switch is not surfaced and counts as a completed flap.
     """
 
     NAME = "thrift_stress"
     DEFAULT_REQUESTS_PER_API: int = 10000
-    # Burst timeout — if `asyncio.gather(...)` hasn't returned by this many
-    # seconds, we cancel all pending coroutines, log a loud warning, record a
-    # timed-out burst with the count, and return so the worker loop continues
-    # to the next interval. Without this, an unresponsive agent (e.g. when
-    # the storm we're firing pegs `fboss_sw_agent` CPU at 100%) causes
-    # gather() to hang indefinitely — we'd never get a burst result, never
+    # Burst timeout — calls still pending after this many seconds are
+    # cancelled and recorded as timed out (finished calls keep their result),
+    # with a loud warning, and the worker loop continues to the next interval.
+    # Without this, an unresponsive agent (e.g. when the storm we're firing
+    # pegs `fboss_sw_agent` CPU at 100%) hangs the burst indefinitely — we'd
+    # never get a burst result, never
     # write to shared_data, and the test would terminate the worker with
     # `_data entries=0` and no diagnostic. 60s default is generous for
     # ~70K well-behaved concurrent calls (~5-30s normal) but tight enough
     # to surface trouble within one burst window.
     DEFAULT_BURST_TIMEOUT_S: float = 60.0
+    # Re-runs of a dynamic flap whose SSH transport failed within its burst.
+    DEFAULT_FLAP_RETRY_ATTEMPTS = 2
 
     @staticmethod
     def _resolve_calls(params: t.Dict[str, t.Any]) -> t.List[ThriftStressCall]:
@@ -2704,12 +2737,13 @@ class ThriftStressPeriodicTask(PeriodicTask):
                     args=(flap_interfaces, *call.args[1:]),
                     requests_per_burst=call.requests_per_burst,
                 )
-                if call.method == "async_do_rapid_interface_flaps"
+                if call.method == _RAPID_FLAP_METHOD
                 else call
                 for call in calls
             ]
 
         coros: t.List[t.Coroutine] = []
+        coro_calls: t.List[ThriftStressCall] = []
         skipped: t.List[str] = []
         scheduled_breakdown: t.List[str] = []
         for call in calls:
@@ -2719,6 +2753,7 @@ class ThriftStressPeriodicTask(PeriodicTask):
                 continue
             for _ in range(call.requests_per_burst):
                 coros.append(method(*call.args))
+                coro_calls.append(call)
             scheduled_breakdown.append(f"{call.method}x{call.requests_per_burst}")
 
         if skipped:
@@ -2738,57 +2773,125 @@ class ThriftStressPeriodicTask(PeriodicTask):
             f"(timeout={burst_timeout_s:.0f}s) ({', '.join(scheduled_breakdown)})"
         )
         burst_start = time.time()
+        tasks = [asyncio.ensure_future(c) for c in coros]
+        # Calls still pending at the deadline are cancelled and counted as
+        # timed out; the ones that finished keep their ok/exception result.
         try:
-            results = await asyncio.wait_for(
-                asyncio.gather(*coros, return_exceptions=True),
-                timeout=burst_timeout_s,
-            )
-        except asyncio.TimeoutError:
-            elapsed = time.time() - burst_start
-            # `asyncio.wait_for` cancels the pending gather on timeout,
-            # which cancels each child coroutine. We can't recover partial
-            # results, so we record a fully timed-out burst and continue.
-            # The worker loop's outer `time.sleep(interval)` then fires,
-            # then we try the next burst — if the agent has recovered we
-            # see normal completion; if it's still unresponsive we keep
-            # timing out, but at least we get a diagnostic per burst
-            # instead of an indefinite hang that produces no data.
-            self.logger.warning(
-                f"thrift_stress: burst TIMED OUT after {elapsed:.1f}s "
-                f"(limit {burst_timeout_s}s) — device likely unresponsive; "
-                f"{len(coros)} coros cancelled, no per-call results"
-            )
-            self.add_data(
-                {
-                    "hostname": hostname,
-                    "flap_interfaces": flap_interfaces,
-                    "total": len(coros),
-                    "success": 0,
-                    "failures": 0,
-                    "timed_out": len(coros),
-                    "elapsed_s": elapsed,
-                }
-            )
-            return
+            done, pending = await asyncio.wait(tasks, timeout=burst_timeout_s)
+        finally:
+            for pending_task in tasks:
+                pending_task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         elapsed = time.time() - burst_start
 
-        success = sum(1 for r in results if not isinstance(r, BaseException))
-        failures = len(results) - success
+        failures = sum(1 for d in done if d.cancelled() or d.exception() is not None)
+        success = len(done) - failures
+        timed_out = len(pending)
+        if pending:
+            self.logger.warning(
+                f"thrift_stress: burst TIMED OUT after {elapsed:.1f}s "
+                f"(limit {burst_timeout_s}s); {len(pending)}/{len(tasks)} calls "
+                "still pending were cancelled"
+            )
+
+        # A flap whose SSH transport dropped never ran its tx_enable, so the
+        # requested write workload is incomplete; re-run it so the cycle
+        # completes and the ports end enabled. A flap that hangs past the
+        # burst, or whose call raised anything but a transport error, is not
+        # retried. The driver does not surface the flap command's exit status,
+        # so a failure on the switch itself never reaches this loop.
+        flap_attempts: int = int(
+            params.get("flap_retry_attempts", self.DEFAULT_FLAP_RETRY_ATTEMPTS)
+        )
+        flap_retries = 0
+        for call, task in zip(coro_calls, tasks):
+            if call.method != _RAPID_FLAP_METHOD or not (
+                task.cancelled() or task.exception() is not None
+            ):
+                continue
+            if task in pending:
+                self.logger.error(
+                    f"thrift_stress: flap timed out after {burst_timeout_s:.0f}s; "
+                    "not retried"
+                )
+                continue
+            error = task.exception()
+            if not _is_transport_error(error):
+                self.logger.error(f"thrift_stress: flap failed: {error!r}; not retried")
+                continue
+            if not _is_single_flap(call):
+                # The retry re-runs the whole driver call; for a multi-flap call
+                # that is not the cycle that failed, and the burst deadline would
+                # cut the re-run mid-flap.
+                self.logger.error(
+                    f"thrift_stress: flap transport error {error!r} on a call "
+                    "with more than one flap; not retried"
+                )
+                continue
+            recovered, attempts, reason = await self._async_retry_flap(
+                driver, call, repr(error), burst_timeout_s, flap_attempts
+            )
+            flap_retries += attempts
+            if recovered:
+                success += 1
+                failures -= 1
+            else:
+                self.logger.error(
+                    f"thrift_stress: flap not completed after {attempts} "
+                    f"retries: {reason}"
+                )
         self.add_data(
             {
                 "hostname": hostname,
                 "flap_interfaces": flap_interfaces,
-                "total": len(results),
+                "total": len(tasks),
                 "success": success,
                 "failures": failures,
-                "timed_out": 0,
+                "timed_out": timed_out,
+                "flap_retries": flap_retries,
                 "elapsed_s": elapsed,
             }
         )
         self.logger.info(
-            f"thrift_stress burst: {success}/{len(results)} ok, "
-            f"{failures} exceptions, elapsed={elapsed:.1f}s"
+            f"thrift_stress burst: {success}/{len(tasks)} ok, "
+            f"{failures} exceptions, {timed_out} timed out, "
+            f"elapsed={elapsed:.1f}s"
         )
+
+    async def _async_retry_flap(
+        self,
+        driver: t.Any,
+        call: ThriftStressCall,
+        reason: str,
+        burst_timeout_s: float,
+        flap_attempts: int,
+    ) -> t.Tuple[bool, int, str]:
+        """Re-run a flap whose SSH transport failed.
+
+        Re-runs the whole driver call, so it is only used for calls that flap
+        once (``_is_single_flap``). Returns (recovered, retries made, last
+        failure reason). Only another transport error is retried; a retry that
+        raises anything else or hangs past ``burst_timeout_s`` ends it.
+        """
+        for attempt in range(1, flap_attempts + 1):
+            self.logger.warning(
+                f"thrift_stress: flap transport error {reason}; "
+                f"retry {attempt}/{flap_attempts}"
+            )
+            try:
+                # asyncio.timeout rather than asyncio.wait: deadline.expired()
+                # tells a hung retry apart from one that raised.
+                async with asyncio.timeout(burst_timeout_s) as deadline:
+                    await getattr(driver, call.method)(*call.args)
+            except Exception as e:
+                if deadline.expired():
+                    return False, attempt, f"retry hung past {burst_timeout_s:.0f}s"
+                reason = repr(e)
+                if _is_transport_error(e):
+                    continue
+                return False, attempt, reason
+            return True, attempt, reason
+        return False, flap_attempts, reason
 
     async def run_final_check(self) -> t.Optional[PeriodicCheckResult]:
         """Summarize bursts and verify every dynamically flapped port recovered.
@@ -2814,6 +2917,7 @@ class ThriftStressPeriodicTask(PeriodicTask):
         timed_out_bursts = sum(
             1 for d in self._data.values() if d.get("timed_out", 0) > 0
         )
+        flap_retries = sum(d.get("flap_retries", 0) for d in self._data.values())
         elapsed_total = sum(d.get("elapsed_s", 0.0) for d in self._data.values())
         avg_elapsed = elapsed_total / batches if batches else 0.0
         success_pct = (100.0 * success / total) if total else 0.0
@@ -2825,6 +2929,10 @@ class ThriftStressPeriodicTask(PeriodicTask):
             f"{failures} exceptions, {timed_out} timed-out calls, "
             f"avg burst {avg_elapsed:.1f}s"
         )
+        if flap_retries:
+            message += (
+                f", {flap_retries} flap retries after an SSH transport error"
+            )
 
         flap_interfaces = sorted(
             {

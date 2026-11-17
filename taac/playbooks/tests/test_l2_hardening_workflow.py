@@ -250,6 +250,19 @@ class L2HardeningWorkflowTest(unittest.TestCase):
         serialized_post_disruption = json.dumps(_validation_payload(post_disruption))
         self.assertIn("l2_disruption_start_time", serialized_post_disruption)
         self.assertIn("expected_restarted_services", serialized_post_disruption)
+        # Only a rejection after the relearn counts, not one from before the
+        # coldboots; cores and restarts still cover the whole disruption.
+        checks = _validation_payload(post_disruption)["point_in_time_checks"]
+        ra_checks = [
+            json.dumps(c)
+            for c in checks
+            if "resource_accountant_activation" in json.dumps(c)
+        ]
+        self.assertEqual(1, len(ra_checks))
+        self.assertIn("l2_relearn_start_time", ra_checks[0])
+        self.assertNotIn("l2_disruption_start_time", ra_checks[0])
+        settle = playbook.stages[stage_ids.index("ndp_overload_post_churn_settle")]
+        self.assertIn("l2_relearn_start_time", repr(settle.steps[0]))
 
         normalize = playbook.stages[stage_ids.index("ndp_normalize")]
         self.assertIn("l2_recovery_start_time", repr(normalize))

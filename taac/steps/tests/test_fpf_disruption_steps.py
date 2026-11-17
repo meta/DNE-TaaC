@@ -1633,6 +1633,8 @@ class TestRapidFlapStepLldp(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p["up_time_sec"], 6.0)
         # No pre-resolved interface map.
         self.assertNotIn("interfaces_by_device", p)
+        # tx_disable unless asked: the key is absent, so existing params are unchanged.
+        self.assertNotIn("flap_method", p)
 
     def test_factory_shape_with_neighbor_hosts(self):
         step = create_fpf_rapid_flap_step_lldp(

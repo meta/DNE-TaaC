@@ -36,7 +36,6 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
 from taac.abstractions.churn.attribute import AttributeChurn
-from neteng.test_infra.dne.taac.abstractions.churn.route import RouteChurn, RouteStorm
 from taac.abstractions.churn.session import SessionChurn
 from taac.abstractions.churn.workloads import (
     IgpUnresolvableChurn,
@@ -147,6 +146,15 @@ from taac.test_as_a_config.types import (
     Step,
     StepName,
 )
+from taac.utils.oss_taac_constants import TAAC_OSS
+
+if TAAC_OSS:
+    from taac.abstractions.churn.route import RouteChurn, RouteStorm
+else:
+    from neteng.test_infra.dne.taac.abstractions.churn.route import (
+        RouteChurn,
+        RouteStorm,
+    )
 
 
 def create_bgp_restart_test_stage(
@@ -4819,6 +4827,7 @@ def create_periodic_service_restart_stage(
     iteration_index: int = 0,
     total_iterations: int = 1,
     trigger: ServiceInterruptionTrigger = ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+    clear_thrift_drain_exit: bool = False,
 ) -> Stage:
     """Single iteration of a periodic service-restart cycle.
 
@@ -4842,6 +4851,7 @@ def create_periodic_service_restart_stage(
             in the stage id for human-readable progress.
         trigger: How to interrupt the service. Default
             `SYSTEMCTL_RESTART` (graceful systemctl restart).
+        clear_thrift_drain_exit: See `create_service_interruption_step`.
     """
     return Stage(
         id=(
@@ -4855,6 +4865,7 @@ def create_periodic_service_restart_stage(
                     f"systemctl restart {service_label} "
                     f"(iter {iteration_index + 1}/{total_iterations})"
                 ),
+                clear_thrift_drain_exit=clear_thrift_drain_exit,
             ),
             create_longevity_step(duration=period_s),
         ],

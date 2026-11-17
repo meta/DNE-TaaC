@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
+import os
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,7 +19,10 @@ from taac.steps.step_definitions import (
 )
 from taac.test_as_a_config.thrift_types import BaseInput, Step, StepName
 
-BASE_PATH = "neteng.test_infra.dne.taac.steps.step_definitions"
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+BASE_PATH = f"{_PACKAGE}.steps.step_definitions"
 
 
 class RegisterPortChannelMinLinkPercentagePatchersTest(
@@ -143,8 +147,7 @@ class RegisterPortChannelMinLinkPercentagePatchersTest(
         self.driver_mock.async_restart_service = AsyncMock()
 
         with patch(
-            "neteng.test_infra.dne.taac.steps.step_definitions."
-            "oss_config_patcher_enabled",
+            f"{BASE_PATH}.oss_config_patcher_enabled",
             return_value=True,
         ):
             await (

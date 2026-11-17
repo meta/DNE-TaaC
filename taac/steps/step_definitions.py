@@ -7,11 +7,14 @@ used in TAAC test playbooks.
 """
 
 import asyncio
+import contextlib
 import ipaddress
 import itertools
 import json
+import logging
 import math
 import os
+import pathlib
 import re
 import time
 import typing as t
@@ -21,7 +24,6 @@ from dataclasses import dataclass
 
 import paramiko
 from taac.abstractions.churn.attribute import AttributeChurn
-from neteng.test_infra.dne.taac.abstractions.churn.route import RouteChurn, RouteStorm
 from taac.abstractions.churn.session import SessionChurn
 from taac.abstractions.churn.workloads import (
     IgpMetricChurn,
@@ -34,7 +36,22 @@ from taac.abstractions.eos_bgpcpp_setup_tasks import (
     POLICY_EVALUATION_SOURCE_CONFIG_PATH,
 )
 
-TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+# Imported rather than re-derived from the environment: two independently
+# patchable definitions of the same env var is a trap for the next person
+# writing a test.
+from taac.utils.oss_taac_constants import (  # noqa: E402
+    OSS_MEMORY_PRESSURE_LOG,
+    OSS_MEMORY_PRESSURE_PATH,
+    TAAC_OSS,
+)
+
+if TAAC_OSS:
+    from taac.abstractions.churn.route import RouteChurn, RouteStorm
+else:
+    from neteng.test_infra.dne.taac.abstractions.churn.route import (
+        RouteChurn,
+        RouteStorm,
+    )
 
 if not TAAC_OSS:
     from libfb.py.asyncio.await_utils import convert_to_async
@@ -51,7 +68,10 @@ else:
 
 
 from neteng.fboss.ctrl.thrift_types import DsfSessionState
-from neteng.fboss.switch_config.thrift_mutable_types import PortSpeed
+from neteng.fboss.switch_config.thrift_mutable_types import (
+    PortProfileID,
+    PortSpeed,
+)
 from neteng.fboss.switch_config.thrift_types import SwitchDrainState
 
 if not TAAC_OSS:
@@ -79,6 +99,7 @@ if not TAAC_OSS:
     from neteng.netcastle.utils.reachability_utils import wait_for_ping_reachable
 else:
     from taac.utils.oss_driver_utils import (
+        is_host_ping_reachable,
         wait_for_ping_reachable,
     )
 
@@ -92,6 +113,7 @@ from taac.constants import (
 )
 from taac.driver.driver_constants import (
     AristaCriticalAgents,
+    wedge_qsfp_util_cmd,
     FbossSystemctlServiceName,
     OtherSystemctlServiceName,
     Service as DriverService,
@@ -106,6 +128,9 @@ from taac.health_checks.abstract_health_check import (
 from taac.health_checks.all_health_checks import (
     HEALTH_CHECK_NAME_TO_INPUT,
     NAME_TO_POINT_IN_TIME_HEALTH_CHECK,
+)
+from taac.health_checks.device_health_checks.bgp_session_health_check import (
+    BgpSessionEstablishedHealthCheck,
 )
 from taac.health_checks.healthcheck_definitions import (
     create_next_hop_count_check,
@@ -148,6 +173,7 @@ else:
             )
 
 
+from taac.steps.speed_flip_profiles import default_profile_id
 from taac.steps.step import (  # oss-rewrite (force ShipIt re-export to taac.* root)
     Step as StepBase,
 )
@@ -184,7 +210,7 @@ from taac.utils.oss_taac_lib_utils import (
 from taac.utils.system_stress_utils import (
     async_get_memory_current_pct,
 )
-from taac.utils.taac_log_formatter import log_results_table
+from taac.utils.taac_log_formatter import log_results_table, suppress_console_logs
 
 if t.TYPE_CHECKING or not TAAC_OSS:
     from rfe.scubadata.scubadata_py3 import Sample, ScubaData
@@ -3790,6 +3816,7 @@ def create_fpf_set_interface_admin_step(
     best_effort: bool = False,
     record_event_time: bool = True,
     description: t.Optional[str] = None,
+    skip_missing: bool = False,
 ) -> Step:
     """Disable/enable interface(s) on the live agent via thrift (held).
 
@@ -3809,6 +3836,9 @@ def create_fpf_set_interface_admin_step(
         params["best_effort"] = True
     if not record_event_time:
         params["record_event_time"] = False
+    if skip_missing:
+        # A port the agent no longer has (e.g. a removed subsumed mate) is skipped.
+        params["skip_missing"] = True
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description
@@ -4390,6 +4420,7 @@ def create_fpf_rapid_flap_step_lldp(
     ] = None,
     device_regexes: t.Optional[t.List[str]] = None,
     description: t.Optional[str] = None,
+    admin_flap: bool = False,
 ) -> Step:
     """Rapid-flap variant that resolves interfaces from LLDP at run time.
 
@@ -4438,6 +4469,8 @@ def create_fpf_rapid_flap_step_lldp(
             PAOS-UP fallback for an admin-UP/oper-DOWN latch.
         device_regexes: Optional device-regex scope (e.g. the DUT GTSW).
         description: Custom step description.
+        admin_flap: Flap by admin state (thrift setPortState) instead of
+            tx_disable, which is a no-op on passive-copper DAC. Same cycle.
     """
     if fail_closed and not expected_interfaces:
         raise ValueError(
@@ -4454,6 +4487,9 @@ def create_fpf_rapid_flap_step_lldp(
         "down_time_sec": flap_down_time_sec,
         "up_time_sec": flap_up_time_sec,
     }
+    # Only when set, so the params of existing tx_disable callers are unchanged.
+    if admin_flap:
+        params["flap_method"] = "thrift"
     if fail_closed:
         params.update(
             {
@@ -5601,6 +5637,10 @@ def create_run_ssh_command_step(
     step_id: t.Optional[str] = None,
     device_regexes: t.Optional[t.List[str]] = None,
     log_output: bool = False,
+    expect_in_output: t.Optional[str] = None,
+    timeout: t.Optional[int] = None,
+    best_effort: bool = False,
+    start_traffic: bool = True,
 ) -> Step:
     """Run an arbitrary shell command on the DUT via SSH.
 
@@ -5620,6 +5660,13 @@ def create_run_ssh_command_step(
         log_output: When True the step logs the command's stdout/stderr at
             INFO level (useful for smoke/connectivity checks). Default False
             keeps the output out of the log.
+        expect_in_output: When set, the step fails unless this string appears
+            in the command's output. The exit status is not available to the
+            step, so a command that can fail should print a marker on success.
+        timeout: SSH command timeout in seconds; the driver default when None.
+        best_effort: When True an SSH error or timeout is logged instead of
+            failing the step (for informational steps, e.g. in cleanup).
+        start_traffic: Whether the generic step pre-hook should start traffic.
 
     Returns:
         A `Step` with `step_name=StepName.RUN_SSH_COMMAND_STEP`.
@@ -5627,6 +5674,13 @@ def create_run_ssh_command_step(
     params: t.Dict[str, t.Any] = {"cmd": cmd}
     if log_output:
         params["log_output"] = True
+    if expect_in_output is not None:
+        params["expect_in_output"] = expect_in_output
+    if timeout is not None:
+        params["timeout"] = timeout
+    if best_effort:
+        params["best_effort"] = True
+    _add_skip_start_traffic_param(params, start_traffic)
     return Step(
         name=StepName.RUN_SSH_COMMAND_STEP,
         step_params=Params(json_params=json.dumps(params)),
@@ -5707,6 +5761,7 @@ def create_service_interruption_step(
     step_id: t.Optional[str] = None,
     device_regexes: t.Optional[t.List[str]] = None,
     start_traffic: bool = True,
+    clear_thrift_drain_exit: bool = False,
 ) -> Step:
     """
     Create a step to interrupt a service (restart, crash, etc.).
@@ -5721,10 +5776,22 @@ def create_service_interruption_step(
         description: Custom description for the step
         step_id: Optional step ID
         start_traffic: Whether the generic step pre-hook should start IXIA.
+        clear_thrift_drain_exit: For a SYSTEMCTL_RESTART of Service.AGENT on a
+            split-agent FBOSS DUT, clear bgpd's failed state when its stop ends
+            in a thrift drain-deadline exit. Only for a caller that puts bgpd
+            under a thrift load it cannot drain.
 
     Returns:
         Step object for service interruption
     """
+    if clear_thrift_drain_exit and (
+        service != taac_types.Service.AGENT
+        or trigger != taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART
+    ):
+        raise ValueError(
+            "clear_thrift_drain_exit is valid only for a SYSTEMCTL_RESTART of "
+            "Service.AGENT"
+        )
     if (
         intentional_stop
         and trigger != taac_types.ServiceInterruptionTrigger.SYSTEMCTL_STOP
@@ -5739,6 +5806,8 @@ def create_service_interruption_step(
     step_params_dict: t.Dict[str, t.Any] = {}
     if intentional_stop:
         step_params_dict["intentional_stop"] = True
+    if clear_thrift_drain_exit:
+        step_params_dict["clear_thrift_drain_exit"] = True
     _add_skip_start_traffic_param(step_params_dict, start_traffic)
 
     return Step(
@@ -6353,6 +6422,7 @@ def create_register_speed_flip_patcher_step(
     description: t.Optional[str] = None,
     target_port_cage_count: int = 4,
     apply_patcher_method: t.Optional[int] = None,
+    profile_id: t.Optional[str] = None,
 ) -> Step:
     """
     Create a step to register/unregister speed flip patcher (v3 shape used by speed_flip_test_configs).
@@ -6372,6 +6442,9 @@ def create_register_speed_flip_patcher_step(
         apply_patcher_method: ``ApplyPatcherMethod`` value used to activate the
             change; AGENT_WARMBOOT when unset. AGENT_RELOAD applies it with a
             config reload alone, without restarting the agent.
+        profile_id: cfg.PortProfileID NAME to request for every named port
+            on every device in ``endpoints``. Omit to take each device's
+            platform default from ``taac.steps.speed_flip_profiles``.
     """
     params: t.Dict[str, t.Any] = {
         "register_patcher": register_patcher,
@@ -6383,6 +6456,9 @@ def create_register_speed_flip_patcher_step(
     }
     if apply_patcher_method is not None:
         params["apply_patcher_method"] = apply_patcher_method
+    # Only when supplied, so existing callers' params stay byte-identical.
+    if profile_id is not None:
+        params["profile_id"] = profile_id
     return Step(
         name=StepName.REGISTER_SPEED_FLIP_PATCHER,
         step_params=Params(json_params=json.dumps(params)),
@@ -11364,6 +11440,9 @@ class DummyStep(StepBase[taac_types.BaseInput]):
 
 class LongevityStep(StepBase[taac_types.BaseInput]):
     STEP_NAME = taac_types.StepName.LONGEVITY_STEP
+    # Above the driver's own worst case (3 attempts x 120s thrift deadline + 2 x 5s
+    # backoff), so its retries get to finish before the poll is abandoned.
+    PORT_STATE_POLL_TIMEOUT_S = 600
 
     async def run(
         self,
@@ -11440,10 +11519,19 @@ class LongevityStep(StepBase[taac_types.BaseInput]):
                 break
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             try:
-                oper = await self.driver.async_get_all_interfaces_operational_status()
+                # The hold's end is only checked between polls, so a poll that never
+                # returns would hold the step past `duration` indefinitely.
+                async with asyncio.timeout(
+                    min(self.PORT_STATE_POLL_TIMEOUT_S, duration - elapsed)
+                ):
+                    oper = (
+                        await self.driver.async_get_all_interfaces_operational_status()
+                    )
             except Exception as e:  # keep polling through transient agent errors
                 poll_errors += 1
-                self.logger.warning(f"[PortStateCollector] {ts} poll error: {e}")
+                self.logger.warning(
+                    f"[PortStateCollector] {ts} poll error: {type(e).__name__}: {e}"
+                )
                 await asyncio.sleep(poll_interval)
                 continue
 
@@ -11543,9 +11631,28 @@ class RunSSHCmdStep(StepBase[taac_types.BaseInput]):
     ) -> None:
         cmd = params["cmd"]
         log_output = params.get("log_output", False)
-        output = await self.driver.async_run_cmd_on_shell(cmd)
+        timeout = params.get("timeout")
+        try:
+            output = await (
+                self.driver.async_run_cmd_on_shell(cmd, timeout=timeout)
+                if timeout is not None
+                else self.driver.async_run_cmd_on_shell(cmd)
+            )
+        except Exception as e:
+            if not params.get("best_effort", False):
+                raise
+            self.logger.warning(f"Best-effort command failed: {e!r}")
+            return
         if log_output and output:
-            self.logger.info(f"Command output:\n{output}")
+            # run_step runs every step console-suppressed; log_output exists to
+            # be read, so lower the console to INFO for this line only.
+            with suppress_console_logs(self.logger, suppress_level=logging.INFO):
+                self.logger.info(f"Command output:\n{output}")
+        expected = params.get("expect_in_output")
+        if expected is not None and expected not in (output or ""):
+            raise RuntimeError(
+                f"expected {expected!r} in command output; got: {(output or '')[-500:]!r}"
+            )
 
 
 class DrainUndrainStep(StepBase[taac_types.DrainUndrainInput]):
@@ -11684,6 +11791,22 @@ class DrainUndrainStep(StepBase[taac_types.DrainUndrainInput]):
                 await self.driver.async_onbox_drain_device()
             else:
                 await self.driver.async_onbox_undrain_device()
+        elif (
+            input.drain_handler == taac_types.DrainHandler.NDS
+            and TAAC_OSS
+            and not interfaces
+        ):
+            # NDS is Meta-internal. In OSS a whole-device drain uses the on-box
+            # drain, the same path LOCAL_DRAINER takes without interfaces.
+            # WARNING, not INFO: step-level INFO does not reach the console.
+            self.logger.warning(
+                f"NDS is unavailable in OSS; {self.device.name} uses the on-box "
+                f"{'drain' if input.drain else 'undrain'} (BGP soft drain; undrain restarts bgpd)"
+            )
+            if input.drain:
+                await self.driver.async_onbox_drain_device()
+            else:
+                await self.driver.async_onbox_undrain_device()
         elif input.drain_handler == taac_types.DrainHandler.NDS:
             # NDS requires topology-backed interfaces. Resolve and validate raw
             # names before constructing the external drainer request.
@@ -11725,11 +11848,61 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
                 )
             await asyncio.sleep(2)
 
+    async def _async_wait_for_bgp_established(
+        self,
+        start_time: float,
+        timeout: int,
+        check_params: t.Dict[str, t.Any],
+        settle_until: float = 0.0,
+    ) -> None:
+        """Wait until BgpSessionEstablishedHealthCheck would pass.
+
+        bgpd's initializationConverged() only checks that the INITIALIZED counter
+        exists, so it stays true for the life of the process and returns at once
+        after a restart that leaves bgpd running. This runs the health check
+        itself with the playbook's own check params, so the peers it counts
+        (allowlist, ignored prefixes, dynamic ranges) and its pass rule are the
+        health check's. The wait shares the BGP convergence timeout, counted
+        from ``start_time``.
+
+        Sessions still read Established after a restart until their hold timers
+        run out, so a poll straight away passes on sessions about to drop. When
+        ``settle_until`` is set (an epoch), the wait sleeps until then first.
+        """
+        if settle_until > time.time():
+            await asyncio.sleep(settle_until - time.time())
+        check = BgpSessionEstablishedHealthCheck(self.logger)
+        check.driver = self.driver
+        # The per-poll peer listing would repeat every few seconds.
+        params = {**check_params, "verbose": False}
+        deadline = start_time + timeout
+        while True:
+            # _run is called directly, so a read error (thrift not up right
+            # after a restart) must not escape; the health check path would
+            # turn it into ERROR and retry.
+            try:
+                result = await check._run(
+                    self.device, hc_types.BaseHealthCheckIn(), params
+                )
+                if result.status == hc_types.HealthCheckStatus.PASS:
+                    return
+                last = result.message or ""
+            except Exception as e:
+                self.logger.warning(f"BGP session read failed, will retry: {e!r}")
+                last = f"last error: {e!r}"
+            if time.time() >= deadline:
+                raise Exception(
+                    f"BGP sessions did not all establish within {timeout} seconds "
+                    f"({last[:500]})"
+                )
+            await asyncio.sleep(5)
+
     async def run(
         self,
         input: taac_types.ServiceConvergenceInput,
         params: t.Dict[str, t.Any],
     ) -> None:
+        run_start = time.time()
         if any(
             agent in [taac_types.Service.AGENT, taac_types.Service.FBOSS_SW_AGENT]
             for agent in input.services
@@ -11779,6 +11952,15 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             )
             start_time = time.time()
             await self.driver.async_wait_for_bgp_convergence(timeout)
+            if params.get("wait_for_bgp_established"):
+                # Counted from the start of the step, which runs right after the
+                # restart, so the agent wait above is part of the settle.
+                await self._async_wait_for_bgp_established(
+                    start_time,
+                    timeout,
+                    params.get("bgp_session_check_params") or {},
+                    run_start + params.get("bgp_established_settle_s", 0),
+                )
             end_time = time.time()
             self.logger.info(f"Bgpd converged in {end_time - start_time} seconds")
         if taac_types.Service.QSFP_SERVICE in input.services and self.is_fboss:
@@ -11896,7 +12078,17 @@ class ServiceInterruptionStep(StepBase[taac_types.ServiceInterruptionInput]):
             case taac_types.ServiceInterruptionTrigger.SYSTEMCTL_START:
                 await self.driver.async_start_service(service, agents)
             case taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART:
-                await self.driver.async_restart_service(service, agents)
+                if not params.get("clear_thrift_drain_exit", False):
+                    await self.driver.async_restart_service(service, agents)
+                else:
+                    if not self.is_fboss or not isinstance(self.driver, FbossSwitch):
+                        raise ValueError(
+                            "clear_thrift_drain_exit is supported only by the "
+                            "FBOSS driver"
+                        )
+                    await self.driver.async_restart_service(
+                        service, agents, clear_thrift_drain_exit=True
+                    )
             case taac_types.ServiceInterruptionTrigger.CRASH:
                 await self.driver.async_crash_service(service, agents)
 
@@ -12290,12 +12482,48 @@ class RegisterPatcherStep(StepBase[taac_types.RegisterPatcherInput]):
 class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
     STEP_NAME = taac_types.StepName.ALLOCATE_CGROUP_SLICE_MEMORY_STEP
 
+    async def _async_oss_slice_memory_current(self, slice_name: str) -> float:
+        """``memory.current`` for ``<slice_name>.slice``, read off the DUT.
+
+        The OSS stand-in for the Meta-only ODS p90 query. Returns bytes, the
+        same unit the ODS series is in (the series is
+        ``cgroup.slice.<slice>.memory.current`` despite the ``_pct`` in the
+        query's name), so the caller's arithmetic is unchanged. It is an
+        instantaneous read, so ``ods_query_duration`` has no effect under
+        OSS.
+
+        Raises rather than defaulting: the whole allocation size is derived
+        from this number, and on a cgroup-v1/hybrid DUT -- where this
+        unified-hierarchy path does not exist -- a quiet 0 would silently
+        allocate the full target instead of target-minus-current.
+        """
+        path = f"/sys/fs/cgroup/{slice_name}.slice/memory.current"
+        # pyre-ignore
+        raw = await self.driver.async_run_cmd_on_shell(f"cat {path}")
+        stripped = (raw or "").strip()
+        if not stripped.isdigit():
+            raise Exception(
+                f"could not read {path} on {self.hostname} (got {raw!r}); "
+                "this DUT may not be cgroup v2, or the memory controller is "
+                "not enabled on the slice"
+            )
+        return float(stripped)
+
     async def run(
         self,
         input: taac_types.BaseInput,
         params: t.Dict[str, t.Any],
     ) -> None:
-        executable_path = params.get("executable_path", "/opt/memory_pressure")
+        # Under OSS the executable path is not caller-configurable.
+        # TAAC_OSS is a framework mode, not a DUT type; never overwrite
+        # /opt/memory_pressure. The OOM healthcheck's marker/log paths are
+        # also fixed to OSS_MEMORY_PRESSURE_PATH, so a different push path
+        # would go un-checked (a silent SKIP).
+        executable_path = (
+            OSS_MEMORY_PRESSURE_PATH
+            if TAAC_OSS
+            else params.get("executable_path", "/opt/memory_pressure")
+        )
         slice_name = params["slice_name"]
         keep_alive = params.get("keep_alive", False)
         initial_memory_allocation = params.get("initial_memory_allocation")
@@ -12304,20 +12532,58 @@ class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
         minimum_memory_allocation = params.get("minimum_memory_allocation", 0)
         oom_score_adj = params.get("oom_score_adj", 0)
 
-        # pyre-ignore
-        if not await self.driver.async_check_if_file_exists(executable_path):
+        if TAAC_OSS:
+            # Meta's /opt/memory_pressure doesn't exist on an OSS DUT; push
+            # our stand-in with the same CLI so the command line below is
+            # unaffected. Written every run, not only when absent: a DUT that
+            # ran an older stand-in would otherwise keep it forever, and a
+            # stale allocator fails as a wrong stress profile, not an error.
+            from taac.driver import oss_memory_pressure_dut_script
+
+            script_source = pathlib.Path(
+                oss_memory_pressure_dut_script.__file__
+            ).read_text()
+            # pyre-ignore
+            await self.driver.async_write_file_on_device(
+                script_source, executable_path
+            )
+            # Truncated here, not at launch: a device that takes the
+            # memory_to_allocate<=0 early return below never launches the
+            # allocator, but its marker (this write's mtime) is already
+            # fresh. Without this, _async_oss_allocator_log would quote a
+            # previous run's log as evidence about a run that never
+            # started -- a worse diagnostic than no log at all.
+            await self.driver.async_run_cmd_on_shell(
+                f": > {OSS_MEMORY_PRESSURE_LOG}"
+            )
+        # No existence check under OSS: we just wrote the file, and the
+        # invocation goes through "python3 <path>" rather than the exec bit,
+        # so this guard's only real job is Meta's "the binary is missing".
+        elif not await self.driver.async_check_if_file_exists(  # pyre-ignore
+            executable_path
+        ):
             raise Exception(
                 f"Memory pressure script does not exist at {executable_path} on {self.hostname}"
             )
 
         end_time = int(time.time())
         start_time = end_time - ods_query_duration
-        p90_memory_current = await async_get_memory_current_pct(
-            self.hostname,
-            slice_name,
-            start_time,
-            end_time,
-        )
+        if TAAC_OSS:
+            # async_get_memory_current_pct is an ODS query, Meta-only (see
+            # taac/utils/system_stress_utils.py). The DUT holds the same
+            # number cgroup-side; read it directly. No p90 window -- this is
+            # the instantaneous value, which is what a one-shot pre-stress
+            # baseline needs anyway.
+            p90_memory_current = await self._async_oss_slice_memory_current(
+                slice_name
+            )
+        else:
+            p90_memory_current = await async_get_memory_current_pct(
+                self.hostname,
+                slice_name,
+                start_time,
+                end_time,
+            )
 
         if params.get("total_memory_pct_decimal") is not None:
             total_memory_pct = float(params["total_memory_pct_decimal"])
@@ -12367,7 +12633,12 @@ class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
             )
             return
         allocate_memory_cmds = [
-            f"{executable_path}",
+            # /tmp is mounted noexec on plenty of hardened images, and the
+            # failure would be a bare "Permission denied" inside a
+            # fire-and-forget thread. Invoking via "python3 <path>" (same
+            # shape as oss_coop_patcher's "python3 /tmp/_oss_patch.$$.py")
+            # sidesteps that -- no chmod +x is issued or needed under OSS.
+            f"python3 {executable_path}" if TAAC_OSS else f"{executable_path}",
             "-c",
             f"{slice_name}.slice",
             "-m",
@@ -12382,8 +12653,18 @@ class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
         if oom_score_adj:
             allocate_memory_cmds.extend(["-s", oom_score_adj])
         allocate_memory_cmds = [str(cmd) for cmd in allocate_memory_cmds]
+        allocate_memory_cmd = " ".join(allocate_memory_cmds)
+        if TAAC_OSS:
+            # run_in_thread is fire-and-forget, so a stand-in that dies on a
+            # cgroup EACCES or a missing python3 would read only as "no OOM
+            # kill found" 300s later. Keep its output on the DUT to tell the
+            # two apart.
+            # ">" not ">>": one run per file, so the log answers "did this
+            # invocation's allocator die" rather than accumulating every
+            # past run's output with no delimiter.
+            allocate_memory_cmd += f" > {OSS_MEMORY_PRESSURE_LOG} 2>&1"
         run_in_thread(
-            self.driver.async_run_cmd_on_shell, cmd=" ".join(allocate_memory_cmds)
+            self.driver.async_run_cmd_on_shell, cmd=allocate_memory_cmd
         )
 
 
@@ -12583,6 +12864,11 @@ class ChronosNode(StepBase[taac_types.BaseInput]):
             await asyncio.sleep(churn_duration_s)
         else:
             self.logger.info("Flap operation completed (non-blocking).")
+
+
+# Safety cap on the remediation pause around a down flap, well above any hold time;
+# the matching up flap lifts it, so this only bounds a pause stranded by a failed test.
+FLAP_PAUSE_REMEDIATION_S = 600
 
 
 class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
@@ -12812,11 +13098,9 @@ class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
         enable: bool,
         sequential: bool,
     ) -> None:
-        coros = [
-            self.driver.async_enable_ports_via_ssh([iface], enable)
-            for iface in interface_names
-        ]
-        await self.run_coroutines(coros, sequential)
+        # One batch call, serial inside: a session per interface, all at once,
+        # trips sshd MaxStartups. `sequential` no longer changes anything here.
+        await self.driver.async_enable_ports_via_ssh(interface_names, enable)
 
     async def flap_with_shell_cmd(
         self,
@@ -12824,18 +13108,46 @@ class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
         subcmd: str,
         sequential: bool,
     ) -> None:
-        coros = []
-        if not sequential:
-            ifaces = " ".join(interface_names)
-            coros = [
-                self.driver.async_run_cmd_on_shell(f"wedge_qsfp_util {subcmd} {ifaces}")
-            ]
-        else:
-            coros = [
-                self.driver.async_run_cmd_on_shell(f"wedge_qsfp_util {subcmd} {iface}")
-                for iface in interface_names
-            ]
-        await self.run_coroutines(coros, sequential)
+        util = wedge_qsfp_util_cmd()
+        down = subcmd in ("--set_low_power", "--tx_disable")
+        up = subcmd in ("--clear_low_power", "--tx_enable")
+        try:
+            if down:
+                # qsfp_service remediation re-inits a module whose port is down and clears its
+                # low-power / tx-disable state, bringing the port back up mid-flap.
+                await self.driver.async_wedge_qsfp_util_pause_remediation(
+                    FLAP_PAUSE_REMEDIATION_S, ports=interface_names
+                )
+            if not sequential:
+                ifaces = " ".join(interface_names)
+                coros = [
+                    self.driver.async_run_cmd_on_shell(f"{util} {subcmd} {ifaces}")
+                ]
+            else:
+                coros = [
+                    self.driver.async_run_cmd_on_shell(f"{util} {subcmd} {iface}")
+                    for iface in interface_names
+                ]
+            await self.run_coroutines(coros, sequential)
+        except Exception:
+            if down:  # don't leave the ports' remediation paused behind a failed flap
+                with contextlib.suppress(Exception):
+                    await self.driver.async_wedge_qsfp_util_pause_remediation(
+                        0, ports=interface_names
+                    )
+            raise
+        finally:
+            if up:
+                # Best effort, also after a failed up command: the ports are up, and a
+                # pause left behind expires within FLAP_PAUSE_REMEDIATION_S.
+                try:
+                    await self.driver.async_wedge_qsfp_util_pause_remediation(
+                        0, ports=interface_names
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"remediation resume on {interface_names} not confirmed: {e}"
+                    )
 
 
 PATCHER_NAME = "configure_port_channel_min_link_percentage"
@@ -12950,69 +13262,20 @@ _SUPPORTED_51T_SPEED_COMBINATIONS = {
     (200, 200),
     (400, 400),
 }
-_PLATFORM_SPEED_PROFILE_MAPPING = {
-    # Wedge800 (TH5-T, NextHop). Optical-family cage profiles per the on-box
-    # platform_mapping.json (nexthop/wedge800bnhp): 800G=39, 400G=38, 200G=25,
-    # 100G=23. Copper-family cages carry 22/24 at 100G/200G instead, so this
-    # one-id-per-speed table can satisfy only one end of a mixed-media link.
-    # 800G exists only on the /1 subport; flipping /1 to 800G subsumes its
-    # /5 mate.
-    "WEDGE800BNHP": {
-        PortSpeed.EIGHTHUNDREDG: "PROFILE_800G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-    },
-    "MONTBLANC": {
-        PortSpeed.EIGHTHUNDREDG: "PROFILE_800G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-    },
-    "MORGAN800CC": {
-        PortSpeed.EIGHTHUNDREDG: "PROFILE_800G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-    },
-    "WEDGE400C": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "WEDGE400": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "ELBERT": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "FUJI": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "DARWIN": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "YAMP": {
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "MINIPACK": {
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-}
 
 
 class UnsupportedSpeedCombinationError(Exception):
     pass
+
+
+# The methods that activate an agent config change (BGP_RESTART does not).
+_AGENT_APPLY_PATCHER_METHODS = frozenset(
+    {
+        taac_types.ApplyPatcherMethod.AGENT_RELOAD,
+        taac_types.ApplyPatcherMethod.AGENT_WARMBOOT,
+        taac_types.ApplyPatcherMethod.AGENT_RELOAD_AND_WARMBOOT,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -13044,6 +13307,7 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
         self._assert_target_port_cage_count(endpoints, target_port_cage_count)
         device_infos = await self._gather_device_infos(endpoints)
         speed_in_gbps = params.get("speed_in_gbps", 0)
+        profile_id = params.get("profile_id")
 
         if port_state_change:
             await self._disable_device_ports(device_infos)
@@ -13054,12 +13318,19 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
                 "apply_patcher_method", taac_types.ApplyPatcherMethod.AGENT_WARMBOOT
             )
         )
+        if apply_patcher_method not in _AGENT_APPLY_PATCHER_METHODS:
+            raise ValueError(
+                f"{self.STEP_NAME} changes the agent config, but "
+                f"apply_patcher_method={apply_patcher_method.name} does not "
+                f"activate it: the ports would keep their old speed."
+            )
 
         if register_patcher:
             await self._register_speed_flip_patchers(
                 device_infos=device_infos,
                 speed_in_gbps=speed_in_gbps,
                 patcher_name=patcher_name,
+                profile_id=profile_id,
             )
         else:
             await self._unregister_speed_flip_patchers(
@@ -13151,21 +13422,44 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
         device_infos: t.List[_SpeedFlipDeviceInfo],
         speed_in_gbps: int,
         patcher_name: str,
+        profile_id: t.Optional[str] = None,
     ) -> None:
+        """Queue the agent-config mutation a speed flip needs, one per device.
+
+        Registers COOP's ``change_speed`` agent patcher through
+        ``async_change_speed_patcher``. ``profile_id`` is a cfg.PortProfileID
+        NAME the test config may supply; otherwise the platform default is
+        used.
+
+        Why not ``fboss2-dev config interface ... profile``: the CLI commits a
+        subsuming profile change as a coldboot (removing a port from a live
+        agent risks T281221621), which would wipe BGP and counters mid-test.
+        The patcher removes the subsumed mate from the config too -- a merely
+        disabled mate still owns its lanes, so the 8-lane port is never created
+        in either boot mode. A stage whose config removes a port (entry into a
+        whole-cage profile) is cold-booted by ``async_apply_patchers``; every
+        other stage warm-boots.
+        """
         speed_in_mbps = speed_in_gbps * 1000
+        # Resolve every profile before building any coroutine: a raise halfway
+        # through would otherwise leave the earlier ones created and unawaited.
+        profiles = [
+            profile_id
+            or default_profile_id(device_info.hardware_type, speed_in_mbps)
+            for device_info in device_infos
+        ]
         coros = []
-        for device_info in device_infos:
-            profile_id = _PLATFORM_SPEED_PROFILE_MAPPING.get(
-                device_info.hardware_type,
-                {},
-                # pyrefly: ignore [bad-index]
-            )[speed_in_mbps]
+        for device_info, profile in zip(device_infos, profiles):
             coros.append(
                 device_info.driver.async_change_speed_patcher(
-                    device_info.ports,
+                    intf_names=list(device_info.ports),
                     desired_speed=PortSpeed(speed_in_mbps).name,
-                    profile_id=profile_id,
+                    profile_id=PortProfileID[profile].name,
                     patcher_name=patcher_name,
+                    patcher_desc=(
+                        f"speed flip: {len(device_info.ports)} port(s) to "
+                        f"{PortSpeed(speed_in_mbps).name}"
+                    ),
                 )
             )
         await asyncio.gather(*coros)
@@ -13177,7 +13471,9 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
     ) -> None:
         await asyncio.gather(
             *[
-                device_info.driver.async_coop_unregister_patchers(patcher_name)
+                device_info.driver.async_coop_unregister_patchers(
+                    patcher_name, config_name=AGENT_CONFIG
+                )
                 for device_info in device_infos
             ]
         )
@@ -13224,7 +13520,14 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
 # =============================================================================
 
 _WEDGE_POWER_CMD: str = "/usr/local/bin/wedge_power.sh"
+# Failed probes in a row before a BMC-reset device counts as down.
+_REBOOT_DOWN_CONSECUTIVE_PROBES: int = 3
 _BOOT_ID_CMD: str = "cat /proc/sys/kernel/random/boot_id"
+_BOOT_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_BMC_RESET_TRIGGERS = (
+    taac_types.SystemRebootTrigger.BMC_POWER_RESET,
+    taac_types.SystemRebootTrigger.BMC_MICROSERVER_ONLY_RESET,
+)
 _REBOOT_VERIFY_TIMEOUT_S: int = 900
 _REBOOT_VERIFY_INTERVAL_S: int = 10
 
@@ -13245,7 +13548,20 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
     ) -> None:
         start_time = time.time()
         sleep_time_after_reboot = params.get("sleep_time_after_reboot", 0)
-        boot_id_before = await self._async_read_boot_id() if self.is_fboss else None
+        bmc_error = ""
+        if self.is_fboss:
+            await self._sync_to_disk()
+        # An OSS BMC reset checks the boot ID before the ping wait, because the
+        # BMC call can block until the host is back; every other FBOSS reset
+        # checks it once SSH is back.
+        oss_bmc_reset = (
+            TAAC_OSS and input.trigger in _BMC_RESET_TRIGGERS and self.is_fboss
+        )
+        if oss_bmc_reset:
+            boot_id_before = await self._read_boot_id()
+        else:
+            boot_id_before = await self._async_read_boot_id() if self.is_fboss else None
+        issued_at = time.monotonic()
         if input.trigger == taac_types.SystemRebootTrigger.FULL_SYSTEM_REBOOT:
             await self.driver.async_full_system_reboot()
             self.logger.info(
@@ -13257,12 +13573,54 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
             and self.is_fboss
         ):
             # `reset -s` power-cycles the whole chassis; bare `reset` is microserver-only.
-            await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset -s")
+            bmc_error = await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset -s")
         elif (
             input.trigger == taac_types.SystemRebootTrigger.BMC_MICROSERVER_ONLY_RESET
             and self.is_fboss
         ):
-            await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset")
+            bmc_error = await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset")
+        use_ipv6 = params.get("use_ipv6", True)
+        if oss_bmc_reset and boot_id_before:
+            # wedge_power.sh reset -s power-cycles the BMC too, so the command can
+            # block until the host is already back up and the down window is gone.
+            await self._wait_for_new_boot_id(
+                boot_id_before,
+                issued_at + params.get("reboot_boot_id_timeout_s", 900),
+                input.trigger.name,
+                bmc_error,
+                use_ipv6,
+            )
+        elif oss_bmc_reset:
+            # The BMC call swallows connect/exit errors and does not wait, so the
+            # pingable wait below would pass on a device that never went down.
+            # ping -c 5 -w 10 also fails on a single lost reply, so "down" takes
+            # consecutive failed probes.
+            self.logger.info(f"Waiting for {self.device.name} to go down...")
+            down_start = time.monotonic()
+            deadline = down_start + params.get("reboot_down_timeout_s", 180)
+            unreachable = 0
+            while unreachable < _REBOOT_DOWN_CONSECUTIVE_PROBES:
+                if await convert_to_async(
+                    is_host_ping_reachable, self.device.name, use_ipv6=use_ipv6
+                ):
+                    unreachable = 0
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"{self.device.name} never went down after {input.trigger.name}; "
+                            "the BMC reset did not take effect (check TAAC_BMC_HOST)"
+                            + (f"; BMC command {bmc_error}" if bmc_error else "")
+                        )
+                    await asyncio.sleep(5)
+                else:
+                    unreachable += 1
+                    if unreachable < _REBOOT_DOWN_CONSECUTIVE_PROBES:
+                        # An instant failure (DNS, no route) must not count
+                        # three times within a second.
+                        await asyncio.sleep(5)
+            self.logger.info(
+                f"{self.device.name} went down {time.monotonic() - down_start:.1f} seconds after {input.trigger.name}"
+            )
+
         if sleep_time_after_reboot > 0:
             self.logger.info(
                 f"Waiting for {sleep_time_after_reboot} seconds after reboot"
@@ -13270,7 +13628,6 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
             await asyncio.sleep(sleep_time_after_reboot)
 
         self.logger.info(f"Waiting for {self.device.name} to be pingable...")
-        use_ipv6 = params.get("use_ipv6", True)
         if TAAC_OSS:
             # Only the OSS helper takes use_ipv6; netcastle's always pings v6.
             # pyre resolves wait_for_ping_reachable to the netcastle binding
@@ -13290,7 +13647,7 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
         self.logger.debug(
             f"{self.device.name} is ssh-able {time.time() - start_time} seconds after {input.trigger.name}"
         )
-        if boot_id_before is not None:
+        if boot_id_before is not None and not oss_bmc_reset:
             await self._async_wait_for_new_boot_id(
                 boot_id_before,
                 start_time,
@@ -13304,7 +13661,8 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
             raise RuntimeError(f"{self.device.name} returned an empty boot_id")
         return boot_id
 
-    async def _async_run_bmc_reset(self, cmd: str) -> None:
+    async def _async_run_bmc_reset(self, cmd: str) -> str:
+        """Run a BMC reset command; return the error it swallowed, or ""."""
         if lab_ssh_transport_enabled():
             # The lab-ssh daemon authenticates to the BMC with the caller's
             # certificate; the hwcontrol path needs a Rotor password instead.
@@ -13324,7 +13682,7 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
                 f"BMC command {cmd!r} on {bmc}: exit {result.exit_code}, "
                 f"output {result.stdout.strip()!r}"
             )
-            return
+            return ""
         try:
             output = run_bmc_cmd_hwcontrol(self.device.name, cmd)
             self.logger.info(f"BMC command {cmd!r} returned {output!r}")
@@ -13334,10 +13692,10 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
             paramiko.SSHException,
             RuntimeError,
         ) as e:
-            self.logger.info(
-                f"BMC command {cmd!r} raised {type(e).__name__} "
-                f"(expected post-reboot disconnect): {e}"
-            )
+            error = f"{cmd!r} raised {type(e).__name__}: {e}"
+            self.logger.info(f"BMC command {error} (expected post-reboot disconnect)")
+            return error
+        return ""
 
     async def _async_wait_for_new_boot_id(
         self,
@@ -13376,6 +13734,55 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
             f"{self.device.name} did not reboot after {trigger.name}: no new "
             f"boot_id within {timeout}s (before: {boot_id_before})"
             + (f"; last error: {last_error}" if last_error else "")
+        )
+
+    async def _sync_to_disk(self) -> None:
+        # Flush config writes before the reset: a write not yet on disk is lost by the BMC power cut.
+        try:
+            out = await asyncio.wait_for(
+                self.driver.async_run_cmd_on_shell("sync && echo SYNCED", timeout=20), 30
+            )
+        except Exception as e:
+            out = f"raised {e!r}"
+        if "SYNCED" not in out:
+            self.logger.warning(
+                f"sync on {self.device.name} did not confirm ({out!r}); rebooting anyway"
+            )
+
+    async def _read_boot_id(self) -> t.Optional[str]:
+        try:
+            out = await asyncio.wait_for(
+                self.driver.async_run_cmd_on_shell(_BOOT_ID_CMD, timeout=20), 30
+            )
+        except Exception as e:
+            self.logger.info(f"Boot ID of {self.device.name} unreadable: {e!r}")
+            return None
+        out = out.strip() if isinstance(out, str) else ""
+        return out if _BOOT_ID_RE.match(out) else None
+
+    async def _wait_for_new_boot_id(
+        self,
+        before: str,
+        deadline: float,
+        trigger: str,
+        bmc_error: str,
+        use_ipv6: bool,
+    ) -> None:
+        while time.monotonic() < deadline:
+            if await convert_to_async(
+                is_host_ping_reachable, self.device.name, use_ipv6=use_ipv6
+            ):
+                now = await self._read_boot_id()
+                if now and now != before:
+                    self.logger.info(
+                        f"{self.device.name} rebooted after {trigger} (boot ID {before} -> {now})"
+                    )
+                    return
+            await asyncio.sleep(10)
+        raise RuntimeError(
+            f"{self.device.name} did not reboot after {trigger}: boot ID still {before}; "
+            "the BMC reset did not take effect (check TAAC_BMC_HOST)"
+            + (f"; BMC command {bmc_error}" if bmc_error else "")
         )
 
 

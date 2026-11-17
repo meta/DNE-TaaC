@@ -8,6 +8,7 @@ from taac.playbooks.playbook_definitions import (
     create_thft_playbooks,
 )
 from taac.health_check.health_check import types as hc_types
+from taac.test_as_a_config.types import StepName
 
 
 class ThftPlaybooksTest(unittest.TestCase):
@@ -89,6 +90,17 @@ class ThftPlaybooksTest(unittest.TestCase):
         self.assertEqual(flap_task.interval, 0)
         self.assertEqual(flap_task.max_runtime, 600)
 
+    def test_thrift_stress_tasks_are_retryable(self) -> None:
+        # Guards against a later change restoring retryable=False.
+        playbooks = create_thft_playbooks(
+            "dut", test_duration_s=600, include_kitchen_sink=True
+        )
+        for playbook in playbooks:
+            tasks = playbook.periodic_tasks or []
+            self.assertTrue(tasks, f"{playbook.name} has no periodic tasks")
+            for task in tasks:
+                self.assertTrue(task.retryable, f"{playbook.name}: {task.name}")
+
     def test_each_stress_playbook_has_five_minute_clean_longevity_stage(self) -> None:
         playbooks = create_thft_playbooks(
             "dut",
@@ -127,6 +139,30 @@ class ThftPlaybooksTest(unittest.TestCase):
                 hc_types.CheckName.CORE_DUMPS_CHECK,
                 [check.name for check in (playbook.snapshot_checks or [])],
             )
+
+    def test_only_the_wedge_agent_restart_clears_the_bgpd_drain_exit(self) -> None:
+        playbooks = create_thft_playbooks(
+            "dut", restart_test_duration_s=600, restart_period_s=300
+        )
+        for playbook in playbooks:
+            if "_with_restart_" not in playbook.name:
+                continue
+            interruptions = [
+                step
+                for stage in playbook.stages or []
+                for step in stage.steps or []
+                if step.name == StepName.SERVICE_INTERRUPTION_STEP
+            ]
+            self.assertEqual(len(interruptions), 2, playbook.name)
+            for step in interruptions:
+                params = json.loads(
+                    step.step_params.json_params if step.step_params else "{}"
+                )
+                self.assertEqual(
+                    params.get("clear_thrift_drain_exit", False),
+                    playbook.name.endswith("_wedge_agent"),
+                    playbook.name,
+                )
 
 
 if __name__ == "__main__":

@@ -1,16 +1,24 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
+import importlib
+import os
 import time
 import typing as t
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from neteng.test_infra.dne.taac.constants import TestDevice, TestTopology
 from taac.libs.parameter_evaluator import ParameterEvaluator
 from taac.steps.step_definitions import RegisterPatcherStep
 from taac.test_as_a_config import types as taac_types
 
-_STEPS = "neteng.test_infra.dne.taac.steps.step_definitions"
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+_constants = importlib.import_module(f"{_PACKAGE}.constants")
+TestDevice = _constants.TestDevice
+TestTopology = _constants.TestTopology
+
+_STEPS = f"{_PACKAGE}.steps.step_definitions"
 
 
 class RegisterPatcherStepTest(unittest.IsolatedAsyncioTestCase):

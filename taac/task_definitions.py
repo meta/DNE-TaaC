@@ -745,6 +745,51 @@ def create_wait_for_bgp_convergence_task(
     )
 
 
+def create_wait_for_bgp_fib_sync_task(
+    hostnames: t.List[str] | str,
+    min_rib_prefixes: int = 1,
+    timeout: int = 900,
+    interval: int = 15,
+    stable_polls: int = 3,
+    parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
+) -> Task:
+    """Post-IXIA gate: wait until the FIB holds bgpd's RIB and has stopped moving.
+
+    Unlike `create_wait_for_bgp_convergence_task`, whose flag is set once per
+    bgpd start, this compares the RIB with the FIB, so it waits out the
+    programming of routes the traffic generator's peers have just sent. See
+    `taac/tasks/wait_for_bgp_fib_sync_task.py` for the predicate.
+
+    Args:
+        hostnames: Devices to wait on.
+        min_rib_prefixes: RIB best paths required before the RIB counts as
+            loaded; set it above the pre-traffic-generator baseline.
+        timeout: Seconds before the task raises.
+        interval: Seconds between polls.
+        stable_polls: Consecutive identical, consistent polls required.
+        parent_prefixes_to_ignore: CIDRs whose subnets are left out of both
+            sides, as for BGP_RIB_FIB_CONSISTENCY_CHECK.
+    """
+    if isinstance(hostnames, str):
+        hostnames = [hostnames]
+    return Task(
+        task_name="wait_for_bgp_fib_sync",
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostnames": hostnames,
+                    "min_rib_prefixes": min_rib_prefixes,
+                    "timeout": timeout,
+                    "interval": interval,
+                    "stable_polls": stable_polls,
+                    "parent_prefixes_to_ignore": parent_prefixes_to_ignore or [],
+                }
+            )
+        ),
+        ixia_needed=True,
+    )
+
+
 def create_configure_parallel_bgp_peers_task(
     hostname: str,
     peer_configs: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
@@ -4249,7 +4294,12 @@ def create_thrift_stress_periodic_task(
         interval=interval,
         max_runtime=max_runtime,
         task=Task(task_name="thrift_stress"),
-        retryable=False,
+        # Restart variants take the agent down mid-run; a transient RPC raise
+        # or an empty LLDP table right after the restart (the flap task's
+        # LLDP query) must not end the task and fail the playbook at teardown.
+        # A task that never records data still fails: the runner turns its
+        # SKIP final check into ERROR.
+        retryable=True,
         terminate_on_error=False,
         params_list=[Params(json_params=json.dumps(params))],
     )
@@ -4595,6 +4645,7 @@ def create_fpf_withdraw_stale_prefixes_task(
 def create_setup_base_configs_task(
     hostname: t.Optional[str] = None,
     restart_bgp: bool = True,
+    peer_group_regex: t.Optional[str] = None,
 ) -> Task:
     """Create a task that generates a device's live and soft-drain BGP configs.
 
@@ -4616,12 +4667,19 @@ def create_setup_base_configs_task(
         restart_bgp: Restart bgpd so the live config takes effect. False stages
             both files without disturbing a running session, for batching
             several changes before one restart.
+        peer_group_regex: Retarget only the peer groups whose name matches and
+            keep every existing policy; unscoped, the policy section is
+            replaced wholesale, which a device wired into a live fabric cannot
+            survive.
 
     Returns:
         Task object to generate the base BGP configs.
     """
+    params: t.Dict[str, t.Any] = {"restart_bgp": restart_bgp}
+    if peer_group_regex is not None:
+        params["peer_group_regex"] = peer_group_regex
     return Task(
         task_name="setup_base_configs",
         hostname=hostname,
-        params=Params(json_params=json.dumps({"restart_bgp": restart_bgp})),
+        params=Params(json_params=json.dumps(params)),
     )

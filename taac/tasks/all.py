@@ -39,9 +39,9 @@ from taac.tasks.base_task import BaseTask
 from taac.utils import arista_utils
 from taac.utils.bgpcpp_log_level_marker import record_configured
 from taac.utils.common import (
+    get_bgp_peer_configs,
     get_default_bgp_configs,
     get_default_configs,
-    is_host_drainable,
     run_in_thread,
 )
 from taac.utils.driver_factory import async_get_device_driver
@@ -534,10 +534,7 @@ class ConfigureParallelBgpPeers(BaseTask):
             "patcher_args": {"peer_configs": json.dumps(add_bgp_peer_configs)},
             "patcher_desc": "",
         }
-        if is_host_drainable(hostname):
-            configs = ["bgpcpp", "bgpcpp_softdrain"]
-        else:
-            configs = ["bgpcpp"]
+        configs = get_bgp_peer_configs(hostname)
         await asyncio.gather(
             *[
                 # pyre-fixme[16]: `AbstractSwitch` has no attribute
@@ -729,7 +726,10 @@ class CoopUnregisterPatchersTask(BaseTask):
             self.logger.info(
                 f"Unregistering patchers {patchers_to_unregister} from {hostname}:{config_name}"
             )
-            for patcher in patchers_to_unregister:
+            # Newest first: a later patcher may build on an earlier one (a term
+            # in a policy another one cloned), and the OSS patcher rebuilds the
+            # config from those still registered after every removal.
+            for patcher in reversed(patchers_to_unregister):
                 await driver.async_coop_unregister_patchers(
                     patcher,
                     config_name,
@@ -827,13 +827,21 @@ class CoopApplyPatchersTask(BaseTask):
                 if params.get("do_warmboot")
                 else None
             )
+            do_coldboot = bool(params.get("do_coldboot"))
             for hostname in hostnames:
                 driver = await async_get_device_driver(hostname)
-                # pyre-fixme[16]: `AbstractSwitch` has no attribute
-                #  `async_apply_patchers`.
-                await driver.async_apply_patchers(
-                    method, coldboot=bool(params.get("do_coldboot"))
-                )
+                try:
+                    # pyre-fixme[16]: `AbstractSwitch` has no attribute
+                    #  `async_apply_patchers`.
+                    await driver.async_apply_patchers(method, coldboot=do_coldboot)
+                finally:
+                    if do_coldboot:
+                        # The agents do not delete their flag after honouring
+                        # it and /dev/shm outlives every restart, so one left
+                        # behind by a failed apply cold boots the next warm boot.
+                        # pyre-fixme[16]: `AbstractSwitch` has no attribute
+                        #  `async_remove_cold_boot_file`.
+                        await driver.async_remove_cold_boot_file()
             return
         config_names = params.get("config_names")
         config_name = params.get("config_name")

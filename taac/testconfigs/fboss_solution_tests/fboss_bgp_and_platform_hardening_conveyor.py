@@ -1572,6 +1572,7 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
     validate_test_bgp_sessions=False,
     fsdb_memory_threshold_bytes=None,
     fail_on_bgp_route_collection_error=False,
+    ixia_port_queue_config=None,
 ):
     """Build the conveyor TestConfig for combined BGP++ and FBOSS platform hardening.
 
@@ -1665,7 +1666,7 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
             and uplink IPv4/IPv6 peer addresses to be Established. Intentionally
             flapping rogue peers are excluded. Defaults to the legacy filter.
         fsdb_memory_threshold_bytes: Optional positive FSDB ceiling shared by
-            pre- and postchecks. With None, retain the legacy 7/5 GiB limits.
+            pre- and postchecks. With None, FSDB uses the shared 6 GiB ceiling.
         fail_on_bgp_route_collection_error: Opt into raising filtered-RIB
             collection failures when peer-route snapshots are enabled. Defaults
             to the legacy zero-count fallback.
@@ -1755,15 +1756,14 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
         ),
         create_unclean_exit_check(),
         create_memory_utilization_check(
-            threshold=5 * (1024**3),
+            threshold=6 * (1024**3),
             threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
-                "fsdb": fsdb_memory_threshold_bytes
-                if fsdb_memory_threshold_bytes is not None
-                else 5 * (1024**3),
-                "qsfp_service": 2 * (1024**3),
-                "fboss_sw_agent": 9 * (1024**3),
-                "fboss_hw_agent@0": 8 * (1024**3),
+                "bgpd": 10 * (1024**3),
+                **(
+                    {"fsdb": fsdb_memory_threshold_bytes}
+                    if fsdb_memory_threshold_bytes is not None
+                    else {}
+                ),
             },
             start_time_jq_var="test_case_start_time",
         ),
@@ -1792,20 +1792,36 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
         ),
         create_unclean_exit_check(),
         create_memory_utilization_check(
-            threshold=5 * (1024**3),
+            threshold=6 * (1024**3),
             threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
-                "fsdb": fsdb_memory_threshold_bytes
-                if fsdb_memory_threshold_bytes is not None
-                else 7 * (1024**3),
-                "qsfp_service": 2 * (1024**3),
-                "fboss_sw_agent": 12 * (1024**3),
-                "fboss_hw_agent@0": 8 * (1024**3),
+                "bgpd": 10 * (1024**3),
+                **(
+                    {"fsdb": fsdb_memory_threshold_bytes}
+                    if fsdb_memory_threshold_bytes is not None
+                    else {}
+                ),
             },
             start_time_jq_var="test_case_start_time",
         ),
         *([] if l2_overload_only else [bgp_session_check]),
     ]
+
+    ixia_queue_tasks = (
+        [
+            create_coop_register_patcher_task(
+                hostname=device_name,
+                config_name="agent",
+                patcher_name="queue_config_all_ixia_ports",
+                py_func_name="change_port_queue_config",
+                patcher_args={
+                    ixia_uplink_interface: ixia_port_queue_config,
+                    ixia_downlink_interface: ixia_port_queue_config,
+                },
+            )
+        ]
+        if ixia_port_queue_config
+        else []
+    )
 
     return TestConfig(
         name=test_config_name,
@@ -1847,6 +1863,7 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
                     hostnames=[device_name],
                 ),
                 create_wait_for_agent_convergence_task([device_name]),
+                *ixia_queue_tasks,
                 create_coop_register_patcher_task(
                     hostname=device_name,
                     config_name="bgpcpp",

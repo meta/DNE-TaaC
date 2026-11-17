@@ -81,11 +81,6 @@ from taac.testconfigs.npi.thrift_hardening_test_config import (
     create_npi_thrift_hardening_test_config,
     NPI_DVT_ICEPACK_GTSW__THRIFT_HARDENING_TEST_CONFIG,
 )
-from taac.testconfigs.npi.wedge400c_rsw001_p001_qzd1_test_config import (
-    RSW001_P001_F01_QZD1_SYSTEM_REBOOT_TEST_CONFIG,
-    RSW001_P001_F01_QZD1_TEST_CONFIGS,
-    RSW001_P001_F01_QZD1_THRIFT_HARDENING_TEST_CONFIG,
-)
 from taac.testconfigs.npi.wedge800_npi_test_config import (
     W800_BGP_HARDENING_TEST_CONFIG,
     W800_CPU_QUEUE_TEST_CONFIG,
@@ -94,6 +89,7 @@ from taac.testconfigs.npi.wedge800_npi_test_config import (
     W800_TEST_CONFIGS,
     W800_THRIFT_HARDENING_TEST_CONFIG,
 )
+from taac.utils.oss_taac_constants import TAAC_OSS
 
 __all__ = [
     "AC100T_CPU_QUEUE_TEST_CONFIG",
@@ -125,9 +121,6 @@ __all__ = [
     "NPI_DVT_ICEPACK_GTSW__THRIFT_HARDENING_TEST_CONFIG",
     "NPI_ICEPACK_GTSW007_WARMBOOT_TROUBLESHOOTING_TEST_CONFIG",
     "QZA_RTSW001_CHENAB_DLB_CASE18_QUICK_TEST_CONFIG",
-    "RSW001_P001_F01_QZD1_SYSTEM_REBOOT_TEST_CONFIG",
-    "RSW001_P001_F01_QZD1_TEST_CONFIGS",
-    "RSW001_P001_F01_QZD1_THRIFT_HARDENING_TEST_CONFIG",
     "W800_BGP_HARDENING_TEST_CONFIG",
     "W800_CPU_QUEUE_TEST_CONFIG",
     "MINIPACK_FSW004_P003_QZD1_CPU_QUEUE_TEST_CONFIG",
@@ -144,3 +137,19 @@ __all__ = [
     "get_cpu_queue_constants",
     "test_config_for_icepack_ecmp_resource_testing",
 ]
+
+# The wedge400c thrift-hardening config asserts its platform through netwhoami
+# at import. There is no inventory under TAAC_OSS, so the assert raises and
+# would take this whole package -- every NPI config -- down with it.
+if not TAAC_OSS:
+    from taac.testconfigs.npi.wedge400c_rsw001_p001_qzd1_test_config import (
+        RSW001_P001_F01_QZD1_SYSTEM_REBOOT_TEST_CONFIG,
+        RSW001_P001_F01_QZD1_TEST_CONFIGS,
+        RSW001_P001_F01_QZD1_THRIFT_HARDENING_TEST_CONFIG,
+    )
+
+    __all__ += [
+        "RSW001_P001_F01_QZD1_SYSTEM_REBOOT_TEST_CONFIG",
+        "RSW001_P001_F01_QZD1_TEST_CONFIGS",
+        "RSW001_P001_F01_QZD1_THRIFT_HARDENING_TEST_CONFIG",
+    ]

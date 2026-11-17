@@ -52,6 +52,7 @@ from taac.task_definitions import (
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.types import Endpoint, Playbook, Stage, TestConfig
+from taac.utils.oss_taac_constants import TAAC_OSS
 
 
 # Function to create a list of stages for a service event test.
@@ -299,14 +300,21 @@ def build_speed_flip_subsume_churn_playbook(
     - churn_patcher_1 = all 3 cages (A-F)
     - churn_patcher_2 = cages 2 & 3 (C,D,E,F)
 
-    Sequence (each register/unregister step warmboots the agent):
+    Sequence (each register/unregister step warmboots the agent, or cold-boots it when the step adds or removes a port):
       0. Precheck: assert all 6 circuits (both ends) at baseline_speed_gbps (400G).
       1. Register churn_patcher_1 (A-F -> 800G). B,D up initially, subsumed by the
          flip. Validate primaries at 800G.
       2. Force F (cage_3 /5) admin-down on the DUT, then register churn_patcher_2
-         (C,D,E,F -> 800G). Validate primaries at 800G.
+         (C,D,E,F -> 800G). Validate primaries at 800G. In OSS the whole-cage
+         patcher has already removed F from the agent config, so the admin-down
+         is skipped (skip_missing, OSS only) and this case is not covered there.
       3. Churn x churn_iterations: remove p1, remove p2, reapply p1, reapply p2,
          remove p2 (each +warmboot, each followed by a primary-speed validation).
+         Each validation expects target_speed_gbps on the primaries whose cage a
+         still-registered patcher covers and baseline_speed_gbps on the rest.
+         Each cycle ends with only p1 registered, so from the second cycle on
+         "remove p2" is a no-op and "remove p1" drops straight to baseline: the
+         "p1 removed while p2 holds cages 2 and 3" case runs only in cycle 1.
 
     Asserts: exactly 6 circuits; exactly 3 distinct a_end cages; exactly 3
     distinct z_end cages. The all-at-400G check is enforced at runtime (step 0).
@@ -353,9 +361,33 @@ def build_speed_flip_subsume_churn_playbook(
         c for c in ordered_cages[2] if _subport(c.a_end_interface_name) == "5"
     )
 
-    primary_hc = _speed_flip_hc_params(
-        _circuit_endpoints(primary_circuits), target_speed_gbps
-    )
+    covers = {
+        patcher1_name: {_cage_base(c.a_end_interface_name) for c in patcher1_circuits},
+        patcher2_name: {_cage_base(c.a_end_interface_name) for c in patcher2_circuits},
+    }
+    # Mutated by _patcher_step as each stage is built, so stages must be built in
+    # run order.
+    registered: t.Set[str] = set()
+
+    def _primary_hc() -> t.Dict[str, t.Any]:
+        # A primary is at the target only while some registered patcher covers its
+        # cage; removing the last one returns it to the baseline.
+        flipped = set().union(*(covers[p] for p in registered))
+        params: t.Dict[str, t.Any] = {}
+        for c in primary_circuits:
+            speed = (
+                target_speed_gbps
+                if _cage_base(c.a_end_interface_name) in flipped
+                else baseline_speed_gbps
+            )
+            for device, port in (
+                (c.a_end_device_name, c.a_end_interface_name),
+                (c.z_end_device_name, c.z_end_interface_name),
+            ):
+                params.setdefault(device, {"interfaces": []})["interfaces"].append(
+                    {"interface_name": port, "expected_speed": speed}
+                )
+        return params
 
     def _patcher_step(
         patcher_name: str, circuits: t.List[Circuit], register: bool
@@ -363,6 +395,7 @@ def build_speed_flip_subsume_churn_playbook(
         # target_port_cage_count = number of a_end cages this patcher covers, so
         # the runtime cage gate passes for this intentionally-3/2-cage test.
         cage_count = len({_cage_base(c.a_end_interface_name) for c in circuits})
+        (registered.add if register else registered.discard)(patcher_name)
         return create_steps_stage(
             steps=[
                 create_register_speed_flip_patcher_step(
@@ -373,7 +406,7 @@ def build_speed_flip_subsume_churn_playbook(
                     speed_in_gbps=target_speed_gbps,
                     target_port_cage_count=cage_count,
                 ),
-                get_validation_step(primary_hc),
+                get_validation_step(_primary_hc()),
             ]
         )
 
@@ -400,7 +433,11 @@ def build_speed_flip_subsume_churn_playbook(
         create_steps_stage(
             steps=[
                 create_fpf_set_interface_admin_step(
-                    interfaces=[f_circuit.a_end_interface_name], enable=False
+                    interfaces=[f_circuit.a_end_interface_name],
+                    enable=False,
+                    # OSS only: the whole-cage patcher has already removed F, the
+                    # subsumed mate. skip_missing is never sent when TAAC_OSS is false.
+                    skip_missing=TAAC_OSS,
                 ),
             ]
         )
@@ -428,7 +465,13 @@ def build_subsume_churn_test_config(
     circuit_info: t.List[Circuit],
     churn_iterations: int = 1,
 ) -> TestConfig:
-    """Wrap the SPD_041 subsume-churn playbook into a runnable TestConfig."""
+    """Wrap the SPD_041 subsume-churn playbook into a runnable TestConfig.
+
+    No start-vs-end PORT_SPEED_SNAPSHOT_CHECK: the churn loop ends with
+    patcher 1 registered (/1 at target speed, /5 subsumed) against the baseline
+    the playbook's own precheck asserts, and the runner snapshots test_case_end
+    before teardown restores, so that check fails by construction here.
+    """
     churn_playbook = build_speed_flip_subsume_churn_playbook(
         playbook_name=playbook_name,
         circuit_info=circuit_info,
@@ -436,24 +479,13 @@ def build_subsume_churn_test_config(
     )
     endpoints = _circuit_endpoints(circuit_info)
     dut_device = circuit_info[0].a_end_device_name
-    snapshot_checks = [
-        create_port_speed_snapshot_check(
-            json_params={"endpoints": endpoints},
-            pre_snapshot_checkpoint_id="test_case_start",
-            post_snapshot_checkpoint_id="test_case_end",
-        ),
-    ]
-    wrapped = create_speed_flip_test_config_playbook(
-        built_playbook=churn_playbook,
-        snapshot_checks=snapshot_checks,
-    )
     return TestConfig(
         name=test_config_name,
         basset_pool="dne.test",
         endpoints=[
             Endpoint(name=device, dut=(device == dut_device)) for device in endpoints
         ],
-        playbooks=[wrapped],
+        playbooks=[churn_playbook],
     )
 
 

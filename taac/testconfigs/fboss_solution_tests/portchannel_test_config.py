@@ -714,6 +714,9 @@ def test_config_for_portchannel(
     # Optional overrides
     basset_pool: str = "dne.test",
     additional_setup_tasks: list[Task] | None = None,
+    # False leaves the IXIA ports at the speed the device config gives them,
+    # for testbeds whose IXIA links are not 400G optical.
+    set_ixia_port_speed: bool = True,
 ) -> TestConfig:
     hostnames = [uplink_device, downlink_device]
     if uplink_bgp_communities is None:
@@ -742,6 +745,8 @@ def test_config_for_portchannel(
         ]
 
     def _speed_patcher_tasks(device: str, ports: list[IxiaPortSpec]) -> list[Task]:
+        if not set_ixia_port_speed:
+            return []
         return [
             create_coop_register_patcher_task(
                 hostname=device,

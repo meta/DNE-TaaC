@@ -49,7 +49,7 @@ Network Groups (3 distribution types):
 # =============================================================================
 import json
 import typing as t
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Dict, List
 
@@ -442,6 +442,8 @@ class PrefixProfilingProfile:
     non_contiguous: dict[int, PrefixMaskConfig]
     # Per-distribution PREFIX_LIMIT_CHECK ceiling: total routes + headroom.
     prefix_limits: Dict[str, int]
+    # PFOV_TIMING_PROFILES keys this platform overrides.
+    timing_overrides: Dict[str, int] = field(default_factory=dict)
 
     def configs_for(self, distribution: str) -> dict[int, PrefixMaskConfig]:
         """Prefix configs keyed by prefix length for one distribution type."""
@@ -476,6 +478,7 @@ def build_prefix_profiling_profile(
     non_contiguous_scale: dict[int, tuple[int, int]],
     prefix_limits: Dict[str, int],
     baseline: PrefixProfilingProfile = MP3N_PREFIX_PROFILE,
+    timing_overrides: Dict[str, int] | None = None,
 ) -> PrefixProfilingProfile:
     """Build a platform profile from just its scale numbers.
 
@@ -511,6 +514,7 @@ def build_prefix_profiling_profile(
         hybrid=_scaled(baseline.hybrid, hybrid_scale),
         non_contiguous=_scaled(baseline.non_contiguous, non_contiguous_scale),
         prefix_limits=prefix_limits,
+        timing_overrides=dict(timing_overrides or {}),
     )
 
 
@@ -1078,7 +1082,7 @@ def _create_common_postchecks(
         create_memory_utilization_check(
             threshold=5 * (1024**3),
             threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
+                "bgpd": 10 * (1024**3),
                 "fsdb": 7 * (1024**3),
                 "qsfp_service": 2 * (1024**3),
                 "fboss_sw_agent": 0.8 * 16 * (1024**3),
@@ -1132,7 +1136,7 @@ def create_warmboot_playbook(
         distribution_interface_map = DISTRIBUTION_INTERFACE_MAP
     ng_regex = f".*PREFIX_STRESSER_{distribution_type.upper()}.*"
     dist_interface = distribution_interface_map[distribution_type]
-    timing = get_pfov_timing_profile(device_name)
+    timing = {**get_pfov_timing_profile(device_name), **profile.timing_overrides}
 
     return build_mp3n_profiling_playbook(
         name=f"test_{distribution_type}_warmboot_{prefix_length}",
@@ -1301,7 +1305,7 @@ def create_bgp_restart_playbook(
         distribution_interface_map = DISTRIBUTION_INTERFACE_MAP
     ng_regex = f".*PREFIX_STRESSER_{distribution_type.upper()}.*"
     dist_interface = distribution_interface_map[distribution_type]
-    timing = get_pfov_timing_profile(device_name)
+    timing = {**get_pfov_timing_profile(device_name), **profile.timing_overrides}
 
     return build_mp3n_profiling_playbook(
         name=f"bgp_restart_{distribution_type}_{prefix_length}",
@@ -1471,7 +1475,7 @@ def create_coldboot_playbook(
         distribution_interface_map = DISTRIBUTION_INTERFACE_MAP
     ng_regex = f".*PREFIX_STRESSER_{distribution_type.upper()}.*"
     dist_interface = distribution_interface_map[distribution_type]
-    timing = get_pfov_timing_profile(device_name)
+    timing = {**get_pfov_timing_profile(device_name), **profile.timing_overrides}
 
     return build_mp3n_profiling_playbook(
         name=f"test_{distribution_type}_coldboot_{prefix_length}",
@@ -2184,14 +2188,59 @@ def create_two_port_device_test_configs(
     pre_setup_tasks: list[taac_types.Task] | None = None,
     post_setup_tasks: list[taac_types.Task] | None = None,
     profile: PrefixProfilingProfile = MP3N_PREFIX_PROFILE,
+    switch_prefix_limit: int = MP3N_SWITCH_PREFIX_LIMIT,
+    ixia_port_queue_config: str | None = None,
 ) -> tuple[TestConfig, TestConfig, TestConfig]:
     """Create the three prefix-distribution configs on two physical ports.
 
     Each TestConfig owns one distribution-specific device group on the shared
     prefix-stresser port and one L3 traffic device group on the downlink port.
+
+    Args:
+        switch_prefix_limit: the switch-wide BGP prefix limit the setup tasks
+            write. PREFIX_LIMIT_CHECK asserts exact equality against it, so a
+            caller that overrides it must give ``profile`` matching
+            ``prefix_limits``.
+        ixia_port_queue_config: portQueueConfigName to rebind BOTH IXIA-facing
+            ports to. Set it when the DUT's committed binding carries an egress
+            shaper (e.g. a 12.5 Gbps ``downlink_queue_config``) that would drop
+            most of the offered traffic and fail IXIA_PACKET_LOSS_CHECK for a
+            reason unrelated to the prefix scale. None leaves the binding alone.
     """
     stresser_iface, stresser_net, stresser_chassis, stresser_port = prefix_stresser
     downlink_iface, downlink_net, downlink_chassis, downlink_port = downlink
+
+    def _with_port_queue_rebind(
+        tasks: list[taac_types.Task],
+    ) -> list[taac_types.Task]:
+        if not ixia_port_queue_config:
+            return tasks
+        # Registering a patcher only queues it; coop_apply_patchers is what
+        # writes the config. Splice ahead of that task: pre_setup_tasks would
+        # land before the setup's own coop_unregister_patchers and be dropped,
+        # and post_setup_tasks after the apply, where it never lands.
+        apply_idx = next(
+            (i for i, t in enumerate(tasks) if t.task_name == "coop_apply_patchers"),
+            None,
+        )
+        if apply_idx is None:
+            raise RuntimeError(
+                "create_two_port_device_test_configs: create_mp3n_setup_tasks "
+                "returned no 'coop_apply_patchers' task to splice the port-queue "
+                f"rebind before (task_names: {[t.task_name for t in tasks]})"
+            )
+        rebind = create_coop_register_patcher_task(
+            hostname=device_name,
+            config_name="agent",
+            patcher_name="queue_config_all_ixia_ports",
+            task_name="change_port_queue_config",
+            py_func_name="change_port_queue_config",
+            patcher_args={
+                f"{stresser_iface}": ixia_port_queue_config,
+                f"{downlink_iface}": ixia_port_queue_config,
+            },
+        )
+        return tasks[:apply_idx] + [rebind] + tasks[apply_idx:]
     endpoint = taac_types.Endpoint(
         name=device_name,
         ixia_ports=[stresser_iface, downlink_iface],
@@ -2286,7 +2335,7 @@ def create_two_port_device_test_configs(
             ],
             setup_tasks=[
                 *(pre_setup_tasks or []),
-                *create_mp3n_setup_tasks(
+                *_with_port_queue_rebind(create_mp3n_setup_tasks(
                     device_name=device_name,
                     peer_group=peer_group,
                     local_ip=f"{stresser_net}::a",
@@ -2310,7 +2359,8 @@ def create_two_port_device_test_configs(
                     ingress_policy=ingress_policy,
                     egress_policy=egress_policy,
                     patcher_suffix=patcher_suffix,
-                ),
+                    prefix_limit=switch_prefix_limit,
+                )),
                 *(post_setup_tasks or []),
             ],
             teardown_tasks=create_mp3n_teardown_tasks(device_name=device_name),

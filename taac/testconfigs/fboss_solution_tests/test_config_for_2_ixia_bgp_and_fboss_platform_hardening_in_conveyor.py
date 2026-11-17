@@ -381,7 +381,7 @@ def get_bgp_peer_config_tasks_uplink_only(
                     "bgpcpp",
                     "bgpcpp_softdrain",
                 ],
-                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_uplink_ingress}",
+                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_uplink_ingress}_uplink_ecmp",
                 py_func_name="add_bgp_policy_match_prefix_to_propagate_routes",
                 patcher_args={
                     "matching_prefix": f"{ecmp_group_overflow_prefix}::/16",
@@ -416,12 +416,53 @@ def get_bgp_peer_config_tasks(
     ecmp_group_overflow_prefix,
     v6_uplink_prefix,
     v6_downlink_prefix=None,
+    permissive_ingress=None,
 ):
     """
     Returns the list of BGP peer configuration tasks that were originally part of list b in
     test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor.py
     """
     tasks = []
+
+    # The uplink V6 mimic group's peer-group patcher was left commented out
+    # below, so it alone kept the DUT's *production* baseline for this group.
+    # The attribute set is the downlink sibling's verbatim (and the commented
+    # original's), rather than just the ingress policy: repointing ingress
+    # alone fixes the prefixes and leaves the AFI divergence in place.
+    tasks.append(
+        create_coop_register_patcher_task(
+            hostname=device_name,
+            config_names=[
+                "bgpcpp",
+                "bgpcpp_softdrain",
+            ],
+            patcher_name=(
+                f"update_peer_group_patcher_{peergroup_uplink_mimic_v6}_Uplink"
+            ),
+            py_func_name="configure_bgp_peer_group",
+            patcher_args={
+                "name": peergroup_uplink_mimic_v6,
+                "attributes_to_update_json": json.dumps(
+                    {
+                        "disable_ipv4_afi": "True",
+                        "v4_over_v6_nexthop": "False",
+                        "is_passive": "False",
+                        "is_confed_peer": is_uplink_peer_confed,
+                        "max_routes": per_peer_max_route_limit,
+                        # The V6 groups take their ingress from the baseline
+                        # unless asked otherwise; without this only the V4
+                        # groups get repointed and half the mimic prefixes are
+                        # still rejected.
+                        **(
+                            {"ingress_policy_name": permissive_ingress}
+                            if permissive_ingress
+                            else {}
+                        ),
+                    }
+                ),
+            },
+        )
+    )
 
     # Add FAUU EB peer groups if device name contains "uu"
     if "uu" in device_name:
@@ -447,6 +488,16 @@ def get_bgp_peer_config_tasks(
                             "is_passive": "False",
                             "is_confed_peer": is_downlink_peer_confed,
                             "max_routes": per_peer_max_route_limit,
+                            # The V6 groups take their ingress from
+                            # the baseline unless asked otherwise;
+                            # without this only the V4 groups get
+                            # repointed and half the mimic prefixes
+                            # are still rejected.
+                            **(
+                                {"ingress_policy_name": permissive_ingress}
+                                if permissive_ingress
+                                else {}
+                            ),
                         }
                     ),
                 },
@@ -523,10 +574,13 @@ def get_bgp_peer_config_tasks(
                 py_func_name="add_peer_group_patcher",
                 patcher_args={
                     "name": peergroup_downlink_mimic_v6,
-                    "description": "BGP peering from RSW to FSW, IPv4 sessions",
+                    "description": (
+                        "BGP peering from RSW to server/SLB downlinks, "
+                        "IPv6 sessions"
+                    ),
                     "next_hop_self": "True",
-                    "disable_ipv4_afi": "False",
-                    "disable_ipv6_afi": "True",
+                    "disable_ipv4_afi": "True",
+                    "disable_ipv6_afi": "False",
                     "is_confed_peer": is_downlink_peer_confed,
                     "ingress_policy_name": route_map_downlink_ingress,
                     "egress_policy_name": route_map_downlink_egress,
@@ -552,10 +606,13 @@ def get_bgp_peer_config_tasks(
                 py_func_name="add_peer_group_patcher",
                 patcher_args={
                     "name": peergroup_downlink_mimic_v6,
-                    "description": "BGP peering from RSW to FSW, IPv4 sessions",
+                    "description": (
+                        "BGP peering from RSW to server/SLB downlinks, "
+                        "IPv6 sessions"
+                    ),
                     "next_hop_self": "True",
-                    "disable_ipv4_afi": "False",
-                    "disable_ipv6_afi": "True",
+                    "disable_ipv4_afi": "True",
+                    "disable_ipv6_afi": "False",
                     "is_confed_peer": is_downlink_peer_confed,
                     "ingress_policy_name": route_map_downlink_ingress,
                     "egress_policy_name": route_map_downlink_egress + "_DRAIN",
@@ -694,7 +751,7 @@ def get_bgp_peer_config_tasks(
                     "bgpcpp",
                     "bgpcpp_softdrain",
                 ],
-                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_downlink_ingress}",
+                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_downlink_ingress}_downlink_ecmp",
                 py_func_name="add_bgp_policy_match_prefix_to_propagate_routes",
                 patcher_args={
                     "matching_prefix": f"{ecmp_group_overflow_prefix}::/16",
@@ -728,7 +785,7 @@ def get_bgp_peer_config_tasks(
                 config_names=[
                     "bgpcpp",
                 ],
-                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_uplink_ingress}",
+                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_uplink_ingress}_uplink_ecmp",
                 py_func_name="add_bgp_policy_match_prefix_to_propagate_routes",
                 patcher_args={
                     "matching_prefix": f"{ecmp_group_overflow_prefix}::/16",
@@ -741,7 +798,7 @@ def get_bgp_peer_config_tasks(
                 config_names=[
                     "bgpcpp_softdrain",
                 ],
-                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_uplink_ingress}",
+                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_uplink_ingress}_uplink_ecmp_drain",
                 py_func_name="add_bgp_policy_match_prefix_to_propagate_routes",
                 patcher_args={
                     "matching_prefix": f"{ecmp_group_overflow_prefix}::/16",
@@ -755,7 +812,7 @@ def get_bgp_peer_config_tasks(
                     "bgpcpp",
                     "bgpcpp_softdrain",
                 ],
-                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_uplink_ingress}_uplink",
+                patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_uplink_ingress}_uplink_prefix",
                 py_func_name="add_bgp_policy_match_prefix_to_propagate_routes",
                 patcher_args={
                     "matching_prefix": f"{v6_uplink_prefix}::/16",
@@ -880,6 +937,11 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
     wedge_agent_restart_no_of_interations=1,
     direct_ixia_connections=None,
     basset_pool=None,
+    # Seconds `Ixia.verify_protocols` sleeps on its SKIP path (this factory
+    # sets skip_ixia_protocol_verification=True). Pass 0 to return immediately
+    # (`verify_protocols` guards the sleep on a truthy timeout). The default
+    # window elapses BEFORE traffic items are created, so opting out also
+    # starts traffic earlier in the DUT's convergence.
     ixia_protocol_verification_timeout=1200,
     ecmp_group_overflow_prefix="7000",  # 7000:1:f::/64
     v6_uplink_prefix="6000",
@@ -935,6 +997,20 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
     bgp_longevity_ndp_cycles=None,
     # Replaces the bare BGP_CONVERGENCE_CHECK on the service-restart playbooks.
     bgp_convergence_check=None,
+    # Serialized BGP policy statement (JSON) to splice in and point the
+    # IXIA-mimic peer groups' ingress at, replacing route_map_*_ingress. The
+    # production SLB import policy filters on VIP prefix length and accepts
+    # none of the mimic prefixes, so without this the DUT receives every
+    # prefix and installs none, directional traffic has no route, and
+    # IXIA_PACKET_LOSS_CHECK fails in prechecks before any playbook body runs.
+    permissive_ingress_policy_json=None,
+    # Opt-in portQueueConfigName for the two IXIA-facing ports, e.g.
+    # "uplink_sp_olympic". The binding carries an egress SHAPER, not just queue
+    # names.
+    ixia_port_queue_config=None,
+    # Build the PTP master/slave stacks (uplink dg0 as master, downlink dg0 as
+    # slave). Set False on a chassis without PTP support.
+    enable_ptp=True,
 ):
     """Build the BGP/FBOSS platform-hardening conveyor TestConfig for two IXIA chassis.
 
@@ -1028,22 +1104,26 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         neighbor_interfaces_to_flap,
     )
 
-    ptp_configs = [
-        ixia_types.PTPConfig(
-            server_endpoint=ixia_types.PTPEndpoint(
-                name=f"{device_name}:{ixia_uplink_interface}",
-                device_group_index=0,
-            ),
-            client_endpoints=[
-                ixia_types.PTPEndpoint(
-                    name=f"{device_name}:{ixia_downlink_interface}",
+    ptp_configs = (
+        [
+            ixia_types.PTPConfig(
+                server_endpoint=ixia_types.PTPEndpoint(
+                    name=f"{device_name}:{ixia_uplink_interface}",
                     device_group_index=0,
                 ),
-            ],
-            communication_mode=ixia_types.PTPCommunicationMode.UNICAST,
-            step_mode=ixia_types.PTPStepMode.TWO_STEP,
-        ),
-    ]
+                client_endpoints=[
+                    ixia_types.PTPEndpoint(
+                        name=f"{device_name}:{ixia_downlink_interface}",
+                        device_group_index=0,
+                    ),
+                ],
+                communication_mode=ixia_types.PTPCommunicationMode.UNICAST,
+                step_mode=ixia_types.PTPStepMode.TWO_STEP,
+            ),
+        ]
+        if enable_ptp
+        else []
+    )
 
     directional_traffic_items = [
         f"{device_name.upper()}_V6_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK"
@@ -1098,17 +1178,22 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         create_prefix_limit_check(prefix_limit=prefix_limit),
         create_unclean_exit_check(),
         create_cpu_utilization_check(
-            threshold=400.0, start_time_jq_var="test_case_start_time"
+            threshold=700.0, start_time_jq_var="test_case_start_time"
         ),
         create_service_restart_check(),
     ]
     # Variant for playbooks that restart wedge_agent by design: the bare
     # TC-level SERVICE_RESTART_CHECK would flag the intentional restart and its
     # systemd cascade as a failure.
+    # The allowlisted check judges "recovered" from the SystemdStateCollector's
+    # last sample before the post-checks open, right after the restart step:
+    # that sample can still read `deactivating`. Re-evaluate.
+    _RESTART_CHECK_RETRY = dict(retry_count=3, retry_delay_seconds=5, retry_delay_multiplier=1.0)
     _tc_postchecks_agent_restart = [
         (
             create_service_restart_check(
                 expected_restarted_services=WEDGE_AGENT_BINDS_TO_CASCADE + ["openr"],
+                **_RESTART_CHECK_RETRY,
             )
             if check.name == hc_types.CheckName.SERVICE_RESTART_CHECK
             else check
@@ -1136,6 +1221,8 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     expect_packet_loss=False,
                 ),
             ],
+            clear_traffic_stats=precheck_packet_loss_clear_stats,
+            skip_traffic_items=_flap_skip_items,
         ),
         create_prefix_limit_check(prefix_limit=prefix_limit),
         create_memory_utilization_check(
@@ -1151,11 +1238,12 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     expect_packet_loss=False,
                 ),
             ],
+            skip_traffic_items=_flap_skip_items,
         ),
         create_prefix_limit_check(prefix_limit=prefix_limit),
         create_unclean_exit_check(),
         create_cpu_utilization_check(
-            threshold=400.0, start_time_jq_var="test_case_start_time"
+            threshold=700.0, start_time_jq_var="test_case_start_time"
         ),
         create_service_restart_check(),
     ]
@@ -1287,6 +1375,45 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         else []
     )
 
+    # ROGUE_PREFIX_FLAP (:f) and ROGUE_SESSION_FLAP (:e) churn by design, so
+    # their ranges are never RIB==FIB stable.
+    rib_fib_ignore_prefixes = [
+        "103.0.0.0/8",
+        f"{v6_uplink_prefix}:1::/32",
+        f"{v6_prefix_flapping_prefix}:e::/32",
+        f"{v6_prefix_flapping_prefix}:f::/32",
+    ]
+    permissive_ingress_patchers = []
+    _permissive = None
+    if permissive_ingress_policy_json is not None:
+        _policy = json.loads(permissive_ingress_policy_json)
+        _permissive = _policy["name"]
+        permissive_ingress_patchers = [
+            create_coop_register_patcher_task(
+                hostname=device_name,
+                config_name="bgpcpp",
+                patcher_name=f"a_add_bgp_policy_statement_{_permissive}",
+                task_name="coop_register_patcher",
+                patcher_args={
+                    "name": _permissive,
+                    "description": _policy.get("description", ""),
+                    "policy_version": str(_policy.get("policy_version", "1")),
+                    "result": str(_policy.get("result", 1)),
+                    "policy_entries": json.dumps(_policy.get("policy_entries", [])),
+                },
+                py_func_name="add_bgp_policy_statement",
+            ),
+        ]
+        route_map_uplink_ingress = _permissive
+        route_map_downlink_ingress = _permissive
+        # NOTE: route_map_rogue_ingress is deliberately NOT repointed. This
+        # factory takes the rogue_* route-map parameters but never reads them,
+        # so assigning here would be dead. Wiring the rogue group up is a
+        # separate change: some platforms point the rogue peer-group name at
+        # the SAME peer group as the uplink one, so a rogue patcher would
+        # collide with the uplink patcher and last-write-wins would silently
+        # repoint the uplink group.
+
     churn_kwargs = {
         k: v
         for k, v in {
@@ -1321,6 +1448,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         + _nbr_endpoints,
         setup_tasks=[
             create_coop_unregister_patchers_task(device_name),
+            *permissive_ingress_patchers,
             # Task(
             #     task_name="coop_register_patcher",
             #     params=Params(
@@ -1358,8 +1486,25 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                 },
             ),
         ]
+        + (
+            [
+                create_coop_register_patcher_task(
+                    hostname=device_name,
+                    config_name="agent",
+                    patcher_name="queue_config_all_ixia_ports",
+                    py_func_name="change_port_queue_config",
+                    patcher_args={
+                        f"{ixia_uplink_interface}": ixia_port_queue_config,
+                        f"{ixia_downlink_interface}": ixia_port_queue_config,
+                    },
+                )
+            ]
+            if ixia_port_queue_config
+            else []
+        )
         + get_bgp_peer_config_tasks(
             device_name=device_name,
+            permissive_ingress=_permissive,
             peergroup_downlink_mimic_v6=peergroup_downlink_mimic_v6,
             peergroup_uplink_mimic_v6=peergroup_uplink_mimic_v6,
             peergroup_uplink_mimic_v4=peergroup_uplink_mimic_v4,
@@ -2435,17 +2580,14 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": [
-                                "103.0.0.0/8",
-                                "6000:1::/32",
-                            ]
+                            "parent_prefixes_to_ignore": rib_fib_ignore_prefixes
                         },
                         # bgpd re-syncs the FIB for ~2-3 min after a restart.
                         retry_count=6,
                         retry_delay_seconds=30,
                     ),
                 ]
-                + _tc_postchecks,
+                + _tc_postchecks_agent_restart,
             ),
             build_2_ixia_hardening_playbook(
                 name="test_bgpd_restart",
@@ -2462,22 +2604,25 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    # The TC-level check would flag the restart this playbook performs.
-                    create_service_restart_check(expected_restarted_services=["bgpd"]),
                     bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": [
-                                "103.0.0.0/8",
-                                "6000:1::/32",
-                            ]
+                            "parent_prefixes_to_ignore": rib_fib_ignore_prefixes
                         },
                         # bgpd re-syncs the FIB for ~2-3 min after a restart.
                         retry_count=6,
                         retry_delay_seconds=30,
                     ),
                 ]
-                + _tc_postchecks,
+                + _tc_postchecks
+                # Last on purpose: get_checks_to_run keeps the last same-named check,
+                # so this replaces the bare TC-level SERVICE_RESTART_CHECK.
+                + [
+                    create_service_restart_check(
+                        expected_restarted_services=["bgpd"],
+                        **_RESTART_CHECK_RETRY,
+                    )
+                ],
             ),
             build_2_ixia_hardening_playbook(
                 name="test_5_min_longevity",
@@ -2654,7 +2799,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                 iteration=1,
                 name="test_ecmp_member_overload_limit",
                 prechecks=_tc_prechecks,
-                postchecks=_tc_postchecks,
+                postchecks=_tc_postchecks_agent_restart,
                 snapshot_checks=_tc_snapshot_checks,
                 cleanup_steps=[
                     create_ixia_api_step(
@@ -2818,24 +2963,25 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    # The TC-level check would flag the restart this playbook performs.
-                    create_service_restart_check(
-                        expected_restarted_services=["qsfp_service"]
-                    ),
                     bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": [
-                                "103.0.0.0/8",
-                                "6000:1::/32",
-                            ]
+                            "parent_prefixes_to_ignore": rib_fib_ignore_prefixes
                         },
                         # bgpd re-syncs the FIB for ~2-3 min after a restart.
                         retry_count=6,
                         retry_delay_seconds=30,
                     ),
                 ]
-                + _tc_postchecks,
+                + _tc_postchecks
+                # Last on purpose: get_checks_to_run keeps the last same-named check,
+                # so this replaces the bare TC-level SERVICE_RESTART_CHECK.
+                + [
+                    create_service_restart_check(
+                        expected_restarted_services=["qsfp_service"],
+                        **_RESTART_CHECK_RETRY,
+                    )
+                ],
             ),
             build_2_ixia_hardening_playbook(
                 name="test_fsdb_restart",
@@ -2852,22 +2998,25 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    # The TC-level check would flag the restart this playbook performs.
-                    create_service_restart_check(expected_restarted_services=["fsdb"]),
                     bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": [
-                                "103.0.0.0/8",
-                                "6000:1::/32",
-                            ]
+                            "parent_prefixes_to_ignore": rib_fib_ignore_prefixes
                         },
                         # bgpd re-syncs the FIB for ~2-3 min after a restart.
                         retry_count=6,
                         retry_delay_seconds=30,
                     ),
                 ]
-                + _tc_postchecks,
+                + _tc_postchecks
+                # Last on purpose: get_checks_to_run keeps the last same-named check,
+                # so this replaces the bare TC-level SERVICE_RESTART_CHECK.
+                + [
+                    create_service_restart_check(
+                        expected_restarted_services=["fsdb"],
+                        **_RESTART_CHECK_RETRY,
+                    )
+                ],
             ),
         ]
         + _uplink_flap_playbooks

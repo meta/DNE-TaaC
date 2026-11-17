@@ -548,12 +548,23 @@ def _annotate_check(
         # itself restarts. Inject the same ``expected_restarted_services``
         # allowlist SERVICE_RESTART_CHECK already uses so the check subtracts
         # those before evaluating.
+        #
+        # Also retry like SERVICE_RESTART_CHECK does. The window end is
+        # ``time.time()`` at evaluation, and the collector polls every few
+        # seconds, so when the post-check runs right after a sub-second
+        # intentional restart the last in-window sample can still read
+        # ``deactivating`` and the "expected-restart didn't recover" verdict
+        # fires with no second look. Each retry re-evaluates with a later
+        # window end; a genuinely stuck service still fails every attempt.
+        overrides: t.Dict[str, t.Any] = {
+            "retry_count": 3,
+            "retry_delay_seconds": 10,
+            "retry_delay_multiplier": 1.0,
+        }
         expected = _PLAYBOOK_INTENDED_RESTARTS.get(playbook_name)
         if expected:
-            return _override_check_params(
-                check, {"expected_restarted_services": expected}
-            )
-        return check
+            overrides["expected_restarted_services"] = expected
+        return _override_check_params(check, overrides)
     if check.name == hc_types.CheckName.UNCLEAN_EXIT_CHECK:
         # Playbooks that intentionally SIGKILL / abort a service produce a
         # real unclean exit that the collector's Result sampling AND the

@@ -24,15 +24,20 @@ definition file, not a unit test (per the TAAC repo convention).
 import typing as t
 
 from ixia.ixia import types as ixia_types
+from taac.constants import Gigabyte
 from taac.health_checks.healthcheck_definitions import (
+    create_cpu_utilization_check,
     create_device_core_dumps_check,
     create_ixia_packet_loss_check,
+    create_lldp_check,
     create_port_state_check,
+    create_memory_utilization_check,
     create_systemctl_active_state_check,
 )
 from taac.playbooks.playbook_definitions import (
     gen_common_hcs,
     gen_snake_playbooks,
+    ixia_traffic_item_identifiers,
     SNAKE_BENCHMARK_PACKET_SIZES,
 )
 from taac.health_check.health_check import types as hc_types
@@ -134,9 +139,11 @@ def gen_benchmark_traffic_item_configs(
 
     IXIA frame size is pinned on the traffic item when the config is built,
     so a packet-size sweep needs one traffic item per size rather than a
-    runtime resize. Each item is named ``SNAKE_BENCHMARK_<size>B`` and the
-    returned map feeds ``gen_snake_playbooks`` so every benchmark playbook
-    starts only its own size.
+    runtime resize. Each size gets one item per snake, named
+    ``SNAKE_BENCHMARK_<size>B`` for the first snake and ``... #N`` for the
+    rest (``ixia_traffic_item_identifiers``); the returned map of bare names
+    feeds ``gen_snake_playbooks`` so every benchmark playbook starts only its
+    own size.
 
     Args:
         snake_configs: Loop topology entries; each contributes one traffic
@@ -152,18 +159,38 @@ def gen_benchmark_traffic_item_configs(
     for packet_size in packet_sizes:
         traffic_item_name = f"{BENCHMARK_TRAFFIC_ITEM_PREFIX}{packet_size}B"
         name_by_packet_size[packet_size] = traffic_item_name
-        traffic_item_configs.extend(
-            gen_basic_traffic_item_configs(
-                snake_configs,
-                line_rate,
-                name=traffic_item_name,
-                frame_size_settings=ixia_types.FrameSize(
-                    type=ixia_types.FrameSizeType.FIXED,
-                    fixed_size=packet_size,
-                ),
-            )
+        # Each snake needs a distinct name: the IXIA layer skips a traffic item
+        # whose name already exists, so a shared name would benchmark only the
+        # first snake. These are the identifiers the benchmark playbooks expect.
+        per_snake_names = ixia_traffic_item_identifiers(
+            traffic_item_name, len(snake_configs)
         )
+        for snake_config, per_snake_name in zip(snake_configs, per_snake_names):
+            traffic_item_configs.extend(
+                gen_basic_traffic_item_configs(
+                    [snake_config],
+                    line_rate,
+                    name=per_snake_name,
+                    frame_size_settings=ixia_types.FrameSize(
+                        type=ixia_types.FrameSizeType.FIXED,
+                        fixed_size=packet_size,
+                    ),
+                )
+            )
     return traffic_item_configs, name_by_packet_size
+
+
+# Standard FBOSS per-service memory ceilings, matching the set the other test
+# configs use (see bgp_ebb_health_checks, bgp_dc_tc_checks, the hyperport and
+# fboss_solution_tests configs). Duplicated here rather than shared because no
+# common constant exists yet — worth extracting if a fourth copy appears.
+_MEMORY_THRESHOLD_BY_SERVICE: t.Dict[str, t.Union[int, float]] = {
+    "bgpd": Gigabyte.GIG_4_POINT_5.value,
+    "fsdb": Gigabyte.GIG_5.value,
+    "qsfp_service": Gigabyte.GIG_2.value,
+    "fboss_sw_agent": Gigabyte.GIG_9.value,
+    "fboss_hw_agent@0": Gigabyte.GIG_8.value,
+}
 
 
 def gen_snake_test_config(
@@ -196,7 +223,9 @@ def gen_snake_test_config(
     packet_loss_sleep_time: int = 10,
     include_benchmark: bool = False,
     benchmark_packet_sizes: t.Optional[t.List[int]] = None,
-    benchmark_line_rate: int = 100,
+    # 99, not 100: LLDP multicast every 5s contends for the same egress, so a
+    # 100% item has nowhere to put it and tail-drops.
+    benchmark_line_rate: int = 99,
     benchmark_link_speed_gbps: t.Optional[int] = None,
     benchmark_min_rate_percent: int = 98,
     benchmark_allowed_loss_packet_sizes: t.Optional[t.Set[int]] = None,
@@ -219,6 +248,11 @@ def gen_snake_test_config(
     default_ixia_l1_config: t.Optional[ixia_types.L1Config] = None,
     postcheck_systemctl_services: t.Optional[t.List[hc_types.Service]] = None,
     postcheck_systemctl_min_active_seconds: t.Optional[int] = None,
+    include_48hr_longevity: bool = False,
+    optics_recovery_wait_s: int = 300,
+    precheck_port_state_retry_count: t.Optional[int] = None,
+    precheck_port_state_retry_delay_seconds: float = 10.0,
+    include_utilization_checks: bool = False,
 ) -> taac_types.TestConfig:
     """Build a snake/loopback ``TestConfig``.
 
@@ -262,6 +296,10 @@ def gen_snake_test_config(
                 (default 10).
             playbooks_to_skip: Test-case names to drop from the
                 generated playbook list.
+            include_48hr_longevity: When True, include the
+                ``test_48hr_longevity`` soak (172800s) alongside the
+                standard 1m/10m/1h/72h longevity playbooks. Opt-in since
+                it adds two more days of runtime on top of the 72hr soak.
             additional_dut_hostnames: Optional DUTs that share the
                 primary DUT's IXIA traffic path without owning IXIA ports.
             playbooks_to_include: Optional exact allowlist of generated
@@ -272,10 +310,20 @@ def gen_snake_test_config(
             use_cross_device_half_interface_toggle: Replace the loopback-circuit
                 half-toggle playbook with per-DUT interface slicing suitable for
                 a cross-device snake.
-            postcheck_port_state_retry_count: Optional number of post-test port
-                state retries. Prechecks remain single-shot.
+            postcheck_port_state_retry_count: Optional number of post-test
+                retries for PORT_STATE_CHECK and LLDP_CHECK (both read the
+                same recovering links; the name predates LLDP's inclusion).
             postcheck_port_state_retry_delay_seconds: Fixed delay between
-                post-test port-state retries.
+                post-test retries.
+            precheck_port_state_retry_count: Optional number of pre-test
+                retries for PORT_STATE_CHECK and LLDP_CHECK. Unset =
+                single-shot. The port-state check surfaces a wedge_agent
+                thrift stall as ERROR once its driver-level retry is spent;
+                the framework retries ERROR for every check when
+                retry_count > 0, so this rides out a stall that outlives the
+                driver retry.
+            precheck_port_state_retry_delay_seconds: Fixed delay between
+                pre-test port-state retries.
             half_toggle_check_retry_count: Optional number of retries for the
                 half-interface-toggle LLDP and port-state checks that run
                 after interfaces are re-enabled. None keeps them single-shot.
@@ -295,12 +343,18 @@ def gen_snake_test_config(
                 1-hour soak). ``_interface_slice`` is a positional slice
                 expression (e.g. ``":3"`` = first 3 interfaces) to flap a
                 subset; ``None`` flaps all. ``_disable_delay_s`` /
-                ``_enable_delay_s`` also set the per-interface spacing of
-                every interface-disruptive playbook in the suite (thrift
-                toggle, qsfp_util disable / low-power, qsfp reset), not
-                just the link-flap longevity one. ``_enable_delay_s``
-                defaults to 10s; ZR optics need ~5 minutes to relock, so
-                the ZR4 800G configs pass 300.
+                ``_enable_delay_s`` also set the post-batch settle of the
+                thrift-toggle and qsfp_util tx-disable playbooks (the
+                ``delay`` is one sleep after all interfaces are flapped,
+                not per-interface spacing). ``_enable_delay_s`` defaults
+                to 10s; ZR optics need ~5 minutes to relock, so the ZR4
+                800G configs pass 300.
+            optics_recovery_wait_s: Post-flap wait for the playbooks that
+                reinitialise the transceiver (qsfp_util low-power exit and
+                qsfp reset). Kept separate from ``_enable_delay_s`` so a
+                short link-flap-longevity loop never starves module
+                relock; 800G DR4/FR4 modules can take minutes to relink.
+                Defaults to 300s.
             include_rapid_a_end_flap_stress: When True, include the
                 ``test_snake_rapid_a_end_flap_stress`` playbook -- a rapid
                 optical (wedge_qsfp_util tx_disable/tx_enable) flap of every
@@ -335,6 +389,15 @@ def gen_snake_test_config(
                 that these units are active, retried like the port-state check.
             postcheck_systemctl_min_active_seconds: Minimum time each of those
                 units must have been active, so a crash loop FAILs.
+
+        Service utilization reporting:
+            include_utilization_checks: Append CPU + memory utilization
+                checks to every playbook's POSTchecks, so each playbook
+                logs the per-service peak it reached
+                (``MAX over Ns: <service> NN.NN%/no limit, ...``).
+                CPU reports only; memory gates on the standard FBOSS
+                per-service ceilings. Backed by the OSS collectors; off
+                by default so the internal snake configs are unaffected.
 
     Returns:
         A ``TestConfig`` ready to slot into ``SNAKE_TEST_CONFIGS``.
@@ -412,26 +475,58 @@ def gen_snake_test_config(
 
     common_prechecks = common_hcs
     common_postchecks = common_hcs
+    def _with_link_recovery_retry(
+        hcs: t.List[taac_types.PointInTimeHealthCheck],
+        retry_count: int,
+        retry_delay_seconds: float,
+    ) -> t.List[taac_types.PointInTimeHealthCheck]:
+        """Give PORT_STATE_CHECK *and* LLDP_CHECK the same retry budget.
+
+        Both read the same recovering links, and LLDP is the stricter of the
+        two: it raises on a mismatch and has only a short internal retry, so
+        retrying PORT_STATE alone can leave LLDP to ERROR while its sibling
+        passes on a later attempt. The common checks are built bare, so
+        recreating them here drops no parameters.
+        """
+        retry_kwargs = {
+            "retry_count": retry_count,
+            "retry_delay_seconds": retry_delay_seconds,
+            "retry_delay_multiplier": 1.0,
+        }
+        out = []
+        for hc in hcs:
+            if hc.name == hc_types.CheckName.PORT_STATE_CHECK:
+                out.append(create_port_state_check(**retry_kwargs))
+            elif hc.name == hc_types.CheckName.LLDP_CHECK:
+                out.append(create_lldp_check(**retry_kwargs))
+            else:
+                out.append(hc)
+        return out
+
     if postcheck_port_state_retry_count is not None:
-        common_postchecks = [
-            (
-                create_port_state_check(
-                    retry_count=postcheck_port_state_retry_count,
-                    retry_delay_seconds=postcheck_port_state_retry_delay_seconds,
-                    retry_delay_multiplier=1.0,
-                )
-                if hc.name == hc_types.CheckName.PORT_STATE_CHECK
-                else hc
-            )
-            for hc in common_hcs
-        ]
+        common_postchecks = _with_link_recovery_retry(
+            common_hcs,
+            postcheck_port_state_retry_count,
+            postcheck_port_state_retry_delay_seconds,
+        )
+    if precheck_port_state_retry_count is not None:
+        common_prechecks = _with_link_recovery_retry(
+            common_hcs,
+            precheck_port_state_retry_count,
+            precheck_port_state_retry_delay_seconds,
+        )
+    # Layer on top of the retry-rewritten lists, not common_hcs: rebuilding
+    # from common_hcs here would discard the pre/post retry knobs above
+    # whenever a config also sets precheck_packet_loss_clear_stats.
     if precheck_packet_loss_clear_stats or packet_loss_sleep_time != 10:
         common_prechecks = _override_packet_loss(
-            common_hcs, clear_traffic_stats=precheck_packet_loss_clear_stats
+            common_prechecks, clear_traffic_stats=precheck_packet_loss_clear_stats
         )
     if packet_loss_sleep_time != 10:
         # post-check: keep clear_traffic_stats=False, only adjust the drain window
-        common_postchecks = _override_packet_loss(common_hcs, clear_traffic_stats=False)
+        common_postchecks = _override_packet_loss(
+            common_postchecks, clear_traffic_stats=False
+        )
     if postcheck_systemctl_services:
         common_postchecks = common_postchecks + [
             create_systemctl_active_state_check(
@@ -450,6 +545,38 @@ def gen_snake_test_config(
         qsfp_service_restart_postchecks = _override_packet_loss(
             common_postchecks, clear_traffic_stats=True
         )
+
+    if include_utilization_checks:
+        # Postchecks only. Both checks are MAX-over-window against the OSS
+        # collectors, and the window defaults to [test_case_start_time, now] --
+        # as a precheck that window is empty, so the check would SKIP and only
+        # add noise. As a postcheck it spans the playbook.
+        #
+        # CPU reports only: threshold=0 means "no gate" on the OSS path, so it
+        # reports its peak without being able to fail a traffic test on a
+        # number nobody has baselined.
+        #
+        # qsfp_service and the hw agent both spike far above their median for
+        # one or two polls when transceivers are re-polled after a service or
+        # agent restart. The burst is short enough that repeated runs of the
+        # same playbook report very different peaks, so a ceiling in that band
+        # gates on which poll caught the burst rather than on device health.
+        # Gate per-playbook if a baseline ever justifies it.
+        #
+        # Memory DOES gate, on the standard FBOSS per-service ceilings the
+        # other test configs use. Unlike the CPU peaks these are steady
+        # values, so a ceiling here gates on real growth rather than on poll
+        # timing.
+        # The collector measures cgroup ``anon``, not systemd's MemoryCurrent,
+        # which also counts the page cache of a service's own unrotated log
+        # and so grows with log volume rather than process memory.
+        common_postchecks = common_postchecks + [
+            create_cpu_utilization_check(threshold=0),
+            create_memory_utilization_check(
+                threshold=Gigabyte.GIG_5.value,
+                threshold_by_service=_MEMORY_THRESHOLD_BY_SERVICE,
+            ),
+        ]
 
     ptp_configs = (
         [
@@ -494,6 +621,11 @@ def gen_snake_test_config(
         benchmark_traffic_item_name_by_packet_size=benchmark_name_by_packet_size,
         benchmark_min_rate_gbps_by_packet_size=benchmark_min_rate_gbps_by_packet_size,
         benchmark_allowed_loss_packet_sizes=benchmark_allowed_loss_packet_sizes,
+        # One benchmark item per snake, named by gen_benchmark_traffic_item_configs;
+        # the loss exemption, rate check and report have to name each one.
+        benchmark_traffic_item_instances=len(snake_configs),
+        include_48hr_longevity=include_48hr_longevity,
+        optics_recovery_wait_s=optics_recovery_wait_s,
         use_ipv6_ping=use_ipv6_ping,
         use_cross_device_half_interface_toggle=use_cross_device_half_interface_toggle,
         qsfp_service_restart_postchecks=qsfp_service_restart_postchecks,

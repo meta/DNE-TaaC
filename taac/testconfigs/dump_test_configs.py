@@ -9,8 +9,13 @@ Usage:
 
 import argparse
 
-from neteng.test_infra.dne.taac.test_configs import get_test_config, get_test_configs
 from taac.utils.json_thrift_utils import thrift_to_json
+from taac.utils.oss_taac_constants import TAAC_OSS
+
+if TAAC_OSS:
+    from taac.test_configs import get_test_config, get_test_configs
+else:
+    from neteng.test_infra.dne.taac.test_configs import get_test_config, get_test_configs
 
 
 def main() -> None:

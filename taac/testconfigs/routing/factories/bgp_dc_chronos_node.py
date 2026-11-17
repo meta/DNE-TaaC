@@ -134,6 +134,27 @@ def get_bgp_dc_playbooks(
     return playbooks
 
 
+def _select_playbooks(playbooks, playbooks_selected):
+    """The playbooks named in ``playbooks_selected``, in that order.
+
+    A name the category getters did not produce raises, so a config whose
+    allowlist and the getters' output have drifted apart fails at build time
+    instead of quietly running fewer playbooks than its list says. Same
+    contract as ``_select_2_ixia_hardening_playbooks`` in the 2-IXIA conveyor
+    factory.
+    """
+    playbooks_by_name = {playbook.name: playbook for playbook in playbooks}
+    unknown_names = [
+        name for name in playbooks_selected if name not in playbooks_by_name
+    ]
+    if unknown_names:
+        raise ValueError(
+            f"Unknown bgp_dc playbook selections: {unknown_names}; "
+            f"available: {sorted(playbooks_by_name)}"
+        )
+    return [playbooks_by_name[name] for name in playbooks_selected]
+
+
 def build_bgp_dc_test_config(
     test_config_name,
     device_name,
@@ -223,6 +244,10 @@ def build_bgp_dc_test_config(
     convergence_wait_interval=None,
     bgp_hardening_timing_profile=None,
     include_extended_bgp_hardening_playbooks=False,
+    # Next-hops for the ECMP stress groups; defaults to good_ndp_entries_uplink.
+    # Must satisfy max_group * min(36, count // 4) >= max_members --
+    # generate_prefix_nh_list_map asserts on the total.
+    ecmp_nh_device_group_count=None,
 ):
     """Build the full conveyor test configuration for a BGP++ Chronos node.
 
@@ -246,6 +271,7 @@ def build_bgp_dc_test_config(
         "v4_downlink_prefix",
         "v6_downlink_prefix",
         "ecmp_member_limit",
+        "ecmp_nh_device_group_count",
         "additional_setup_tasks",
         "allow_all_v4_policies",
         "uplink_bgp_peer_type",
@@ -263,9 +289,7 @@ def build_bgp_dc_test_config(
     )
 
     if playbooks_selected:
-        playbooks = [
-            playbook for playbook in playbooks if playbook.name in playbooks_selected
-        ]
+        playbooks = _select_playbooks(playbooks, playbooks_selected)
     configure_induced_ecmp_2_peers = any(
         playbook.name in _INDUCED_ECMP_2_PLAYBOOKS for playbook in playbooks
     )
@@ -557,6 +581,8 @@ def build_bgp_dc_test_config(
             # generate_prefix_nh_list_map caps each group at
             # device_group_count // 4 members, so a platform with few uplink
             # NDP nexthops cannot reach ecmp_member_limit; let it opt out.
+            # ecmp_nh_device_group_count is the other lever for the same
+            # assert: raise the NH pool instead of skipping the task.
             *(
                 [
                     create_add_stress_static_routes_task(
@@ -565,7 +591,9 @@ def build_bgp_dc_test_config(
                         max_ecmp_members=ecmp_member_limit,
                         nh_prefix_1=f"{ixia_uplink_good_ndp_network}::/80",
                         lb_prefix_agg="6000:ab::/32",
-                        device_group_count=good_ndp_entries_uplink,
+                        device_group_count=(
+                            ecmp_nh_device_group_count or good_ndp_entries_uplink
+                        ),
                     )
                 ]
                 if stress_static_routes

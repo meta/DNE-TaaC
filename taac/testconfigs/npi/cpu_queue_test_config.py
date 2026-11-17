@@ -310,6 +310,8 @@ def create_npi_cpu_queue_test_config(
     high_queue: int | None = None,
     playbooks_selected: list[str] | None = None,
     restore_soft_drain: bool = False,
+    permissive_ingress_policy_json: str | None = None,
+    remove_peer_addrs: list[str] | None = None,
 ):
     """Build the DC-TypeF 51T NPI CPU queue TestConfig.
 
@@ -347,6 +349,22 @@ def create_npi_cpu_queue_test_config(
         restore_soft_drain: Undrain the DUT before setup and restore its original
             soft-drained lab posture during teardown. The commands run through
             the device driver, which selects the NetOS managed shell when needed.
+        remove_peer_addrs: Peer addresses to strip before adding the IXIA-mimic
+            peers, in place of wiping every peer. Omitted (None) = delete all,
+            which isolates the DUT as a pure traffic-generator target. Pass the
+            passive listen-ranges only to keep the DUT's fabric sessions up, so
+            IXIA-injected routes propagate into the Clos and can be observed on
+            the far side -- required for anything measuring real ECMP width,
+            which a two-port IXIA attachment cannot produce on its own.
+        permissive_ingress_policy_json: Serialized BGP policy statement (JSON) to
+            splice in and point every IXIA-mimic peer group's ingress at, in
+            place of `route_map_*_ingress`. Set it when the DUT's production
+            import policy rejects the mimic prefixes -- an SLB policy filtering
+            on VIP prefix length accepts none of them, and the run then fails
+            its packet-loss precheck with every prefix received and none
+            accepted. Egress is untouched, so nothing leaks into
+            the fabric. Omitted (None) = keep the production policies, which is
+            what every non-IXIA-mimic caller of this factory wants.
 
     Returns:
         TestConfig: The DC-TypeF NPI CPU queue TestConfig.
@@ -361,6 +379,37 @@ def create_npi_cpu_queue_test_config(
     # netwhoami lookup.
     if low_queue is None or mid_queue is None or high_queue is None:
         low_queue, mid_queue, high_queue = get_cpu_queue_constants(device_name)
+
+    # Permissive ingress for the IXIA-mimic groups, when the caller asked for
+    # it. The policy has to be spliced before any peer group names it, so this
+    # patcher is registered ahead of the peer-group ones below (they apply in
+    # registration order).
+    permissive_ingress_patchers = []
+    permissive_ingress = None
+    if permissive_ingress_policy_json is not None:
+        _policy = json.loads(permissive_ingress_policy_json)
+        permissive_ingress = _policy["name"]
+        permissive_ingress_patchers = [
+            create_coop_register_patcher_task(
+                hostname=device_name,
+                config_name="bgpcpp",
+                patcher_name=f"a_add_bgp_policy_statement_{permissive_ingress}",
+                task_name="coop_register_patcher",
+                patcher_args={
+                    "name": permissive_ingress,
+                    "description": _policy.get("description", ""),
+                    "policy_version": str(_policy.get("policy_version", "1")),
+                    "result": str(_policy.get("result", 1)),
+                    "policy_entries": json.dumps(_policy.get("policy_entries", [])),
+                },
+                py_func_name="add_bgp_policy_statement",
+            ),
+        ]
+        # Downlink and uplink only: this factory accepts rogue_* parameters but
+        # instantiates no rogue peers, so route_map_rogue_ingress reaches nothing.
+        route_map_uplink_ingress = permissive_ingress
+        route_map_downlink_ingress = permissive_ingress
+
     # Create and return the complete test configuration
     return TestConfig(
         name=test_config_name,
@@ -401,7 +450,11 @@ def create_npi_cpu_queue_test_config(
                 config_names=_BGP_CONFIG_NAMES,
                 patcher_name="a_remove_bgp_peers",
                 task_name="coop_register_patcher",
-                patcher_args={"delete_all": "True"},
+                patcher_args=(
+                    {"peer_addrs": json.dumps(remove_peer_addrs)}
+                    if remove_peer_addrs is not None
+                    else {"delete_all": "True"}
+                ),
                 py_func_name="remove_bgp_peers",
             ),
             # Configure BGP switch prefix limit
@@ -415,6 +468,7 @@ def create_npi_cpu_queue_test_config(
                 },
                 py_func_name="configure_bgp_switch_limit",
             ),
+            *permissive_ingress_patchers,
             create_coop_register_patcher_task(
                 hostname=device_name,
                 config_names=_BGP_CONFIG_NAMES,
@@ -429,6 +483,13 @@ def create_npi_cpu_queue_test_config(
                             "is_passive": "False",
                             "max_routes": per_peer_max_route_limit,
                             "is_confed_peer": is_downlink_peer_confed,
+                            # Only when asked: the V6 groups otherwise keep
+                            # whatever ingress policy the baseline gave them.
+                            **(
+                                {"ingress_policy_name": permissive_ingress}
+                                if permissive_ingress
+                                else {}
+                            ),
                         }
                     ),
                 },
@@ -448,6 +509,11 @@ def create_npi_cpu_queue_test_config(
                             "is_passive": "False",
                             "max_routes": per_peer_max_route_limit,
                             "is_confed_peer": is_uplink_peer_confed,
+                            **(
+                                {"ingress_policy_name": permissive_ingress}
+                                if permissive_ingress
+                                else {}
+                            ),
                         }
                     ),
                 },
@@ -1046,7 +1112,7 @@ def create_npi_cpu_queue_test_config(
                 bidirectional=False,
                 packet_headers=DHCP_V6_GLOBAL_DSCP0_TRAFFIC_PACKET_HEADERS,
             ),
-            # CPU_009: DHCPv6 link-local + DSCP=48 → MID queue
+            # CPU_009: DHCPv6 link-local + DSCP=48 → HIGH queue
             taac_types.BasicTrafficItemConfig(
                 src_endpoints=[
                     taac_types.TrafficEndpoint(
@@ -1460,7 +1526,7 @@ def create_npi_cpu_queue_test_config(
                 packet_headers=DSCP_48_TO_SWITCH_GLOBAL_IPV6_TRAFFIC_PACKET_HEADERS,
             ),
             # CPU_048: DSCP=48 to-switch link-local IPv6 — host-bound,
-            # SIP=Ixia LL, DIP=switch LL, DSCP=48 → MID queue.
+            # SIP=Ixia LL, DIP=switch LL, DSCP=48 → HIGH queue.
             taac_types.BasicTrafficItemConfig(
                 src_endpoints=[
                     taac_types.TrafficEndpoint(

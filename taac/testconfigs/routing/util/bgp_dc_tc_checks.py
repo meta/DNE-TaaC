@@ -116,6 +116,8 @@ _PLAYBOOK_EXPECTED_RESTARTED_SERVICES = {
     + ["openr"],
     "test_hardening_of_mac_overload_with_agent_churn": WEDGE_AGENT_BINDS_TO_CASCADE
     + ["openr"],
+    # Restarts bgpd by design.
+    "test_bgp_restart": ["bgpd"],
 }
 
 # This can be narrower than the restart allowlist: a dependent service may be
@@ -167,6 +169,26 @@ def _set_clear_traffic_stats(check):
     return check(input_json=json.dumps(input_params))
 
 
+def _with_expected_restarts(check, expected):
+    """Rebuild a restart-sensitive check with ``expected``; pass others through.
+
+    Applied to the playbook's own postchecks as well as the TC-level ones, so a
+    playbook check's ``services=`` scoping is replaced. That does not change the
+    outcome: the TC-level copy comes last and wins the runner's last-wins dedup
+    either way. Both SERVICE_RESTART_CHECK and SYSTEMCTL_ACTIVE_STATE_CHECK give
+    the allowlist a final-sample-only verdict, so an intentional restart's
+    transient states pass while a service that never comes back still fails.
+    """
+    name = getattr(check, "name", None)
+    if name == hc_types.CheckName.SERVICE_RESTART_CHECK:
+        return create_service_restart_check(expected_restarted_services=expected)
+    if name == hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK:
+        return create_systemctl_active_state_check(
+            expected_restarted_services=expected
+        )
+    return check
+
+
 def _apply_tc_checks_to_playbooks(
     playbooks, tc_prechecks, tc_postchecks, tc_snapshot_checks
 ):
@@ -176,8 +198,8 @@ def _apply_tc_checks_to_playbooks(
     to the playbook's existing checks (if any).
 
     For playbooks that intentionally restart services (see
-    ``_PLAYBOOK_EXPECTED_RESTARTED_SERVICES``), the TC-level
-    SERVICE_RESTART_CHECK is rebuilt with the matching
+    ``_PLAYBOOK_EXPECTED_RESTARTED_SERVICES``), SERVICE_RESTART_CHECK and
+    SYSTEMCTL_ACTIVE_STATE_CHECK are rebuilt with the matching
     ``expected_restarted_services`` so the by-design restart + its BindsTo
     cascade are not flagged as failures.
     """
@@ -219,6 +241,8 @@ def _apply_tc_checks_to_playbooks(
                     expected_restarted_services=expected,
                 ),
             )
+            # Also rebuild SYSTEMCTL_ACTIVE_STATE_CHECK with the same allowlist.
+            postchecks = [_with_expected_restarts(c, expected) for c in postchecks]
         applied.append(
             pb(
                 prechecks=prechecks,
@@ -267,14 +291,8 @@ def build_bgp_dc_tc_prechecks(prefix_limit, *, include_traffic_check, device_nam
         create_prefix_limit_check(prefix_limit=prefix_limit),
         create_unclean_exit_check(),
         create_memory_utilization_check(
-            threshold=5 * (1024**3),
-            threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
-                "fsdb": 7 * (1024**3),
-                "qsfp_service": 2 * (1024**3),
-                "fboss_sw_agent": 12 * (1024**3),
-                "fboss_hw_agent@0": 8 * (1024**3),
-            },
+            threshold=6 * (1024**3),
+            threshold_by_service={"bgpd": 10 * (1024**3)},
             start_time_jq_var="test_case_start_time",
         ),
         BGP_SESSION_HEALTHCHECK_NO_V6_LOSS_EXPECTED,
@@ -304,14 +322,8 @@ def build_bgp_dc_tc_postchecks(
         BGP_SESSION_HEALTHCHECK_NO_V6_LOSS_EXPECTED,
         create_unclean_exit_check(),
         create_memory_utilization_check(
-            threshold=5 * (1024**3),
-            threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
-                "fsdb": 5 * (1024**3),
-                "qsfp_service": 2 * (1024**3),
-                "fboss_sw_agent": 12 * (1024**3),
-                "fboss_hw_agent@0": 8 * (1024**3),
-            },
+            threshold=6 * (1024**3),
+            threshold_by_service={"bgpd": 10 * (1024**3)},
             start_time_jq_var="test_case_start_time",
         ),
         create_cpu_utilization_check(

@@ -41,10 +41,12 @@ from taac.testconfigs.fboss_solution_tests.fboss_bgp_and_platform_hardening_conv
     create_ixia_packet_loss_check_traffic_split,
     test_config_for_bgp_and_fboss_platform_hardening_in_conveyor,
 )
+from taac.utils.json_thrift_utils import json_to_thrift, thrift_to_json
 from taac.utils.qos_constants import ClassOfService
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.types import (
+    Params,
     Playbook,
     PointInTimeHealthCheck,
     Service,
@@ -313,6 +315,35 @@ def _make_scheduling_packet_loss_check(
             for traffic in DISABLED_AUXILIARY_TRAFFIC_SUFFIXES
         ],
     )
+
+
+def _qos_active_traffic_checks(checks, device_name):
+    """QoS stops the hardening streams; their missing stats are intentional."""
+    inactive = {
+        f"{device_name.upper()}_{suffix}"
+        for suffix in (
+            "GOOD_BUT_LOSSY_NDP_TRAFFIC",
+            "LOSSY_ROGUE_NDP_TRAFFIC",
+            "HIGH_QUEUE_BGP_CP_TRAFFIC",
+        )
+    }
+    result = []
+    for check in checks or []:
+        if check.name == hc_types.CheckName.IXIA_PACKET_LOSS_CHECK and check.input_json:
+            input = json_to_thrift(check.input_json, hc_types.IxiaPacketLossHealthCheckIn)
+            thresholds = []
+            for threshold in input.thresholds:
+                names = [name for name in threshold.names if name not in inactive]
+                if names or not threshold.names:
+                    thresholds.append(threshold(names=names))
+            params = json.loads(check.check_params.json_params or "{}") if check.check_params else {}
+            params["skip_traffic_items"] = sorted(set(params.get("skip_traffic_items", [])) | inactive)
+            check = check(
+                input_json=thrift_to_json(input(thresholds=thresholds)),
+                check_params=(check.check_params or Params())(json_params=json.dumps(params)),
+            )
+        result.append(check)
+    return result
 
 
 def _make_congestion_packet_loss_check(
@@ -2104,6 +2135,7 @@ def _build_congestion_port_config(
     congestion_prefix_start_v6: str,
     is_congestion_peer_confed: str,
     bgp_peer_type=None,
+    congestion_device_name: t.Optional[str] = None,
 ) -> taac_types.BasicPortConfig:
     """Build the BasicPortConfig for the dedicated congestion IXIA port.
 
@@ -2111,9 +2143,14 @@ def _build_congestion_port_config(
     advertises routes toward the same destination as the uplink/downlink
     peers so that the congestion traffic egresses through the same
     DUT interface.
+
+    `congestion_device_name` defaults to `device_name` (the congestion port
+    is a DUT-local cage); pass a different device to place it there instead
+    (e.g. a neighbouring RSW reaching the DUT through the fabric).
     """
+    congestion_device_name = congestion_device_name or device_name
     return taac_types.BasicPortConfig(
-        endpoint=f"{device_name}:{ixia_congestion_interface}",
+        endpoint=f"{congestion_device_name}:{ixia_congestion_interface}",
         device_group_configs=[
             taac_types.DeviceGroupConfig(
                 device_group_index=0,
@@ -2158,13 +2195,16 @@ def _build_congestion_traffic_item_config(
     device_name: str,
     ixia_congestion_interface: str,
     ixia_downlink_interface: str,
+    congestion_device_name: t.Optional[str] = None,
 ) -> taac_types.BasicTrafficItemConfig:
     """Build the BasicTrafficItemConfig for the congestion traffic item.
 
     Traffic flows from the congestion port → through the DUT → to the
     downlink port, targeting the same egress interface as the existing
-    bidirectional traffic items.
+    bidirectional traffic items. `congestion_device_name` defaults to
+    `device_name`; see `_build_congestion_port_config`.
     """
+    congestion_device_name = congestion_device_name or device_name
     return taac_types.BasicTrafficItemConfig(
         name=f"{device_name.upper()}_{CONGESTION_TRAFFIC_ITEM_SUFFIX}",
         bidirectional=False,
@@ -2173,7 +2213,7 @@ def _build_congestion_traffic_item_config(
         src_dest_mesh=ixia_types.SrcDestMeshType.MANY_TO_MANY,
         src_endpoints=[
             taac_types.TrafficEndpoint(
-                name=f"{device_name}:{ixia_congestion_interface}",
+                name=f"{congestion_device_name}:{ixia_congestion_interface}",
                 network_group_index=0,
                 device_group_index=0,
             ),
@@ -2188,6 +2228,12 @@ def _build_congestion_traffic_item_config(
         traffic_type=ixia_types.TrafficType.IPV6,
         tracking_types=[ixia_types.TrafficStatsTrackingType.TRAFFIC_ITEM],
         frame_size_settings=DEFAULT_FRAME_SIZE,
+        # Only when the source is off-DUT: the traffic generator otherwise
+        # adds a TCP header cycling source and destination ports, which can
+        # lose traffic on a fabric leg with no drop counter moving. A
+        # DUT-local congestion cage keeps the default stack, unchanged for
+        # existing callers.
+        skip_default_l4_protocol=congestion_device_name != device_name,
     )
 
 
@@ -2195,14 +2241,17 @@ def _build_per_queue_congestion_traffic_item_configs(
     device_name: str,
     ixia_congestion_interface: str,
     ixia_downlink_interface: str,
+    congestion_device_name: t.Optional[str] = None,
 ) -> t.List[taac_types.BasicTrafficItemConfig]:
     """Build per-queue congestion traffic items for multi-queue congestion tests.
 
     Creates one traffic item per queue in COS_CONGESTION_TRAFFIC_SUFFIX,
     each at MULTI_CONGESTION_LINERATE% linerate.  These are used in
     multi-queue congestion playbooks where multiple queues are congested
-    simultaneously on the same egress port.
+    simultaneously on the same egress port. `congestion_device_name`
+    defaults to `device_name`; see `_build_congestion_port_config`.
     """
+    congestion_device_name = congestion_device_name or device_name
     configs = []
     for cos, suffix in COS_CONGESTION_TRAFFIC_SUFFIX.items():
         dscp_value = COS_DSCP_VALUES[cos]
@@ -2215,7 +2264,7 @@ def _build_per_queue_congestion_traffic_item_configs(
                 src_dest_mesh=ixia_types.SrcDestMeshType.MANY_TO_MANY,
                 src_endpoints=[
                     taac_types.TrafficEndpoint(
-                        name=f"{device_name}:{ixia_congestion_interface}",
+                        name=f"{congestion_device_name}:{ixia_congestion_interface}",
                         network_group_index=0,
                         device_group_index=0,
                     ),
@@ -2230,6 +2279,8 @@ def _build_per_queue_congestion_traffic_item_configs(
                 traffic_type=ixia_types.TrafficType.IPV6,
                 tracking_types=[ixia_types.TrafficStatsTrackingType.TRAFFIC_ITEM],
                 frame_size_settings=DEFAULT_FRAME_SIZE,
+                # See _build_congestion_port_config's sibling item.
+                skip_default_l4_protocol=congestion_device_name != device_name,
                 qos_config=ixia_types.QoSConfig(
                     phb_type=ixia_types.PHBTypes.TRAFFIC_CLASS,
                     dscp_value=dscp_value,
@@ -2321,6 +2372,8 @@ def test_config_qos_scheduling(
     direct_ixia_connections=None,
     precheck_packet_loss_clear_stats=False,
     stress_static_routes=True,
+    ixia_port_queue_config=None,
+    congestion_device_name=None,
 ):
     """Build a QoS scheduling + congestion TestConfig for FBOSS BGP++ devices.
 
@@ -2415,6 +2468,15 @@ def test_config_qos_scheduling(
                 advertisements.
             is_congestion_peer_confed: bgpcpp `is_confed_peer` for the
                 congestion peer (default "False").
+            congestion_device_name: Device the congestion IXIA port is
+                physically attached to. Defaults to `device_name` (the DUT),
+                preserving prior behaviour. Pass a different device (e.g. a
+                neighbouring RSW) to source congestion traffic across the
+                fabric instead of from a DUT-local cage; the caller is
+                responsible for making that device a legal endpoint (its
+                health checks, IXIA wiring, and any BGP transport it needs)
+                before this TestConfig runs -- this factory only places the
+                congestion BasicPortConfig / traffic items on it.
 
         Conveyor passthrough:
             additional_setup_tasks: Extra `Task` objects merged into the
@@ -2551,6 +2613,17 @@ def test_config_qos_scheduling(
         direct_ixia_connections=direct_ixia_connections,
         precheck_packet_loss_clear_stats=precheck_packet_loss_clear_stats,
         stress_static_routes=stress_static_routes,
+        ixia_port_queue_config=ixia_port_queue_config,
+    )
+
+    test_config = test_config(
+        playbooks=[
+            playbook(
+                prechecks=_qos_active_traffic_checks(playbook.prechecks, device_name),
+                postchecks=_qos_active_traffic_checks(playbook.postchecks, device_name),
+            )
+            for playbook in test_config.playbooks
+        ]
     )
 
     # Append congestion port config and traffic item to the TestConfig
@@ -2565,6 +2638,7 @@ def test_config_qos_scheduling(
         # separate IXIA vport for the rogue interface — rogue BGP sessions
         # are configured as device groups on the uplink port.  The congestion
         # traffic item needs its own vport, so we always add the port config.
+        resolved_congestion_device_name = congestion_device_name or device_name
         port_configs = list(test_config.basic_port_configs)
         congestion_port_config = _build_congestion_port_config(
             device_name=device_name,
@@ -2575,6 +2649,7 @@ def test_config_qos_scheduling(
             congestion_prefix_start_v6=congestion_prefix_start_v6,
             is_congestion_peer_confed=is_congestion_peer_confed,
             bgp_peer_type=uplink_bgp_peer_type,
+            congestion_device_name=congestion_device_name,
         )
         port_configs.append(congestion_port_config)
 
@@ -2591,6 +2666,7 @@ def test_config_qos_scheduling(
             device_name=device_name,
             ixia_congestion_interface=ixia_congestion_interface,
             ixia_downlink_interface=ixia_downlink_interface,
+            congestion_device_name=congestion_device_name,
         )
         traffic_configs.append(congestion_traffic_item)
         # Per-queue congestion traffic items for multi-queue congestion playbooks.
@@ -2599,15 +2675,28 @@ def test_config_qos_scheduling(
                 device_name=device_name,
                 ixia_congestion_interface=ixia_congestion_interface,
                 ixia_downlink_interface=ixia_downlink_interface,
+                congestion_device_name=congestion_device_name,
             )
         )
 
-        # Add the congestion port to the DUT endpoint's ixia_ports so that
-        # the IXIA layer creates a vport for it.  Endpoint is also an immutable
+        # Add the congestion port to the congestion device's ixia_ports so
+        # that the IXIA layer creates a vport for it. With no
+        # `congestion_device_name` that is the DUT endpoint, selected by
+        # `ep.dut` exactly as before -- not by name, so a DUT endpoint whose
+        # name differs from `device_name` keeps working. When
+        # `congestion_device_name` names a different device, target that
+        # endpoint by name instead -- it must already be present on
+        # `test_config.endpoints` (e.g. added by the caller) or this is a
+        # no-op and the caller must wire ixia_ports /
+        # direct_ixia_connections for it itself. Endpoint is an immutable
         # Thrift struct, so we reconstruct it via dict().
         updated_endpoints = []
         for ep in test_config.endpoints:
-            if ep.dut:
+            if (
+                ep.dut
+                if congestion_device_name is None
+                else ep.name == resolved_congestion_device_name
+            ):
                 ep_fields = dict(ep)
                 ep_fields["ixia_ports"] = list(ep.ixia_ports or []) + [
                     ixia_congestion_interface,

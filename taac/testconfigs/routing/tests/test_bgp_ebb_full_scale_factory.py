@@ -201,6 +201,55 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
             with self.subTest(config=config.name):
                 self.assertEqual("routing.qual", config.basset_pool)
 
+    def test_nrq_non_ug_canaries_select_fy27_without_changing_ug(self) -> None:
+        for non_ug, ug, expected_playbooks in (
+            (
+                cicd_ebb_int_tc.NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
+                cicd_ebb_int_tc.NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+                [
+                    "bgp_ebb_attribute_churn_playbook",
+                    "bgp_ebb_fauu_drain_undrain_playbook",
+                ],
+            ),
+            (
+                cicd_ebb_int_tc.NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
+                cicd_ebb_int_tc.NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+                [
+                    "bgp_ebb_ebgp_route_oscillation_playbook",
+                    "bgp_ebb_igp_unresolvable_pnh_playbook",
+                ],
+            ),
+        ):
+            with self.subTest(config=non_ug.name):
+                (endpoint,) = non_ug.endpoints or []
+                self.assertEqual(3, len(endpoint.ixia_ports or ()))
+                self.assertNotIn(
+                    "DEVICE_GROUP_BGP_MON", _enabled_device_group_names(non_ug)
+                )
+                self.assertEqual(
+                    expected_playbooks,
+                    [playbook.name for playbook in non_ug.playbooks or []],
+                )
+                self.assertEqual(
+                    1,
+                    sum(
+                        task.task_name == "configure_bgpcpp_startup"
+                        and _json_params(task.params).get("flags")
+                        == {"platform": "ebb"}
+                        for task in non_ug.setup_tasks or []
+                    ),
+                )
+            with self.subTest(config=ug.name):
+                self.assertIn("DEVICE_GROUP_BGP_MON", _enabled_device_group_names(ug))
+                self.assertFalse(
+                    any(
+                        task.task_name == "configure_bgpcpp_startup"
+                        and _json_params(task.params).get("flags")
+                        == {"platform": "ebb"}
+                        for task in ug.setup_tasks or []
+                    )
+                )
+
     def test_non_fy26_forces_ebb_platform_before_bgpcpp_enable(self) -> None:
         topology = _compiled_topology()
         with mock.patch.object(factory, "ebb_topology", return_value=topology):
@@ -889,6 +938,12 @@ def _bgp_peer_names(device_group: taac_types.DeviceGroupConfig) -> list[str]:
 
 
 _COLD_START_PLAYBOOK = "bgp_ebb_cold_start_playbook"
+_FY27_NON_UG_CANARY_NAMES = frozenset(
+    {
+        "NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
+        "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
+    }
+)
 
 # Every registered TestConfig the gateway gates change. The golden manifest
 # skips NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG.
@@ -1036,7 +1091,8 @@ class GatewayResolutionGateTest(unittest.TestCase):
                     and _json_params(tasks[index].params).get("daemon_name") == "Bgpcpp"
                     and _json_params(tasks[index].params).get("action") == "enable"
                 )
-                self.assertEqual(first_bgpcpp_enable - 1, gates[0])
+                expected_gate_offset = 2 if name in _FY27_NON_UG_CANARY_NAMES else 1
+                self.assertEqual(first_bgpcpp_enable - expected_gate_offset, gates[0])
                 self.assertLess(last_interface_ip, gates[0])
                 names = _gate_device_group_names(tasks[gates[0]].params)
                 self.assertEqual(_enabled_device_group_names(config), names)
@@ -1044,10 +1100,13 @@ class GatewayResolutionGateTest(unittest.TestCase):
                     {
                         "DEVICE_GROUP_IPV6_EBGP",
                         "DEVICE_GROUP_IPV4_EBGP",
-                        "DEVICE_GROUP_BGP_MON",
                     }
                     <= set(names)
                 )
+                if name in _FY27_NON_UG_CANARY_NAMES:
+                    self.assertNotIn("DEVICE_GROUP_BGP_MON", names)
+                else:
+                    self.assertIn("DEVICE_GROUP_BGP_MON", names)
                 self.assertEqual(len(names), len(set(names)))
                 for device_group in _enabled_device_groups(config):
                     self.assertTrue(
@@ -1163,10 +1222,13 @@ class GatewayGateScopeTest(unittest.TestCase):
                 self.assertNotEqual(self.gateless[name], config)
                 self.assertEqual(self.gateless[name], _without_gateway_gates(config))
 
-    def test_fy26_configs_carry_no_state_guard(self) -> None:
+    def test_state_guard_matches_registered_scale(self) -> None:
         for name, config in self.gated.items():
             with self.subTest(config=name):
-                self.assertEqual([], _state_guard_tasks(config))
+                self.assertEqual(
+                    name in _FY27_NON_UG_CANARY_NAMES,
+                    bool(_state_guard_tasks(config)),
+                )
 
 
 _STATE_GUARD_ACTIONS = frozenset(

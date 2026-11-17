@@ -21,6 +21,7 @@ from taac.abstractions.topologies.bounded_ecmp import (
     BOUNDED_ECMP_PARENT_NETWORKS_IXIA03,
 )
 from taac.abstractions.topologies.ebb_full_scale import (
+    EBB_FY27_SCALE,
     EBB_NEXT_HOPS_IXIA03,
     EBB_PARENT_NETWORKS_IXIA03,
 )
@@ -110,6 +111,7 @@ NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG = create_bgp_ebb_full_scale_test_co
     enable_update_group=False,
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
+    scale=EBB_FY27_SCALE,
 )
 
 NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_config(
@@ -177,6 +179,7 @@ NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG = create_bgp_ebb_full_scale_test_co
     ),
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
+    scale=EBB_FY27_SCALE,
 )
 
 NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_config(

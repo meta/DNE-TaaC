@@ -76,7 +76,7 @@ from configerator.structs.neteng.robotron.bgp_policy.thrift_types import (
     LocalPreference,
 )
 from taac.driver.abstract_switch import AbstractSwitch
-from taac.driver.driver_constants import FbossSystemctlServiceName
+from taac.driver.driver_constants import DeviceDrainState, FbossSystemctlServiceName
 from taac.utils.oss_taac_lib_utils import (
     oss_bgpd_config_install_enabled,
 )
@@ -112,6 +112,10 @@ MARKER_SOFT_DRAINED: str = f"{FBOSS_DRAIN_DIR}/SOFT_DRAINED"
 COOP_DIR: str = "/etc/coop"
 LIVE_CONFIG_PATH: str = f"{COOP_DIR}/bgpcpp.conf"
 SOFTDRAIN_CONFIG_PATH: str = f"{COOP_DIR}/bgpcpp_softdrain.conf"
+# Present while bgpcpp_softdrain.conf is a plain copy of bgpcpp that a test
+# config seeded for its softdrain patchers, so the patcher teardown deletes it
+# instead of leaving it.
+SOFTDRAIN_SEED_MARKER: str = f"{SOFTDRAIN_CONFIG_PATH}.taac-seeded"
 AGENT_CONFIG_PATH: str = f"{COOP_DIR}/agent.conf"
 # Where the undrained config is parked while a drain is installed over the path
 # bgpd reads. Only used on images that read a real file rather than the startup
@@ -120,6 +124,7 @@ PREDRAIN_CONFIG_PATH: str = f"{COOP_DIR}/bgpcpp.predrain.conf"
 
 _UNDRAIN: str = "undrain"
 _SOFT_DRAIN: str = "soft-drain"
+_READ_DRAIN_STATE: str = "read the drain state of"
 _BASE_CONFIG_SETUP: str = "set up base configs for"
 
 # The two communities that carry drain state between devices. A drained device
@@ -360,6 +365,39 @@ async def undrain_device(switch: AbstractSwitch, restart_bgp: bool = True) -> No
     )
 
 
+async def get_device_drain_state(switch: AbstractSwitch) -> DeviceDrainState:
+    """Read the drain state declared by the config bgpd is launched with.
+
+    ``generate_base_configs`` sets ``drain_state`` in both files it writes, so
+    the file bgpd opens says which one it is, however it got there. The markers
+    cannot: /dev/shm is tmpfs, so a reboot clears them, and a patcher apply or
+    restore rewrites bgpcpp.conf without touching them. Reading through the
+    startup symlink gives its target, so this covers both image layouts.
+
+    This is the file bgpd loads on its next start: after a drain with
+    ``restart_bgp=False`` it is ahead of the running daemon. DRAINED means any
+    declared drain, which in OSS is always a soft drain.
+
+    Raises:
+        ConfigModifierError: the config cannot be read as JSON.
+    """
+    _assert_fboss_device(switch, _READ_DRAIN_STATE)
+    path = await _async_resolve_bgpd_config_path(switch)
+    raw = await switch.async_read_file(path)
+    try:
+        state = DrainState(json.loads(raw).get("drain_state", DrainState.UNDRAINED.value))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ConfigModifierError(
+            f"Cannot {_READ_DRAIN_STATE} {switch.hostname}: {path} is not a "
+            f"bgpd config with a readable drain_state ({exc})"
+        ) from exc
+    return (
+        DeviceDrainState.UNDRAINED
+        if state == DrainState.UNDRAINED
+        else DeviceDrainState.DRAINED
+    )
+
+
 async def _apply_drain_state(
     switch: AbstractSwitch,
     *,
@@ -390,12 +428,13 @@ async def _apply_drain_state(
     # UNDRAINED > WARM_DRAINED > SOFT_DRAINED > DRAINED, so leaving UNDRAINED in
     # place while adding SOFT_DRAINED would silently keep the device live. Removing
     # the opposite marker and setting the target in one invocation also avoids a
-    # window where both or neither marker exists.
+    # window where both or neither marker exists. /dev/shm is tmpfs: right after
+    # a reboot the directory may not exist yet, and every write below would fail.
     switch.logger.info(
         f"[{state_name}] {hostname}: clearing {opposite_marker}, setting {target_marker}"
     )
     await switch.async_run_cmd_on_shell(
-        f"rm -f {opposite_marker} && touch {target_marker}"
+        f"mkdir -p {FBOSS_DRAIN_DIR} && rm -f {opposite_marker} && touch {target_marker}"
     )
 
     # Symlink into a staging name, then rename over the real one. rename(2) is
@@ -924,13 +963,25 @@ async def setup_base_configs(
         f"Cannot {_BASE_CONFIG_SETUP} {hostname}: {LIVE_CONFIG_PATH}",
     )
 
-    live_config, drain_config = generate_base_configs(config, peer_group_regex)
+    # A config parked by an earlier drain is the undrained source only while the
+    # live path still declares the drain variant (a run that died drained). Once
+    # something put an undrained config back -- a patcher restore, an
+    # interrupted drain -- the parked copy is stale. Either way it is removed
+    # below, only once both configs have been written.
+    if config.drain_state not in (None, DrainState.UNDRAINED) and (
+        await async_file_exists(switch, PREDRAIN_CONFIG_PATH)
+    ):
+        switch.logger.info(
+            f"{hostname}: {LIVE_CONFIG_PATH} is a drain variant; rebuilding from "
+            f"the parked {PREDRAIN_CONFIG_PATH}"
+        )
+        config = deserialize_config(
+            BgpConfig,
+            await switch.async_read_file(PREDRAIN_CONFIG_PATH),
+            f"Cannot {_BASE_CONFIG_SETUP} {hostname}: {PREDRAIN_CONFIG_PATH}",
+        )
 
-    if oss_bgpd_config_install_enabled():
-        # The configs written below are the new truth. A config parked by an
-        # earlier drain (a run torn down while drained, or a drain interrupted
-        # after parking) would otherwise be installed by the undrain below.
-        await switch.async_run_cmd_on_shell(f"rm -f {PREDRAIN_CONFIG_PATH}")
+    live_config, drain_config = generate_base_configs(config, peer_group_regex)
 
     switch.logger.info(
         f"{hostname}: writing {LIVE_CONFIG_PATH} and {SOFTDRAIN_CONFIG_PATH}"
@@ -938,6 +989,13 @@ async def setup_base_configs(
     await async_write_configs(
         switch, {LIVE_CONFIG_PATH: live_config, SOFTDRAIN_CONFIG_PATH: drain_config}
     )
+
+    # The parked copy is now either consumed or stale, and the undrain below
+    # would install it over what we just wrote. A seed marker left by a run that
+    # died is stale too: this softdrain is generated, not a seed to delete.
+    if oss_bgpd_config_install_enabled():
+        await switch.async_run_cmd_on_shell(f"rm -f {PREDRAIN_CONFIG_PATH}")
+    await switch.async_run_cmd_on_shell(f"rm -f {SOFTDRAIN_SEED_MARKER}")
 
     # Leave the device in a known state rather than wherever its markers happened
     # to point: the symlink may still reference a config that no longer exists.

@@ -29,6 +29,7 @@ SSH auth configured via environment variables:
 import asyncio
 import logging
 import os
+import socket
 import subprocess
 import tempfile
 import time
@@ -98,6 +99,7 @@ class AsyncSSHClient:
         password_list: t.Optional[t.List[str]] = None,
         force_connect: bool = False,
         timeout: int = _DEFAULT_CONNECT_TIMEOUT_SEC,
+        connect_timeout: t.Optional[float] = None,
         **kwargs,
     ) -> None:
         if isinstance(ssh_entity, str) and ssh_entity:
@@ -112,6 +114,9 @@ class AsyncSSHClient:
         self._password = password or _get_ssh_password()
         self._password_list = password_list or []
         self._timeout = timeout
+        # Bounds TCP connect + handshake + auth. login_timeout only starts once
+        # TCP is up, so without this a lost SYN is left to the kernel (~2 min).
+        self._connect_timeout = connect_timeout
         self._conn = None
 
     async def __aenter__(self) -> "AsyncSSHClient":
@@ -137,6 +142,8 @@ class AsyncSSHClient:
             "known_hosts": None,
             "login_timeout": self._timeout,
         }
+        if self._connect_timeout:
+            connect_kwargs["connect_timeout"] = self._connect_timeout
 
         if key_path:
             connect_kwargs["client_keys"] = [key_path]
@@ -506,6 +513,18 @@ class ParamikoClient:
 # =============================================================================
 
 
+# Hosts whose IPv4 fallback was already logged: wait_for_ping_reachable probes
+# up to 120 times.
+_IPV4_FALLBACK_LOGGED: t.Set[str] = set()
+
+
+def _has_ipv6_address(hostname: str) -> bool:
+    try:
+        return bool(socket.getaddrinfo(hostname, None, socket.AF_INET6))
+    except socket.gaierror:
+        return False
+
+
 def is_host_ping_reachable(
     hostname: str,
     use_ipv6: bool = True,
@@ -514,12 +533,18 @@ def is_host_ping_reachable(
     """
     Check if a host responds to ICMP ping.
 
-    Returns True if host is reachable, False otherwise.
+    Returns True if host is reachable, False otherwise. A host with no IPv6
+    address is pinged over IPv4: ``ping -6`` fails at once on it, which reads
+    as unreachable forever and as "went down" to a reboot down-wait. A host
+    that has an IPv6 address the runner cannot route to still fails at once.
     """
     ping_logger = ping_logger or logger
     cmd = ["ping", "-i", "0.5", "-c", "5", "-w", "10"]
-    if use_ipv6:
+    if use_ipv6 and _has_ipv6_address(hostname):
         cmd.append("-6")
+    elif use_ipv6 and hostname not in _IPV4_FALLBACK_LOGGED:
+        _IPV4_FALLBACK_LOGGED.add(hostname)
+        ping_logger.info(f"{hostname} has no IPv6 address, pinging over IPv4")
     cmd.append(hostname)
     ping_logger.debug(f"Running {' '.join(cmd)}")
     try:

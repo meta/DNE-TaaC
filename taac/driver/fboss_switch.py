@@ -78,6 +78,7 @@ if not TAAC_OSS:
     from fboss.fb_thrift_clients import FbossAgentClient
 
 
+from facebook.network.Address.thrift_types import BinaryAddress
 from neteng.fboss.bgp_attr.types import TBgpAfi, TIpPrefix
 from neteng.fboss.bgp_route_types.types import TBgpPath, TRibEntry
 from neteng.fboss.bgp_thrift.clients import TBgpService
@@ -92,11 +93,14 @@ from neteng.fboss.ctrl.clients import FbossCtrl
 from neteng.fboss.ctrl.types import (
     AggregatePortThrift,
     ArpEntryThrift,
+    ClientID,
     BootType,
     DsfSessionThrift,
     FabricEndpoint,
+    FbossFibUpdateError,
     HwObjectType,
     InterfaceDetail,
+    IpPrefix,
     L2EntryThrift,
     LinkNeighborThrift,
     MultiSwitchRunState,
@@ -162,6 +166,7 @@ from taac.utils.client_factory_interface import (
 )
 from taac.driver.driver_constants import (
     _ONE_MBPS,
+    wedge_qsfp_util_cmd,
     ALLOWED_FBOSS_AGENTS,
     AristaCriticalAgents,
     BGP_SUMMARY_HEADER,
@@ -230,7 +235,6 @@ from taac.utils.oss_taac_lib_utils import (
     to_fb_fqdn,
     to_fb_uqdn,
 )
-from taac.test_as_a_config import types as taac_types
 
 if not TAAC_OSS:
     from openr.py.openr.cli.utils.commands import OpenrCtrlCmd
@@ -246,6 +250,7 @@ if not TAAC_OSS:
     from openr.thrift.Types.thrift_types import AdjacencyDatabase
 from thrift.py3.exceptions import Error as ThriftError
 from thrift.python.exceptions import Error as ThriftPythonError
+from thrift.python.exceptions import ApplicationError, ApplicationErrorType
 
 
 def _is_fboss_method_rate_limit(error: BaseException) -> bool:
@@ -290,6 +295,26 @@ class FBOSSConsoleError(Exception):
 
 class MnpuNotEnabled(Exception):
     pass
+
+
+def _build_ip_prefix(cidr: str) -> IpPrefix:
+    """'2001:db8::/64' -> IpPrefix. Host addresses get their full-width mask."""
+    network = ipaddress.ip_network(cidr, strict=False)
+    return IpPrefix(
+        ip=BinaryAddress(addr=network.network_address.packed),
+        prefixLength=network.prefixlen,
+    )
+
+
+def _build_binary_address(addr: str) -> BinaryAddress:
+    """'2001:db8::1' -> BinaryAddress."""
+    return BinaryAddress(addr=ipaddress.ip_address(addr).packed)
+
+
+# Prefixes programmed per (host, patcher). Module-level, not per instance:
+# async_get_device_driver builds a fresh driver for every step, so the step that
+# withdraws is never the one that added, and an attribute would always be empty.
+_STATIC_ROUTE_PREFIXES: Dict[Tuple[str, str], List[IpPrefix]] = {}
 
 
 def _to_interface_state(port_status: PortStatus) -> InterfaceState:
@@ -1212,8 +1237,36 @@ class FbossSwitch(AbstractSwitch):
         config_name: Optional[str] = None,
         auto_remediate_failure: bool = False,
     ) -> None:
-        """Unregister a config patcher."""
+        """Unregister a config patcher, or withdraw a static-route patcher."""
+        await self._async_unregister_patcher(patcher_name, config_name)
+
+    async def _async_unregister_patcher(
+        self,
+        patcher_name: str,
+        config_name: Optional[str],
+        install_now: bool = False,
+    ) -> None:
         self._require_oss_config_patcher()
+        # Static routes go over thrift, not through the config patcher (see
+        # async_add_static_route_patcher). `in`, not truthiness: a registered
+        # patcher that added no prefix still owns its key.
+        key = (self.hostname, patcher_name)
+        if key in _STATIC_ROUTE_PREFIXES:
+            prefixes = _STATIC_ROUTE_PREFIXES[key]
+            self.logger.info(
+                f"{self.hostname}: withdrawing {len(prefixes)} static route(s) "
+                f"for patcher {patcher_name}"
+            )
+            if prefixes:
+                # Popped only after the delete lands, so a failed withdrawal
+                # stays available to retry.
+                async with self.async_agent_client as client:
+                    await client.deleteUnicastRoutes(
+                        int(ClientID.STATIC_ROUTE), prefixes
+                    )
+            _STATIC_ROUTE_PREFIXES.pop(key, None)
+            return
+
         from taac.driver import oss_coop_patcher
 
         # Without a config_name, drop the name from every config holding it. An
@@ -1224,7 +1277,9 @@ class FbossSwitch(AbstractSwitch):
             else oss_coop_patcher.find_configs(self.hostname, patcher_name)
         )
         for name in config_names:
-            if await oss_coop_patcher.async_unregister(self, name, patcher_name):
+            if await oss_coop_patcher.async_unregister(
+                self, name, patcher_name, install_now=install_now
+            ):
                 self.logger.info(
                     f"[oss-patcher] unregistered {patcher_name} on "
                     f"{self.hostname}:{name}"
@@ -1278,9 +1333,14 @@ class FbossSwitch(AbstractSwitch):
         self, patcher_name: str, config_name: str
     ) -> None:
         """Unregister one patcher from ``config_name``; the signature matches
-        ``FbossSwitchInternalMixin``'s."""
-        self._require_oss_config_patcher()
-        await self.async_coop_unregister_patchers(patcher_name, config_name)
+        ``FbossSwitchInternalMixin``'s.
+
+        Installs the rebuilt config without restarting anything: a playbook step
+        unregisters and then restarts the service itself, expecting the patch
+        gone."""
+        await self._async_unregister_patcher(
+            patcher_name, config_name, install_now=True
+        )
 
     async def async_get_platform_mapping(self) -> Any:
         """The agent's platform mapping (ports, their supported profiles and the
@@ -1319,26 +1379,53 @@ class FbossSwitch(AbstractSwitch):
         patcher_desc: str = "",
         is_patcher_name_uuid_needed: bool = True,
     ) -> str:
-        """Register COOP's ``add_static_routes`` agent patcher and reload the
-        agent config, as ``FbossSwitchInternalMixin`` does. The routes live in
-        the agent config, so later applies keep them and teardown's unregister
-        withdraws them. Returns the patcher name."""
+        """Program static routes over thrift, in place of a COOP patcher.
+
+        ClientID.STATIC_ROUTE exists for exactly this, so no config rewrite or
+        daemon restart is needed. Unlike COOP these live only in the running
+        agent: ConfigApplier resets ClientID::STATIC_ROUTE on every config
+        apply (fboss/agent/rib/ConfigApplier.cpp), so an agent restart *or any
+        config reload* -- another step's `config session commit`, a
+        config_modifiers drain, a rollback -- drops them, and the later
+        unregister will delete prefixes that are already gone.
+        """
         self._require_oss_config_patcher()
         if is_patcher_name_uuid_needed:
             patcher_name += uuid.uuid4().hex
-        await self.async_register_python_patcher(
-            "agent",
-            patcher_name,
-            "add_static_routes",
-            {
-                prefix: json.dumps(next_hops)
-                for prefix, next_hops in prefix_to_next_hops_map.items()
-            },
-            patcher_desc,
+        routes = []
+        prefixes = []
+        for cidr, next_hops in prefix_to_next_hops_map.items():
+            prefix = _build_ip_prefix(cidr)
+            prefixes.append(prefix)
+            routes.append(
+                UnicastRoute(
+                    dest=prefix,
+                    nextHopAddrs=[_build_binary_address(nh) for nh in next_hops],
+                )
+            )
+
+        self.logger.info(
+            f"{self.hostname}: programming {len(routes)} static route(s) "
+            f"for patcher {patcher_name}"
         )
-        await self.async_apply_patchers(
-            apply_patcher_method=taac_types.ApplyPatcherMethod.AGENT_RELOAD
-        )
+        # Track before the RPC: a failure part-way still leaves routes the agent
+        # accepted, and untracked routes can never be withdrawn.
+        _STATIC_ROUTE_PREFIXES.setdefault(
+            (self.hostname, patcher_name), []
+        ).extend(prefixes)
+        try:
+            async with self.async_agent_client as client:
+                await client.addUnicastRoutes(int(ClientID.STATIC_ROUTE), routes)
+        except FbossFibUpdateError as e:
+            # Overload playbooks exceed the HW limit on purpose; COOP only logs it.
+            failed = sum(
+                len(v) for v in (e.vrf2failedAddUpdatePrefixes or {}).values()
+            )
+            self.logger.warning(
+                f"{self.hostname}: agent rejected {failed}/{len(routes)} static "
+                f"route(s) for patcher {patcher_name} (FbossFibUpdateError); "
+                "continuing, as an overload playbook expects"
+            )
         return patcher_name
 
     async def async_get_ip_route(
@@ -1551,6 +1638,16 @@ class FbossSwitch(AbstractSwitch):
             )
         return transceiver_id
 
+    @staticmethod
+    def _map_admin_states(
+        all_ports_info: Mapping[int, PortInfoThrift]
+    ) -> Dict[str, bool]:
+        """Port name -> True when its admin state is ENABLED."""
+        return {
+            port_info.name: port_info.adminState == PortAdminState.ENABLED
+            for port_info in all_ports_info.values()
+        }
+
     async def async_get_all_interfaces_admin_status(self) -> DefaultDict[str, bool]:
         """
         Used to fetch a snapshot of the admin status of all the
@@ -1558,17 +1655,8 @@ class FbossSwitch(AbstractSwitch):
         will be marked as True, while it will be marked as False if
         it is DISABLED.
         """
-        all_interfaces_status_map: DefaultDict[str, bool] = defaultdict(bool)
-
         all_ports_info: Dict[int, PortInfoThrift] = await self.async_get_all_port_info()
-
-        for port_info in all_ports_info.values():
-            if port_info.adminState == PortAdminState.ENABLED:
-                all_interfaces_status_map[port_info.name] = True
-            else:
-                all_interfaces_status_map[port_info.name] = False
-
-        return all_interfaces_status_map
+        return defaultdict(bool, self._map_admin_states(all_ports_info))
 
     async def async_get_all_interfaces_operational_status(
         self,
@@ -2945,7 +3033,7 @@ class FbossSwitch(AbstractSwitch):
 
         action_cmd = FLAP_COMMAND[flap_method][enable]
 
-        qsfp_command = f"wedge_qsfp_util {action_cmd} {interface_name}"
+        qsfp_command = f"{wedge_qsfp_util_cmd()} {action_cmd} {interface_name}"
 
         result = asyncio.run(self.async_run_cmd_on_shell(qsfp_command))
 
@@ -2984,21 +3072,26 @@ class FbossSwitch(AbstractSwitch):
         if up_time_sec is not None:
             for _ in range(total_flaps):
                 flap_command = (
-                    f"wedge_qsfp_util -tx_enable {interface_names_str} "
+                    f"{wedge_qsfp_util_cmd()} -tx_enable {interface_names_str} "
                     f"&& sleep {up_time_sec} "
-                    f"&& wedge_qsfp_util -tx_disable {interface_names_str} "
+                    f"&& {wedge_qsfp_util_cmd()} -tx_disable {interface_names_str} "
                     f"&& sleep {down_time_sec}"
                 )
-                await self.async_run_cmd_on_shell(flap_command)
+                await self.async_run_cmd_on_shell(
+                    flap_command, connect_timeout=self._FLAP_SSH_CONNECT_TIMEOUT_S
+                )
                 self.logger.info("Symmetric flap cycle executed")
             # Leave the link UP — the cycle above ends tx_disabled.
             await self.async_run_cmd_on_shell(
-                f"wedge_qsfp_util -tx_enable {interface_names_str}"
+                f"{wedge_qsfp_util_cmd()} -tx_enable {interface_names_str}",
+                connect_timeout=self._FLAP_SSH_CONNECT_TIMEOUT_S,
             )
             return
         for _ in range(total_flaps):
-            flap_command = f"wedge_qsfp_util -tx_disable {interface_names_str} && sleep {down_time_sec} && wedge_qsfp_util -tx_enable {interface_names_str}"
-            await self.async_run_cmd_on_shell(flap_command)
+            flap_command = f"{wedge_qsfp_util_cmd()} -tx_disable {interface_names_str} && sleep {down_time_sec} && {wedge_qsfp_util_cmd()} -tx_enable {interface_names_str}"
+            await self.async_run_cmd_on_shell(
+                flap_command, connect_timeout=self._FLAP_SSH_CONNECT_TIMEOUT_S
+            )
             await asyncio.sleep(interval_to_link_up)
             self.logger.info("Flap command executed")
 
@@ -3472,7 +3565,14 @@ class FbossSwitch(AbstractSwitch):
             reraise=True,
         )(read_state)
 
-    @async_retryable(retries=3, sleep_time=5, exceptions=(Exception,))
+    # The thrift client's own timeout does not cover a reply that stalls mid-stream
+    # (e.g. on a half-open connection), which would otherwise hang forever.
+    @async_retryable(
+        retries=3,
+        sleep_time=5,
+        exceptions=(Exception,),
+        attempt_timeout=DEFAULT_THRIFT_TIMEOUT,
+    )
     async def async_get_all_port_info(self) -> Dict[int, PortInfoThrift]:
         """
         Makes a thrift call to agent to get all the port info
@@ -3561,6 +3661,7 @@ class FbossSwitch(AbstractSwitch):
         *args,
         ssh_port: int = 22,
         username: t.Optional[str] = None,
+        connect_timeout: t.Optional[float] = None,
         **kwargs,
     ) -> str:
         """
@@ -3589,7 +3690,10 @@ class FbossSwitch(AbstractSwitch):
             # TAAC_SSH_PASSWORD when set. See oss_driver_utils for the
             # supported env vars.
             async with AsyncSSHClient(
-                self.hostname, port=ssh_port, username=username
+                self.hostname,
+                port=ssh_port,
+                username=username,
+                connect_timeout=connect_timeout,
             ) as client:
                 result = await client.async_run(
                     cmd=cmd,
@@ -3834,6 +3938,7 @@ class FbossSwitch(AbstractSwitch):
         self,
         service: Service,
         agents: Optional[List[str]] = None,
+        clear_thrift_drain_exit: bool = False,
     ) -> None:
         """
         Restart service and validate restart process by comparing service uptime
@@ -3848,6 +3953,9 @@ class FbossSwitch(AbstractSwitch):
 
         Args:
             service: service to restart
+            clear_thrift_drain_exit: Passed to ``async_restart_split_agents``.
+                Only that split-agent ``Service.AGENT`` path honours it;
+                elsewhere a True value is logged and ignored.
         """
         if (
             oss_agent_restart_paths_enabled()
@@ -3862,9 +3970,17 @@ class FbossSwitch(AbstractSwitch):
             # surface as a failure. Retrying would restart from an already
             # cold-booted hw agent, which reliably "succeeds" and hides the
             # very regression this orchestration exists to catch.
-            await self.async_restart_split_agents()
+            if clear_thrift_drain_exit:
+                await self.async_restart_split_agents(clear_thrift_drain_exit=True)
+            else:
+                await self.async_restart_split_agents()
             return
 
+        if clear_thrift_drain_exit:
+            self.logger.warning(
+                f"clear_thrift_drain_exit has no effect on the systemctl restart "
+                f"of {service.value} on {self.hostname}"
+            )
         await self._async_restart_single_service(service)
 
     @async_retryable(retries=2, sleep_time=10, exceptions=(Exception,))
@@ -4070,7 +4186,21 @@ class FbossSwitch(AbstractSwitch):
         this reflects real hardware instead of a hardcoded/env-configured
         guess that silently drifts from the DUT it runs against.
         """
-        multi_switch_state = await self.async_get_multi_switch_run_state()
+        try:
+            multi_switch_state = await self.async_get_multi_switch_run_state()
+            async with self.async_agent_client as client:
+                switch_infos = await client.getSwitchIdToSwitchInfo()
+        except Exception as rpc_error:
+            # A restart has to work with the sw agent down or stalled, so fall
+            # back to the deployed config's switch indices when either RPC fails.
+            is_multi_switch, indices = await self._async_get_recovery_agent_topology(
+                rpc_error
+            )
+            if not is_multi_switch:
+                raise RuntimeError(
+                    f"{self.hostname} is configured as monolithic; no HW agent indices"
+                ) from rpc_error
+            return indices
         # Keyed by SwitchID despite the thrift comment saying SwitchIndex
         # (MultiHwSwitchHandler::getHwSwitchRunStates). The cold-boot flags and
         # the fboss_hw_agent@<N> units are keyed by switch index, and the two
@@ -4081,8 +4211,6 @@ class FbossSwitch(AbstractSwitch):
                 f"{self.hostname} reports multi-switch enabled but "
                 "hwIndexToRunState is empty -- cannot determine NPU count"
             )
-        async with self.async_agent_client as client:
-            switch_infos = await client.getSwitchIdToSwitchInfo()
         missing = [sid for sid in switch_ids if sid not in switch_infos]
         if missing:
             raise Exception(
@@ -4095,7 +4223,9 @@ class FbossSwitch(AbstractSwitch):
         self,
         exit_timeout: int = 120,
         hw_ready_timeout: int = 300,
-        hw_settle_timeout: int = 120,
+        hw_settle_timeout: Optional[int] = None,
+        stop_bgpd: bool = True,
+        clear_thrift_drain_exit: bool = False,
     ) -> None:
         """Restart the split agents in warmboot-safe order.
 
@@ -4111,6 +4241,18 @@ class FbossSwitch(AbstractSwitch):
         lost. On a multi-NPU DUT this has to cover every NPU: leaving one
         hw agent running across the sw agent restart reintroduces the same
         ordering bug for that NPU alone.
+
+        ``stop_bgpd`` brackets all of that: bgpd is stopped before the sw agent
+        and started once the sw agent is CONFIGURED. Stopping while the sw
+        agent still punts lets the TCP close reach every peer, which puts them
+        in GR helper mode; with no bgpd during the blackout there is no local
+        hold-timer expiry to purge the FIB. A restart anywhere
+        later cannot do either.
+
+        ``clear_thrift_drain_exit`` makes that bgpd stop clear a thrift
+        drain-deadline exit (see ``_stop_clearing_thrift_drain_exit_cmd``).
+        Off by default: only a caller that knows bgpd is under a thrift load
+        it cannot drain should opt in.
         """
         sw_agent = FbossSystemctlServiceName.FBOSS_SW_AGENT
         switch_indices = await self.async_get_hw_agent_switch_indices()
@@ -4118,6 +4260,9 @@ class FbossSwitch(AbstractSwitch):
         all_services = [sw_agent] + hw_agents
         # Read before anything starts: an agent consumes its flag at startup.
         cold_boot_flags = await self._async_present_cold_boot_flags()
+        if hw_settle_timeout is None:
+            # A cold boot can take longer than 120 s to reach CONFIGURED.
+            hw_settle_timeout = 600 if cold_boot_flags else 120
 
         # Only the sw agent needs a before/after uptime check: each hw
         # agent's pid is tracked continuously from its own start through
@@ -4126,6 +4271,18 @@ class FbossSwitch(AbstractSwitch):
         sw_agent_start_time_before_restart = (
             await self.async_get_service_monotonic_start_time(sw_agent)
         )
+
+        bgpd = FbossSystemctlServiceName.BGP
+        if stop_bgpd:
+            self.logger.debug(f"Stopping {bgpd.value} on {self.hostname}...")
+            if clear_thrift_drain_exit:
+                await self._async_stop_clearing_thrift_drain_exit(bgpd)
+            else:
+                await self.async_run_cmd_on_shell(f"systemctl stop {bgpd.value}")
+            await self.async_wait_for_service_exit(bgpd, timeout=exit_timeout)
+            # The FIN/ACK exchange has to finish before the sw agent takes the
+            # TUN interfaces down with it.
+            await asyncio.sleep(self.BGPD_STOP_SETTLE_S)
 
         for svc in all_services:
             self.logger.debug(f"Stopping {svc.value} on {self.hostname}...")
@@ -4169,6 +4326,61 @@ class FbossSwitch(AbstractSwitch):
             self.logger.debug(
                 f"Successfully restarted service {svc.value} on {self.hostname} "
             )
+
+        if stop_bgpd:
+            # Peers can only reconnect once the TUN interfaces are back, which
+            # happens at CONFIGURED; starting earlier just burns their GR
+            # restart time on failed dials.
+            await self.async_wait_for_agent_state_configured()
+            self.logger.debug(f"Starting {bgpd.value} on {self.hostname}...")
+            await self.async_run_cmd_on_shell(f"systemctl start {bgpd.value}")
+
+    # Seconds between bgpd's exit and the sw agent stop (see stop_bgpd).
+    BGPD_STOP_SETTLE_S: t.ClassVar[float] = 2.0
+    # fbthrift quick-exits with this status when a server cannot drain its
+    # in-flight requests inside its shutdown deadline, and logs this line.
+    THRIFT_DRAIN_EXIT_STATUS: t.ClassVar[int] = 124
+    THRIFT_DRAIN_JOURNAL_MARKER: t.ClassVar[str] = (
+        "Could not drain active requests within allotted deadline"
+    )
+    THRIFT_DRAIN_CLEARED_MARKER: t.ClassVar[str] = "__TAAC_THRIFT_DRAIN_EXIT_CLEARED__"
+
+    def _stop_clearing_thrift_drain_exit_cmd(self, service: Service) -> str:
+        """``systemctl stop`` followed, on the box and in the same shell, by a
+        ``reset-failed`` when the only failure is the service's thrift server
+        missing its drain deadline: exit status 124 and fbthrift's journal line
+        since the stop. Doing it on the box keeps the unit's ``failed`` window
+        to milliseconds, below the state collector's sampling period. Any
+        other failure (a signal, a core dump, a timeout, a 124 without the
+        drain line) is left for the unclean-exit check."""
+        unit = service.value
+        return (
+            "t=$(date +%s); "
+            f"systemctl stop {unit}; "
+            f'if [ "$(systemctl show -p Result --value {unit})" = exit-code ] && '
+            f'[ "$(systemctl show -p ExecMainStatus --value {unit})" = '
+            f'{self.THRIFT_DRAIN_EXIT_STATUS} ] && '
+            f"journalctl -u {unit} --since @$t -q --no-pager | "
+            f"grep -q '{self.THRIFT_DRAIN_JOURNAL_MARKER}'; then "
+            f"systemctl reset-failed {unit}; "
+            f"echo {self.THRIFT_DRAIN_CLEARED_MARKER}; fi"
+        )
+
+    async def _async_stop_clearing_thrift_drain_exit(self, service: Service) -> bool:
+        """Stop ``service``; see ``_stop_clearing_thrift_drain_exit_cmd``.
+        Returns True when a drain-deadline exit was cleared."""
+        output = await self.async_run_cmd_on_shell(
+            self._stop_clearing_thrift_drain_exit_cmd(service)
+        )
+        cleared = self.THRIFT_DRAIN_CLEARED_MARKER in (output or "")
+        if cleared:
+            self.logger.warning(
+                f"{service.value} on {self.hostname} missed its thrift drain "
+                f"deadline on stop (exit {self.THRIFT_DRAIN_EXIT_STATUS}); cleared "
+                "the failed state so the stop reads as clean. Not a crash: see "
+                "the unit's journal."
+            )
+        return cleared
 
     async def _async_present_cold_boot_flags(self) -> t.Set[str]:
         output = await self.async_run_cmd_on_shell(
@@ -4374,7 +4586,8 @@ class FbossSwitch(AbstractSwitch):
         if start_time is None and grep_pattern is None and tail_lines is None:
             return await self.async_read_file(log_file_path)
 
-        command = f"cat {shlex.quote(log_file_path)}"
+        # zcat -f also reads the rotated .gz archives.
+        command = f"zcat -f {shlex.quote(log_file_path)}"
         if start_time is not None:
             stop_time = end_time if end_time is not None else int(time.time())
             formatted_times = []
@@ -4443,6 +4656,12 @@ class FbossSwitch(AbstractSwitch):
         """
         Checks the onbox status drained status of the device
         """
+        if TAAC_OSS:
+            # No local drainer in OSS: read drain_state from the config bgpd
+            # launches with; DRAINED means soft-drained.
+            from taac.driver.config_modifiers import get_device_drain_state
+
+            return await get_device_drain_state(self)
         async with self.get_async_local_drainer_client() as client:
             is_drained: bool = await client.is_drained()
             on_box_drain_state: DeviceDrainState = (
@@ -4626,13 +4845,22 @@ class FbossSwitch(AbstractSwitch):
     ) -> None:
         """Soft-drain or undrain ``interfaces`` on the live BGP config.
 
-        Only the live config: the soft-drain config drains every session
-        already, and a device drain parks the live config and an undrain puts
-        it back, so a drained interface stays drained across them. Refused
-        while the device is drained, since the live config is then not what
-        bgpd serves. One apply for the batch, so bgpd restarts once.
+        Only the live config: a device drain parks the live config and an
+        undrain puts it back, so a drained interface stays drained across them.
+        The soft-drain config advertises DRAIN on every session whose group it
+        points at a drained policy. Where a config does that for a group, a
+        device drain leaves the interface's session drained too. Where the
+        soft-drain config leaves a group on its own policy
+        (scoped base configs) a device drain while an interface is drained
+        advertises that session LIVE, and nothing here guards against it.
+        Refused while the device is drained, since the live config is then not
+        what bgpd serves. One apply for the batch, so bgpd restarts once.
         """
-        from neteng.test_infra.dne.taac.driver import config_modifiers, oss_coop_patcher
+        import importlib
+
+        package = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+        config_modifiers = importlib.import_module(f"{package}.driver.config_modifiers")
+        oss_coop_patcher = importlib.import_module(f"{package}.driver.oss_coop_patcher")
 
         action = "drain" if drain else "undrain"
         if await config_modifiers.async_is_device_drained(self):
@@ -5212,7 +5440,13 @@ class FbossSwitch(AbstractSwitch):
             "Will be implemented for OSS in a future update."
         )
 
-    async def async_wedge_qsfp_util_pause_remediation(self, duration: int) -> None:
+    async def async_wedge_qsfp_util_pause_remediation(
+        self, duration: int, ports: t.Sequence[str] = ()
+    ) -> None:
+        """Pause qsfp_service remediation for `duration` s (0 resumes) on `ports`' modules, or globally when empty.
+
+        The pause is per module, so every breakout port on the same cage is paused too.
+        """
         if duration == 0:
             self.logger.info(
                 f"Attempting to resume qsfp remediations on {self.hostname}."
@@ -5221,8 +5455,17 @@ class FbossSwitch(AbstractSwitch):
             self.logger.info(
                 f"Attempting to pause qsfp remediations duration on {self.hostname} for {duration} seconds."
             )
-        cmd = f"wedge_qsfp_util --pause_remediation {duration}"
-        await self.async_run_cmd_on_shell(cmd)
+        # wedge_qsfp_util treats --pause_remediation 0 as "flag not given" (no RPC), so resume
+        # with 1 s: the module's until-time becomes now+1 and remediation is back within a second.
+        sent = max(duration, 1)
+        cmd = " ".join([wedge_qsfp_util_cmd(), *ports, "--pause_remediation", str(sent)])
+        out = await self.async_run_cmd_on_shell(cmd)
+        confirmed = {line.strip() for line in out.splitlines()}
+        missing = [p for p in ports if f"PauseRemediation set for port {p}" not in confirmed]
+        if missing:
+            raise RuntimeError(
+                f"wedge_qsfp_util --pause_remediation {sent} not confirmed on {self.hostname} for {missing}: {out!r}"
+            )
 
     async def async_get_global_system_port_offset(self) -> int:
         async with self.async_agent_client as client:
@@ -5556,7 +5799,16 @@ class FbossSwitch(AbstractSwitch):
     async def async_get_vlan_addresses(
         self, vlan_id: int, global_only: bool = False
     ) -> List[str]:
-        all_interface_details = await self.async_get_all_interfaces()
+        # The agent can rate-limit getAllInterfaces; setup calls this once per
+        # VLAN, so a LOADSHEDDING reply means wait and ask again, not fail setup.
+        for attempt in range(1, 31):
+            try:
+                all_interface_details = await self.async_get_all_interfaces()
+                break
+            except ApplicationError as e:
+                if e.type != ApplicationErrorType.LOADSHEDDING or attempt == 30:
+                    raise
+                await asyncio.sleep(1)
         addresses = None
         for interface_detail in all_interface_details.values():
             if interface_detail.vlanId == vlan_id:
@@ -5768,8 +6020,86 @@ class FbossSwitch(AbstractSwitch):
             async with self.async_agent_client as client:
                 mpnu_state = await client.getMultiSwitchRunState()
             return mpnu_state.multiSwitchEnabled
-        except Exception:
-            return False
+        except Exception as rpc_error:
+            is_multi_switch, _ = await self._async_get_recovery_agent_topology(rpc_error)
+            return is_multi_switch
+
+    async def _async_get_recovery_agent_topology(
+        self, rpc_error: Exception
+    ) -> Tuple[bool, List[int]]:
+        """Recover topology from explicit OSS deployment evidence during an outage.
+
+        Never infer monolithic hardware from a failed agent RPC. Both the
+        deployed configuration and loaded service units must agree before a
+        restart can choose its topology without the SW agent.
+        """
+        if not TAAC_OSS:
+            # Only the OSS deployment exposes the agent config and systemd
+            # units read below. NotImplementedError (a RuntimeError subclass,
+            # so nothing that catches the wrapper below stops catching this)
+            # is what callers able to degrade already handle, which keeps
+            # async_crash_service and the cold-boot flag lookup working on a
+            # platform this fallback was never written for.
+            raise NotImplementedError(
+                "deployment topology fallback is only supported in OSS"
+            ) from rpc_error
+        try:
+            from taac.driver.config_modifiers import AGENT_CONFIG_PATH
+
+            config = json.loads(await self.async_read_file(AGENT_CONFIG_PATH))
+            flag = config["defaultCommandLineArgs"]["multi_switch"]
+            if type(flag) is bool:
+                is_multi_switch = flag
+            elif isinstance(flag, str) and flag in ("true", "false"):
+                is_multi_switch = flag == "true"
+            else:
+                raise ValueError("multi_switch must be explicitly true or false")
+            indices = []
+            if is_multi_switch:
+                infos = config["sw"]["switchSettings"]["switchIdToSwitchInfo"]
+                if not isinstance(infos, dict) or not infos:
+                    raise ValueError("missing configured HW switch indices")
+                indices = [info["switchIndex"] for info in infos.values()]
+                if any(
+                    type(index) is not int or index not in self.HW_AGENT_SERVICE_BY_INDEX
+                    for index in indices
+                ) or len(set(indices)) != len(indices):
+                    raise ValueError("unsupported or duplicate configured HW switch indices")
+                indices.sort()
+
+            # A systemd template makes arbitrary instances loadable, even if
+            # never configured. Discover indices only from the explicit config;
+            # LoadState corroborates availability, not topology or liveness.
+            units = ["wedge_agent.service"]
+            if is_multi_switch:
+                units = ["fboss_sw_agent.service"] + [
+                    self.HW_AGENT_SERVICE_BY_INDEX[index].value + ".service"
+                    for index in indices
+                ]
+            output = await self.async_run_cmd_on_shell(
+                "systemctl show " + " ".join(units) + " -p Id -p LoadState --no-pager"
+            )
+            states = {}
+            for block in output.strip().split("\n\n"):
+                fields = dict(
+                    line.split("=", 1) for line in block.splitlines() if "=" in line
+                )
+                if "Id" in fields and "LoadState" in fields:
+                    states[fields["Id"]] = fields["LoadState"]
+            if any(states.get(unit) != "loaded" for unit in units):
+                raise ValueError(
+                    "configured agent topology requires missing or unloadable systemd units"
+                )
+        except Exception as evidence_error:
+            raise RuntimeError(
+                f"Cannot determine agent topology on {self.hostname} after RPC failure: "
+                f"{evidence_error}"
+            ) from rpc_error
+        self.logger.warning(
+            f"Agent RPC unavailable on {self.hostname}; using corroborated deployment "
+            f"topology (multi_switch={is_multi_switch}, hw_indices={indices})"
+        )
+        return is_multi_switch, indices
 
     async def async_wait_for_agent_configured(
         self, timeout: int = 300, interval: int = 5
@@ -5955,18 +6285,275 @@ class FbossSwitch(AbstractSwitch):
 
         return []
 
+    # marker appended to the fboss2 command so the caller can see the remote
+    # exit status: async_run_cmd_on_shell returns stdout only. Same trick as
+    # oss_coop_patcher._async_run_checked.
+    _RC_MARKER = "__fboss2_rc="
+    # Caps TCP connect + SSH handshake + login together for a flap command. A
+    # connection that misses it raises TimeoutError before the command starts,
+    # so the flap task can retry it as a transport error without flapping twice.
+    _FLAP_SSH_CONNECT_TIMEOUT_S = 30
+    # one tuning surface for the verify loop. The per-command cap is not the
+    # whole story: async_run_cmd_on_shell is itself @async_retryable on
+    # ConnectionResetError (2 retries, 10s apart), so one issue can cost
+    # ~3x the cap plus its own backoff.
+    _SET_PORT_STATE_TIMEOUT_S = 30
+    _SET_PORT_STATE_ATTEMPTS = 6
+    _SET_PORT_STATE_RETRY_SLEEP_S = 5
+    # dropping async_get_all_port_info's retry decorator removes the backoff
+    # but not the wait: the agent client is built with DEFAULT_THRIFT_TIMEOUT
+    # (120s), so an agent that accepts connections without answering -- the
+    # window this whole method exists for -- would cost 2 minutes per round.
+    _SET_PORT_STATE_READ_TIMEOUT_S = 15
+
+    @staticmethod
+    def _split_rc_marker(raw: str) -> t.Tuple[int, str]:
+        """Split ``<output>__fboss2_rc=<n>`` into (returncode, output)."""
+        head, sep, tail = (raw or "").rpartition(FbossSwitch._RC_MARKER)
+        if not sep:
+            # no marker: the shell never got that far (timeout, dropped session)
+            return -1, (raw or "").strip()
+        try:
+            return int(tail.strip().split()[0]), head.strip()
+        except (IndexError, ValueError):
+            # marker present but unparseable: the output is still everything
+            # before it, not the raw string with the marker glued on
+            return -1, head.strip()
+
+    @staticmethod
+    def _yes_option_unsupported(output: str, cmd: str) -> bool:
+        """True when the failure looks like an fboss2 build without ``--yes``.
+
+        The echoed command is stripped first: an SSH implementation that echoes
+        the command line into stdout would otherwise supply the ``--yes`` this
+        looks for. Only phrases an option parser emits count -- a bare
+        "unknown" also matches ``Unknown port eth1/1/1``, which is a real
+        failure that must keep the flag. gflags reports the flag without its
+        dashes ("unknown command line flag 'yes'"), so match on ``yes`` rather
+        than ``--yes`` -- but on the same line as the phrase, so an unrelated
+        parser complaint plus the word "yes" somewhere else does not count.
+        """
+        phrases = (
+            "unknown option",
+            "unknown argument",
+            "unknown command line flag",
+            "unrecognized option",
+            "unrecognised option",
+            "invalid option",
+            "no such option",
+        )
+        return any(
+            "yes" in line and any(phrase in line for phrase in phrases)
+            for line in output.replace(cmd, "").lower().splitlines()
+        )
+
+    async def _async_admin_status_once(self) -> Dict[str, bool]:
+        """One ``getAllPortInfo`` read, no retries.
+
+        ``async_get_all_port_info`` carries ``@async_retryable(retries=3,
+        sleep_time=5)``, so a read taken while the agent is still starting
+        costs ~15s before it fails. The verify loop below does its own
+        retrying and wants a fast answer instead. Same mapping as
+        ``async_get_all_interfaces_admin_status``, which keeps the retries,
+        and the same empty-map rule: an agent that answers with no ports at
+        all has told us nothing, so that is a failed read, not a snapshot in
+        which every port is missing.
+        """
+        async with self.async_agent_client as client:
+            all_ports_info = await client.getAllPortInfo()
+        if not all_ports_info:
+            raise EmptyOutputReturnError(
+                f"getAllPortInfo returned no ports on {self.hostname}"
+            )
+        return self._map_admin_states(all_ports_info)
+
+    async def _async_fboss2_set_port_state(
+        self, interface: str, subcmd: str, use_yes: bool
+    ) -> t.Tuple[int, str, str]:
+        """Issue one ``fboss2 set port ... state ...``; return (rc, output, cmd)."""
+        # --yes: the current fboss2 refuses `set port ... state` when stdin is
+        # not a TTY ("Refusing to proceed ...", exit 1, empty stdout).
+        # </dev/null: fboss2 otherwise waits on stdin forever.
+        # 2>&1: the refusal (and any other diagnostic) goes to stderr, which
+        # async_run_cmd_on_shell drops.
+        cmd = (
+            f"fboss2 set port {interface} state {subcmd}"
+            f"{' --yes' if use_yes else ''} </dev/null 2>&1"
+        )
+        # explicit timeout: async_run_cmd_on_shell defaults to 300s, and this
+        # command is issued up to _SET_PORT_STATE_ATTEMPTS times. A healthy
+        # `set port ... state` returns in well under a second; a session that
+        # is half dead after an agent restart must not hold the loop for five
+        # minutes per attempt.
+        raw = await self.async_run_cmd_on_shell(
+            f"{cmd}; echo {self._RC_MARKER}$?",
+            timeout=self._SET_PORT_STATE_TIMEOUT_S,
+        )
+        rc, output = self._split_rc_marker(raw)
+        return rc, output, cmd
+
     # pyrefly: ignore [bad-override]
     async def async_enable_ports_via_ssh(
         self, interfaces: List[str], enable: bool
     ) -> None:
+        """
+        Set each interface's admin state via the SSH `fboss2` CLI and verify
+        it actually took effect via thrift getAllPortInfo() before returning.
+
+        `fboss2 set port ... state ...` is issued over SSH while the CLI's
+        thrift bootstrap can still be failing (e.g. right after an agent
+        restart); the SSH command then "succeeds" (no exception) while the
+        port never changes state. Retrying against the real device state
+        closes that gap; a bare command retry would not, since the command
+        itself doesn't fail.
+
+        The command is issued as `fboss2 set port <iface> state <state> --yes
+        </dev/null 2>&1`: `--yes` because the current fboss2 refuses the
+        subcommand off a TTY, `</dev/null` so it cannot block on stdin, `2>&1`
+        so its diagnostics reach the caller. An fboss2 build that does not know
+        `--yes` is retried once without it, so older builds keep working.
+
+        Within a round the interfaces are done one at a time, not gathered:
+        concurrent `fboss2 set port ... state` races and silently drops writes
+        (most parallel enables can be lost). The retry loop would eventually converge
+        on a dropped write anyway, but losing them costs a whole round each.
+
+        One admin-state snapshot is taken per retry round and every requested
+        interface is checked against it, so a batch of N interfaces costs one
+        thrift read per round rather than N. Callers pass the whole batch
+        (``InterfaceFlapStep.flap_with_ssh``,
+        ``VerifyDsfMinLinkCustomStep._set_ports_state``) rather than gathering
+        one call per interface, which would also open one SSH session per
+        interface at once and trip sshd MaxStartups.
+        """
+        if not interfaces:
+            return
         subcmd = "enable" if enable else "disable"
-        tasks = []
-        for interface in interfaces:
-            # -y is required: fboss2 refuses a port-state change when stdin/stderr
-            # is not a TTY, which is always the case over the driver's shell.
-            cmd = f"fboss2 set port {interface} state {subcmd} -y"
-            tasks.append(self.async_run_cmd_on_shell(cmd))
-        await asyncio.gather(*tasks)
+        max_attempts = self._SET_PORT_STATE_ATTEMPTS
+        retry_sleep_s = self._SET_PORT_STATE_RETRY_SLEEP_S
+        use_yes = True
+        read_ever_succeeded = False
+        pending: List[str] = list(interfaces)
+        # interface -> (rc, output, cmd) of its most recent command
+        last_result: Dict[str, t.Tuple[int, str, str]] = {}
+        status: Dict[str, bool] = {}
+        # the most recent snapshot that was actually read, for the error text:
+        # `status` is emptied by a failed read, which would otherwise report
+        # every interface as absent from the port map
+        last_good_status: Dict[str, bool] = {}
+
+        async def _issue(interface: str) -> None:
+            """Issue the command; an SSH failure is a failed attempt, not a raise.
+
+            sshd and the CLI may still be coming up -- the same window the
+            state read below is guarded against -- and the command cap makes a
+            TimeoutError reachable too. The device state decides the outcome,
+            not the transport, so a raising command must not abort the loop
+            and take the other interfaces of this round down with it.
+            """
+            try:
+                await _issue_or_raise(interface)
+            except Exception as ssh_error:
+                self.logger.warning(
+                    f"{interface}: set-port-state over SSH failed on "
+                    f"{self.hostname}: {ssh_error!r}"
+                )
+                last_result[interface] = (
+                    -1,
+                    f"{type(ssh_error).__name__}: {ssh_error}",
+                    "<not issued>",
+                )
+
+        async def _issue_or_raise(interface: str) -> None:
+            nonlocal use_yes
+            # capture the flag this command was actually issued with, so the
+            # fallback tests what was sent rather than what the flag says now
+            issued_with_yes = use_yes
+            rc, output, cmd = await self._async_fboss2_set_port_state(
+                interface, subcmd, issued_with_yes
+            )
+            if (
+                rc != 0
+                and issued_with_yes
+                and self._yes_option_unsupported(output, cmd)
+            ):
+                self.logger.warning(
+                    f"{self.hostname}: fboss2 does not support --yes "
+                    f"(rc={rc}: {output[-500:]!r}); retrying without it"
+                )
+                use_yes = False
+                rc, output, cmd = await self._async_fboss2_set_port_state(
+                    interface, subcmd, False
+                )
+                if rc != 0:
+                    # the build was supposed to be the one that dislikes
+                    # --yes; failing without it too is the signature of a
+                    # false positive in _yes_option_unsupported
+                    self.logger.error(
+                        f"{interface}: '{cmd}' on {self.hostname} also failed "
+                        f"without --yes (rc={rc}: {output[-500:]!r}); the "
+                        "--yes fallback may have fired on an unrelated error"
+                    )
+            elif rc != 0:
+                self.logger.warning(
+                    f"{interface}: '{cmd}' on {self.hostname} exited {rc}: "
+                    f"{output[-500:]!r}"
+                )
+            last_result[interface] = (rc, output, cmd)
+
+        for attempt in range(1, max_attempts + 1):
+            # serial on purpose -- see the concurrency note in the docstring
+            for iface in pending:
+                await _issue(iface)
+            try:
+                # bounded: the client's own timeout is 120s, which the loop
+                # cannot absorb (asyncio.TimeoutError lands in the except)
+                status = await asyncio.wait_for(
+                    self._async_admin_status_once(),
+                    timeout=self._SET_PORT_STATE_READ_TIMEOUT_S,
+                )
+                read_ever_succeeded = True
+                last_good_status = status
+            except Exception as read_error:  # agent thrift may still be starting
+                self.logger.warning(
+                    f"admin state read failed on {self.hostname} "
+                    f"(attempt {attempt}/{max_attempts}): {read_error}"
+                )
+                status = {}
+            # a missing interface is not a match, even when enable is False
+            pending = [
+                iface
+                for iface in pending
+                if iface not in status or status[iface] != enable
+            ]
+            if not pending:
+                return
+            if attempt < max_attempts:
+                self.logger.warning(
+                    f"{', '.join(pending)} admin state not yet {subcmd}d on "
+                    f"{self.hostname} (attempt {attempt}/{max_attempts}); "
+                    f"retrying in {retry_sleep_s}s"
+                )
+                await asyncio.sleep(retry_sleep_s)
+
+        details = "; ".join(
+            f"{iface}: last observed enabled={last_good_status.get(iface)}, "
+            f"'{last_result.get(iface, (None, '', ''))[2]}' exited "
+            f"{last_result.get(iface, (None, '', ''))[0]} with "
+            f"{last_result.get(iface, (None, '', ''))[1][-500:]!r}"
+            for iface in pending
+        )
+        # tell the two failure modes apart without going to the logs: the state
+        # was read and disagreed, or it was never read at all
+        why = (
+            "did not reach admin state"
+            if read_ever_succeeded
+            else "could not be confirmed (no admin state read succeeded) as"
+        )
+        raise RuntimeError(
+            f"{', '.join(pending)} on {self.hostname} {why} "
+            f"{subcmd}d after {max_attempts} attempts -- {details}"
+        )
 
     async def async_get_memory_total(
         self,

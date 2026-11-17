@@ -2,8 +2,10 @@
 
 # pyre-unsafe
 
+import importlib
 import json
 import logging
+import os
 import typing as t
 
 # IsolatedAsyncioTestCase, not later.unittest.TestCase: ShipIt exports
@@ -32,7 +34,6 @@ from configerator.structs.neteng.robotron.bgp_policy.thrift_types import (
     DrainState,
     FlowControlAction,
 )
-from neteng.test_infra.dne.taac.driver import config_modifiers as _config_modifiers
 from taac.driver.abstract_switch import AbstractSwitch
 from taac.driver.config_modifiers import (
     _async_resolve_bgpd_config_path,
@@ -43,7 +44,9 @@ from taac.driver.config_modifiers import (
     COMMUNITY_LIVE,
     ConfigModifierError,
     drain_device,
+    FBOSS_DRAIN_DIR,
     generate_base_configs,
+    get_device_drain_state,
     LIVE_CONFIG_PATH,
     LOCAL_PREF_DRAIN,
     LOCAL_PREF_LIVE,
@@ -57,13 +60,21 @@ from taac.driver.config_modifiers import (
     serialize_config,
     setup_base_configs,
     SOFTDRAIN_CONFIG_PATH,
+    SOFTDRAIN_SEED_MARKER,
     STARTUP_CONFIG_SYMLINK,
     undrain_device,
 )
-from taac.driver.driver_constants import FbossSystemctlServiceName
+from taac.driver.driver_constants import DeviceDrainState, FbossSystemctlServiceName
+from taac.driver import fboss_switch as _fboss_switch_module
 from taac.driver.fboss_switch import FbossSwitch
 from taac.utils import oss_taac_lib_utils
 from thrift.python.serializer import deserialize, Protocol, serialize
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+
+_config_modifiers = importlib.import_module(f"{_PACKAGE}.driver.config_modifiers")
 
 # ShipIt rewrites import statements but not string literals, so a hardcoded
 # dotted path is only correct in one of the two worlds; read the name off the
@@ -95,6 +106,8 @@ class _Device:
         # and the default here, so the existing tests describe that path; an OSS
         # image names a real file instead.
         self.bgpd_config_path: str = STARTUP_CONFIG_SYMLINK
+        # /dev/shm is tmpfs, so right after a reboot the drain directory is absent.
+        self.drain_dir_exists: bool = True
 
     @property
     def mutating_commands(self) -> list[str]:
@@ -120,7 +133,9 @@ class _Device:
             return f"{FILE_EXISTS_SENTINEL}\n" if path in self.files else "\n"
         if cmd.startswith("readlink "):
             return f"{self.symlink_target}\n"
-        if cmd.startswith("ln -sfn "):
+        if cmd.startswith("mkdir -p "):
+            self.drain_dir_exists = True
+        if cmd.startswith("ln -sfn ") and self.drain_dir_exists:
             # "ln -sfn <target> <staging> && mv -Tf <staging> <link>"
             self.symlink_target = cmd.split()[2]
         if cmd.startswith("systemctl cat "):
@@ -149,6 +164,9 @@ class _Device:
             self.symlink_target = self.symlink_after_restart
 
     async def read_file(self, file_location: str) -> str:
+        # cat follows the startup symlink to whatever it points at.
+        if file_location == STARTUP_CONFIG_SYMLINK:
+            file_location = self.symlink_target
         return self.files[file_location]
 
     async def write_file(self, contents: str, remote_path: str, **kwargs) -> None:
@@ -242,9 +260,15 @@ class DrainUndrainTest(TestCase):
         await drain_device(self.switch)
 
         self.assertEqual(
-            f"rm -f {MARKER_UNDRAINED} && touch {MARKER_SOFT_DRAINED}",
+            f"mkdir -p {FBOSS_DRAIN_DIR} && rm -f {MARKER_UNDRAINED} && touch {MARKER_SOFT_DRAINED}",
             self.device.command_containing("touch "),
         )
+
+    async def test_undrain_right_after_a_reboot_creates_the_drain_dir(self) -> None:
+        """An undrain right after a reboot can run before /dev/shm/fboss exists."""
+        self.device.drain_dir_exists = False
+        await undrain_device(self.switch)
+        self.assertEqual(LIVE_CONFIG_PATH, self.device.symlink_target)
 
     async def test_drain_points_symlink_at_softdrain_config(self) -> None:
         await drain_device(self.switch)
@@ -349,6 +373,76 @@ class DrainUndrainTest(TestCase):
             self.assertEqual(LIVE_CONFIG_PATH, self.device.symlink_target)
 
         self.assert_restarted_bgpd(6)
+
+
+
+def _config_with(state: DrainState) -> str:
+    """The one field get_device_drain_state reads, as bgpd's SimpleJSON has it."""
+    return json.dumps({"drain_state": state.value})
+
+
+class DrainStateTest(TestCase):
+    """Drain state is read from the config bgpd loads, not from the markers."""
+
+    def setUp(self) -> None:
+        self.device = _Device()
+        self.device.files[LIVE_CONFIG_PATH] = _config_with(DrainState.UNDRAINED)
+        self.device.files[SOFTDRAIN_CONFIG_PATH] = _config_with(
+            DrainState.SOFT_DRAINED
+        )
+        self.switch = _make_switch(self.device)
+        guard = patch(f"{_MODULE}._fboss_switch_cls", return_value=type(self.switch))
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    async def assert_state(self, expected: DeviceDrainState) -> None:
+        self.assertEqual(expected, await get_device_drain_state(self.switch))
+
+    async def test_drain_and_undrain_read_back_on_both_layouts(self) -> None:
+        for bgpd_config in (STARTUP_CONFIG_SYMLINK, LIVE_CONFIG_PATH):
+            with self.subTest(bgpd_config=bgpd_config):
+                self.device.bgpd_config_path = bgpd_config
+                await drain_device(self.switch)
+                await self.assert_state(DeviceDrainState.DRAINED)
+                await undrain_device(self.switch)
+                await self.assert_state(DeviceDrainState.UNDRAINED)
+
+    async def test_survives_losing_the_markers(self) -> None:
+        # /dev/shm is tmpfs: a reboot wipes the markers but not /etc/coop.
+        self.device.bgpd_config_path = LIVE_CONFIG_PATH
+        await drain_device(self.switch)
+        for marker in (MARKER_SOFT_DRAINED, MARKER_UNDRAINED):
+            self.device.files.pop(marker, None)
+
+        await self.assert_state(DeviceDrainState.DRAINED)
+
+    async def test_a_stale_marker_does_not_override_the_config(self) -> None:
+        # A patcher restore or apply rewrites bgpcpp.conf without touching the
+        # markers, so they can claim a drain bgpd is no longer serving.
+        self.device.bgpd_config_path = LIVE_CONFIG_PATH
+        self.device.files[MARKER_SOFT_DRAINED] = ""
+
+        await self.assert_state(DeviceDrainState.UNDRAINED)
+
+    async def test_a_config_without_the_field_reads_undrained(self) -> None:
+        # The thrift default (0): a config that declares nothing is not drained.
+        self.device.bgpd_config_path = LIVE_CONFIG_PATH
+        self.device.files[LIVE_CONFIG_PATH] = "{}"
+
+        await self.assert_state(DeviceDrainState.UNDRAINED)
+
+    async def test_an_unparseable_config_raises(self) -> None:
+        self.device.bgpd_config_path = LIVE_CONFIG_PATH
+        self.device.files[LIVE_CONFIG_PATH] = "not json"
+
+        with self.assertRaisesRegex(ConfigModifierError, LIVE_CONFIG_PATH):
+            await get_device_drain_state(self.switch)
+
+    async def test_reading_state_changes_nothing(self) -> None:
+        self.device.bgpd_config_path = LIVE_CONFIG_PATH
+        await get_device_drain_state(self.switch)
+        self.assertEqual([], self.device.mutating_commands)
+        self.assertEqual([], self.device.restarted_services)
 
 
 class FbossDeviceGuardTest(TestCase):
@@ -794,6 +888,42 @@ class SetupBaseConfigsTest(TestCase):
         contents = dict(self.device.writes)[path]
         return deserialize(BgpConfig, contents.encode(), protocol=Protocol.JSON)
 
+    async def test_clears_a_stale_softdrain_seed_marker(self) -> None:
+        # A seeded run that died before teardown leaves its marker; the softdrain
+        # generated here is not a seed and must survive the next teardown.
+        self.device.files[SOFTDRAIN_SEED_MARKER] = ""
+        await setup_base_configs(self.switch)
+        self.assertNotIn(SOFTDRAIN_SEED_MARKER, self.device.files)
+
+    async def test_rebuilds_from_the_parked_config_after_a_run_died_drained(
+        self,
+    ) -> None:
+        # The earlier run scoped both groups and died drained: bgpcpp.conf holds
+        # its drain variant, and the parked copy is the only undrained one. A
+        # narrower scope now would leave RSW_TO_FSW on the drain egress policy
+        # if the drained file were the source.
+        earlier_live, earlier_drain = generate_base_configs(
+            _sample_config(), peer_group_regex="RSW"
+        )
+        self.device.bgpd_config_path = LIVE_CONFIG_PATH
+        self.device.files[LIVE_CONFIG_PATH] = serialize_config(earlier_drain)
+        self.device.files[PREDRAIN_CONFIG_PATH] = serialize_config(earlier_live)
+
+        await setup_base_configs(self.switch, peer_group_regex="SLB")
+
+        live = self.written(LIVE_CONFIG_PATH)
+        self.assertEqual(
+            {"RSW_TO_FSW": POLICY_PROPAGATE_OUT, "RSW_TO_SLB": POLICY_PROPAGATE_OUT},
+            {g.name: g.egress_policy_name for g in _present(live.peer_groups)},
+        )
+        self.assertEqual(DrainState.UNDRAINED, live.drain_state)
+        # The undrain that ends setup must not reinstall the parked copy.
+        self.assertEqual(
+            dict(self.device.writes)[LIVE_CONFIG_PATH],
+            self.device.files[LIVE_CONFIG_PATH],
+        )
+        self.assertNotIn(PREDRAIN_CONFIG_PATH, self.device.files)
+
     async def test_writes_the_live_and_drain_configs(self) -> None:
         await setup_base_configs(self.switch)
 
@@ -930,6 +1060,40 @@ class OnboxDrainDriverMethodsTest(TestCase):
             any("SOFT" in line for line in logs.output),
             f"expected a soft-drain warning, got {logs.output}",
         )
+
+    async def test_onbox_drained_helper_reads_the_oss_drain(self) -> None:
+        # What DRAIN_STATE_CHECK calls. Outside OSS it goes through the
+        # Meta-internal LocalDrainer client, which raises NotImplementedError here.
+        self.device.files[LIVE_CONFIG_PATH] = _config_with(DrainState.UNDRAINED)
+        self.device.files[SOFTDRAIN_CONFIG_PATH] = _config_with(
+            DrainState.SOFT_DRAINED
+        )
+        with patch.object(_fboss_switch_module, "TAAC_OSS", True):
+            await FbossSwitch.async_onbox_drain_device(self.switch)
+            self.assertEqual(
+                DeviceDrainState.DRAINED,
+                await FbossSwitch._async_is_onbox_drained_helper(self.switch),
+            )
+
+            await FbossSwitch.async_onbox_undrain_device(self.switch)
+            self.assertEqual(
+                DeviceDrainState.UNDRAINED,
+                await FbossSwitch._async_is_onbox_drained_helper(self.switch),
+            )
+
+    async def test_onbox_drained_helper_outside_oss_asks_the_local_drainer(
+        self,
+    ) -> None:
+        # The OSS branch must not replace the internal (non-OSS) path.
+        client = AsyncMock()
+        client.is_drained.return_value = True
+        drainer = t.cast(AsyncMock, self.switch).get_async_local_drainer_client
+        drainer.return_value.__aenter__.return_value = client
+        with patch.object(_fboss_switch_module, "TAAC_OSS", False):
+            state = await FbossSwitch._async_is_onbox_drained_helper(self.switch)
+
+        self.assertEqual(DeviceDrainState.DRAINED, state)
+        self.assertEqual([], self.device.commands)
 
     def test_overrides_the_abstract_no_ops(self) -> None:
         # AbstractSwitch declares both with `...` as the body, so losing these
@@ -1238,7 +1402,7 @@ class DrainOnRealConfigFileTest(TestCase):
 
         self.assertEqual(SOFTDRAIN_CONFIG_PATH, self.device.symlink_target)
         self.assertIn(
-            f"rm -f {MARKER_UNDRAINED} && touch {MARKER_SOFT_DRAINED}",
+            f"mkdir -p {FBOSS_DRAIN_DIR} && rm -f {MARKER_UNDRAINED} && touch {MARKER_SOFT_DRAINED}",
             self.device.commands,
         )
 

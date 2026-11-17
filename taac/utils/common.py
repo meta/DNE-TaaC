@@ -471,6 +471,14 @@ def get_default_configs(hostname: str) -> t.List[str]:
     return ["agent"] + get_default_bgp_configs(hostname)
 
 
+def get_bgp_peer_configs(hostname: str) -> t.List[str]:
+    """The BGP configs ``add_bgp_peers`` writes a host's added peers to.
+
+    Anything those peers reference (peer group, policies) must be in each.
+    """
+    return ["bgpcpp", "bgpcpp_softdrain"] if is_host_drainable(hostname) else ["bgpcpp"]
+
+
 def get_default_bgp_configs(hostname: str) -> t.List[str]:
     if is_host_drainable(hostname):
         return ["bgpcpp", "bgpcpp_drain", "bgpcpp_softdrain"]

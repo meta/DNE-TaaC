@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, MagicMock, patch, PropertyMock
 
@@ -24,6 +25,12 @@ from thrift.python.exceptions import (
     TransportError,
     TransportErrorType,
 )
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+
+_FBOSS_SWITCH_MODULE = f"{_PACKAGE}.driver.fboss_switch"
 
 
 class FbossSwitchTest(TestCase):
@@ -96,7 +103,7 @@ class FbossSwitchTest(TestCase):
         self.switch.async_count_established_bgp_sessions = AsyncMock(return_value=1)
 
         with patch(
-            "neteng.test_infra.dne.taac.driver.fboss_switch.asyncio.sleep",
+            f"{_FBOSS_SWITCH_MODULE}.asyncio.sleep",
             new_callable=AsyncMock,
         ) as sleep:
             self.assertTrue(await self.switch.start_all_bgp_sessions())
@@ -166,7 +173,7 @@ class SwitchRunStateRetryTest(TestCase):
         )
         self.sleep = self.enterContext(
             patch(
-                "neteng.test_infra.dne.taac.driver.fboss_switch.asyncio.sleep",
+                f"{_FBOSS_SWITCH_MODULE}.asyncio.sleep",
                 new_callable=AsyncMock,
             )
         )

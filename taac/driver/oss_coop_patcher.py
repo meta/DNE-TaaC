@@ -84,6 +84,12 @@ _OPTIONAL_CONFIGS: t.FrozenSet[str] = frozenset({"bgpcpp_softdrain"})
 # Meta's hard-drain variant, which nothing creates in OSS.
 IGNORED_CONFIGS: t.FrozenSet[str] = frozenset({"bgpcpp_drain"})
 
+# Meta-only telemetry with no OSS consumer: the sFlow mirror feeds a collector no
+# OSS check or step reads, so registering it is a logged no-op.
+IGNORED_PY_FUNCS: t.FrozenSet[str] = frozenset(
+    {"configure_ingress_sflow_mirror_sampling"}
+)
+
 PATCHER_DIR_ENV = "TAAC_OSS_PATCHER_DIR"
 # A config change that removes a port (e.g. a speed change subsuming a /5) can
 # crash a running agent (T281221621), so such an apply cold boots the agent, as
@@ -202,6 +208,12 @@ async def async_register(
     if config_name in IGNORED_CONFIGS:
         switch.logger.info(f"[oss-patcher] ignoring {config_name} patcher on {host}")
         return ""
+    if patcher.py_func_name in IGNORED_PY_FUNCS:
+        switch.logger.warning(
+            f"[oss-patcher] ignoring {patcher.name} ({patcher.py_func_name}) on "
+            f"{host}: Meta-only telemetry with no OSS consumer"
+        )
+        return ""
     spec = _spec(config_name)
     _check_patcher_targets(patcher, spec)
 
@@ -228,7 +240,20 @@ async def async_register(
         config = _read_working_copy(state, spec)
 
     try:
-        if any(p.name == patcher.name for p in state.patchers):
+        existing = next((p for p in state.patchers if p.name == patcher.name), None)
+        if existing is not None and existing.args != patcher.args:
+            # Legal, but nearly always a test-config bug: make the loss visible.
+            changed = sorted(
+                str(k)
+                for k in existing.args.keys() | patcher.args.keys()
+                if existing.args.get(k) != patcher.args.get(k)
+            )
+            switch.logger.warning(
+                f"[oss-patcher] {patcher.name} on {host}:{config_name} re-registered "
+                f"with different args; the earlier registration is discarded. "
+                f"Changed keys: {changed}"
+            )
+        if existing is not None:
             patchers = [
                 patcher if p.name == patcher.name else p for p in state.patchers
             ]
@@ -254,12 +279,17 @@ async def async_register(
     return state.working_path
 
 
-async def async_unregister(switch: t.Any, config_name: str, patcher_name: str) -> bool:
+async def async_unregister(
+    switch: t.Any, config_name: str, patcher_name: str, install_now: bool = False
+) -> bool:
     """Drop ``patcher_name`` from its config. Returns whether it was registered.
 
-    With patchers left, the working copy is rebuilt from the baseline. With none
-    left, the baseline goes back on the device now, so a daemon restart picks it
-    up even if the caller never applies.
+    With patchers left, the working copy is rebuilt from the baseline;
+    ``install_now`` also installs it on the device, as COOP regenerates the
+    config on unregister. With none left, the baseline goes back on the device
+    now. Either way a daemon restart picks it up even if the caller never
+    applies, and the config stays pending, so the next apply or teardown still
+    activates it.
     """
     host = switch.hostname
     state = _STATE.get(host, {}).get(config_name)
@@ -272,6 +302,15 @@ async def async_unregister(switch: t.Any, config_name: str, patcher_name: str) -
         config = await _async_rebuild(switch, spec, _applier(switch), remaining)
         _write_working_copy(state.working_path, config)
         state.patchers = remaining
+        if install_now:
+            # Installs any patcher registered since the last apply too.
+            if config_name == "agent":
+                await _async_note_removed_ports(
+                    switch, config_modifiers.serialize_config(config)
+                )
+            await config_modifiers.async_write_configs(
+                switch, {await _async_device_path(switch, spec): config}
+            )
     else:
         if config_name == "agent":
             await _async_note_removed_ports(
@@ -282,6 +321,25 @@ async def async_unregister(switch: t.Any, config_name: str, patcher_name: str) -
         del _STATE[host][config_name]
     _PENDING.setdefault(host, set()).add(config_name)
     return True
+
+
+async def _async_remove_seeded_softdrain(switch: t.Any) -> bool:
+    """Delete a seeded softdrain config (config_modifiers.SOFTDRAIN_SEED_MARKER),
+    undraining first if bgpd still starts from it (a run that died drained).
+    Returns whether it undrained, i.e. bgpd needs a restart."""
+    marker = config_modifiers.SOFTDRAIN_SEED_MARKER
+    if not await config_modifiers.async_file_exists(switch, marker):
+        return False
+    was_drained = await config_modifiers.async_is_device_drained(switch)
+    if was_drained:
+        await config_modifiers.undrain_device(switch, restart_bgp=False)
+    await _async_run_checked(
+        switch, f"rm -f {CONFIG_SPECS['bgpcpp_softdrain'].live_path} && rm -f {marker}"
+    )
+    switch.logger.info(
+        f"[oss-patcher] removed the seeded softdrain config on {switch.hostname}"
+    )
+    return was_drained
 
 
 async def async_restore_baselines(switch: t.Any) -> None:
@@ -303,6 +361,11 @@ async def async_restore_baselines(switch: t.Any) -> None:
                 )
             await _async_restore_baseline(switch, spec)
             changed.add(name)
+    # Recorded before the undrain, which can raise, so a retry still activates them.
+    _PENDING[host] = changed
+    if await _async_remove_seeded_softdrain(switch):
+        # The undrain repointed bgpd's startup config without restarting it.
+        changed.add("bgpcpp")
     for state in _STATE.get(host, {}).values():
         _remove_working_copy(state.working_path)
     coldboot = _coldboot_for_removed_ports(switch)
@@ -408,14 +471,72 @@ async def _async_snapshot_baseline(
         source = await _async_device_path(switch, spec)
         await _async_run_checked(switch, f"cp -a {source} {baseline}")
         created = True
-    return await _async_read_baseline(switch, spec), created
+    try:
+        return await _async_read_baseline(switch, spec), created
+    except Exception:
+        # Nothing got registered, so teardown has nothing to restore.
+        if created:
+            await _async_run_checked(switch, f"rm -f {baseline}")
+        raise
 
 
 async def _async_read_baseline(switch: t.Any, spec: ConfigSpec) -> t.Any:
+    source = f"{switch.hostname}:{spec.baseline_path}"
     raw = await switch.async_read_file(spec.baseline_path)
-    return config_modifiers.deserialize_config(
-        spec.config_type, raw, f"{switch.hostname}:{spec.baseline_path}"
+    config = config_modifiers.deserialize_config(spec.config_type, raw, source)
+    # Deserializing skips fields the TAAC thrift bindings do not know, so every
+    # config patched from this baseline would silently lose them.
+    deprecated: t.List[str] = []
+    dropped = _dropped_fields(
+        json.loads(raw),
+        json.loads(config_modifiers.serialize_config(config)),
+        deprecated=deprecated,
     )
+    if deprecated:
+        switch.logger.warning(
+            f"[oss-patcher] {source}: dropping {deprecated}, which FBOSS renamed "
+            "to <name>_DEPRECATED. The agent already ignores the old name."
+        )
+    if dropped:
+        raise RuntimeError(
+            f"oss-patcher: {source} has {len(dropped)} field(s) the TAAC thrift "
+            f"bindings do not know, which patching would drop: {dropped[:10]}. "
+            "Bump the fboss-thrift-defs pin to the device's FBOSS version."
+        )
+    return config
+
+
+def _dropped_fields(
+    raw: t.Any,
+    kept: t.Any,
+    path: str = "",
+    deprecated: t.Optional[t.List[str]] = None,
+) -> t.List[str]:
+    """Key paths in ``raw`` that ``kept`` lacks. Keys only ``kept`` has (defaults
+    the serializer fills in) and explicit nulls (it omits them) are fine. A key
+    whose ``<key>_DEPRECATED`` twin ``kept`` has goes to ``deprecated`` instead."""
+    if isinstance(raw, dict) and isinstance(kept, dict):
+        dropped = []
+        for key, value in raw.items():
+            key_path = f"{path}.{key}" if path else str(key)
+            if key in kept:
+                dropped += _dropped_fields(value, kept[key], key_path, deprecated)
+            elif value is None:
+                continue
+            elif f"{key}_DEPRECATED" in kept and deprecated is not None:
+                deprecated.append(key_path)
+            else:
+                dropped.append(key_path)
+        return dropped
+    if isinstance(raw, list) and isinstance(kept, list) and len(raw) == len(kept):
+        return [
+            dropped_path
+            for i, (item, kept_item) in enumerate(zip(raw, kept))
+            for dropped_path in _dropped_fields(
+                item, kept_item, f"{path}[{i}]", deprecated
+            )
+        ]
+    return []
 
 
 async def _async_rebuild(
@@ -498,7 +619,19 @@ async def _async_activate(
     methods = taac_types.ApplyPatcherMethod
     agent_changed = "agent" in changed
     bgp_changed = bool(changed & _BGP_CONFIGS)
-    agent_restarted = True
+    activate_bgp = bgp_changed or method == methods.BGP_RESTART
+    agent_restarts = (
+        coldboot
+        or method in (methods.AGENT_WARMBOOT, methods.AGENT_RELOAD_AND_WARMBOOT)
+        or (method is None and agent_changed and bgp_changed)
+    )
+    # Only an agent restart can take bgpd with it, so only then is bgpd's start
+    # time worth comparing.
+    bgpd_started = (
+        await _async_bgpd_start_time(switch)
+        if activate_bgp and agent_restarts
+        else None
+    )
     if coldboot:
         await switch.async_create_cold_boot_file()
         await _async_restart_agent(switch)
@@ -512,24 +645,43 @@ async def _async_activate(
         await _async_restart_agent(switch)
     elif method == methods.AGENT_RELOAD or (method is None and agent_changed):
         await switch.async_try_agent_config_reload()
-        agent_restarted = False
-    else:
-        agent_restarted = False
-        if agent_changed:
-            switch.logger.warning(
-                f"[oss-patcher] agent config installed on {switch.hostname} but "
-                f"not activated: {method} does not touch the agent"
-            )
-    if bgp_changed or method == methods.BGP_RESTART:
-        await _async_activate_bgp(switch, agent_restarted)
+    elif agent_changed:
+        switch.logger.warning(
+            f"[oss-patcher] agent config installed on {switch.hostname} but "
+            f"not activated: {method} does not touch the agent"
+        )
+    if activate_bgp:
+        await _async_activate_bgp(switch, agent_restarts, bgpd_started)
 
 
-async def _async_activate_bgp(switch: t.Any, agent_restarted: bool) -> None:
-    # bgpd's unit has BindsTo=wedge_agent.service, so an agent restart already
-    # restarted it.
-    if not agent_restarted:
-        await switch.async_restart_service(FbossSystemctlServiceName.BGP)
+async def _async_activate_bgp(
+    switch: t.Any, agent_restarted: bool, started_before: t.Optional[int]
+) -> None:
+    # An agent restart restarts bgpd only where bgpd's unit is bound to the
+    # agent's (e.g. BindsTo=wedge_agent.service); split-agent units are not, so
+    # restart it unless it demonstrably started again. On a bound unit bgpd's
+    # restart can still be queued when the agent's finishes; an unchanged start
+    # time then costs one extra, harmless restart.
+    if agent_restarted and started_before is not None:
+        after = await _async_bgpd_start_time(switch)
+        if after is not None and after != started_before:
+            await switch.async_wait_for_bgp_convergence()
+            return
+    await switch.async_restart_service(FbossSystemctlServiceName.BGP)
     await switch.async_wait_for_bgp_convergence()
+
+
+async def _async_bgpd_start_time(switch: t.Any) -> t.Optional[int]:
+    try:
+        return await switch.async_get_service_monotonic_start_time(
+            FbossSystemctlServiceName.BGP
+        )
+    except Exception as ex:
+        switch.logger.warning(
+            f"[oss-patcher] could not read bgpd's start time on {switch.hostname} "
+            f"({ex}); bgpd will be restarted"
+        )
+        return None
 
 
 async def _async_restart_agent(switch: t.Any) -> None:

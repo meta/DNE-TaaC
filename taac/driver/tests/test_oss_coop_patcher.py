@@ -6,15 +6,22 @@
 fake device that keeps its files in memory."""
 
 import asyncio
+import importlib
 import json
 import logging
 import os
 import tempfile
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from configerator.structs.neteng.fboss.bgp.bgp_config.thrift_types import (
     BgpConfig,
+    BgpPeer,
     PeerGroup,
+)
+from configerator.structs.neteng.robotron.bgp_policy.thrift_types import (
+    BgpPolicies,
+    BgpPolicyStatement,
+    BgpPolicyTerm,
 )
 from later.unittest import TestCase
 from neteng.fboss.agent_config.thrift_types import AgentConfig
@@ -32,16 +39,23 @@ from neteng.fboss.switch_config.thrift_types import (
     Vlan,
     VlanPort,
 )
-from neteng.test_infra.dne.taac.driver import oss_coop_patcher as ocp
 from taac.driver.config_modifiers import (
     deserialize_config,
+    MARKER_SOFT_DRAINED,
     PREDRAIN_CONFIG_PATH,
+    SOFTDRAIN_SEED_MARKER,
     serialize_config,
 )
 from taac.driver.driver_constants import FbossSystemctlServiceName
 from taac.driver.oss_patchers import PatcherError
 from pyre_extensions import none_throws
 from taac.test_as_a_config import types as taac_types
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+
+ocp = importlib.import_module(f"{_PACKAGE}.driver.oss_coop_patcher")
 
 HOST = "dut1"
 BGP_LIVE = ocp.CONFIG_SPECS["bgpcpp"].live_path
@@ -67,6 +81,10 @@ class _FakeSwitch:
         self.reads = []
         self.events = []
         self.platform_mapping_reads = 0
+        # Whether an agent restart restarts bgpd too, as a BindsTo= unit does.
+        self.bgpd_restarts_with_agent = True
+        self.bgpd_start_time = 1000
+        self.bgpd_start_time_reads = 0
 
     async def async_get_platform_mapping(self) -> PlatformMapping:
         self.platform_mapping_reads += 1
@@ -112,6 +130,15 @@ class _FakeSwitch:
 
     async def async_restart_service(self, service) -> None:
         self.events.append(("restart", service))
+        if service == FbossSystemctlServiceName.BGP or (
+            service == FbossSystemctlServiceName.AGENT and self.bgpd_restarts_with_agent
+        ):
+            self.bgpd_start_time += 1
+
+    async def async_get_service_monotonic_start_time(self, service) -> int:
+        assert service == FbossSystemctlServiceName.BGP, service
+        self.bgpd_start_time_reads += 1
+        return self.bgpd_start_time
 
     async def async_wait_for_agent_configured(self) -> None:
         self.events.append(("wait_agent",))
@@ -229,6 +256,33 @@ def _vlan_patcher() -> ocp.OssPatcher:
     )
 
 
+def _own_policy_bgp() -> BgpConfig:
+    """Two fabric sessions in one group, on an egress policy of its own."""
+    return BgpConfig(
+        policies=BgpPolicies(
+            bgp_policy_statements=[
+                BgpPolicyStatement(
+                    name="OUT", policy_entries=[BgpPolicyTerm(name="permit")]
+                )
+            ]
+        ),
+        peer_groups=[PeerGroup(name="FABRIC", egress_policy_name="OUT")],
+        peers=[
+            BgpPeer(peer_addr="2001:db8:1::1", peer_group_name="FABRIC"),
+            BgpPeer(peer_addr="2001:db8:2::1", peer_group_name="FABRIC"),
+        ],
+    )
+
+
+def _interface_drain(interface: str, network: str) -> ocp.OssPatcher:
+    return ocp.OssPatcher(
+        name=f"interface-drain-{interface}",
+        config_name="bgpcpp",
+        py_func_name="drain_interface",
+        args={"interface_name": interface, "networks": json.dumps([network])},
+    )
+
+
 class OssCoopPatcherTest(TestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -296,6 +350,163 @@ class OssCoopPatcherTest(TestCase):
 
         self.assertEqual(["BASE", "B"], _group_names(self._working_bgp()))
         self.assertEqual(["B"], [p.name for p in ocp.list_patchers(HOST, "bgpcpp")])
+
+    async def test_an_interface_drain_unregisters_back_to_the_exact_policy(
+        self,
+    ) -> None:
+        # The twin and the session's egress override are the patcher's alone, so
+        # the rebuild without it puts the session's own policy back.
+        baseline = _own_policy_bgp()
+        self.switch.files[BGP_LIVE] = serialize_config(baseline)
+        drain = _interface_drain("eth1/1/1", "2001:db8:1::/127")
+        await self._register(_peer_group("A"))
+        await self._register(drain)
+        await ocp.async_apply(self.switch)
+
+        drained = self.switch.bgp()
+        self.assertEqual(
+            [("2001:db8:1::1", "OUT_DRAIN"), ("2001:db8:2::1", None)],
+            [(p.peer_addr, p.egress_policy_name) for p in drained.peers],
+        )
+        self.assertEqual(
+            ["OUT", "OUT_DRAIN"],
+            [s.name for s in none_throws(drained.policies).bgp_policy_statements],
+        )
+        self.assertEqual(["eth1/1/1"], list(drained.drained_interfaces))
+
+        await ocp.async_unregister(self.switch, "bgpcpp", drain.name)
+        await ocp.async_apply(self.switch)
+
+        undrained = self.switch.bgp()
+        self.assertEqual(baseline.peers, undrained.peers)
+        self.assertEqual(baseline.policies, undrained.policies)
+        self.assertEqual([], list(undrained.drained_interfaces))
+        self.assertEqual(["FABRIC", "A"], _group_names(undrained))
+
+    async def test_interface_drains_share_a_twin_and_undrain_one_at_a_time(
+        self,
+    ) -> None:
+        baseline = _own_policy_bgp()
+        self.switch.files[BGP_LIVE] = serialize_config(baseline)
+        first = _interface_drain("eth1/1/1", "2001:db8:1::/127")
+        second = _interface_drain("eth1/2/1", "2001:db8:2::/127")
+        await self._register(first)
+        await self._register(second)
+        await ocp.async_apply(self.switch)
+
+        def egress(config: BgpConfig) -> list:
+            return [(p.peer_addr, p.egress_policy_name) for p in config.peers]
+
+        def statements(config: BgpConfig) -> list:
+            return [s.name for s in none_throws(config.policies).bgp_policy_statements]
+
+        both = self.switch.bgp()
+        self.assertEqual(
+            [("2001:db8:1::1", "OUT_DRAIN"), ("2001:db8:2::1", "OUT_DRAIN")],
+            egress(both),
+        )
+        self.assertEqual(["OUT", "OUT_DRAIN"], statements(both))
+
+        await ocp.async_unregister(self.switch, "bgpcpp", first.name)
+        await ocp.async_apply(self.switch)
+
+        rest = self.switch.bgp()
+        self.assertEqual(
+            [("2001:db8:1::1", None), ("2001:db8:2::1", "OUT_DRAIN")], egress(rest)
+        )
+        self.assertEqual(["OUT", "OUT_DRAIN"], statements(rest))
+        self.assertEqual(["eth1/2/1"], list(rest.drained_interfaces))
+
+        await ocp.async_unregister(self.switch, "bgpcpp", second.name)
+        await ocp.async_apply(self.switch)
+
+        self.assertEqual(baseline, self.switch.bgp())
+
+    async def test_unregister_leaves_the_device_alone_until_apply(self) -> None:
+        await self._register(_peer_group("A"))
+        await self._register(_peer_group("B"))
+        await ocp.async_apply(self.switch)
+
+        await ocp.async_unregister(self.switch, "bgpcpp", "A")
+
+        self.assertEqual(["BASE", "A", "B"], _group_names(self.switch.bgp()))
+
+    async def test_unregister_with_install_now_installs_without_activating(
+        self,
+    ) -> None:
+        await self._register(_peer_group("A"))
+        await self._register(_peer_group("B"))
+        await ocp.async_apply(self.switch)
+        self.switch.events.clear()
+
+        await ocp.async_unregister(self.switch, "bgpcpp", "A", install_now=True)
+
+        self.assertEqual(["BASE", "B"], _group_names(self.switch.bgp()))
+        self.assertNotIn(("restart", FbossSystemctlServiceName.BGP), self.switch.events)
+        # Still pending, so the next apply activates it.
+        await ocp.async_apply(self.switch)
+        self.assertIn(("restart", FbossSystemctlServiceName.BGP), self.switch.events)
+
+    async def test_reregistering_with_different_args_warns(self) -> None:
+        await self._register(_peer_group("A", description="one"))
+
+        with self.assertLogs(self.switch.logger, logging.WARNING) as logs:
+            await self._register(_peer_group("A", description="two"))
+
+        self.assertIn("Changed keys: ['description']", logs.output[0])
+
+    async def test_sflow_mirror_patcher_is_a_no_op(self) -> None:
+        path = await ocp.async_register(
+            self.switch,
+            ocp.OssPatcher(
+                name="sflow",
+                config_name="agent",
+                py_func_name="configure_ingress_sflow_mirror_sampling",
+            ),
+            patcher_dir=self.patcher_dir,
+        )
+
+        self.assertEqual("", path)
+        self.assertEqual([], ocp.list_patchers(HOST, "agent"))
+        self.assertNotIn(AGENT_BASELINE, self.switch.files)
+
+    async def test_a_field_the_bindings_do_not_know_refuses_to_patch(self) -> None:
+        doc = json.loads(serialize_config(_baseline_bgp()))
+        doc["zz_future_field"] = {"enabled": True}
+        doc["peer_groups"][0]["zz_future_field"] = 1
+        self.switch.files[BGP_LIVE] = json.dumps(doc)
+
+        with self.assertRaisesRegex(RuntimeError, "zz_future_field") as ctx:
+            await self._register(_peer_group("A"))
+
+        self.assertIn("peer_groups[0].zz_future_field", str(ctx.exception))
+        self.assertNotIn(BGP_BASELINE, self.switch.files)
+        self.assertEqual([], ocp.list_patchers(HOST, "bgpcpp"))
+
+    async def test_a_key_renamed_to_deprecated_is_dropped_with_a_warning(
+        self,
+    ) -> None:
+        # FBOSS renamed maxRouteCounterIDs to maxRouteCounterIDs_DEPRECATED; the
+        # agent already ignores the old key, so dropping it changes nothing.
+        doc = json.loads(serialize_config(_baseline_agent()))
+        doc["sw"].setdefault("switchSettings", {})["maxRouteCounterIDs"] = 13
+        self.switch.files[AGENT_LIVE] = json.dumps(doc)
+
+        with self.assertLogs(self.switch.logger, logging.WARNING) as logs:
+            await self._register(_vlan_patcher())
+
+        self.assertIn("sw.switchSettings.maxRouteCounterIDs", "\n".join(logs.output))
+        self.assertIn(AGENT_BASELINE, self.switch.files)
+        self.assertEqual(1, len(ocp.list_patchers(HOST, "agent")))
+
+    async def test_an_explicit_null_is_not_a_dropped_field(self) -> None:
+        doc = json.loads(serialize_config(_baseline_bgp()))
+        doc["zz_unset_field"] = None
+        self.switch.files[BGP_LIVE] = json.dumps(doc)
+
+        await self._register(_peer_group("A"))
+
+        self.assertEqual(["BASE", "A"], _group_names(self._working_bgp()))
 
     async def test_unregister_undoes_side_effects_on_unnamed_entries(self) -> None:
         # Moving a port rewrites its vlanPorts entry, which the patcher never
@@ -409,6 +620,102 @@ class OssCoopPatcherTest(TestCase):
         self.assertEqual([], ocp.list_patchers(HOST, "bgpcpp_softdrain"))
         self.assertNotIn(SOFTDRAIN_BASELINE, self.switch.files)
 
+    def _softdrain_patcher(self) -> ocp.OssPatcher:
+        return ocp.OssPatcher(
+            name="A",
+            config_name="bgpcpp_softdrain",
+            py_func_name="add_peer_group_patcher",
+            args={"name": "A"},
+        )
+
+    def _seed_softdrain(self) -> None:
+        # What a seeding task leaves behind.
+        self.switch.files[SOFTDRAIN_LIVE] = self.switch.files[BGP_LIVE]
+        self.switch.files[SOFTDRAIN_SEED_MARKER] = ""
+
+    async def test_restore_removes_a_seeded_softdrain(self) -> None:
+        self._seed_softdrain()
+        await self._register(self._softdrain_patcher())
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch)
+
+        await ocp.async_restore_baselines(self.switch)
+
+        self.assertNotIn(SOFTDRAIN_LIVE, self.switch.files)
+        self.assertNotIn(SOFTDRAIN_BASELINE, self.switch.files)
+        self.assertNotIn(SOFTDRAIN_SEED_MARKER, self.switch.files)
+        self.assertEqual(_baseline_bgp(), self.switch.bgp())
+
+    async def test_restore_keeps_a_softdrain_it_did_not_seed(self) -> None:
+        original = serialize_config(
+            BgpConfig(peer_groups=[PeerGroup(name="DRAIN_BASE")])
+        )
+        self.switch.files[SOFTDRAIN_LIVE] = original
+        await self._register(self._softdrain_patcher())
+        await ocp.async_apply(self.switch)
+
+        await ocp.async_restore_baselines(self.switch)
+
+        self.assertEqual(original, self.switch.files[SOFTDRAIN_LIVE])
+
+    async def test_restore_undrains_before_removing_a_seeded_softdrain(self) -> None:
+        # A run that died drained leaves bgpd starting from the softdrain file,
+        # so it must still be there when the undrain repoints bgpd away from it.
+        self._seed_softdrain()
+        self.switch.files[MARKER_SOFT_DRAINED] = ""
+
+        async def _undrain(switch, restart_bgp):
+            self.assertIn(SOFTDRAIN_LIVE, switch.files)
+
+        with patch.object(
+            ocp.config_modifiers, "undrain_device", side_effect=_undrain
+        ) as undrain:
+            await ocp.async_restore_baselines(self.switch)
+        undrain.assert_awaited_once_with(self.switch, restart_bgp=False)
+        self.assertNotIn(SOFTDRAIN_LIVE, self.switch.files)
+        self.assertNotIn(SOFTDRAIN_SEED_MARKER, self.switch.files)
+        # Nothing was registered, so no baseline restore restarts bgpd; the
+        # undrain must not leave it on the drained config.
+        self.assertIn(("restart", FbossSystemctlServiceName.BGP), self.switch.events)
+
+    async def test_restore_retry_after_a_failed_undrain_activates_the_agent(
+        self,
+    ) -> None:
+        self._seed_softdrain()
+        await self._register(_vlan_patcher())
+        await ocp.async_apply(self.switch)
+        self.switch.files[MARKER_SOFT_DRAINED] = ""
+        self.switch.events.clear()
+
+        with patch.object(
+            ocp.config_modifiers, "undrain_device", side_effect=RuntimeError("undrain")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "undrain"):
+                await ocp.async_restore_baselines(self.switch)
+        self.assertNotIn(AGENT_BASELINE, self.switch.files)
+
+        # The baseline is already back; the retry still activates the agent
+        # (with the undrain's bgp change, as one warmboot).
+        with patch.object(ocp.config_modifiers, "undrain_device"):
+            await ocp.async_restore_baselines(self.switch)
+        self.assertIn(("restart", FbossSystemctlServiceName.AGENT), self.switch.events)
+
+    async def test_restore_puts_a_parked_bgpcpp_back_before_the_undrain(self) -> None:
+        # Drained mid-run: bgpcpp is parked in bgpcpp.predrain.conf, so its
+        # snapshot and restore go there, and the undrain then reinstalls it.
+        self.switch.files[PREDRAIN] = self.switch.files[BGP_LIVE]
+        self._seed_softdrain()
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch)
+        self.switch.files[MARKER_SOFT_DRAINED] = ""
+
+        async def _undrain(switch, restart_bgp):
+            self.assertEqual(_baseline_bgp(), switch.bgp(PREDRAIN))
+
+        with patch.object(ocp.config_modifiers, "undrain_device", side_effect=_undrain):
+            await ocp.async_restore_baselines(self.switch)
+        self.assertNotIn(SOFTDRAIN_LIVE, self.switch.files)
+
     async def test_patcher_sent_to_both_bgp_configs_patches_each(self) -> None:
         # What configure_parallel_bgp_peers does for a drainable host: one
         # register per config name, run concurrently.
@@ -520,6 +827,106 @@ class OssCoopPatcherTest(TestCase):
                 )
                 self.assertEqual(("wait_bgp",), self.switch.events[-1])
 
+    async def test_agent_restart_not_covering_bgpd_restarts_it(self) -> None:
+        """A split-agent bgpd unit is not bound to the agent's; restart it."""
+        self.switch.bgpd_restarts_with_agent = False
+        await self._register(_vlan_patcher())
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch)
+
+        self.assertEqual(
+            [
+                ("write", AGENT_LIVE),
+                ("write", BGP_LIVE),
+                ("restart", FbossSystemctlServiceName.AGENT),
+                ("wait_agent",),
+                ("restart", FbossSystemctlServiceName.BGP),
+                ("wait_bgp",),
+            ],
+            self.switch.events,
+        )
+
+    async def test_unbound_bgpd_is_restarted_for_warmboot_and_coldboot(self) -> None:
+        self.switch.bgpd_restarts_with_agent = False
+        for method, coldboot in (
+            (taac_types.ApplyPatcherMethod.AGENT_WARMBOOT, False),
+            (None, True),
+        ):
+            with self.subTest(method=method, coldboot=coldboot):
+                await self._register(_peer_group(f"A{coldboot}"))
+                self.switch.events.clear()
+                await ocp.async_apply(self.switch, method, coldboot=coldboot)
+                self.assertEqual(
+                    [
+                        ("restart", FbossSystemctlServiceName.AGENT),
+                        ("wait_agent",),
+                        ("restart", FbossSystemctlServiceName.BGP),
+                        ("wait_bgp",),
+                    ],
+                    self.switch.events[-4:],
+                )
+
+    async def test_restore_baselines_restarts_an_unbound_bgpd(self) -> None:
+        await self._register(_vlan_patcher())
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch)
+        self.switch.bgpd_restarts_with_agent = False
+        self.switch.events.clear()
+
+        await ocp.async_restore_baselines(self.switch)
+
+        self.assertEqual(_baseline_bgp(), self.switch.bgp())
+        self.assertEqual(
+            [
+                ("restart", FbossSystemctlServiceName.AGENT),
+                ("wait_agent",),
+                ("restart", FbossSystemctlServiceName.BGP),
+                ("wait_bgp",),
+            ],
+            self.switch.events,
+        )
+
+    async def test_unreadable_bgpd_start_time_restarts_bgpd(self) -> None:
+        async def _unreadable(service) -> int:
+            raise RuntimeError("systemctl show failed")
+
+        self.switch.async_get_service_monotonic_start_time = _unreadable
+        await self._register(_vlan_patcher())
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch)
+
+        self.assertIn(("restart", FbossSystemctlServiceName.BGP), self.switch.events)
+        self.assertEqual(("wait_bgp",), self.switch.events[-1])
+
+    async def test_bgpd_start_time_is_read_only_around_an_agent_restart(
+        self,
+    ) -> None:
+        """Paths that restart bgpd regardless need no start-time snapshot."""
+        await self._register(_vlan_patcher())
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch, taac_types.ApplyPatcherMethod.AGENT_RELOAD)
+        self.assertEqual(0, self.switch.bgpd_start_time_reads)
+
+        await self._register(_peer_group("B"))
+        await ocp.async_apply(self.switch)  # bgp-only change
+        self.assertEqual(0, self.switch.bgpd_start_time_reads)
+
+        await self._register(
+            ocp.OssPatcher(
+                name="vlan21",
+                config_name="agent",
+                py_func_name="configure_vlans",
+                args={
+                    "vlan21": json.dumps(
+                        {"vlan_id": 21, "ip_addresses": ["10.0.1.1/31"]}
+                    )
+                },
+            )
+        )
+        await self._register(_peer_group("C"))
+        await ocp.async_apply(self.switch)  # agent + bgp: one agent restart
+        self.assertEqual(2, self.switch.bgpd_start_time_reads)
+
     async def test_agent_reload_still_restarts_bgp(self) -> None:
         await self._register(_vlan_patcher())
         await self._register(_peer_group("A"))
@@ -562,7 +969,7 @@ class OssCoopPatcherTest(TestCase):
         self.assertFalse(os.path.exists(self.working_bgp))
         self.assertEqual([], ocp.list_patchers(HOST, "agent"))
         self.assertEqual([], ocp.list_patchers(HOST, "bgpcpp"))
-        # The agent warmboot restarts bgpd too (BindsTo=wedge_agent.service).
+        # The agent warmboot restarts bgpd too where bgpd's unit is bound to it.
         self.assertEqual(
             [
                 ("restart", FbossSystemctlServiceName.AGENT),

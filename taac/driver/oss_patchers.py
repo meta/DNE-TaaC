@@ -28,6 +28,7 @@ import inspect
 import ipaddress
 import json
 import logging
+import sys
 import typing as t
 
 # @manual=//configerator/structs/neteng/fboss/bgp:bgp_config-python-types
@@ -41,7 +42,11 @@ from configerator.structs.neteng.fboss.bgp.bgp_config.thrift_types import (
     PeerGroup,
     RouteLimit,
 )
-from configerator.structs.neteng.robotron.bgp_policy.thrift_types import BgpPolicies
+from configerator.structs.neteng.robotron.bgp_policy.thrift_types import (
+    BgpPolicies,
+    BgpPolicyActionType,
+    DrainState,
+)
 from neteng.fboss.agent_config.thrift_types import AgentConfig
 from neteng.fboss.bgp_attr.thrift_types import AddPath
 from neteng.fboss.switch_config.thrift_types import (
@@ -58,8 +63,12 @@ from neteng.fboss.switch_config.thrift_types import (
     Vlan,
     VlanPort,
 )
+from thrift.python.metadata import gen_metadata, ThriftKind
+from thrift.python.types import Struct
 from taac.driver import oss_bgp_policy
 from taac.driver.config_modifiers import (
+    COMMUNITY_DRAIN,
+    COMMUNITY_LIVE,
     POLICY_PROPAGATE_IN,
     POLICY_PROPAGATE_OUT,
     POLICY_PROPAGATE_OUT_DRAIN,
@@ -82,9 +91,21 @@ PATCHER_CONFIG_TYPES: t.Dict[str, type] = {
     "add_static_routes": AgentConfig,
     "add_bgp_policy_statement": BgpConfig,
     "add_bgp_policy_match_prefix_to_propagate_routes": BgpConfig,
+    "add_bgp_policy_match_prefix_with_actions": BgpConfig,
     "drain_interface": BgpConfig,
     "set_port_channel_min_link_capacity": AgentConfig,
+    "change_port_queue_config": AgentConfig,
+    "clone_bgp_policy_statement_as_drained": BgpConfig,
+    "set_bgp_drain_state": BgpConfig,
 }
+
+# A community action's action_type: 1 adds the communities, 3 removes them.
+_COMMUNITY_ADD = 1
+_COMMUNITY_REMOVE = 3
+# Flow-control actions that hand a route to a later term instead of accepting it.
+_PASS_ON = frozenset({BgpPolicyActionType.CONTINUE, BgpPolicyActionType.GOTO})
+# What follows a policy's name in its drained twin.
+_DRAIN_SUFFIX = "_DRAIN"
 
 # Hardware whose /1 and /5 subports share a cage and so constrain each other's
 # speed (COOP's _validate_51t_speed_change).
@@ -152,15 +173,37 @@ def _add_path(value: t.Any) -> AddPath:
         raise PatcherError(f"unknown add_path {value!r}") from exc
 
 
+def _struct_class(struct: t.Any, key: str) -> t.Any:
+    """The thrift struct class field ``key`` holds, or None for any other type."""
+    current = getattr(struct, key)
+    if isinstance(current, Struct):
+        return type(current)
+    field = next((f for f in gen_metadata(type(struct)).fields if f.name == key), None)
+    if field is None or field.type.kind != ThriftKind.STRUCT:
+        return None
+    name = field.type.as_struct().name.rsplit(".", 1)[-1]
+    return getattr(sys.modules[type(struct).__module__], name, None)
+
+
 def _with_field(struct: t.Any, key: str, raw: t.Any) -> t.Any:
     """Set one field from a string arg, converted to the type the field holds.
 
     COOP's ``_patch_object_attribute`` rule, except that an unset optional field
     is set (best-guess type, falling back to the string) rather than skipped,
-    and an unknown field raises.
+    and an unknown field raises. A dict builds a new struct for a struct field
+    and replaces the old one whole: pass every field, because omitted fields
+    take their thrift defaults.
     """
     if not hasattr(struct, key):
         raise PatcherError(f"{type(struct).__name__} has no field {key!r}")
+    if isinstance(raw, dict):
+        cls = _struct_class(struct, key)
+        if cls is None:
+            raise PatcherError(f"{type(struct).__name__}.{key} cannot hold {raw!r}")
+        value = cls()
+        for name, item in raw.items():
+            value = _with_field(value, name, item)
+        return struct(**{key: value})
     current = getattr(struct, key)
     try:
         if isinstance(current, bool):
@@ -171,7 +214,7 @@ def _with_field(struct: t.Any, key: str, raw: t.Any) -> t.Any:
             candidates = [str(raw)]
         else:
             candidates = [_coerce(raw), str(raw)]
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         raise PatcherError(
             f"{type(struct).__name__}.{key} cannot hold {raw!r}"
         ) from exc
@@ -626,6 +669,16 @@ class OssPatchApplier:
             result = await result
         return result
 
+    def set_bgp_drain_state(
+        self, config: BgpConfig, config_name: str, my_args: t.Dict[str, t.Any]
+    ) -> BgpConfig:
+        """Record ``drain_state`` (a DrainState name, e.g. SOFT_DRAINED) on the config.
+
+        Declarative, as in config_modifiers: bgpd's policy engine never reads it,
+        but drain-state queries and DrainStateHealthCheck do.
+        """
+        return config(drain_state=DrainState[my_args["drain_state"]])
+
     def remove_bgp_peers(
         self, config: BgpConfig, config_name: str, my_args: t.Dict[str, t.Any]
     ) -> BgpConfig:
@@ -695,13 +748,18 @@ class OssPatchApplier:
 
         group = groups[index]
         updates = json.loads(my_args.get("attributes_to_update_json", "{}"))
-        pre_filter = group.pre_filter or RouteLimit()
+        mixed = sorted(_ROUTE_LIMIT_FIELDS & updates.keys())
+        if "pre_filter" in updates and mixed:
+            # A pre_filter dict replaces the whole RouteLimit, so one side
+            # would silently undo the other.
+            raise PatcherError(f"peer group {name}: set pre_filter or {mixed}, not both")
         for key, value in updates.items():
             if key == "add_path":
                 group = group(add_path=_add_path(value))
             elif key in _ROUTE_LIMIT_FIELDS:
-                pre_filter = _with_field(pre_filter, key, value)
-                group = group(pre_filter=pre_filter)
+                group = group(
+                    pre_filter=_with_field(group.pre_filter or RouteLimit(), key, value)
+                )
             else:
                 group = _with_field(group, key, value)
         groups[index] = group
@@ -811,8 +869,9 @@ class OssPatchApplier:
         name) with ``profile_id`` (a PortProfileID name), as COOP's change_speed.
 
         Every port must offer the profile in the platform mapping, or else exactly
-        one wire-identical profile (``_fit_profile``), and on 51T hardware a
-        /1-/5 pair must stay a valid speed combination. A named port
+        one wire-identical profile (``_fit_profile``). On 51T hardware a /1-/5 pair
+        must stay a valid speed combination. A port that another requested port's
+        fitted profile subsumes is exempt from both rules and is removed. A named port
         the config lacks is created (see ``_new_port``). Ports a resulting
         profile subsumes are then removed with their VLAN memberships, which is
         why an apply that removes ports cold boots the agent (oss_coop_patcher).
@@ -835,6 +894,24 @@ class OssPatchApplier:
             name: _fit_profile(entries[name], profile, platform_mapping)
             for name in intfs
         }
+        # SPD_041 requests both subports of a cage: a port that another requested
+        # port's fitted profile subsumes is removed with it, so it skips the fit,
+        # the 51T adjacent-port rule and the "lost" check. That accepts a request
+        # COOP's up-front 51T validation would reject; the result is the same as
+        # requesting the subsuming port alone.
+        ids = {e.mapping.id: name for name, e in entries.items()}
+        subsumed: t.Set[str] = set()
+        for name, fit in fitted.items():
+            port_config = _profile_config(entries[name], fit) if fit else None
+            for pid in (port_config.subsumedPorts or []) if port_config else []:
+                if ids.get(pid) in intfs and ids[pid] != name:
+                    subsumed.add(ids[pid])
+        if subsumed:
+            self.logger.info(
+                f"change_speed: {sorted(subsumed)} are subsumed in this request"
+            )
+            intfs = [name for name in intfs if name not in subsumed]
+            fitted = {name: fit for name, fit in fitted.items() if name not in subsumed}
         unsupported = [name for name, fit in fitted.items() if fit is None]
         if unsupported:
             raise PatcherError(
@@ -863,6 +940,14 @@ class OssPatchApplier:
         # A requested port another port's profile still subsumes is gone again;
         # registering that would report a speed change on a port that is absent.
         present = {p.name for p in sw.ports}
+        # A port taken as subsumed above must really be gone (a chained or
+        # hyper-port subsumer would leave it unchanged): nothing drops silently.
+        kept = sorted(subsumed & present)
+        if kept:
+            raise PatcherError(
+                f"change_speed: {kept} were requested as subsumed but remain; "
+                "request the subsuming port alone"
+            )
         lost = [name for name in intfs if name not in present]
         if lost:
             raise PatcherError(
@@ -1039,6 +1124,37 @@ class OssPatchApplier:
             )
         )
 
+    def change_port_queue_config(
+        self, config: AgentConfig, config_name: str, my_args: t.Dict[str, t.Any]
+    ) -> AgentConfig:
+        """``{port_name: queue_config_name}``: rebind each port to another entry
+        of ``sw.portQueueConfigs``.
+
+        The binding carries a rate shaper: a queue config whose queues set
+        ``portQueueRate`` caps the port's egress, which reads as a steady loss
+        percentage in IXIA_PACKET_LOSS_CHECK rather than a config error.
+        Rebinding traffic-generator ports to a queue config without one removes
+        the cap. An unknown port or queue config raises, since either leaves the
+        port shaped."""
+        sw = config.sw
+        ports = list(sw.ports)
+        index = {p.name: i for i, p in enumerate(ports)}
+        known = set(sw.portQueueConfigs)
+        for port_name, want in my_args.items():
+            if port_name not in index:
+                raise PatcherError(
+                    f"change_port_queue_config: no port {port_name!r} "
+                    f"(have {len(index)} ports)"
+                )
+            if want not in known:
+                raise PatcherError(
+                    f"change_port_queue_config: {want!r} is not in "
+                    f"sw.portQueueConfigs (have: {sorted(known)})"
+                )
+            i = index[port_name]
+            ports[i] = ports[i](portQueueConfigName=want)
+        return config(sw=sw(ports=ports))
+
     def add_static_routes(
         self, config: AgentConfig, config_name: str, my_args: t.Dict[str, t.Any]
     ) -> AgentConfig:
@@ -1051,6 +1167,79 @@ class OssPatchApplier:
                 StaticRouteWithNextHops(prefix=prefix, nexthops=json.loads(next_hops))
             )
         return config(sw=config.sw(staticRoutesWithNhops=routes))
+
+    def clone_bgp_policy_statement_as_drained(
+        self, config: BgpConfig, config_name: str, my_args: t.Dict[str, t.Any]
+    ) -> BgpConfig:
+        """Copy policy statement ``source`` as ``name``, re-tagged as drained.
+
+        A soft drain keeps advertising and the neighbour depreferences routes
+        tagged ``drain_community`` instead of ``live_community``. So every term
+        that advertises a route -- one that accepts it (no flow-control action
+        means permit) or already carries a community action -- also removes LIVE
+        and then adds DRAIN. Deny terms stay as they are, and so do pass-on terms
+        that tag nothing: retagged, they would change what the deny terms behind
+        them match. Pass-on terms that already tag are retagged, as before. A
+        route accepted on a term miss or by the statement's default result passes
+        through no term and keeps LIVE; a policy whose default result is DENY
+        has no such path.
+        The term order is kept. A statement already named ``name`` is replaced."""
+        source, name = my_args["source"], my_args["name"]
+        policies = config.policies or BgpPolicies()
+        statements = list(policies.bgp_policy_statements or [])
+        original = next((s for s in statements if s.name == source), None)
+        if original is None:
+            raise PatcherError(
+                f"clone_bgp_policy_statement_as_drained: no policy statement "
+                f"{source!r} to copy (have: {sorted(s.name for s in statements)})"
+            )
+        retag = oss_bgp_policy.create_policy_actions(
+            [
+                {
+                    "type": 2,  # BgpPolicyActionType: community
+                    "community_action": {
+                        "name": "",
+                        "description": "",
+                        "communities": [community],
+                        "action_type": action_type,
+                    },
+                }
+                for community, action_type in (
+                    (my_args["live_community"], _COMMUNITY_REMOVE),
+                    (my_args["drain_community"], _COMMUNITY_ADD),
+                )
+            ]
+        )
+        terms = []
+        retagged = 0
+        for term in original.policy_entries or []:
+            actions = list(term.policy_action_entries or [])
+            kinds = {a.type for a in actions}
+            if BgpPolicyActionType.DENY not in kinds and (
+                kinds.isdisjoint(_PASS_ON)
+                or any(a.community_action is not None for a in actions)
+            ):
+                term = term(policy_action_entries=[*actions, *retag])
+                retagged += 1
+            terms.append(term)
+        if not retagged:
+            raise PatcherError(
+                f"clone_bgp_policy_statement_as_drained: {source!r} has no term "
+                "that advertises a route, so the copy would not differ from the "
+                "live policy"
+            )
+        self.logger.info(
+            f"Cloned {source} -> {name}, retagged {retagged} term(s) "
+            f"{my_args['live_community']} -> {my_args['drain_community']}"
+        )
+        twin = original(
+            name=name, description=f"Drained twin of {source}", policy_entries=terms
+        )
+        if any(s.name == name for s in statements):
+            statements = [twin if s.name == name else s for s in statements]
+        else:
+            statements.append(twin)
+        return config(policies=policies(bgp_policy_statements=statements))
 
     def add_bgp_policy_statement(
         self, config: BgpConfig, config_name: str, my_args: t.Dict[str, t.Any]
@@ -1071,18 +1260,21 @@ class OssPatchApplier:
     ) -> BgpConfig:
         """Put a term matching ``matching_prefix`` (and longer) first in the
         ``in_stmt_name`` and ``out_stmt_name`` statements; the ingress term also
-        sets local-pref 100.
+        sets local-pref 100. With ``deny="True"`` both terms reject the prefix.
 
         A named statement the config lacks is skipped with a warning, as COOP
         skips it silently: callers derive both names from the role path,
         including drain variants a given config does not carry."""
         prefix = my_args["matching_prefix"]
+        deny = _is_true(my_args.get("deny", ""))
         # Same statement for both: the ingress term wins, as in COOP's if/elif.
         targets = {
             my_args["out_stmt_name"]: oss_bgp_policy.matching_prefix_term(
-                prefix, False
+                prefix, False, deny
             ),
-            my_args["in_stmt_name"]: oss_bgp_policy.matching_prefix_term(prefix, True),
+            my_args["in_stmt_name"]: oss_bgp_policy.matching_prefix_term(
+                prefix, True, deny
+            ),
         }
         policies = config.policies
         statements = list((policies.bgp_policy_statements if policies else None) or [])
@@ -1105,6 +1297,99 @@ class OssPatchApplier:
             )
         )
 
+    def add_bgp_policy_match_prefix_with_actions(
+        self, config: BgpConfig, config_name: str, my_args: t.Dict[str, t.Any]
+    ) -> BgpConfig:
+        """Put first in ``stmt_name`` a term matching ``matching_prefix`` (and
+        longer) plus every community in ``match_communities``, applying
+        ``local_pref`` and the ``remove_communities`` / ``add_communities``
+        actions.
+
+        The plain prefix permit above carries no community actions, so on a
+        first-match policy nothing behind it runs: a DRAIN-tagged path would
+        neither be depreferenced on ingress nor re-tagged on egress. A missing
+        statement raises, since skipping would silently leave the drain inert,
+        unless ``skip_if_missing`` is true: then it is skipped with a warning, as
+        the plain prefix permit does, for a caller whose configs may lack it."""
+        prefix = my_args["matching_prefix"]
+        match_entries: t.List[t.Dict[str, t.Any]] = [
+            {
+                "type": 5,  # BgpPolicyAtomicMatchType: prefix list
+                "prefix_filters": {
+                    "prefixes": [
+                        {
+                            "base_prefix": prefix,
+                            "prefix_len_ranges": [
+                                {"value": int(prefix.split("/")[1]), "compare_operator": 2}
+                            ],
+                        }
+                    ],
+                    "boolean_operator": 2,
+                },
+            }
+        ]
+        for community in my_args.get("match_communities") or []:
+            match_entries.append(
+                {
+                    "type": 3,  # BgpPolicyAtomicMatchType: community list
+                    "communities_filter": {"communities": [community], "boolean_operator": 1},
+                }
+            )
+        actions: t.List[t.Dict[str, t.Any]] = []
+        if my_args.get("local_pref") is not None:
+            actions.append(
+                {
+                    "type": 3,  # BgpPolicyActionType: set local-pref
+                    "action_type": {"route_action": 3},
+                    "set_local_pref": {
+                        "local_pref": int(my_args["local_pref"]),
+                        "boolean_operator": 2,
+                    },
+                }
+            )
+        for community, action_type in [
+            *[(c, _COMMUNITY_REMOVE) for c in my_args.get("remove_communities") or []],
+            *[(c, _COMMUNITY_ADD) for c in my_args.get("add_communities") or []],
+        ]:
+            actions.append(
+                {
+                    "type": 2,  # BgpPolicyActionType: community
+                    "community_action": {
+                        "communities": [community],
+                        "action_type": action_type,
+                    },
+                }
+            )
+        term = oss_bgp_policy.create_policy_term(
+            {
+                "name": my_args.get("term_name", ""),
+                "policy_match_entries": {"match_entries": match_entries, "match_logic_type": 1},
+                "policy_action_entries": actions,
+            }
+        )
+        name = my_args["stmt_name"]
+        policies = config.policies or BgpPolicies()
+        statements = list(policies.bgp_policy_statements or [])
+        if not any(s.name == name for s in statements):
+            if _is_true(my_args.get("skip_if_missing", "")):
+                self.logger.warning(
+                    f"add_bgp_policy_match_prefix_with_actions: no statement "
+                    f"{name!r} to add {prefix} to"
+                )
+                return config
+            raise PatcherError(
+                f"add_bgp_policy_match_prefix_with_actions: no policy statement "
+                f"{name!r} for {prefix} (have: {sorted(s.name for s in statements)})"
+            )
+        return config(
+            policies=policies(
+                bgp_policy_statements=[
+                    s(policy_entries=[term, *(s.policy_entries or [])]) if s.name == name else s
+                    for s in statements
+                ]
+            )
+        )
+
     def drain_interface(
         self, config: BgpConfig, config_name: str, my_args: t.Dict[str, t.Any]
     ) -> BgpConfig:
@@ -1119,33 +1404,23 @@ class OssPatchApplier:
         live and the soft-drain config, and a device drain points every group
         it manages at them.
 
-        Refused: a config without those policies, an interface with no peer,
-        and a session not on ``PROPAGATE_EVERYTHING_OUT`` -- already drained,
-        or in a group a scoped setup left on its own policies, which a device
-        drain does not drain either.
+        A session on its own egress policy is drained by
+        ``_drain_own_policy_sessions`` instead, when none of the interface's
+        sessions is on ``PROPAGATE_EVERYTHING_OUT``; it has its own refusals.
+
+        Refused here: a config without those policies, and a session with no
+        egress policy or not on ``PROPAGATE_EVERYTHING_OUT`` -- already
+        drained, or on its own policy -- beside one that is. An interface with
+        no peer is refused either way.
         """
         target = my_args.get("interface_name")
         if not target:
             raise PatcherError("drain_interface: no interface_name")
-        declared = {
-            s.name
-            for s in (
-                (config.policies.bgp_policy_statements if config.policies else None)
-                or []
-            )
-        }
-        missing = sorted({POLICY_PROPAGATE_IN, POLICY_PROPAGATE_OUT_DRAIN} - declared)
-        if missing:
-            raise PatcherError(
-                f"drain_interface: the config does not declare {', '.join(missing)}; "
-                "generate the base configs first"
-            )
         networks = [
             ipaddress.ip_network(network, strict=False)
             for network in json.loads(my_args.get("networks", "[]"))
         ]
         groups = {g.name: g for g in config.peer_groups or []}
-
         peers = list(config.peers)
         matched = [i for i, peer in enumerate(peers) if _peer_on(peer, networks)]
         if not matched:
@@ -1154,16 +1429,40 @@ class OssPatchApplier:
                 f"({', '.join(map(str, networks)) or 'no address'}), so there "
                 "is no session to drain"
             )
+        egress = {}
         for i in matched:
-            peer = peers[i]
-            group = groups.get(peer.peer_group_name or "")
-            egress = peer.egress_policy_name or (
+            group = groups.get(peers[i].peer_group_name or "")
+            egress[i] = peers[i].egress_policy_name or (
                 group.egress_policy_name if group else None
             )
-            if egress != POLICY_PROPAGATE_OUT:
+        declared = {
+            s.name
+            for s in (
+                (config.policies.bgp_policy_statements if config.policies else None)
+                or []
+            )
+        }
+        if POLICY_PROPAGATE_OUT not in egress.values():
+            return self._drain_own_policy_sessions(
+                config, config_name, target, peers, egress, declared
+            )
+        missing = sorted({POLICY_PROPAGATE_IN, POLICY_PROPAGATE_OUT_DRAIN} - declared)
+        if missing:
+            raise PatcherError(
+                f"drain_interface: the config does not declare {', '.join(missing)}; "
+                "generate the base configs first"
+            )
+        for i in matched:
+            peer = peers[i]
+            if not egress[i]:
+                raise PatcherError(
+                    f"drain_interface: peer {peer.peer_addr} on {target} has no "
+                    "egress policy to drain"
+                )
+            if egress[i] != POLICY_PROPAGATE_OUT:
                 raise PatcherError(
                     f"drain_interface: peer {peer.peer_addr} on {target} "
-                    f"advertises through {egress}, not {POLICY_PROPAGATE_OUT}; "
+                    f"advertises through {egress[i]}, not {POLICY_PROPAGATE_OUT}; "
                     "only sessions the base configs manage can be drained"
                 )
             self.logger.info(
@@ -1174,6 +1473,61 @@ class OssPatchApplier:
                 ingress_policy_name=POLICY_PROPAGATE_IN,
                 egress_policy_name=POLICY_PROPAGATE_OUT_DRAIN,
             )
+        return config(
+            peers=peers,
+            drained_interfaces=_merge(config.drained_interfaces, [target]),
+        )
+
+    def _drain_own_policy_sessions(
+        self,
+        config: BgpConfig,
+        config_name: str,
+        target: str,
+        peers: t.List[BgpPeer],
+        egress: t.Dict[int, t.Optional[str]],
+        declared: t.Set[str],
+    ) -> BgpConfig:
+        """``drain_interface`` for sessions that stay on their own egress policy.
+
+        ``egress`` maps each matched index in ``peers`` to its egress policy. Each
+        session moves to ``<egress>_DRAIN``, a copy of its policy that
+        ``clone_bgp_policy_statement_as_drained`` builds here unless the config
+        declares it, and keeps its ingress policy. Only that session moves, as a
+        session's policy overrides its group's: a pod that keeps production
+        policies on its fabric group can drain one link of it.
+
+        Refused: a session with no egress policy or on a drain policy already,
+        and one whose policy advertises nothing to retag.
+        """
+        for i, policy in egress.items():
+            peer = peers[i]
+            if not policy:
+                raise PatcherError(
+                    f"drain_interface: peer {peer.peer_addr} on {target} has no "
+                    "egress policy to drain"
+                )
+            if policy.endswith(_DRAIN_SUFFIX):
+                raise PatcherError(
+                    f"drain_interface: peer {peer.peer_addr} on {target} "
+                    f"advertises through {policy}, a drain policy already"
+                )
+            twin = f"{policy}{_DRAIN_SUFFIX}"
+            if twin not in declared:
+                config = self.clone_bgp_policy_statement_as_drained(
+                    config,
+                    config_name,
+                    {
+                        "source": policy,
+                        "name": twin,
+                        "live_community": COMMUNITY_LIVE,
+                        "drain_community": COMMUNITY_DRAIN,
+                    },
+                )
+                declared.add(twin)
+            self.logger.info(
+                f"drain_interface: {target}: peer {peer.peer_addr} -> {twin}"
+            )
+            peers[i] = peer(egress_policy_name=twin)
         return config(
             peers=peers,
             drained_interfaces=_merge(config.drained_interfaces, [target]),

@@ -16,6 +16,15 @@ import typing as t
 # Environment variable to control OSS mode
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
+# The OSS stand-in for Meta's /opt/memory_pressure, and where its output is
+# kept on the DUT. Deliberately NOT /opt/memory_pressure: TAAC_OSS is a
+# framework mode, not a DUT type, and an OSS-mode run driving a Meta host
+# would otherwise overwrite Meta's real binary.
+# Lives here rather than in step_definitions so OomdKillHealthCheck can
+# quote the log in its failure message without importing the steps module.
+OSS_MEMORY_PRESSURE_PATH = "/tmp/taac_oss_memory_pressure.py"
+OSS_MEMORY_PRESSURE_LOG = "/tmp/taac_oss_memory_pressure.log"
+
 
 class InsufficientInputError(Exception):
     """Raised when required inputs are missing or incomplete."""

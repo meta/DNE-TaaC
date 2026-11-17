@@ -375,11 +375,16 @@ def create_community_members(
     return refs
 
 
-def matching_prefix_term(matching_prefix: str, is_in_stmt: bool) -> BgpPolicyTerm:
+def matching_prefix_term(
+    matching_prefix: str, is_in_stmt: bool, deny: bool = False
+) -> BgpPolicyTerm:
     """COOP's ``_create_matching_prefix_patchers`` for one prefix: match the
-    prefix and anything longer; an ingress term also sets local-pref 100."""
+    prefix and anything longer; an ingress term also sets local-pref 100.
+    ``deny`` rejects the prefix instead."""
     actions = (
-        [
+        [BgpPolicyAction(type=BgpPolicyActionType.DENY)]
+        if deny
+        else [
             BgpPolicyAction(
                 type=BgpPolicyActionType.SET_LOCAL_PREF,
                 action_type=BgpPolicyActionTypes(

@@ -2,21 +2,27 @@
 
 # pyre-unsafe
 
+import importlib
 import json
+import os
 import typing as t
 import unittest
 
 from configerator.structs.neteng.fboss.bgp.bgp_config.thrift_types import (
     BgpConfig,
     BgpPeer,
+    BgpPeerTimers,
     OverloadProtectionMode,
     PeerGroup,
     RouteLimit,
 )
 from configerator.structs.neteng.robotron.bgp_policy.thrift_types import (
     BgpPolicies,
+    BgpPolicyAction,
+    BgpPolicyActionType,
     BgpPolicyStatement,
     BgpPolicyTerm,
+    DrainState,
 )
 from later.unittest import TestCase
 from neteng.fboss.agent_config.thrift_types import AgentConfig
@@ -47,13 +53,23 @@ from neteng.fboss.switch_config.thrift_types import (
     Vlan,
     VlanPort,
 )
+from taac.driver import oss_bgp_policy
 from taac.driver.config_modifiers import (
+    COMMUNITY_DRAIN,
+    COMMUNITY_LIVE,
     POLICY_PROPAGATE_IN,
     POLICY_PROPAGATE_OUT,
     POLICY_PROPAGATE_OUT_DRAIN,
 )
-from neteng.test_infra.dne.taac.driver.oss_patchers import OssPatchApplier, PatcherError
 from pyre_extensions import none_throws
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+
+_oss_patchers = importlib.import_module(f"{_PACKAGE}.driver.oss_patchers")
+OssPatchApplier = _oss_patchers.OssPatchApplier
+PatcherError = _oss_patchers.PatcherError
 
 
 def _peer(peer_addr: str, peer_type: str | None = None) -> BgpPeer:
@@ -74,6 +90,17 @@ def _agent_config() -> AgentConfig:
             ],
         )
     )
+
+
+class SetBgpDrainStateTest(unittest.IsolatedAsyncioTestCase):
+    async def test_records_the_drain_state(self) -> None:
+        out = await OssPatchApplier().async_apply(
+            BgpConfig(),
+            "bgpcpp_softdrain",
+            "set_bgp_drain_state",
+            {"drain_state": "SOFT_DRAINED"},
+        )
+        self.assertEqual(DrainState.SOFT_DRAINED, out.drain_state)
 
 
 class RemoveBgpPeersTest(unittest.TestCase):
@@ -164,6 +191,49 @@ class ConfigureBgpPeerGroupTest(unittest.TestCase):
     def test_unknown_field_raises(self) -> None:
         with self.assertRaises(PatcherError):
             self._update({"no_such_field": "1"})
+
+    def test_a_dict_replaces_a_struct_field_whole(self) -> None:
+        # COOP replaced the whole struct; fields the dict omits take defaults.
+        self.config = self.config(
+            peer_groups=[
+                none_throws(self.config.peer_groups)[0](
+                    bgp_peer_timers=BgpPeerTimers(hold_time_seconds=30, out_delay_seconds=2)
+                )
+            ]
+        )
+        group = self._update({"bgp_peer_timers": {"hold_time_seconds": 90, "keep_alive_seconds": "30"}})
+        self.assertEqual(
+            BgpPeerTimers(hold_time_seconds=90, keep_alive_seconds=30), group.bgp_peer_timers
+        )
+
+    def test_a_dict_sets_an_unset_struct_field(self) -> None:
+        group = self._update({"bgp_peer_timers": {"hold_time_seconds": 90}})
+        self.assertEqual(90, none_throws(group.bgp_peer_timers).hold_time_seconds)
+
+    def test_a_dict_with_an_unknown_key_names_it(self) -> None:
+        with self.assertRaisesRegex(PatcherError, "BgpPeerTimers has no field 'hold_time'"):
+            self._update({"bgp_peer_timers": {"hold_time": 90}})
+
+    def test_a_dict_for_a_scalar_field_raises(self) -> None:
+        with self.assertRaisesRegex(PatcherError, "PeerGroup.description"):
+            self._update({"description": {"a": 1}})
+
+    def test_a_pre_filter_dict_with_route_limit_keys_raises_in_either_order(self) -> None:
+        for attrs in (
+            {"pre_filter": {"warning_only": True}, "max_routes": "100"},
+            {"max_routes": "100", "pre_filter": {"warning_only": True}},
+        ):
+            with self.subTest(order=list(attrs)):
+                with self.assertRaisesRegex(PatcherError, "pre_filter.*max_routes"):
+                    self._update(attrs)
+
+    def test_route_limit_keys_build_on_the_current_pre_filter(self) -> None:
+        group = self._update({"max_routes": "200", "warning_limit": "7"})
+        self.assertEqual(RouteLimit(max_routes=200, warning_limit=7), group.pre_filter)
+
+    def test_a_null_inside_a_struct_dict_names_the_field(self) -> None:
+        with self.assertRaisesRegex(PatcherError, "BgpPeerTimers.hold_time_seconds cannot hold None"):
+            self._update({"bgp_peer_timers": {"hold_time_seconds": None}})
 
     def test_missing_group_is_left_alone(self) -> None:
         out = self.applier.configure_bgp_peer_group(
@@ -588,9 +658,10 @@ class ChangeSpeedTest(TestCase):
         self.assertNotIn(4094, [i.vlanID for i in out.sw.interfaces])
 
     async def test_unsupported_profile_and_unknown_port_raise(self) -> None:
+        # /5 alone: nothing else in the request subsumes it, so it must fit.
         with self.assertRaisesRegex(PatcherError, "not supported on ports: eth1/1/5"):
             await self._change(
-                _cage_config(), _speed_args("eth1/1/1,eth1/1/5", "EIGHTHUNDREDG", _P800)
+                _cage_config(), _speed_args("eth1/1/5", "EIGHTHUNDREDG", _P800)
             )
         with self.assertRaisesRegex(PatcherError, "not in the platform mapping"):
             await self._change(
@@ -613,6 +684,67 @@ class ChangeSpeedTest(TestCase):
         with self.assertRaisesRegex(PatcherError, "would be subsumed"):
             await self._change(
                 at_800g, _speed_args("eth1/1/5", "FOURHUNDREDG", _P400), None
+            )
+
+    async def test_mate_requested_with_its_subsuming_primary_is_taken_as_subsumed(
+        self,
+    ) -> None:
+        # SPD_041 registers both subports of a cage at 800G: /1 takes 800G and
+        # subsumes /5, which offers no 800G profile of its own.
+        for hardware in (None, "MONTBLANC"):
+            # On 51T the /5 skips the adjacent-port rule too: the outcome is the
+            # same as requesting /1 alone.
+            with self.subTest(hardware=hardware):
+                out = await self._change(
+                    _cage_config(),
+                    _speed_args("eth1/1/1,eth1/1/5", "EIGHTHUNDREDG", _P800),
+                    hardware,
+                )
+                (port,) = out.sw.ports
+                self.assertEqual(("eth1/1/1", _P800), (port.name, port.profileID))
+
+    async def test_mate_taken_as_subsumed_but_left_in_place_raises(self) -> None:
+        # Chain: /1 subsumes /5, whose own 800G profile would subsume eth1/1/3. /5
+        # never takes that profile, so eth1/1/3 is not removed and must not be
+        # silently skipped.
+        shared = {p: PlatformPortConfig() for p in (_P400, _P200, _P100)}
+        mapping = PlatformMapping(
+            ports={
+                1: PlatformPortEntry(
+                    mapping=PlatformPortMapping(id=1, name="eth1/1/1"),
+                    supportedProfiles={
+                        **shared,
+                        _P800: PlatformPortConfig(subsumedPorts=[2]),
+                    },
+                ),
+                2: PlatformPortEntry(
+                    mapping=PlatformPortMapping(id=2, name="eth1/1/5"),
+                    supportedProfiles={
+                        **shared,
+                        _P800: PlatformPortConfig(subsumedPorts=[3]),
+                    },
+                ),
+                3: PlatformPortEntry(
+                    mapping=PlatformPortMapping(id=3, name="eth1/1/3"),
+                    supportedProfiles=shared,
+                ),
+            }
+        )
+        config = _cage_config()
+        third = Port(
+            logicalID=3,
+            name="eth1/1/3",
+            speed=PortSpeed.FOURHUNDREDG,
+            profileID=_P400,
+            state=PortState.ENABLED,
+        )
+        config = config(sw=config.sw(ports=[*config.sw.ports, third]))
+        with self.assertRaisesRegex(PatcherError, "requested as subsumed but remain"):
+            await OssPatchApplier(inputs=_Inputs(None, mapping=mapping)).async_apply(
+                config,
+                "agent",
+                "change_speed",
+                _speed_args("eth1/1/1,eth1/1/5,eth1/1/3", "EIGHTHUNDREDG", _P800),
             )
 
     async def test_subsumption_keeps_vlans_with_surviving_tagged_members(self) -> None:
@@ -867,6 +999,21 @@ class BgpPolicyPatchersTest(unittest.TestCase):
         self.assertEqual(1, len(stmt_in.policy_entries[0].policy_action_entries))
         self.assertEqual([], list(stmt_out.policy_entries[0].policy_action_entries))
 
+    def test_deny_rejects_the_prefix_instead(self) -> None:
+        out = OssPatchApplier().add_bgp_policy_match_prefix_to_propagate_routes(
+            _policy_config(),
+            "bgpcpp",
+            {
+                "matching_prefix": "5000::/16",
+                "in_stmt_name": "RANDOM",
+                "out_stmt_name": "OUT",
+                "deny": "True",
+            },
+        )
+        _, stmt_out = none_throws(out.policies).bgp_policy_statements
+        (action,) = stmt_out.policy_entries[0].policy_action_entries
+        self.assertEqual(BgpPolicyActionType.DENY, action.type)
+
     def test_missing_statement_is_skipped(self) -> None:
         out = OssPatchApplier().add_bgp_policy_match_prefix_to_propagate_routes(
             _policy_config(),
@@ -880,6 +1027,236 @@ class BgpPolicyPatchersTest(unittest.TestCase):
         stmt_in, stmt_out = none_throws(out.policies).bgp_policy_statements
         self.assertEqual(2, len(stmt_in.policy_entries))
         self.assertEqual(0, len(stmt_out.policy_entries))
+
+
+def _flow_term(name: str, action_type: BgpPolicyActionType) -> BgpPolicyTerm:
+    return BgpPolicyTerm(
+        name=name, policy_action_entries=[BgpPolicyAction(type=action_type)]
+    )
+
+
+def _tag_term() -> BgpPolicyTerm:
+    return oss_bgp_policy.create_policy_term(
+        {
+            "name": "tag",
+            "policy_action_entries": [
+                {
+                    "type": 2,
+                    "community_action": {"communities": ["65000:1"], "action_type": 1},
+                }
+            ],
+        }
+    )
+
+
+def _tagging_config() -> BgpConfig:
+    """OUT tags advertised routes in its first term; its second only filters."""
+    tag = _tag_term()
+    return BgpConfig(
+        policies=BgpPolicies(
+            bgp_policy_statements=[
+                BgpPolicyStatement(
+                    name="OUT",
+                    policy_entries=[
+                        tag,
+                        _flow_term("filter", BgpPolicyActionType.DENY),
+                    ],
+                )
+            ]
+        )
+    )
+
+
+_CLONE_ARGS = {
+    "source": "OUT",
+    "name": "OUT_DRAIN",
+    "live_community": "65000:100",
+    "drain_community": "65000:200",
+}
+
+
+class CloneBgpPolicyStatementAsDrainedTest(unittest.TestCase):
+    def _communities(self, term: BgpPolicyTerm) -> t.List[t.Tuple[t.List[str], int]]:
+        return [
+            (list(a.community_action.communities), int(a.community_action.action_type))
+            for a in term.policy_action_entries
+            if a.community_action is not None
+        ]
+
+    def test_tagging_terms_swap_live_for_drain(self) -> None:
+        out = OssPatchApplier().clone_bgp_policy_statement_as_drained(
+            _tagging_config(), "bgpcpp_softdrain", _CLONE_ARGS
+        )
+        original, twin = none_throws(out.policies).bgp_policy_statements
+        self.assertEqual("OUT_DRAIN", twin.name)
+        tag, filter_term = twin.policy_entries
+        self.assertEqual(
+            [(["65000:1"], 1), (["65000:100"], 3), (["65000:200"], 1)],
+            self._communities(tag),
+        )
+        self.assertEqual(
+            [BgpPolicyActionType.DENY],
+            [a.type for a in filter_term.policy_action_entries],
+        )
+        # The source statement is untouched.
+        self.assertEqual(1, len(original.policy_entries[0].policy_action_entries))
+
+    def test_a_second_clone_replaces_the_first_in_place(self) -> None:
+        applier = OssPatchApplier()
+        once = applier.clone_bgp_policy_statement_as_drained(
+            _tagging_config(), "bgpcpp_softdrain", _CLONE_ARGS
+        )
+        twice = applier.clone_bgp_policy_statement_as_drained(
+            once, "bgpcpp_softdrain", _CLONE_ARGS
+        )
+        self.assertEqual(
+            ["OUT", "OUT_DRAIN"],
+            [s.name for s in none_throws(twice.policies).bgp_policy_statements],
+        )
+
+    def test_missing_source_raises(self) -> None:
+        with self.assertRaises(PatcherError):
+            OssPatchApplier().clone_bgp_policy_statement_as_drained(
+                _tagging_config(), "bgpcpp_softdrain", {**_CLONE_ARGS, "source": "NO"}
+            )
+
+    def _twin_terms(self, *terms: BgpPolicyTerm) -> t.List[BgpPolicyTerm]:
+        config = BgpConfig(
+            policies=BgpPolicies(
+                bgp_policy_statements=[
+                    BgpPolicyStatement(name="OUT", policy_entries=list(terms))
+                ]
+            )
+        )
+        out = OssPatchApplier().clone_bgp_policy_statement_as_drained(
+            config, "bgpcpp_softdrain", _CLONE_ARGS
+        )
+        return list(none_throws(out.policies).bgp_policy_statements[1].policy_entries)
+
+    def test_a_term_that_accepts_without_tagging_is_retagged(self) -> None:
+        # With no flow-control action a term permits, and the route leaves with
+        # the tag it came in with: LIVE, on a drained device.
+        swap = [(["65000:100"], 3), (["65000:200"], 1)]
+        implicit, explicit = self._twin_terms(
+            BgpPolicyTerm(name="implicit"),
+            _flow_term("explicit", BgpPolicyActionType.PERMIT),
+        )
+        self.assertEqual(swap, self._communities(implicit))
+        self.assertEqual(swap, self._communities(explicit))
+        self.assertEqual(
+            BgpPolicyActionType.PERMIT, explicit.policy_action_entries[0].type
+        )
+
+    def test_a_deny_term_is_left_as_it_is(self) -> None:
+        deny = _flow_term("deny", BgpPolicyActionType.DENY)
+        twin, _ = self._twin_terms(deny, _tag_term())
+        self.assertEqual(deny, twin)
+
+    def test_a_pass_on_term_without_a_community_action_is_left_as_it_is(self) -> None:
+        # Retagged ahead of the deny terms behind it, it would change which of
+        # them match: they key on LIVE.
+        for action_type in (BgpPolicyActionType.CONTINUE, BgpPolicyActionType.GOTO):
+            with self.subTest(action_type=action_type):
+                skip = _flow_term("skip", action_type)
+                twin, _ = self._twin_terms(skip, _tag_term())
+                self.assertEqual(skip, twin)
+
+    def test_a_source_that_advertises_nothing_raises(self) -> None:
+        # Only a deny: no term in it lets a route out, so the copy is the source.
+        with self.assertRaises(PatcherError):
+            self._twin_terms(_flow_term("deny", BgpPolicyActionType.DENY))
+
+
+_WITH_ACTIONS_ARGS = {"matching_prefix": "2001:db8:0:1d00::/56", "stmt_name": "IN"}
+
+
+class AddBgpPolicyMatchPrefixWithActionsTest(unittest.TestCase):
+    def test_prefix_and_community_match_with_local_pref_goes_first(self) -> None:
+        out = OssPatchApplier().add_bgp_policy_match_prefix_with_actions(
+            _policy_config(),
+            "bgpcpp",
+            {**_WITH_ACTIONS_ARGS, "match_communities": ["65446:10"], "local_pref": 20},
+        )
+        stmt_in, _ = none_throws(out.policies).bgp_policy_statements
+        new, old = stmt_in.policy_entries
+        self.assertEqual("old", old.name)
+        match = none_throws(new.policy_match_entries)
+        self.assertEqual(1, int(match.match_logic_type))  # AND
+        prefix, community = match.match_entries
+        self.assertEqual(
+            "2001:db8:0:1d00::/56",
+            none_throws(prefix.prefix_filters).prefixes[0].base_prefix,
+        )
+        self.assertEqual(["65446:10"], list(none_throws(community.communities_filter).communities))
+        (action,) = new.policy_action_entries
+        self.assertEqual(20, none_throws(action.set_local_pref).local_pref)
+
+    def test_retags_communities_remove_then_add(self) -> None:
+        out = OssPatchApplier().add_bgp_policy_match_prefix_with_actions(
+            _policy_config(),
+            "bgpcpp",
+            {
+                **_WITH_ACTIONS_ARGS,
+                "remove_communities": ["65446:30"],
+                "add_communities": ["65446:10"],
+            },
+        )
+        new = none_throws(out.policies).bgp_policy_statements[0].policy_entries[0]
+        self.assertEqual(1, len(none_throws(new.policy_match_entries).match_entries))
+        self.assertEqual(
+            [(["65446:30"], 3), (["65446:10"], 1)],
+            [
+                (list(a.community_action.communities), int(a.community_action.action_type))
+                for a in new.policy_action_entries
+                if a.community_action is not None
+            ],
+        )
+
+    def test_missing_statement_raises(self) -> None:
+        with self.assertRaises(PatcherError):
+            OssPatchApplier().add_bgp_policy_match_prefix_with_actions(
+                _policy_config(), "bgpcpp", {**_WITH_ACTIONS_ARGS, "stmt_name": "NOPE"}
+            )
+
+    def test_skip_if_missing_warns_and_leaves_the_config_alone(self) -> None:
+        args = {**_WITH_ACTIONS_ARGS, "stmt_name": "NOPE", "skip_if_missing": "True"}
+        with self.assertLogs(OssPatchApplier.__module__, "WARNING"):
+            out = OssPatchApplier().add_bgp_policy_match_prefix_with_actions(
+                _policy_config(), "bgpcpp", args
+            )
+        self.assertEqual(_policy_config(), out)
+
+    def test_skip_if_missing_false_still_raises(self) -> None:
+        with self.assertRaises(PatcherError):
+            OssPatchApplier().add_bgp_policy_match_prefix_with_actions(
+                _policy_config(),
+                "bgpcpp",
+                {**_WITH_ACTIONS_ARGS, "stmt_name": "NOPE", "skip_if_missing": "False"},
+            )
+
+
+def _queue_config() -> AgentConfig:
+    config = _agent_config()
+    return config(
+        sw=config.sw(portQueueConfigs={"shaped": [], "unshaped": []})
+    )
+
+
+class ChangePortQueueConfigTest(unittest.TestCase):
+    def test_rebinds_only_the_named_port(self) -> None:
+        out = OssPatchApplier().change_port_queue_config(
+            _queue_config(), "agent", {"eth1/2/1": "unshaped"}
+        )
+        self.assertEqual(
+            [None, "unshaped"], [p.portQueueConfigName for p in out.sw.ports]
+        )
+
+    def test_unknown_port_or_queue_config_raises(self) -> None:
+        for args in ({"eth9/9/9": "unshaped"}, {"eth1/2/1": "missing"}):
+            with self.subTest(args=args), self.assertRaises(PatcherError):
+                OssPatchApplier().change_port_queue_config(
+                    _queue_config(), "agent", args
+                )
 
 
 _OPTICAL_100G = PortProfileID.PROFILE_100G_4_NRZ_RS528_OPTICAL  # 23
@@ -1048,11 +1425,22 @@ class DrainInterfaceTest(unittest.TestCase):
         with self.assertRaisesRegex(PatcherError, POLICY_PROPAGATE_OUT_DRAIN):
             OssPatchApplier().drain_interface(config, "bgpcpp", _drain_args())
 
-    def test_session_outside_the_base_configs_is_refused(self) -> None:
-        with self.assertRaisesRegex(PatcherError, "advertises through OTHER_OUT"):
+    def test_session_whose_own_policy_advertises_nothing_is_refused(self) -> None:
+        # Its own policy advertises nothing, so there is no twin to drain it to.
+        with self.assertRaisesRegex(
+            PatcherError, "'OTHER_OUT' has no term that advertises"
+        ):
             OssPatchApplier().drain_interface(
                 _drain_config(), "bgpcpp", _drain_args("2001:db8:3::/127")
             )
+
+    def test_session_without_an_egress_policy_is_refused(self) -> None:
+        # Beside sessions on PROPAGATE_EVERYTHING_OUT, so the stock drain takes it.
+        config = _drain_config()(
+            peers=[BgpPeer(peer_addr="2001:db8:1::1"), *_drain_config().peers]
+        )
+        with self.assertRaisesRegex(PatcherError, "no egress policy"):
+            OssPatchApplier().drain_interface(config, "bgpcpp", _drain_args())
 
     def test_drained_session_is_refused(self) -> None:
         applier = OssPatchApplier()
@@ -1061,3 +1449,129 @@ class DrainInterfaceTest(unittest.TestCase):
             PatcherError, f"advertises through {POLICY_PROPAGATE_OUT_DRAIN}"
         ):
             applier.drain_interface(drained, "bgpcpp", _drain_args())
+
+
+def _own_policy_config() -> BgpConfig:
+    """A fabric group that stays on its own policies, whose egress advertises.
+    One session has an ingress policy of its own."""
+    return BgpConfig(
+        policies=BgpPolicies(
+            bgp_policy_statements=[
+                BgpPolicyStatement(name="FABRIC_IN"),
+                BgpPolicyStatement(
+                    name="FABRIC_OUT",
+                    policy_entries=[
+                        BgpPolicyTerm(name="permit"),
+                        _flow_term("deny", BgpPolicyActionType.DENY),
+                        _tag_term(),
+                    ],
+                ),
+            ]
+        ),
+        peer_groups=[
+            PeerGroup(
+                name="FABRIC",
+                ingress_policy_name="FABRIC_IN",
+                egress_policy_name="FABRIC_OUT",
+            )
+        ],
+        peers=[
+            BgpPeer(peer_addr="2001:db8:1::1", peer_group_name="FABRIC"),
+            BgpPeer(
+                peer_addr="10.0.0.1",
+                peer_group_name="FABRIC",
+                ingress_policy_name="OWN_IN",
+            ),
+            BgpPeer(peer_addr="2001:db8:2::1", peer_group_name="FABRIC"),
+        ],
+    )
+
+
+class DrainInterfaceOwnPolicyTest(unittest.TestCase):
+    """A session that stays on its own egress policy moves to a drained twin of
+    it, as a device drain's soft-drain config does, and keeps its ingress."""
+
+    def _drain(self, config: BgpConfig) -> BgpConfig:
+        return OssPatchApplier().drain_interface(config, "bgpcpp", _drain_args())
+
+    def test_sessions_on_the_interface_move_to_the_twin_alone(self) -> None:
+        out = self._drain(_own_policy_config())
+
+        self.assertEqual(
+            [
+                ("2001:db8:1::1", None, "FABRIC_OUT_DRAIN"),
+                ("10.0.0.1", "OWN_IN", "FABRIC_OUT_DRAIN"),
+                ("2001:db8:2::1", None, None),
+            ],
+            [
+                (p.peer_addr, p.ingress_policy_name, p.egress_policy_name)
+                for p in out.peers
+            ],
+        )
+        self.assertEqual(["eth1/1/1"], list(out.drained_interfaces))
+        self.assertEqual(_own_policy_config().peer_groups, out.peer_groups)
+
+    def test_the_twin_is_the_one_a_device_drain_builds(self) -> None:
+        args = {
+            "source": "FABRIC_OUT",
+            "name": "FABRIC_OUT_DRAIN",
+            "live_community": COMMUNITY_LIVE,
+            "drain_community": COMMUNITY_DRAIN,
+        }
+        want = OssPatchApplier().clone_bgp_policy_statement_as_drained(
+            _own_policy_config(), "bgpcpp_softdrain", args
+        )
+
+        out = self._drain(_own_policy_config())
+
+        self.assertEqual(
+            none_throws(want.policies).bgp_policy_statements,
+            none_throws(out.policies).bgp_policy_statements,
+        )
+
+    def test_a_session_without_an_egress_policy_is_refused(self) -> None:
+        config = _own_policy_config()
+        config = config(peers=[BgpPeer(peer_addr="2001:db8:1::"), *config.peers])
+        with self.assertRaisesRegex(PatcherError, "no egress policy"):
+            self._drain(config)
+
+    def test_an_interface_mixing_both_kinds_is_left_to_the_stock_rules(self) -> None:
+        # The stock drain takes an interface with a session on
+        # PROPAGATE_EVERYTHING_OUT, and refuses a session of its own policy
+        # that shares it.
+        config = _drain_config()
+        policies = none_throws(config.policies)
+        own = BgpPolicyStatement(name="OWN_OUT", policy_entries=[BgpPolicyTerm()])
+        statements = [*policies.bgp_policy_statements, own]
+        config = config(
+            policies=policies(bgp_policy_statements=statements),
+            peer_groups=[
+                *config.peer_groups,
+                PeerGroup(name="OWN", egress_policy_name="OWN_OUT"),
+            ],
+            peers=[*config.peers, BgpPeer(peer_addr="10.0.0.0", peer_group_name="OWN")],
+        )
+        with self.assertRaisesRegex(PatcherError, "advertises through OWN_OUT, not "):
+            self._drain(config)
+
+    def test_a_twin_the_config_declares_is_used_as_it_is(self) -> None:
+        config = _own_policy_config()
+        policies = none_throws(config.policies)
+        declared = BgpPolicyStatement(name="FABRIC_OUT_DRAIN", description="mine")
+        config = config(
+            policies=policies(
+                bgp_policy_statements=[*policies.bgp_policy_statements, declared]
+            )
+        )
+
+        out = self._drain(config)
+
+        self.assertEqual(
+            [declared],
+            [
+                s
+                for s in none_throws(out.policies).bgp_policy_statements
+                if s.name == "FABRIC_OUT_DRAIN"
+            ],
+        )
+        self.assertEqual("FABRIC_OUT_DRAIN", out.peers[0].egress_policy_name)

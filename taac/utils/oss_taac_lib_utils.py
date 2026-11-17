@@ -230,6 +230,33 @@ def retryable(
 # =============================================================================
 
 
+class _AttemptTimeoutError(TimeoutError):
+    """An async_retryable attempt outlived its attempt_timeout.
+
+    Always retried, whatever the caller's retryable exceptions: the deadline is
+    the decorator's own, so the caller cannot have opted out of it.
+    """
+
+
+async def _await_attempt_with_timeout(
+    func: Callable[..., Any],
+    timeout: float,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Any:
+    deadline = asyncio.timeout(timeout)
+    try:
+        async with deadline:
+            return await func(*args, **kwargs)
+    except TimeoutError:
+        # A TimeoutError the call raised itself stays the caller's to classify.
+        if not deadline.expired():
+            raise
+        raise _AttemptTimeoutError(
+            f"{func.__name__} did not complete within {timeout}s"
+        ) from None
+
+
 def async_retryable(
     num_tries: Optional[int] = None,
     retries: Optional[int] = None,  # Alias for num_tries
@@ -242,6 +269,7 @@ def async_retryable(
     exception_to_raise: Optional[
         Exception
     ] = None,  # Custom exception to raise on failure
+    attempt_timeout: Optional[float] = None,  # Per-attempt deadline in seconds
     #  typing.Coroutine[typing.Any, typing.Any, typing.Any]])]` isn't present in the
     #  function's parameters.
 ) -> Callable[[AsyncF], AsyncF]:
@@ -258,6 +286,10 @@ def async_retryable(
         jitter: If True, add random jitter to sleep time (default: False)
         max_duration: Maximum total duration in seconds for all retries (default: None)
         exception_to_raise: Custom exception to raise when all retries fail (default: None)
+        attempt_timeout: Cancel an attempt still running after this many seconds and
+            treat it as a failed, retryable attempt (default: None, no deadline). Use it
+            for calls whose transport timeout cannot be trusted: a thrift reply that
+            stalls mid-stream on a half-open connection never returns on its own.
 
     Returns:
         Decorated async function that will retry on failure
@@ -302,8 +334,12 @@ def async_retryable(
                         raise TimeoutError(timeout_message)
 
                 try:
-                    return await func(*args, **kwargs)
-                except actual_retryable_exs as e:
+                    if attempt_timeout is None:
+                        return await func(*args, **kwargs)
+                    return await _await_attempt_with_timeout(
+                        func, attempt_timeout, args, kwargs
+                    )
+                except (*actual_retryable_exs, _AttemptTimeoutError) as e:
                     last_exception = e
                     if attempt < actual_num_tries - 1:
                         # Check if sleeping would exceed max_duration

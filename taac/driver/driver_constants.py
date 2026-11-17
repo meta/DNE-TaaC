@@ -1419,3 +1419,13 @@ PROD_LIKE_MUTATING_OPTIONS: FrozenSet[ProdLikeEnvOption] = frozenset(
 
 
 FSDB_PORT: int = fboss_thrift_port(5908)
+
+
+# wedge_qsfp_util resolves some platforms only from the platform descriptor root;
+# without it hardware commands such as --set_low_power abort with "invalid model
+# name". The DUT-side check keeps platforms without the root on the plain command.
+PLATFORM_DESCRIPTOR_ROOT: str = "/opt/fboss/share/platform_descriptors"
+
+
+def wedge_qsfp_util_cmd(root: str = PLATFORM_DESCRIPTOR_ROOT) -> str:
+    return f"wedge_qsfp_util $(test -d {root} && echo --platform_descriptor_config_path {root})"

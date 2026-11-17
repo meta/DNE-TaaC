@@ -938,7 +938,7 @@ class TrafficGenerator:
                     # Type is guaranteed to be str here since we checked primary_chassis_ip is truthy
                     asset.ixia_chassis_ip = str(self.primary_chassis_ip)
 
-        desired_ixia_assets = list(set(desired_ixia_assets))
+        desired_ixia_assets = list(dict.fromkeys(desired_ixia_assets))
         self._ixia_asset_snapshot_by_endpoint[endpoint.name] = desired_ixia_assets
         return desired_ixia_assets
 

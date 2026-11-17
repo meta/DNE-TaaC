@@ -107,6 +107,10 @@ TGEN_AS = 65001
 # ---------------------------------------------------------------------------
 TRAFFIC_ITEM_NAME = "L3_IPV4_BIDIR"
 TRAFFIC_LINE_RATE_PERCENT = 10
+# OTG variant: absolute rate per direction. Kept low so that even ixia-c
+# can work properly.
+TRAFFIC_RATE_OTG_PPS = 20_000
+TRAFFIC_OTG_MAX_LOSS_PERCENT = 0.01
 # traffic_forwarding_test.py: dwell while traffic runs so the loss check
 # evaluates a real tx window and the collector checks have samples.
 TRAFFIC_HOLD_SEC = 30

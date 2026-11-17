@@ -68,6 +68,16 @@ _OSS_READY_TEST_FILES = [
     "taac/health_checks/snapshot_health_checks/test_cpu_queue_failure_window.py",
     # Pure unit test: Ixia via __new__, config element mocked.
     "taac/ixia/tests/test_ipv4_ecn_bits.py",
+    # Pure unit tests: Ixia / TaacIxia built via __new__ or a patched __init__,
+    # with the restpy objects mocked.
+    "taac/ixia/tests/test_apply_traffic_retry.py",
+    "taac/ixia/tests/test_custom_network_group_route_property.py",
+    "taac/ixia/tests/test_expected_session_states.py",
+    "taac/ixia/tests/test_packet_capture.py",
+    "taac/ixia/tests/test_port_stats_packet_loss.py",
+    "taac/ixia/tests/test_start_bgp_peers.py",
+    "taac/ixia/tests/test_taac_ixia_deferred_generation.py",
+    "taac/ixia/tests/test_taac_ixia_saved_config.py",
 ]
 
 # Build absolute paths relative to this conftest's directory (repo root).

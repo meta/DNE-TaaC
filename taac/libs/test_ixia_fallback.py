@@ -1605,6 +1605,46 @@ class IxiaLldpDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         optical_discovery.assert_awaited_once_with("dut1")
 
 
+class IxiaAssetOrderTest(unittest.IsolatedAsyncioTestCase):
+    """Port order decides device group creation order, and so the Ixia MACs.
+
+    A set orders by string hash, which changes with every process, so these
+    use enough ports that an unordered result would not match by chance.
+    """
+
+    INTERFACES = [f"eth1/{n}/1" for n in range(40, 0, -1)]
+
+    def setUp(self) -> None:
+        self.generator = TrafficGenerator(endpoints=[], logger=MagicMock())
+
+    def _deduped(self, interfaces):
+        return list(dict.fromkeys(interfaces))
+
+    async def test_direct_connections_keep_config_order(self) -> None:
+        interfaces = self.INTERFACES + [self.INTERFACES[3]]
+        endpoint = taac_types.Endpoint(
+            name="dut1",
+            dut=True,
+            direct_ixia_connections=[
+                taac_types.DirectIxiaConnection(
+                    interface=interface,
+                    ixia_port=f"1/{index + 1}",
+                    ixia_chassis_ip="192.0.2.10",
+                )
+                for index, interface in enumerate(interfaces)
+            ],
+        )
+
+        created = self.generator.create_direct_ixia_connection_assets(endpoint)
+        desired = await self.generator.async_get_endpoint_desired_ixia_assets(endpoint)
+
+        for assets in (created, desired):
+            self.assertEqual(
+                [asset.remote_intf_name for asset in assets],
+                self._deduped(interfaces),
+            )
+
+
 class IxiaFallbackTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.config = _config(_endpoint("eth1/1/1", "2/2"))

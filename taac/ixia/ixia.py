@@ -58,6 +58,7 @@ from ixnetwork_restpy.assistants.sessions.sessionassistant import (
 from ixnetwork_restpy.assistants.statistics.statviewassistant import (
     StatViewAssistant as IxnStatViewAssistant,
 )
+from ixnetwork_restpy.errors import BadRequestError
 from ixnetwork_restpy.errors import IxNetworkError as IxnIxNetworkError
 from ixnetwork_restpy.files import Files
 from taac.abstractions.ixia_semantics import (
@@ -776,6 +777,12 @@ class IxiaSetupError(Exception):
     pass
 
 
+# `verify_protocols` budget. Each poll is a full CSV export of the Protocols
+# Summary view, so polls are deliberately infrequent.
+_PROTOCOLS_SUMMARY_TIMEOUT_SECONDS = 300
+_PROTOCOLS_SUMMARY_POLL_SECONDS = 15
+
+
 class IxiaOperationTimeoutError(TimeoutError):
     def __init__(self, message: str, *, deadline_expired: bool = False) -> None:
         super().__init__(message)
@@ -923,6 +930,13 @@ _PROTOCOL_STATE_SETTLE_TIMEOUT_SECONDS: int = 120
 _PROTOCOL_STATE_POLL_SECONDS: int = 2
 # ApplyOnTheFly failures are commonly transient while a large topology settles.
 _APPLY_CHANGES_MAX_ATTEMPTS: int = 3
+_TRAFFIC_APPLY_MAX_ATTEMPTS: int = 3
+_TRAFFIC_APPLY_RETRY_DELAY_SECONDS: float = 5.0
+# The error IxNetwork raises at Apply time when no stream could be built
+# because a destination MAC never resolved.
+_UNRESOLVED_DESTINATION_ERROR_MARKER: str = "no flow groups"
+# Time for neighbor discovery to complete after a resend, before regenerating.
+_DESTINATION_RESOLUTION_SETTLE_SECONDS: float = 10.0
 _APPLY_CHANGES_RETRY_DELAY_SECONDS: float = 10.0
 
 # A successful BGP peer Start can still leave some sessions `notStarted` (seen on
@@ -3447,6 +3461,87 @@ class Ixia:
             )
             time.sleep(poll_seconds)
 
+    # Which Protocols Summary rows a device group's stacks show up on. A group
+    # that is disabled may only excuse the rows it actually creates -- a v6-only
+    # group must not excuse notStarted sessions on the v4 rows.
+    _NOT_STARTED_ROW_BY_STACK: t.ClassVar[t.Tuple[t.Tuple[str, str], ...]] = (
+        ("v4_addresses_config", "IPv4"),
+        ("v6_addresses_config", "IPv6"),
+        ("v4_bgp_config", "BGP Peer"),
+        ("v6_bgp_config", "BGP+ Peer"),
+    )
+
+    def _expected_not_started_by_protocol(self) -> t.Dict[str, int]:
+        """Sessions the CONFIG says never start, per Protocols Summary row.
+
+        A `DeviceGroupConfig(enable=False)` is created but not started, so its
+        `multiplier` sessions report as notStarted for the whole run.
+
+        Read from `self.ixia_config`, which is the same source the device groups
+        were built from -- no chassis query, so it costs nothing.
+
+        NOTE this is a SETUP-TIME expectation. `ixia_config` does not change
+        when a playbook enables a disabled group mid-test, so a call made after
+        that point would be too lenient by that group's multiplier. The only
+        caller is `start_and_verify_protocols`, which runs before any playbook.
+        """
+        expected: t.Dict[str, int] = {}
+        cfg = getattr(self, "ixia_config", None)
+        for port in getattr(cfg, "port_configs", None) or []:
+            for dg in getattr(port, "device_group_configs", None) or []:
+                if getattr(dg, "enable", True):
+                    continue
+                # ASSUMES ONE SESSION PER DEVICE PER ROW. `multiplier` is the
+                # device count, and each device contributes one entry to each
+                # row its stacks create -- true for the singular
+                # `v{4,6}_bgp_config` / `v{4,6}_addresses_config` this type
+                # model allows. A group carrying more than one peer per device
+                # would UNDERCOUNT the allowance, and the check would then
+                # report a real-looking "N sessions not started" failure. If
+                # that becomes possible, count peers rather than devices.
+                sessions = int(getattr(dg, "multiplier", None) or 1)
+                for stack, protocol_type in self._NOT_STARTED_ROW_BY_STACK:
+                    if getattr(dg, stack, None) is not None:
+                        expected[protocol_type] = (
+                            expected.get(protocol_type, 0) + sessions
+                        )
+        return expected
+
+    @staticmethod
+    def _stat_int(value: t.Any) -> int:
+        """Stat-view cells arrive as CSV strings, and may be blank."""
+        try:
+            return int(str(value).strip() or 0)
+        except ValueError:
+            return 0
+
+    @classmethod
+    def _protocols_summary_failures(
+        cls,
+        rows: t.Iterable[t.Any],
+        expected_not_started: t.Mapping[str, int],
+    ) -> t.List[str]:
+        """Every way a Protocols Summary snapshot disagrees with the config.
+
+        Any protocol type the config does not name is expected fully up. Rows
+        are reported individually so a failure says WHICH protocol is wrong
+        rather than "condition not met".
+        """
+        failures: t.List[str] = []
+        for row in rows:
+            protocol_type = row["Protocol Type"]
+            allowed = expected_not_started.get(protocol_type, 0)
+            not_started = cls._stat_int(row["Sessions Not Started"])
+            down = cls._stat_int(row["Sessions Down"])
+            if not_started > allowed:
+                failures.append(
+                    f"{protocol_type}: {not_started} sessions not started, "
+                    f"config expects at most {allowed}"
+                )
+            if down:
+                failures.append(f"{protocol_type}: {down} sessions down, expected 0")
+        return failures
+
     def verify_protocols(self) -> None:
         """API to verify the status of the protocols in the topology"""
         if self.skip_ixia_protocol_verification:
@@ -3458,21 +3553,51 @@ class Ixia:
             UhdStatViewAssistant if self.is_uhd_chassis else IxnStatViewAssistant
         )
 
-        # `CheckCondition` polls `self.Rows` in a loop until the condition holds
-        # or `Timeout` expires, and every `.Rows` read is a chassis CSV snapshot.
-        # Two 300s conditions therefore make this the heaviest snapshot user in
-        # the class, so it has to hold the session snapshot lock like every other
-        # stat-view reader. Nesting is safe — `_snapshot_lock` is an `RLock`.
+        # `Rows` takes a full CSV export on EVERY access (slow at scale), so the
+        # snapshot count is the whole cost of this check.
+        # On a healthy setup the expectation holds on the first one. Deliberately
+        # not a `CheckCondition` loop: that snapshots per poll, and its Timeout
+        # bounds when polling stops STARTING, not the total duration.
+        #
+        # Holds the session snapshot lock like every other stat-view reader:
+        # every `.Rows` read is a chassis CSV snapshot, so this is one of the
+        # heaviest snapshot users in the class. Nesting is safe --
+        # `_snapshot_lock` is an RLock.
         with self.stat_view_snapshot():
             protocols_summary = StatViewAssistant(self.ixnetwork, "Protocols Summary")
-
-            protocols_summary.CheckCondition(
-                "Sessions Not Started", StatViewAssistant.EQUAL, 0, Timeout=300
+            expected_not_started = self._expected_not_started_by_protocol()
+            self.logger.info(
+                f"[GLOBAL] Verifying protocols; sessions the config expects "
+                f"never to start: {expected_not_started or 'none'}"
             )
 
-            protocols_summary.CheckCondition(
-                "Sessions Down", StatViewAssistant.EQUAL, 0, Timeout=300
-            )
+            # Honour the caller's `ixia_protocol_verification_timeout`: the
+            # parameter is named for verification, so a reader reasonably
+            # expects it to bound verification as well as the blind sleep on
+            # the skip path above. A configured 0 means "no sleep" on the skip
+            # path rather than "no time to verify", so fall back to the default.
+            #
+            # This also bounds how long the snapshot lock is held.
+            budget = int(
+                getattr(self, "ixia_protocol_verification_timeout", 0) or 0
+            ) or _PROTOCOLS_SUMMARY_TIMEOUT_SECONDS
+            deadline = time.monotonic() + budget
+            while True:
+                failures = self._protocols_summary_failures(
+                    protocols_summary.Rows, expected_not_started
+                )
+                if not failures:
+                    break
+                if time.monotonic() >= deadline:
+                    raise IxiaOperationTimeoutError(
+                        "IXIA protocols did not reach the state the config "
+                        f"expects within {budget}s: " + "; ".join(failures),
+                        deadline_expired=True,
+                    )
+                self.logger.info(
+                    f"[GLOBAL] Waiting on protocols: {'; '.join(failures)}"
+                )
+                time.sleep(_PROTOCOLS_SUMMARY_POLL_SECONDS)
 
         self.logger.info(
             "[GLOBAL] Successfully verified the operational status of all "
@@ -8216,9 +8341,21 @@ class Ixia:
 
     def start_and_verify_protocols(self) -> None:
         """Starts and verifies the protocols"""
+        _t = time.time()
         self.start_protocols()
+        self.logger.warning(
+            f"{_GREEN}[IXIA]{_RESET}   start_protocols in {time.time() - _t:.0f}s"
+        )
+        _t = time.time()
         self._send_arp_and_ns()
+        self.logger.warning(
+            f"{_GREEN}[IXIA]{_RESET}   send ARP/NS in {time.time() - _t:.0f}s"
+        )
+        _t = time.time()
         self.verify_protocols()
+        self.logger.warning(
+            f"{_GREEN}[IXIA]{_RESET}   verify_protocols in {time.time() - _t:.0f}s"
+        )
 
     def _send_arp_and_ns(self) -> None:
         """Send ARP (IPv4) and NS (IPv6) on all device group interfaces.
@@ -9142,6 +9279,35 @@ class Ixia:
             )
         return bgp_peers
 
+    @external_api
+    def get_bgp_session_statuses_for_network_groups(
+        self, network_group_regex: str
+    ) -> t.List[t.Tuple[str, str]]:
+        """``(peer address, SessionStatus)`` for every BGP session in the device
+        groups that own the network groups matching ``network_group_regex``.
+        SessionStatus is IxNetwork's "up" / "down" / "notStarted"."""
+        owners = {
+            network_group.parent.href
+            for network_group in self.find_network_groups(network_group_regex)
+        }
+        sessions = []
+        for container in self.find_bgp_peers():
+            # A restpy attribute read sees one item, so walk every peer in it.
+            for bgp_peer in container:
+                # BGP peer -> IP stack -> Ethernet -> device group.
+                if bgp_peer.parent.parent.parent.href not in owners:
+                    continue
+                # restpy serves the snapshot taken at fetch time without refresh().
+                bgp_peer.refresh()
+                addresses = [str(a) for a in bgp_peer.parent.Address.Values]
+                # Keep every status even if the address list is shorter, so a
+                # dropped "up" can never read as a down peer.
+                for i, status in enumerate(bgp_peer.SessionStatus):
+                    sessions.append(
+                        (addresses[i] if i < len(addresses) else "unknown", status)
+                    )
+        return sessions
+
     @staticmethod
     def _validate_bgp_session_address_range(
         session_start_index: int,
@@ -9854,7 +10020,71 @@ class Ixia:
                 "apply_traffic: no enabled traffic items — skipping Traffic.Apply()"
             )
             return
-        self.ixnetwork.Traffic.Apply()
+        self._apply_traffic_with_retry()
+
+    # IxNetwork occasionally rejects an Apply with a bare "Error in L2/L3
+    # Traffic Apply" and no AppErrors, on traffic items identical to ones it
+    # applied cleanly in the previous iteration.
+    # start_traffic already retries, but prepare_traffic and enable_traffic
+    # call Apply directly, so a single rejection there fails the playbook.
+    #
+    # A rejection whose AppErrors say a destination MAC did not resolve (a link
+    # flap can drop the gateway resolution and nothing redoes it) fails the same
+    # way on every identical retry, since the streams were generated without
+    # that destination. Those retries resend ARP/NS and regenerate first.
+    def _apply_traffic_with_retry(self) -> None:
+        for attempt in range(1, _TRAFFIC_APPLY_MAX_ATTEMPTS + 1):
+            try:
+                self.ixnetwork.Traffic.Apply()
+                return
+            except BadRequestError as error:
+                if attempt == _TRAFFIC_APPLY_MAX_ATTEMPTS:
+                    raise
+                try:
+                    traffic_running = self.is_traffic_running()
+                except Exception:
+                    traffic_running = True
+                if (
+                    not traffic_running
+                    and self._apply_failed_on_unresolved_destinations()
+                ):
+                    self.logger.warning(
+                        f"Traffic Apply attempt {attempt}/"
+                        f"{_TRAFFIC_APPLY_MAX_ATTEMPTS} rejected on unresolved "
+                        f"destination MACs ({error}); resending ARP/NS and "
+                        "regenerating traffic items"
+                    )
+                    # A failed recovery step only costs this attempt; the next
+                    # Apply surfaces the real rejection.
+                    try:
+                        self._send_arp_and_ns()
+                        time.sleep(_DESTINATION_RESOLUTION_SETTLE_SECONDS)
+                        self._generate_traffic_items()
+                    except Exception as recovery_error:
+                        self.logger.warning(
+                            "Resolving destinations before the next Traffic "
+                            f"Apply failed (non-fatal): {recovery_error}"
+                        )
+                else:
+                    self.logger.warning(
+                        f"Traffic Apply attempt {attempt}/"
+                        f"{_TRAFFIC_APPLY_MAX_ATTEMPTS} rejected ({error}); "
+                        "retrying"
+                    )
+                    time.sleep(_TRAFFIC_APPLY_RETRY_DELAY_SECONDS)
+
+    def _generate_traffic_items(self) -> None:
+        # Not regenerate_traffic_items: it stops and restarts running traffic,
+        # and its start_traffic re-enters apply_traffic from inside this retry.
+        for traffic_item in self.get_traffic_items():
+            traffic_item.Generate()
+
+    def _apply_failed_on_unresolved_destinations(self) -> bool:
+        # Only the newest entry: older ones may be unrelated leftovers.
+        errors = self._recent_ixia_server_errors()
+        return (
+            bool(errors) and _UNRESOLVED_DESTINATION_ERROR_MARKER in errors[-1].lower()
+        )
 
     def has_traffic_items(self) -> bool:
         try:
@@ -13109,7 +13339,9 @@ class Ixia:
             bgp_ip_route_property_cls = getattr(
                 ip_prefix_pool_obj, bgp_route_property_attr
             )
-            bgp_ip_route_property = bgp_ip_route_property_cls.add()
+            # find(), not add(): the route property already exists under a
+            # new prefix pool, and add() outside a batch context is rejected.
+            bgp_ip_route_property = bgp_ip_route_property_cls.find()
             set_next_hop_type = (
                 import_bgp_routes_params.set_next_hop_type
                 or ixia_types.SetNextHopType.MANUALLY

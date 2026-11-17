@@ -141,7 +141,7 @@ Sample DUT configs satisfying these prerequisites (see
 ### 4. `traffic_forwarding_test.py` — IPv4 L3 Traffic Forwarding (Complex)
 
 Configures two traffic-generator ports as IPv4 endpoints on opposite sides
-of the DUT, sends 10% bidirectional traffic, and verifies zero packet loss.
+of the DUT, sends bidirectional traffic, and verifies packet loss.
 
 Runs on either traffic-generator backend — see
 [Traffic-Generator Backends](#traffic-generator-backends).
@@ -173,7 +173,7 @@ Sample DUT config satisfying these prerequisites (see
 
 | Phase | Description |
 |---|---|
-| `traffic_forwarding` playbook | Sends 10% line-rate bidirectional IPv4 traffic through the DUT |
+| `traffic_forwarding` playbook | Sends bidirectional IPv4 traffic through the DUT (10% line rate on IxNetwork, `TRAFFIC_RATE_OTG_PPS` on OTG) |
 | Postchecks | `IXIA_PACKET_LOSS_CHECK` (0% loss on `L3_IPV4_BIDIR`) + collector-backed `SYSTEMCTL_ACTIVE_STATE_CHECK`, `UNCLEAN_EXIT_CHECK`, `CPU_UTILIZATION_CHECK`, `MEMORY_UTILIZATION_CHECK` |
 
 ---

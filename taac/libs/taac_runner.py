@@ -56,7 +56,13 @@ from taac.ixia.config_render import (
     render_ixia_config,
     ResolvedCheck,
 )
-from neteng.test_infra.dne.taac.ixia.ixia_tracer import IxiaTraceSlice, slugify_phase
+if TAAC_OSS:
+    from taac.ixia.ixia_tracer import IxiaTraceSlice, slugify_phase
+else:
+    from neteng.test_infra.dne.taac.ixia.ixia_tracer import (
+        IxiaTraceSlice,
+        slugify_phase,
+    )
 from taac.ixia.taac_ixia import TaacIxia
 
 # taac.libs.collectors.registry is OSS-safe (no Meta-internal imports) and owns
@@ -115,7 +121,10 @@ from taac.steps.all_steps import (  # oss-rewrite (force ShipIt re-export to taa
     NAME_TO_STEP,
     STEP_NAME_TO_INPUT,
 )
-from neteng.test_infra.dne.taac.steps.step import Step, TestbedError
+if TAAC_OSS:
+    from taac.steps.step import Step, TestbedError
+else:
+    from neteng.test_infra.dne.taac.steps.step import Step, TestbedError
 from taac.steps.step_definitions import ValidationStep
 from taac.tasks.utils import run_task
 from taac.utils.common import (
@@ -150,6 +159,7 @@ from taac.utils.oss_taac_lib_utils import (
 from taac.utils.result_rendering import (
     check_stage_name,
     format_epoch_timestamp,
+    hostnames_cell,
     message_with_url,
     section_failed,
 )
@@ -164,6 +174,7 @@ from taac.utils.taac_log_formatter import (
     suppress_console_logs,
 )
 from taac.utils.taac_test_summary import (
+    section_error_message as _section_error_message,
     SectionResult,
     SectionStatus,
     TaacTestSummary,
@@ -722,6 +733,9 @@ class TaacRunner:
         # Unlike `investigation_link`, this is not reset between test cases.
         self.investigation_artifacts: t.List[trr_types.InvestigationArtifact] = []
         self._current_playbook_section: t.Optional[SectionResult] = None
+        # The in-flight stage's failure, handed to _finalize_playbook_section
+        # by the teardown that runs out of the stage loop's `finally`.
+        self._pending_stage_error: t.Optional[BaseException] = None
         self._last_completed_playbook_section: t.Optional[SectionResult] = None
         self._baseline_lifecycle = BaselineLifecycle(
             BaselineTimeouts(
@@ -1817,6 +1831,11 @@ class TaacRunner:
                 self._current_playbook_section = self.test_summary.start_section(
                     f"Playbook: {playbook.name} | {test_device.name}"
                 )
+                # Reset with the section, not just before the stage loop: a
+                # playbook whose teardown raised before _finalize_playbook_section
+                # leaves its error set, and the next playbook can fail in setUp
+                # (i.e. before the stage loop) and be stamped with it.
+                self._pending_stage_error = None
                 _start_test_case_time_window(self.jq_vars, int(time.time()))
                 await self._capture_topology_baseline(playbook)
                 with suppress_console_logs(self.logger):
@@ -1899,34 +1918,31 @@ class TaacRunner:
                                 else:
                                     test_devices = [test_device]
 
-                            await asyncio.gather(
-                                *[
-                                    self.async_run_stage(
-                                        stage,
-                                        test_device,
-                                        playbook.name,
-                                        test_case_start_time,
-                                        test_case_results,
-                                    )
-                                    for test_device in test_devices
-                                ]
-                            )
-                            if stage.description == _PRECHECK_STAGE_DESCRIPTION:
+                            try:
+                                await asyncio.gather(
+                                    *[
+                                        self.async_run_stage(
+                                            stage,
+                                            test_device,
+                                            playbook.name,
+                                            test_case_start_time,
+                                            test_case_results,
+                                        )
+                                        for test_device in test_devices
+                                    ]
+                                )
+                            finally:
                                 # Tabulate prechecks as soon as they finish
-                                # (not at end-of-case) so someone tailing a
-                                # live run sees them before the stages start.
-                                await self._log_stage_health_results(
-                                    test_case_results,
-                                    taac_types.ValidationStage.PRE_TEST,
-                                    "PRE-HEALTH CHECK RESULTS",
-                                )
+                                # (pass OR fail — ValidationStep appends its
+                                # results before raising) so someone tailing
+                                # a live run sees them before the stages start.
+                                if stage.description == _PRECHECK_STAGE_DESCRIPTION:
+                                    await self._log_stage_health_results(
+                                        test_case_results,
+                                        taac_types.ValidationStage.PRE_TEST,
+                                        "PRE-HEALTH CHECK RESULTS",
+                                    )
                         except TestbedError:
-                            if stage.description == _PRECHECK_STAGE_DESCRIPTION:
-                                await self._log_stage_health_results(
-                                    test_case_results,
-                                    taac_types.ValidationStage.PRE_TEST,
-                                    "PRE-HEALTH CHECK RESULTS",
-                                )
                             if self.continue_on_precheck_failure:
                                 self.logger.warning(
                                     f"[--continue-on-precheck-failure] "
@@ -1945,6 +1961,11 @@ class TaacRunner:
                             )
                 except BaseException as error:
                     _stage_exc = error
+                    # The teardown that runs from the `finally` below reaches
+                    # _finalize_playbook_section, which otherwise only sees
+                    # teardown-local errors and marks the playbook PASS even
+                    # though its stages never finished.
+                    self._pending_stage_error = error
                     raise
                 finally:
                     # always run post-snapshot checks for observability, regardless of stage failures
@@ -1964,28 +1985,33 @@ class TaacRunner:
                             self.logger.error(
                                 f"Failed to run post-snapshot checks for {test_case_name}: {e}"
                             )
-                        if playbook.cleanup_steps:
-                            log_subsection(
-                                f"Cleanup Steps — Playbook '{playbook.name}'",
-                                logger=self.logger,
-                            )
-                            log_phase_start(
-                                f"Cleanup Steps ({len(playbook.cleanup_steps)} step(s))",
-                                logger=self.logger,
-                            )
-                            _cleanup_start = time.time()
-                            await self.initialize_and_run_steps(
-                                playbook.cleanup_steps,
-                                test_device=test_device,
-                                test_case_name=test_case_name,
-                                test_case_start_time=test_case_start_time,
-                                test_case_results=test_case_results,
-                            )
-                            log_phase_end(
-                                f"Cleanup Steps ({len(playbook.cleanup_steps)} step(s))",
-                                duration_secs=time.time() - _cleanup_start,
-                                logger=self.logger,
-                            )
+                    # Not suppressed: cleanup steps log like the playbook's own
+                    # stages. Some exist only for their output (e.g. an
+                    # informational report step), which at WARNING reaches the
+                    # log file alone.
+                    if playbook.cleanup_steps:
+                        log_subsection(
+                            f"Cleanup Steps — Playbook '{playbook.name}'",
+                            logger=self.logger,
+                        )
+                        log_phase_start(
+                            f"Cleanup Steps ({len(playbook.cleanup_steps)} step(s))",
+                            logger=self.logger,
+                        )
+                        _cleanup_start = time.time()
+                        await self.initialize_and_run_steps(
+                            playbook.cleanup_steps,
+                            test_device=test_device,
+                            test_case_name=test_case_name,
+                            test_case_start_time=test_case_start_time,
+                            test_case_results=test_case_results,
+                        )
+                        log_phase_end(
+                            f"Cleanup Steps ({len(playbook.cleanup_steps)} step(s))",
+                            duration_secs=time.time() - _cleanup_start,
+                            logger=self.logger,
+                        )
+                    with suppress_console_logs(self.logger):
                         # Last resort for the CPU/RSS characterization brackets.
                         # Meta-internal: the brackets and their sampler live
                         # under internal/, so there is nothing to reap in OSS.
@@ -2207,13 +2233,15 @@ class TaacRunner:
                 errors,
             )
         if stage_error is not None:
+            # Teardown also summarizes failed health checks; its exception
+            # does not necessarily mean topology/config restoration failed.
             raise _group_exceptions(
-                "test case execution and restoration failed",
+                "test case execution and teardown failed",
                 [stage_error, *cleanup_errors],
             )
         if len(cleanup_errors) == 1:
             raise cleanup_errors[0]
-        raise _group_exceptions("test case restoration failed", cleanup_errors)
+        raise _group_exceptions("test case teardown failed", cleanup_errors)
 
     def _baseline_participants_for(
         self, playbook: taac_types.Playbook
@@ -2531,13 +2559,41 @@ class TaacRunner:
         stage: taac_types.ValidationStage,
         title: str,
     ) -> None:
+        """Tabulate one validation stage's results, never raising.
+
+        Every call site is inside a ``finally`` (the precheck stage's, and the
+        end-of-case MID/POST/SNAPSHOT loop's), so an exception escaping here
+        would REPLACE the in-flight failure: a precheck ``TestbedError`` would
+        surface as an everpaste error, the ``except TestbedError`` handler
+        would never run, and ``--continue-on-precheck-failure`` would silently
+        stop working. The Everpaste upload for failed rows makes that
+        reachable, so failures are logged and swallowed -- this output is
+        diagnostic and must never preempt the real error.
+        """
+        try:
+            await self._log_stage_health_results_inner(
+                test_case_results, stage, title
+            )
+        except Exception as table_exc:
+            self.logger.warning(
+                f"Could not tabulate '{title}' results: {table_exc}"
+            )
+
+    async def _log_stage_health_results_inner(
+        self,
+        test_case_results: t.List[trr_types.CheckResult],
+        stage: taac_types.ValidationStage,
+        title: str,
+    ) -> None:
         """Log a summary table of health check results for one validation stage.
 
         Filters test_case_results to checks whose ``check_stage`` equals
-        ``stage`` and logs them in a formatted table. Rows are prefixed with
-        the device name(s) so multi-DUT stages don't render as N
-        identical-looking rows. For failed checks, uploads the full failure
-        details to Everpaste and appends the URL to the message.
+        ``stage`` (``check_stage`` is the ``ValidationStage`` enum itself, not
+        its name — see ``taac.utils.common.create_test_result``) and logs them
+        in a formatted table. Rows are prefixed with the device name(s) so
+        multi-DUT stages don't render as N identical-looking rows. For
+        failed checks, uploads the full failure details to Everpaste and
+        appends the URL to the message.
         """
         stage_results = [
             result for result in test_case_results if result.check_stage == stage
@@ -2570,7 +2626,7 @@ class TaacRunner:
                 except Exception:
                     pass
 
-            devices = ", ".join(result.hostnames)
+            devices = hostnames_cell(result.hostnames)
             check_name = result.check_name or "Unknown"
             formatted_results.append(
                 {
@@ -2649,7 +2705,7 @@ class TaacRunner:
             f"\033[36m  ├─ Steps: \033[0m{', '.join(step_names)}"
             f" \033[2m(x{stage.iteration} iteration(s))\033[0m"
         )
-        _stage_error = None
+        _stage_error: BaseException | None = None
         try:
             for _stage_iter in range(stage.iteration):
                 if stage.iteration > 1:
@@ -2681,7 +2737,10 @@ class TaacRunner:
                         test_case_start_time,
                         test_case_results,
                     )
-        except Exception as e:
+        # BaseException, not Exception: the --timeout enforced by
+        # asyncio.wait_for in the OSS entry point cancels this stage with
+        # asyncio.CancelledError, which must record the stage as FAIL.
+        except BaseException as e:
             _stage_error = e
             raise
         finally:
@@ -2693,7 +2752,9 @@ class TaacRunner:
             )
             if _stage_error:
                 self.test_summary.end_section(
-                    stage_section, SectionStatus.FAIL, str(_stage_error)
+                    stage_section,
+                    SectionStatus.FAIL,
+                    _section_error_message(_stage_error),
                 )
             else:
                 self.test_summary.end_section(stage_section, SectionStatus.PASS)
@@ -2942,7 +3003,8 @@ class TaacRunner:
                     failed_playbooks.append((playbook.name, dut, e))
                     self.logger.error(
                         f"\033[31m  Playbook '{playbook.name}' failed on "
-                        f"{dut}: {e}\033[0m"
+                        f"{dut}: {type(e).__name__}: {e}\033[0m",
+                        exc_info=True,
                     )
                     if self._topology_baseline_capture_failed:
                         self.logger.error(
@@ -2997,7 +3059,8 @@ class TaacRunner:
             # full traceback remains available, but it's no longer the only
             # carrier of the actual failure reason.
             detail_lines = [
-                f"- {name} ({dut}): {exc}" for name, dut, exc in failed_playbooks
+                f"- {name} ({dut}): {type(exc).__name__}: {exc}"
+                for name, dut, exc in failed_playbooks
             ]
             raise TestCaseFailure(
                 f"{len(failed_playbooks)} playbook(s) failed:\n"
@@ -3376,6 +3439,10 @@ class TaacRunner:
         topology_restore_errors: t.Sequence[BaseException],
     ) -> None:
         section = self._current_playbook_section
+        pending_stage_error = self._pending_stage_error
+        self._pending_stage_error = None
+        if pending_stage_error is not None:
+            exceptions = [pending_stage_error, *exceptions]
         if section is None:
             return
         if exceptions:
@@ -3388,7 +3455,7 @@ class TaacRunner:
             self.test_summary.end_section(
                 section,
                 status,
-                "; ".join(str(error) for error in exceptions),
+                "; ".join(_section_error_message(error) for error in exceptions),
             )
         else:
             self.test_summary.end_section(section, SectionStatus.PASS)

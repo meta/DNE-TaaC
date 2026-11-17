@@ -55,6 +55,10 @@ snappi>=1.0.0
 # reached via taac/libs/taac_runner.py; without it pytest collection fails.
 pydantic>=2.0
 
+# YAML constants overlay (--constants / TAAC_CONSTANTS_PATH). Imported in
+# taac/runner/constants_loader.py.
+PyYAML>=6.0
+
 # Asyncio test helpers (later.unittest.TestCase adds task-leak detection).
 # Imported at module scope by the qual_bgp_update_group tc7_cases tests;
 # without it pytest aborts the whole run with a collection error.

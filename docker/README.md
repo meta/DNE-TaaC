@@ -40,6 +40,12 @@ The full build takes ~22 min cold (folly + fizz + wangle + mvfst + fbthrift comp
 
 ## Usage
 
+Which commit an image was built from (also printed as `Image commit:` in the OSS banner):
+
+```bash
+docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' fboss-taac
+```
+
 **Build the TAAC image:**
 
 ```bash

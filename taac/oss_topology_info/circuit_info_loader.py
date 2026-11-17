@@ -168,8 +168,11 @@ def load_circuit_info(
             )
             all_circuits.append(circuit)
 
-            for device_name in (hostname, neighbor_hostname):
-                normalized = device_name.strip().lower()
+            # A DUT-to-DUT loopback has the same host on both ends; index it once
+            # so per-host interface lists don't repeat every port.
+            for normalized in dict.fromkeys(
+                name.strip().lower() for name in (hostname, neighbor_hostname)
+            ):
                 if not normalized:
                     continue
                 host_to_circuits.setdefault(normalized, []).append(circuit)

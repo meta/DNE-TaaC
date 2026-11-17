@@ -143,6 +143,53 @@ class TaacRunnerTimeWindowTest(unittest.TestCase):
 
 
 class TaacRunnerFailurePrecedenceTest(unittest.IsolatedAsyncioTestCase):
+    def test_health_failure_repeated_at_teardown_is_not_a_restore_failure(self) -> None:
+        from taac.constants import TestCaseFailure
+
+        # Validation raises first; teardown reports the failed health results
+        # again even when IXIA, handlers and topology restoration all succeed.
+        stage_error = TestCaseFailure("MEMORY_UTILIZATION_CHECK failed")
+        health_error = TestCaseFailure(
+            "Health check failed: fsdb memory over threshold",
+            is_postcheck_failure=True,
+        )
+        with self.assertRaises(TestCaseFailure) as teardown:
+            TaacRunner._raise_test_case_teardown_errors(
+                "bronze", SimpleNamespace(name="dut1"),
+                [health_error], [], health_error,
+            )
+        with self.assertRaises(ExceptionGroup) as grouped:
+            TaacRunner._raise_test_case_cleanup_errors(stage_error, [teardown.exception])
+        self.assertEqual(grouped.exception.message, "test case execution and teardown failed")
+        self.assertEqual(grouped.exception.exceptions, (stage_error, teardown.exception))
+        self.assertIn("fsdb memory over threshold", str(teardown.exception))
+
+    async def test_empty_setup_error_keeps_type_and_traceback(self) -> None:
+        logger = logging.getLogger("taac-runner-empty-setup-error")
+        playbook = taac_types.Playbook(name="empty-setup-error", enabled=True)
+        runner = TaacRunner(_config()(playbooks=[playbook]), logger=logger)
+        runner.test_summary = MagicMock()
+        runner.topology = MagicMock()
+        runner.topology.get_device_by_name.return_value = SimpleNamespace(name="dut1")
+        runner._playbooks_for_device = MagicMock(return_value=[playbook])
+        runner._publish_npi_result = AsyncMock()
+        error = AssertionError()
+
+        async def fail_setup(*_args):
+            raise error
+
+        runner.async_test_case_setUp = fail_setup
+        with self.assertLogs(logger, level="ERROR") as captured:
+            with self.assertRaises(Exception) as raised:
+                await runner.run_tests(duts=["dut1"])
+
+        self.assertIs(raised.exception.__cause__, error)
+        self.assertIn("empty-setup-error (dut1): AssertionError", str(raised.exception))
+        output = "\n".join(captured.output)
+        self.assertIn("AssertionError", output)
+        self.assertIn("Traceback (most recent call last)", output)
+        self.assertIn("fail_setup", output)
+
     async def test_teardown_failure_keeps_stage_primary_first(self) -> None:
         logger = logging.getLogger("taac-runner-failure-precedence-test")
         logger.setLevel(logging.INFO)

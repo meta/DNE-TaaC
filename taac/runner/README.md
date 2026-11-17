@@ -265,6 +265,35 @@ python3 -m taac.runner.oss_entry_point \
   --log-file debug.log
 ```
 
+### Live Smoke via Docker (agent-restart / BGP / IXIA loss)
+
+Runs the OSS entry point inside the `fboss-taac` build container, driving a real
+DUT (SSH) and IXIA chassis (REST API). The `TAAC_SSH_*` env vars are picked up
+by the runner's SSH driver; `--regen` regenerates thrift bindings before the
+run (drop it once the image is fresh).
+
+`--skip-setup-tasks` / `--skip-teardown-tasks` skip the factory's TestConfig-level
+setup/teardown hooks — they call `coop_apply_patchers` / `coop_unregister_patchers`,
+both of which raise `NotImplementedError` in OSS mode
+(`taac/driver/fboss_switch.py`). `--skip-post-setup-wait` skips the
+interface-stabilization sleep after testbed setup.
+
+```bash
+# TAAC_SSH_USER / TAAC_SSH_PASSWORD exported beforehand (e.g. source ~/.taac-secrets).
+tmux new-session -d -s smoke \
+"TAAC_OSS=1 TAAC_DUT=<dut> \
+    ./docker/run_taac_docker.sh --regen run \
+    python3 -m taac.runner.oss_entry_point \
+      --test-configs /workspace/taac/testconfigs/oss/single_dut_rsw_config.py \
+      --dut <dut> \
+      --ixia-api-server <ixia-chassis> \
+      --skip-setup-tasks --skip-teardown-tasks --skip-post-setup-wait \
+    2>&1 | tee /tmp/smoke.log"
+
+# Tail the run:
+tmux capture-pane -t smoke -pS -50   # or: tail -f /tmp/smoke.log
+```
+
 ## Test Config File Format
 
 Test config files must be Python modules that define a `test_config`, `TEST_CONFIG`, `config`, or `CONFIG` variable (or callable).

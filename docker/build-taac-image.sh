@@ -98,6 +98,9 @@ if [[ -n "$NUM_JOBS" ]]; then
     echo "Capping getdeps parallelism at $NUM_JOBS"
 fi
 
+TAAC_GIT_SHA=$(git -C "$REPO_ROOT" describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
+DOCKER_BUILD_ARGS+=(--build-arg "TAAC_GIT_SHA=$TAAC_GIT_SHA")
+
 echo "Building $TAG from docker/Dockerfile.taac (base: $BASE_IMAGE) ..."
 docker build \
     "${DOCKER_BUILD_ARGS[@]}" \

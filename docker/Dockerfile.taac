@@ -126,6 +126,12 @@ COPY --from=builder /scratch/installed /scratch/installed
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/lib64/python3.12/site-packages /usr/local/lib64/python3.12/site-packages
 
+# Stamped by docker/build-taac-image.sh; kept below the dnf/builder layers so it
+# does not invalidate them on every commit.
+ARG TAAC_GIT_SHA=unknown
+ENV TAAC_GIT_SHA=${TAAC_GIT_SHA}
+LABEL org.opencontainers.image.revision=${TAAC_GIT_SHA}
+
 # Selective COPYs of only necessary directories
 COPY taac/ /taac/taac/
 COPY thrift/ /taac/thrift/

@@ -40,6 +40,7 @@ from taac.oss_topology_info.circuit_info_loader import (
     load_circuit_info,
 )
 from taac.runner.cli_parser import parse_args
+from taac.runner.constants_loader import CONSTANTS_PATH_ENV
 from taac.runner.oss_exception_classifier import (
     classify_exception,
 )
@@ -60,6 +61,13 @@ from taac.runner.testbed_topology import (
     LinkType,
 )
 from taac.test_as_a_config.thrift_types import Endpoint
+from taac.utils.run_artifacts import (
+    ArtifactKind,
+    get_artifacts,
+    is_dump_disabled,
+    read_artifact_lines,
+    select_artifacts,
+)
 
 
 def _classify_link(
@@ -75,6 +83,51 @@ def _classify_link(
     if a_host.lower() in dut_set and z_host.lower() in dut_set:
         return LinkType.DUT
     return LinkType.UNKNOWN
+
+
+def dump_run_artifacts(logger: logging.Logger, selector: str) -> None:
+    """Emit declared run artifacts inline into the run log.
+
+    Producers write these to a bare file handle outside the logging framework
+    (e.g. ``BaseCollector._run_loop``), so nothing else surfaces them. Called
+    after the result summary and outside any ``suppress_console_logs`` scope,
+    so the rows land on the same stream as the rest of the run.
+    """
+    if is_dump_disabled(selector):
+        return
+
+    artifacts = select_artifacts(selector)
+    if not artifacts:
+        # The artifact set is only knowable after a run, so a selector cannot
+        # be validated upfront; a near-miss is far more likely a typo than an
+        # empty run, and listing what was available is the only discovery
+        # mechanism there is. Never fatal - this is diagnostic output.
+        known = sorted({a.label for a in get_artifacts()})
+        logger.warning(
+            f"--dump-artifacts={selector!r} matched no artifacts. "
+            f"Available labels: {known or 'none declared'}"
+        )
+        return
+
+    logger.info(f"\n{'=' * 70}")
+    logger.info(f"RUN ARTIFACTS ({len(artifacts)} matched: {selector})")
+    logger.info(f"{'=' * 70}")
+    for artifact in artifacts:
+        header = f"----- {artifact.label} ({artifact.path}) -----"
+        if artifact.kind is ArtifactKind.BINARY:
+            logger.info(f"\n{header} [binary, not inlined]")
+            continue
+        try:
+            lines, omitted = read_artifact_lines(artifact)
+        except OSError as e:
+            # A vanished or unreadable artifact must not turn a passing run
+            # into a failing one.
+            logger.warning(f"Could not read artifact {artifact.path}: {e}")
+            continue
+        if omitted:
+            header += f" [showing last {len(lines)} of {len(lines) + omitted} lines]"
+        logger.info("\n" + header + "\n" + "\n".join(lines))
+    logger.info(f"{'=' * 70}\n")
 
 
 def build_testbed_topology(duts: List[str]) -> ConfigTopology:
@@ -125,7 +178,11 @@ def build_testbed_topology(duts: List[str]) -> ConfigTopology:
     return ConfigTopology(links=tuple(links))
 
 
-def load_test_config(config_path: str, topology: Optional[ConfigTopology] = None):
+def load_test_config(
+    config_path: str,
+    topology: Optional[ConfigTopology] = None,
+    attr_name: Optional[str] = None,
+):
     """
     Load a test configuration from a Python file.
 
@@ -136,12 +193,19 @@ def load_test_config(config_path: str, topology: Optional[ConfigTopology] = None
     Args:
         config_path: Path to the Python test config file
         topology: Optional ConfigTopology to pass to callable configs
+        attr_name: If given, load only this named attribute from the
+            module (skipping the default 4-name fallback). Use for
+            modules that expose multiple named TestConfig constants.
+            When omitted,
+            the loader falls back to
+            ``test_config`` / ``TEST_CONFIG`` / ``config`` / ``CONFIG``.
 
     Returns:
         TestConfig object
 
     Raises:
-        OSSConfigError: If the config cannot be loaded
+        OSSConfigError: If the config cannot be loaded, or if
+            ``attr_name`` is given but not defined in the module.
     """
     try:
         # Convert to Path object
@@ -190,9 +254,19 @@ def load_test_config(config_path: str, topology: Optional[ConfigTopology] = None
         )
 
         _testconfig_classes = (_taac_thrift_types.TestConfig, _taac_types.TestConfig)
-        for attr_name in ["test_config", "TEST_CONFIG", "config", "CONFIG"]:
-            if hasattr(module, attr_name):
-                config = getattr(module, attr_name)
+        # A user-supplied ``--test-name`` skips the default fallback list
+        # entirely, so a typo doesn't silently fall through to a
+        # coincidentally-named ``test_config`` / ``CONFIG`` symbol from
+        # some other origin (a helper, an alias, an unrelated constant).
+        # The distinct error message below makes typos easy to spot.
+        if attr_name is not None:
+            candidate_attrs = [attr_name]
+        else:
+            candidate_attrs = ["test_config", "TEST_CONFIG", "config", "CONFIG"]
+
+        for candidate in candidate_attrs:
+            if hasattr(module, candidate):
+                config = getattr(module, candidate)
                 if callable(config) and not isinstance(config, _testconfig_classes):
                     if getattr(config, "_accepts_topology", False):
                         config = config(topology=topology)
@@ -200,10 +274,22 @@ def load_test_config(config_path: str, topology: Optional[ConfigTopology] = None
                         config = config()
                 return config
 
-        # If no config found, raise error
+        # If no config found, raise error. Different messages for the two
+        # cases: a bad ``--test-name`` should not be lumped in with "the
+        # module doesn't declare a test config at all" — the fix is
+        # different (rename the flag vs add a symbol).
+        if attr_name is not None:
+            raise OSSConfigError(
+                f"Test config attribute '{attr_name}' not found in "
+                f"{config_path}. Check --test-name spelling, or omit it to "
+                f"fall back to the default lookup order (test_config / "
+                f"TEST_CONFIG / config / CONFIG)."
+            )
         raise OSSConfigError(
             f"No test config found in {config_path}. "
-            f"Expected one of: test_config, TEST_CONFIG, config, CONFIG"
+            f"Expected one of: test_config, TEST_CONFIG, config, CONFIG. "
+            f"For modules with multiple named TestConfig constants, pass "
+            f"--test-name <NAME>."
         )
 
     except OSSConfigError:
@@ -264,6 +350,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         os.environ["TAAC_DEVICE_INFO_PATH"] = os.path.abspath(args.device_info_csv)
     if args.circuit_info_csv:
         os.environ["TAAC_CIRCUIT_INFO_PATH"] = os.path.abspath(args.circuit_info_csv)
+    if args.constants:
+        os.environ[CONSTANTS_PATH_ENV] = os.path.abspath(args.constants)
     # Env var rather than threading the value down: the validation step that
     # honours it sits several layers below the runner, and this matches how the
     # CSV path flags above are plumbed.
@@ -280,11 +368,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=handlers,
     )
+    # asyncssh / paramiko emit an INFO line per SSH connect + command; with
+    # the many short-lived sessions a run opens this drowns out the actual
+    # test output. Keep them quiet unless we're genuinely at DEBUG.
+    if log_level > logging.DEBUG:
+        for _noisy in ("asyncssh", "paramiko", "paramiko.transport"):
+            logging.getLogger(_noisy).setLevel(logging.WARNING)
     logger = logging.getLogger("taac.oss")
 
     logger.info("=" * 60)
     logger.info("OSS TAAC Test Runner")
     logger.info("=" * 60)
+    logger.info(f"Image commit: {os.environ.get('TAAC_GIT_SHA', 'unknown')}")
     logger.info(f"Test Configs: {args.test_configs}")
     logger.info(f"DUTs: {args.duts}")
     if args.log_file:
@@ -308,7 +403,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         configs = []
         for config_path in args.test_configs:
             logger.info(f"Loading test config from: {config_path}")
-            config = load_test_config(config_path, topology=topology)
+            config = load_test_config(
+                config_path, topology=topology, attr_name=args.test_name
+            )
             configs.append((config_path, config))
 
         # Process each test config
@@ -506,6 +603,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # Print summary
         aggregator.print_summary(logger)
+
+        # The flag wins when passed; the env var lets a wrapper enable
+        # dumping by default without rewriting per-run command lines (same
+        # plumbing as --skip-health-checks / TAAC_SKIP_HEALTH_CHECKS).
+        dump_selector = args.dump_artifacts or os.environ.get(
+            "TAAC_DUMP_ARTIFACTS", ""
+        )
+        if dump_selector:
+            dump_run_artifacts(logger, dump_selector)
 
         # Write output files based on format
         if args.output_format == "json" or args.json_output:

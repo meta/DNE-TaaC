@@ -9,6 +9,8 @@ Defines the command-line interface for the OSS TAAC entry point.
 import argparse
 from typing import List, Optional
 
+from taac.runner.constants_loader import CONSTANTS_PATH_ENV
+
 
 def create_argument_parser() -> argparse.ArgumentParser:
     """
@@ -30,6 +32,17 @@ def create_argument_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path(s) to Python test config files",
     )
+    parser.add_argument(
+        "--test-name",
+        dest="test_name",
+        help=(
+            "Name of the TestConfig attribute to pick from the loaded "
+            "module. Use for modules that expose multiple named "
+            "TestConfig constants. When omitted, the runner falls back to the default "
+            "lookup order: test_config, TEST_CONFIG, config, CONFIG. "
+            "Applies to every --test-configs path."
+        ),
+    )
 
     # Topology fixtures. Exposed as CLI flags rather than env vars so a user
     # running the entry point against a live environment doesn't need to
@@ -50,6 +63,16 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Path to a circuit_info.csv file. Sets TAAC_CIRCUIT_INFO_PATH "
             "so the OSS topology loader picks up your environment's links."
+        ),
+    )
+    parser.add_argument(
+        "--constants",
+        help=(
+            f"Path to a constants YAML file. Sets {CONSTANTS_PATH_ENV}. Only "
+            "affects constants modules that opt in by calling "
+            "taac.runner.constants_loader.apply_overlay(globals()) after "
+            "their defaults; those take the file's values, every other "
+            "module is unchanged."
         ),
     )
 
@@ -174,6 +197,25 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--debug",
         action="store_true",
         help="Enable debug logging (shortcut for --log-level DEBUG)",
+    )
+    parser.add_argument(
+        "--dump-artifacts",
+        nargs="?",
+        const="text",
+        default=None,
+        metavar="SELECTOR",
+        help=(
+            "Dump run artifacts — files written outside the log stream, "
+            "such as collector poll logs — inline after the result "
+            "summary. Only artifacts a producer has declared with "
+            "taac.utils.run_artifacts.declare_artifact() are dumped; a "
+            "selector that matches none logs the available labels. Bare --dump-artifacts dumps every text artifact; pass "
+            "a comma-separated selector of labels and/or kinds to narrow, "
+            "e.g. --dump-artifacts cpu_utilization,memory_utilization or "
+            "--dump-artifacts 'hrt_*'. 'all' additionally reports binary "
+            "artifacts as path-only references, 'none' disables. Falls back "
+            "to TAAC_DUMP_ARTIFACTS when unset. Default: no dump."
+        ),
     )
 
     # Output options

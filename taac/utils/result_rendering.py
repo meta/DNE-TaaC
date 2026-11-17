@@ -128,6 +128,11 @@ def message_with_url(message: t.Optional[str], message_url: t.Optional[str]) -> 
     return f"{message} (full message: {message_url})"
 
 
+def hostnames_cell(hostnames: t.Optional[t.Sequence[str]]) -> str:
+    """Comma-joined device column; thrift-python's List is not a ``list``."""
+    return ", ".join(hostnames or ())
+
+
 def _message_cell(result: trr_types.CheckResult) -> str:
     """The MESSAGE column: wrapped text, with any link on its own line.
 

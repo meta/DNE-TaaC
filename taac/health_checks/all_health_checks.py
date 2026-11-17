@@ -140,6 +140,9 @@ from taac.health_checks.device_health_checks.port_speed_health_check import (
 from taac.health_checks.device_health_checks.port_state_health_check import (
     PortStateHealthCheck,
 )
+from taac.health_checks.device_health_checks.port_transceiver_health_check import (
+    PortTransceiverHealthCheck,
+)
 from taac.health_checks.device_health_checks.prefix_limit_health_check import (
     PrefixLimitHealthCheck,
 )
@@ -157,6 +160,9 @@ from taac.health_checks.device_health_checks.system_cpu_load_average_health_chec
 )
 from taac.health_checks.device_health_checks.systemctl_active_state_health_check import (
     SystemctlActiveStateHealthCheck,
+)
+from taac.health_checks.device_health_checks.unclean_exit_health_check import (
+    UncleanExitHealthCheck,
 )
 from taac.health_checks.device_health_checks.wedge_agent_configured_health_check import (
     WedgeAgentConfiguredHealthCheck,
@@ -242,13 +248,14 @@ OSS_HEALTH_CHECKS: t.List[HealthCheck] = [
     # DsfPfcHealthCheck,  # neteng.test_infra.dne.taac dep, excluded in OSS
     CoreDumpsHealthCheck,
     PortStateHealthCheck,
+    PortTransceiverHealthCheck,
     PrefixLimitHealthCheck,
     BgpRibFibConsistencyHealthCheck,
     LldpHealthCheck,
     IxiaTrafficRateHealthCheck,
     PfcWdHealthCheck,
     CpuQueueHealthCheck,
-    # UncleanExitHealthCheck,  # ODS-dependent (taac.internal), excluded in OSS
+    UncleanExitHealthCheck,
     CpuUtilizationHealthCheck,
     MemoryUtilizationHealthCheck,
     BgpSessionEstablishedHealthCheck,

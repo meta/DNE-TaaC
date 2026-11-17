@@ -36,6 +36,15 @@ from taac.utils.health_check_utils import ip_ntop
 from taac.health_check.health_check import types as hc_types
 
 
+def _requested_peer_addresses(check_params: t.Mapping[str, t.Any]) -> t.List[str]:
+    """Exact peer addresses to check; `peer_addresses` is an older alias."""
+    return list(
+        check_params.get("peer_addresses_to_check")
+        or check_params.get("peer_addresses")
+        or []
+    )
+
+
 class BgpRouteCountVerificationHealthCheck(
     AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn]
 ):
@@ -143,13 +152,20 @@ class BgpRouteCountVerificationHealthCheck(
         descriptions_to_ignore = check_params.get("descriptions_to_ignore", [])
         descriptions_to_check = check_params.get("descriptions_to_check", [])
         exact_peer_group_names = check_params.get("exact_peer_group_names", [])
-        requested_peer_addresses = check_params.get("peer_addresses_to_check", [])
+        # Exact peer addresses to count. Unlike exact_peer_group_names it needs
+        # no running-config read (the OSS driver has no bgp() helper), and it
+        # can name a subset of a peer group. `peer_addresses` is an older
+        # alias of `peer_addresses_to_check`; both select the same thing.
+        requested_peer_addresses = _requested_peer_addresses(check_params)
         direction = check_params.get("direction", "received")
         policy_type = check_params.get("policy_type", "pre_policy")
         expected_count = check_params.get("expected_count")
         expected_count_histogram_by_afi = None
         min_count = check_params.get("min_count")
         max_count = check_params.get("max_count")
+        # Floor on the sum across peers rather than per peer: report-only runs
+        # record every peer's count and fail only when nothing was received.
+        min_total_count = check_params.get("min_total_count")
 
         try:
             self._validate_peer_selectors(
@@ -226,7 +242,8 @@ class BgpRouteCountVerificationHealthCheck(
                 )
             if exact_peer_group_names and not peers_to_check:
                 raise RuntimeError(
-                    "No established peers matched the selected exact peer groups"
+                    "No established peers matched the selected exact peer groups "
+                    "or peer_addresses"
                 )
 
             self.logger.info(
@@ -284,6 +301,13 @@ class BgpRouteCountVerificationHealthCheck(
                 for result in results:
                     validation_errors.extend(result.errors)
 
+            total_routes = sum(peer_route_counts.values())
+            counts_summary = self._format_counts(peer_route_counts, total_routes)
+            if min_total_count is not None and total_routes < int(min_total_count):
+                validation_errors.append(
+                    f"total {total_routes} routes, below minimum {int(min_total_count)}"
+                )
+
             # Build result message
             if not validation_errors:
                 # All peers passed validation
@@ -295,7 +319,10 @@ class BgpRouteCountVerificationHealthCheck(
                         f"({direction}, {policy_type})"
                     )
                 elif expected_count is None and min_count is None and max_count is None:
-                    message = f"BGP route count verification on {hostname} ({direction}, {policy_type})"
+                    message = (
+                        f"BGP route count verification on {hostname} "
+                        f"({direction}, {policy_type}): {counts_summary}"
+                    )
                 else:
                     criteria = []
                     if expected_count is not None:
@@ -307,7 +334,8 @@ class BgpRouteCountVerificationHealthCheck(
 
                     message = (
                         f"BGP route count verification PASSED on {hostname}: "
-                        f"all peers meet criteria ({', '.join(criteria)}) ({direction}, {policy_type})"
+                        f"all peers meet criteria ({', '.join(criteria)}) ({direction}, {policy_type}): "
+                        f"{counts_summary}"
                     )
 
                 return hc_types.HealthCheckResult(
@@ -324,7 +352,10 @@ class BgpRouteCountVerificationHealthCheck(
                         f"\n  ... and {len(validation_errors) - 10} more errors"
                     )
 
-                message = f"BGP route count verification FAILED on {hostname} ({direction}, {policy_type}):\n  {error_summary}"
+                message = (
+                    f"BGP route count verification FAILED on {hostname} "
+                    f"({direction}, {policy_type}):\n  {error_summary}\n  {counts_summary}"
+                )
 
                 return hc_types.HealthCheckResult(
                     status=hc_types.HealthCheckStatus.FAIL,
@@ -337,6 +368,18 @@ class BgpRouteCountVerificationHealthCheck(
                 status=hc_types.HealthCheckStatus.FAIL,
                 message=f"Failed to verify BGP route counts on {hostname}: {str(e)}",
             )
+
+    # Enough for every IXIA mimic peer plus the fabric in a multi-DUT topology.
+    _MAX_PEERS_IN_MESSAGE = 32
+
+    @classmethod
+    def _format_counts(cls, peer_route_counts: t.Dict[str, int], total: int) -> str:
+        shown = sorted(peer_route_counts.items())[: cls._MAX_PEERS_IN_MESSAGE]
+        per_peer = ", ".join(f"{peer}={count}" for peer, count in shown)
+        more = len(peer_route_counts) - len(shown)
+        if more > 0:
+            per_peer += f", ... and {more} more"
+        return f"{len(peer_route_counts)} peers, {total} routes; per peer: {per_peer}"
 
     async def _verify_rib_prefix_and_path_counts(
         self,
@@ -518,7 +561,7 @@ class BgpRouteCountVerificationHealthCheck(
         descriptions_to_check = check_params.get("descriptions_to_check", [])
         descriptions_to_ignore = check_params.get("descriptions_to_ignore", [])
         exact_peer_group_names = check_params.get("exact_peer_group_names", [])
-        requested_peer_addresses = check_params.get("peer_addresses_to_check", [])
+        requested_peer_addresses = _requested_peer_addresses(check_params)
 
         try:
             self._validate_peer_selectors(

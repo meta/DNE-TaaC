@@ -43,7 +43,7 @@ class EcmpGroupAndMemberCountHealthCheck(
             self.logger.warning(
                 f"NEXT_HOP_GROUP dump returned no groups "
                 f"(attempt {attempt}/{self._EMPTY_DUMP_RETRIES}, "
-                f"{len(res)} bytes); retrying"
+                f"{len(res)} bytes, head {res[:200]!r}); retrying"
             )
             if attempt < self._EMPTY_DUMP_RETRIES:
                 await asyncio.sleep(self._EMPTY_DUMP_RETRY_DELAY_S)
@@ -85,13 +85,18 @@ class EcmpGroupAndMemberCountHealthCheck(
                 message=f"{', '.join([str(check) for check in failed_checks])}",
             )
 
+        group_count, member_count = results
         return hc_types.HealthCheckResult(
             status=hc_types.HealthCheckStatus.PASS,
+            message=(
+                f"{group_count} ECMP groups (max {ecmp_group_threshold}), "
+                f"{member_count} members (max {ecmp_member_threshold})"
+            ),
         )
 
     async def async_verify_ecmp_nexthop_group_count(
         self, max_count: int, allow_parent_child_mismatch: bool = False
-    ) -> None:
+    ) -> int:
         # currently only works for fboss
         res = await self._async_dump_next_hop_groups()
         parent_nhop_group_id_set = set()
@@ -137,11 +142,12 @@ class EcmpGroupAndMemberCountHealthCheck(
                 # pyrefly: ignore [missing-attribute]
                 f"The number of ecmp groups on {self.driver.hostname} exceeded the defined threshold {max_count}"
             )
+        return len(group_to_mbr_intf_map)
 
     async def async_verify_ecmp_nexthop_group_member_count(
         self,
         max_count: int,
-    ) -> None:
+    ) -> int:
         # Step 1: Determine the minimum length of subnets needed
 
         # Run the command on the shell and get the result
@@ -164,6 +170,7 @@ class EcmpGroupAndMemberCountHealthCheck(
             raise ValueError(
                 f"Current count ({current_count}) is greater than or equal to the requested scale ({max_count})"
             )
+        return current_count
 
     async def _run_arista(
         self,

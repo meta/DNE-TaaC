@@ -44,12 +44,24 @@ class CreateSystemctlActiveStateCheckTest(unittest.TestCase):
             self._params(check), {"expected_restarted_services": ["fboss_sw_agent"]}
         )
 
-    def test_expected_restarted_services_rejects_thrift_services_variant(self):
-        with self.assertRaises(ValueError):
-            create_systemctl_active_state_check(
-                services=[hc_types.Service.BGPD],
-                expected_restarted_services=["bgpd"],
-            )
+    def test_expected_restarted_services_combines_with_thrift_services(self):
+        # The monitored set rides in input_json and the allowlist in
+        # check_params, and SystemctlActiveStateHealthCheck._run reads them
+        # from those two places independently -- `services` is in fact the
+        # only carrier it reads for the monitored set.
+        check = create_systemctl_active_state_check(
+            services=[hc_types.Service.BGPD],
+            expected_restarted_services=["bgpd"],
+        )
+        self.assertEqual(json.loads(check.input_json)["services"], [2])
+        self.assertEqual(
+            self._params(check), {"expected_restarted_services": ["bgpd"]}
+        )
+
+    def test_thrift_services_alone_carries_no_params(self):
+        check = create_systemctl_active_state_check(services=[hc_types.Service.BGPD])
+        self.assertEqual(json.loads(check.input_json)["services"], [2])
+        self.assertIsNone(check.check_params)
 
     def test_services_and_services_json_are_mutually_exclusive(self):
         with self.assertRaises(ValueError):

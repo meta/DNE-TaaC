@@ -62,6 +62,15 @@ class LldpHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn]):
                 disabled_interface_names.add(disabled_interface.interface_name)
             if disabled_interface.neighbor_switch_name == obj.name:
                 disabled_interface_names.add(disabled_interface.neighbor_interface_name)
+        # An entry that names only one end: this device's end of that link, as the
+        # topology knows it, has no neighbor either.
+        for interface in obj.interfaces:
+            if any(
+                d.switch_name == interface.neighbor_switch_name
+                and d.interface_name == interface.neighbor_interface_name
+                for d in disabled_interfaces
+            ):
+                disabled_interface_names.add(interface.interface_name)
         enabled_interfaces = []
         for interface in obj.interfaces:
             if (
@@ -150,7 +159,12 @@ class LldpHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn]):
     ) -> hc_types.HealthCheckResult:
         return await self._async_validate_or_skip(obj, check_params)
 
-    @async_retryable(retries=3, sleep_time=2, exceptions=(Exception,))
+    # FBOSS paces LLDP sends across its 5 s interval, so a port's first frame
+    # can arrive up to two intervals after link-up. 9 tries 2 s apart give a
+    # 16 s window.
+    # The 24 s cap stops slow failing reads (agent down, thrift retries) from
+    # running all 9 tries.
+    @async_retryable(retries=9, sleep_time=2, max_duration=24, exceptions=(Exception,))
     async def async_validate_lldp_neighbors(
         self,
         enabled_interfaces: t.List[taac_types.TestInterface],

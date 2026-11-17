@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # pyre-unsafe
+import asyncio
+import time
 import typing as t
 from collections import namedtuple
 
@@ -20,6 +22,15 @@ BgpSummaryData = namedtuple(
 )
 
 BgpPeerData = namedtuple("BgpPeerData", ["prefixes_sent", "prefixes_received"])
+
+# Right after peers establish, bgpd is still sending its initial advertisements,
+# so a pre-snapshot taken then records partial sent counts and the post-snapshot
+# reports the finished advertisement as a change. The pre-snapshot is re-read
+# until two consecutive reads match. check_params "pre_snapshot_settle_timeout_s"
+# (wall clock, reads included; 0 takes a single read) and
+# "pre_snapshot_settle_interval_s" override the defaults.
+_PRE_SNAPSHOT_SETTLE_INTERVAL_SECONDS = 10
+_PRE_SNAPSHOT_SETTLE_TIMEOUT_SECONDS = 300
 
 
 def format_ip_prefix(prefix: TIpPrefix) -> str:
@@ -77,15 +88,31 @@ class BgpPeersHealthCheck(
         parent_peers_to_ignore = check_params.get("parent_peers_to_ignore", [])
         parent_prefixes_to_ignore = check_params.get("parent_prefixes_to_ignore", [])
         verbose = check_params.get("verbose", False)
-        bgp_summary_data = await self.get_bgp_summary_data(
-            obj,
-            parent_peers_to_ignore,
-            parent_prefixes_to_ignore,
-            verbose,
-            fail_on_collection_error=check_params.get(
-                "fail_on_collection_error", False
-            ),
+        fail_on_collection_error = check_params.get("fail_on_collection_error", False)
+        settle_timeout_s = check_params.get(
+            "pre_snapshot_settle_timeout_s", _PRE_SNAPSHOT_SETTLE_TIMEOUT_SECONDS
         )
+        settle_interval_s = check_params.get(
+            "pre_snapshot_settle_interval_s", _PRE_SNAPSHOT_SETTLE_INTERVAL_SECONDS
+        )
+        if settle_timeout_s <= 0:
+            bgp_summary_data = await self.get_bgp_summary_data(
+                obj,
+                parent_peers_to_ignore,
+                parent_prefixes_to_ignore,
+                verbose,
+                fail_on_collection_error=fail_on_collection_error,
+            )
+        else:
+            bgp_summary_data = await self._get_settled_bgp_summary_data(
+                obj,
+                parent_peers_to_ignore,
+                parent_prefixes_to_ignore,
+                verbose,
+                settle_timeout_s,
+                settle_interval_s,
+                fail_on_collection_error=fail_on_collection_error,
+            )
         self.logger.info(
             f"Pre-snapshot BGP data for {obj.name}: "
             f"Total paths received: {bgp_summary_data.total_paths_received}, "
@@ -93,6 +120,76 @@ class BgpPeersHealthCheck(
             f"Number of peers: {len(bgp_summary_data.peer_data)}"
         )
         return Snapshot(data=bgp_summary_data, timestamp=timestamp)
+
+    async def _get_settled_bgp_summary_data(
+        self,
+        obj: TestDevice,
+        parent_peers_to_ignore: t.List[str],
+        parent_prefixes_to_ignore: t.List[str],
+        verbose: bool,
+        timeout_s: float,
+        interval_s: float,
+        fail_on_collection_error: bool = False,
+    ) -> BgpSummaryData:
+        """Re-read the BGP summary until two consecutive reads match.
+
+        A read that fails is "not settled": it neither matches nor replaces the
+        last successful read, and the wait goes on rather than raising into the
+        snapshot's retry wrapper. With fail_on_collection_error, a failed
+        per-peer RIB read counts as a failed read instead of zero routes.
+        """
+        start = time.monotonic()
+        deadline = start + timeout_s
+        previous: t.Optional[BgpSummaryData] = None
+        while True:
+            try:
+                latest = await self.get_bgp_summary_data(
+                    obj,
+                    parent_peers_to_ignore,
+                    parent_prefixes_to_ignore,
+                    verbose,
+                    fail_on_collection_error=fail_on_collection_error,
+                )
+            except Exception as e:
+                latest = None
+                self.logger.warning(
+                    f"{obj.name}: BGP summary read failed after "
+                    f"{time.monotonic() - start:.0f}s ({e!r}); re-reading"
+                )
+            if latest is not None:
+                if latest == previous:
+                    return latest
+                if previous is not None:
+                    self.logger.info(
+                        f"{obj.name}: BGP summary still changing after "
+                        f"{time.monotonic() - start:.0f}s (paths sent "
+                        f"{previous.total_paths_sent} -> {latest.total_paths_sent}, "
+                        f"received {previous.total_paths_received} -> "
+                        f"{latest.total_paths_received}); re-reading"
+                    )
+                previous = latest
+            if time.monotonic() + interval_s > deadline:
+                break
+            await asyncio.sleep(interval_s)
+
+        elapsed_s = time.monotonic() - start
+        if previous is not None:
+            self.logger.warning(
+                f"{obj.name}: BGP summary did not settle within {elapsed_s:.0f}s; "
+                f"using the last successful read as the pre-snapshot"
+            )
+            return previous
+        self.logger.warning(
+            f"{obj.name}: no BGP summary read succeeded within {elapsed_s:.0f}s; "
+            f"taking one more read"
+        )
+        return await self.get_bgp_summary_data(
+            obj,
+            parent_peers_to_ignore,
+            parent_prefixes_to_ignore,
+            verbose,
+            fail_on_collection_error=fail_on_collection_error,
+        )
 
     async def capture_post_snapshot(
         self,

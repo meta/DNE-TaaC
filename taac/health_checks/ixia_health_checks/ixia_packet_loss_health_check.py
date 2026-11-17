@@ -45,6 +45,24 @@ class IxiaPacketLossHealthCheck(
                 message="Traffic item tracking is not enabled for any running traffic items",
             )
 
+        # Optional recovery allowance, separate from sleep_time's measurement
+        # window. Keep traffic running, then discard recovery losses only when
+        # the caller explicitly requests clear_traffic_stats. Default callers
+        # continue to measure without any recovery allowance.
+        settle_time = max(0.0, float(check_params.get("settle_time_seconds", 0)))
+        if settle_time and not input.clear_traffic_stats:
+            # The settle only discards recovery losses because clearing resets
+            # the counters afterwards. Without clear_traffic_stats it just
+            # delays the check while the losses it was meant to absorb stay in
+            # the window.
+            self.logger.warning(
+                "settle_time_seconds=%s has no effect without "
+                "clear_traffic_stats: the settle window is still measured",
+                settle_time,
+            )
+        if settle_time:
+            await asyncio.sleep(settle_time)
+
         if input.clear_traffic_stats:
             obj.clear_traffic_stats()
             # Counters now read zero, so the measurement window opens HERE, not
@@ -63,7 +81,9 @@ class IxiaPacketLossHealthCheck(
             time.time() - max(window_start, obj.get_traffic_start_time())
             < input.sleep_time
         ):
-            time.sleep(0.1)
+            # await, not time.sleep: this coroutine shares the loop with the
+            # periodic collectors, and blocking it stalls their sampling.
+            await asyncio.sleep(0.1)
         since_time = time.time()
         # this is necessary to allow in-flight traffic to arrive at the destination
         obj.stop_traffic()
@@ -100,6 +120,11 @@ class IxiaPacketLossHealthCheck(
             violations.extend(
                 self.verify_packet_loss_threshold(latest_stats, threshold)
             )
+        # A loss threshold holds trivially for an item that sent nothing, so
+        # these items must also show frames sent and received in the window.
+        required = sorted(set(check_params.get("require_frames_items", [])) - skip_items)
+        missing_identifiers.extend(sorted(set(required) - all_identifiers))
+        violations.extend(self.verify_frames_flowed(latest_stats, required))
         violations_dict = [try_thrift_to_dict(violation) for violation in violations]
         if violations or missing_identifiers:
             result = await self._failure_result(
@@ -260,6 +285,31 @@ class IxiaPacketLossHealthCheck(
                             threshold=threshold,
                         )
                     )
+        return violations
+
+    def verify_frames_flowed(
+        self,
+        latest_stats: t.List[t.Dict[str, t.Any]],
+        names: t.List[str],
+    ) -> t.List[hc_types.PacketLossViolation]:
+        violations: t.List[hc_types.PacketLossViolation] = []
+        for statistic in latest_stats:
+            if statistic["identifier"] not in names:
+                continue
+            tx, rx = statistic.get("tx_frames"), statistic.get("rx_frames")
+            self.logger.info(
+                f"For {statistic['identifier']}, frames in the window - tx: {tx} rx: {rx}"
+            )
+            if not tx or not rx:
+                violations.append(
+                    hc_types.PacketLossViolation(
+                        name=statistic["identifier"],
+                        str_value=f"no traffic flowed (tx_frames={tx}, rx_frames={rx})",
+                        threshold=hc_types.PacketLossThreshold(
+                            names=[statistic["identifier"]]
+                        ),
+                    )
+                )
         return violations
 
     def _default_input(self, obj: Ixia) -> hc_types.IxiaPacketLossHealthCheckIn:

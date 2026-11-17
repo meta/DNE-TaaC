@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # pyre-unsafe
+import asyncio
+import time
 import typing as t
 
 from taac.constants import TestDevice
@@ -10,6 +12,20 @@ from taac.health_checks.abstract_snapshot_health_check import (
 from taac.health_checks.constants import Snapshot
 from taac.utils.common import async_everpaste_str
 from taac.health_check.health_check import types as hc_types
+
+# The agent fills a queue's counters from its cached stats, which are empty
+# until the first stats collection after an agent restart and hold explicit
+# zeros after it. A queue missing from the pre-snapshot would be scored as a
+# zero baseline, so the pre-snapshot is re-read until every configured queue is
+# reported.
+_PRE_SNAPSHOT_RETRY_ATTEMPTS = 15
+_PRE_SNAPSHOT_RETRY_DELAY_SECONDS = 2
+
+
+def _counters_reported(cpu_port_stats: t.Any) -> bool:
+    reported = set(cpu_port_stats.portStats_.queueOutPackets_)
+    configured = set(cpu_port_stats.queueToName_ or {})
+    return bool(reported) and configured <= reported
 
 
 class CpuQueueHealthCheck(
@@ -27,9 +43,30 @@ class CpuQueueHealthCheck(
     ) -> Snapshot:
         # pyrefly: ignore [missing-attribute]
         cpu_port_stats = await self.driver.async_get_cpu_port_stats()
+        waited_secs = 0
+        for attempt in range(1, _PRE_SNAPSHOT_RETRY_ATTEMPTS + 1):
+            if _counters_reported(cpu_port_stats):
+                break
+            self.logger.warning(
+                f"{obj.name}: CPU queue counters not fully reported "
+                f"(attempt {attempt}/{_PRE_SNAPSHOT_RETRY_ATTEMPTS}); retrying in "
+                f"{_PRE_SNAPSHOT_RETRY_DELAY_SECONDS}s"
+            )
+            await asyncio.sleep(_PRE_SNAPSHOT_RETRY_DELAY_SECONDS)
+            waited_secs += _PRE_SNAPSHOT_RETRY_DELAY_SECONDS
+            # pyrefly: ignore [missing-attribute]
+            cpu_port_stats = await self.driver.async_get_cpu_port_stats()
+        if not _counters_reported(cpu_port_stats):
+            self.logger.warning(
+                f"{obj.name}: CPU queue counters still not fully reported after "
+                f"{waited_secs}s; queues missing from the pre-snapshot read as zero"
+            )
+        # Stamp the read, not the checkpoint `timestamp`: checks at a checkpoint
+        # run one after another, so waiting here or in an earlier check would
+        # otherwise stretch the window.
         return Snapshot(
             data=cpu_port_stats,
-            timestamp=timestamp,
+            timestamp=int(time.time()),
         )
 
     async def capture_post_snapshot(
@@ -41,9 +78,10 @@ class CpuQueueHealthCheck(
     ) -> Snapshot:
         # pyrefly: ignore [missing-attribute]
         cpu_port_stats = await self.driver.async_get_cpu_port_stats()
+        # Stamped at the read, like the pre-snapshot.
         return Snapshot(
             data=cpu_port_stats,
-            timestamp=timestamp,
+            timestamp=int(time.time()),
         )
 
     async def compare_snapshots(
@@ -158,7 +196,7 @@ class CpuQueueHealthCheck(
         for queue in input.inactive_queues or []:
             pre_out_packets = pre_snapshot_out_packets[queue]
             post_out_packets = post_snapshot_out_packets[queue]
-            # FBOSS omits queues with no packets from the sparse counter map.
+            # Not reported in either snapshot: no counters, so nothing to score.
             if pre_out_packets is None and post_out_packets is None:
                 continue
             if pre_out_packets is None and post_out_packets is not None:
@@ -184,8 +222,8 @@ class CpuQueueHealthCheck(
             pre_discards = pre_snapshot_discard_packets[queue]
             post_discards = post_snapshot_discard_packets[queue]
             if pre_discards is None and post_discards is None:
-                # Queue counters are sparse. Absence in both snapshots means
-                # zero discards throughout the observation window.
+                # Not reported in either snapshot: no counters, so nothing to
+                # score.
                 continue
             if pre_discards is None and post_discards is not None:
                 if post_discards > 0:

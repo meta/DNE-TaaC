@@ -566,7 +566,13 @@ def analyze(
     # both Run 13 false-FAILs (05/08/10/11/23 — Silver present) and
     # Run 14 false-FAIL (CASE_04 spillover — 1 ARS-PPR group under
     # `total_dlb`).
-    if snapshot_count is not None and snapshot_match is False:
+    # The comparison assumes the ARS registry scopes the snapshot to the
+    # DLB-managed pool. A profile that asserts no DLB ceiling (empty
+    # ``expected_totals``) is a DUT with no flowlet/DLB config, where the
+    # snapshot is simply every ECMP group on the box, which can far exceed
+    # the Gold total. Render the block, but only fail on it when DLB is
+    # actually being asserted.
+    if snapshot_count is not None and snapshot_match is False and expected_totals:
         return _make_result(
             False,
             f"Snapshot mismatch: ECMP-snapshot={snapshot_count} vs "

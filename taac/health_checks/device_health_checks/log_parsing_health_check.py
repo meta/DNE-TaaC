@@ -2,8 +2,10 @@
 
 # pyre-unsafe
 import re
+import shlex
 import time
 import typing as t
+from pathlib import PurePosixPath
 
 from taac.constants import TestDevice
 from taac.health_checks.abstract_health_check import (
@@ -119,7 +121,7 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
     ) -> hc_types.HealthCheckResult:
         start_time = check_params.get("start_time")
         end_time = int(check_params.get("end_time") or time.time())
-        log_file_path = check_params["log_file_path"]
+        log_file_path = await self._first_readable(check_params["log_file_path"])
         if check_params.get("resource_accountant_activation"):
             # FBOSS agent logs carry the device's wall clock, not UTC, so
             # both the remote grep and the exact window need its offset.
@@ -131,15 +133,23 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
             )
             # The driver reads Classic/NSPAWN files and native NetOS journald,
             # while bounding remote output before applying exact timestamps.
-            # pyrefly: ignore [missing-attribute]
-            log_content = await self.driver.async_read_log_file(
-                log_file_path,
-                start_time=int(start_time) if start_time is not None else None,
-                end_time=end_time,
-                grep_pattern=_RESOURCE_ACCOUNTANT_GREP_PATTERN,
-                tail_lines=200,
-                utc_offset_seconds=utc_offset_seconds,
-            )
+            start = int(start_time) if start_time is not None else None
+            chunks = []
+            for path in await self._rotated_archives(log_file_path, start) + [
+                log_file_path
+            ]:
+                chunks.append(
+                    # pyrefly: ignore [missing-attribute]
+                    await self.driver.async_read_log_file(
+                        path,
+                        start_time=start,
+                        end_time=end_time,
+                        grep_pattern=_RESOURCE_ACCOUNTANT_GREP_PATTERN,
+                        tail_lines=200,
+                        utc_offset_seconds=utc_offset_seconds,
+                    )
+                )
+            log_content = "\n".join(chunks)
             matching_lines = find_resource_accountant_rejections(
                 log_content,
                 int(start_time) if start_time is not None else None,
@@ -202,6 +212,47 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
             status=hc_types.HealthCheckStatus.PASS,
             message=f"No lines matched exclude regex {exclude_regex}",
         )
+
+    async def _rotated_archives(
+        self, log_file: str, start_time: int | None
+    ) -> t.List[str]:
+        """Archives of ``log_file`` rotated at or after ``start_time``, oldest first.
+
+        logrotate moves the agent log to ``archive/<name>-YYYYMMDDHHMM.gz``
+        (stamped with its last line) periodically, so a long window's
+        rejections can be in the archives only.
+        """
+        if start_time is None:
+            return []
+        log = PurePosixPath(log_file)
+        archive_dir = log.parent / "archive"
+        name_re = re.compile(rf"{re.escape(log.name)}-(\d{{12}})\.gz")
+        start_stamp = time.strftime("%Y%m%d%H%M", time.localtime(start_time))
+        # pyrefly: ignore [missing-attribute]
+        out = await self.driver.async_run_cmd_on_shell(
+            f"ls -1 {shlex.quote(str(archive_dir))} 2>/dev/null || true"
+        )
+        stamps = sorted(
+            match.group(1)
+            for name in (out if isinstance(out, str) else "").split()
+            if (match := name_re.fullmatch(name)) and match.group(1) >= start_stamp
+        )
+        return [str(archive_dir / f"{log.name}-{stamp}.gz") for stamp in stamps]
+
+    async def _first_readable(self, log_file_path: t.Union[str, t.List[str]]) -> str:
+        """A list names candidates: images differ in which file the agent appends to."""
+        if isinstance(log_file_path, str):
+            return log_file_path
+        paths = " ".join(shlex.quote(path) for path in log_file_path)
+        # pyrefly: ignore [missing-attribute]
+        result = await self.driver.async_run_cmd_on_shell(
+            f"for path in {paths}; do "
+            'if test -r "$path"; then printf "%s\\n" "$path"; break; fi; done'
+        )
+        selected = (result or "").strip()
+        if selected not in log_file_path:
+            raise RuntimeError(f"none of {', '.join(log_file_path)} is readable")
+        return selected
 
     async def _run_arista(
         self,

@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
+import asyncio
 import ipaddress
+import logging
 import math
 import os
 import random
@@ -41,6 +43,7 @@ from taac.health_checks.constants import (
     EOS_CRITICAL_CORE_DUMPS,
     FBOSS_CORE_DUMP_PATH,
     FBOSS_CRITICAL_CORE_DUMPS,
+    FBOSS_OSS_CORE_DUMP_PATH,
 )
 from taac.libs.collectors.registry import get_test_case_start_time
 from taac.utils.driver_factory import async_get_device_driver
@@ -86,8 +89,20 @@ async def _resolve_fb303_port(host: str) -> int:
     (DNX) box exports them on :5931.
     """
     driver = await async_get_device_driver(host)
-    # pyre-fixme[16]: `AbstractSwitch` has no attribute `async_is_multi_switch`.
-    is_multi_switch = await driver.async_is_multi_switch()
+    try:
+        # pyre-fixme[16]: `AbstractSwitch` has no attribute `async_is_multi_switch`.
+        is_multi_switch = await driver.async_is_multi_switch()
+    except Exception as topology_error:
+        # Choosing a counter port cannot damage the DUT, so it degrades instead
+        # of taking every per-queue / buffer / PFC / DSF check down with it: an
+        # unavailable agent RPC is exactly when a health check most needs to
+        # read counters. buffer_watermark_monitor probes both ports for the
+        # same reason.
+        LOGGER.warning(
+            f"{host}: agent topology unavailable ({topology_error}); reading "
+            f"fb303 counters on the monolithic port {FBOSS_FB303_PORT}"
+        )
+        is_multi_switch = False
     return FBOSS_MNPU_FB303_PORT if is_multi_switch else FBOSS_FB303_PORT
 
 
@@ -147,7 +162,7 @@ async def async_get_core_dump_config(hostname: str) -> t.Tuple[str, t.List[str]]
         Tuple of (core_dump_path, critical_processes)
     """
     if TAAC_OSS:
-        return FBOSS_CORE_DUMP_PATH, FBOSS_CRITICAL_CORE_DUMPS
+        return FBOSS_OSS_CORE_DUMP_PATH, FBOSS_CRITICAL_CORE_DUMPS
 
     else:
         from taac.internal.netwhoami_utils import fetch_whoami
@@ -184,12 +199,22 @@ async def async_find_critical_core_dumps(
 
     if TAAC_OSS:
         # OSS mode: always FBOSS, use find command approach
-        core_dump_find_cmd = f"find {core_dump_path} -type f -printf '%T@ %p\n'"
+        # stderr is folded in so an unreadable directory is seen: without it
+        # find prints nothing to stdout and that reads as "no core dumps".
+        core_dump_find_cmd = (
+            f"find {core_dump_path} -type f -printf '%T@ %p\n' 2>&1"
+        )
         core_dump_output = none_throws(
             await driver.async_run_cmd_on_shell(cmd=core_dump_find_cmd)
         )
         critical_core_dumps = {}
         for line in core_dump_output.splitlines() or []:
+            if not line.strip():
+                continue
+            if line.startswith("find:"):
+                raise RuntimeError(
+                    f"Cannot list core dumps in {core_dump_path} on {hostname}: {line}"
+                )
             timestamp, core_file_full_path = line.split(" ")
             timestamp = int(float(timestamp))
             core_filename = core_file_full_path[len(core_dump_path) :]
@@ -379,6 +404,96 @@ def collector_window_start(
     jq_start = check_params.get("start_time") or 0
     anchor = max(float(jq_start), get_test_case_start_time())
     return anchor if anchor else window_end - lookback_sec
+
+
+# A window narrower than this many poll intervals is widened by
+# ``floor_collector_window``. Two, not one: a CPU sample is a delta against the
+# previous poll, so the first poll in any window yields no value.
+MIN_WINDOW_POLL_INTERVALS: float = 2.0
+
+
+def floor_collector_window(
+    window_start: float, window_end: float, poll_interval_sec: float
+) -> float:
+    """Widen a collector query window backwards to at least
+    ``MIN_WINDOW_POLL_INTERVALS`` poll intervals.
+
+    Measurement checks (CPU, memory) report MAX over the window, so a window
+    shorter than the collector's poll interval contains no sample and the check
+    has to SKIP. That is the common case for a precheck: the runner stamps the
+    test-case start immediately before prechecks run, so the default window is
+    near-zero-width and the check never evaluates.
+
+    Mirrors the ODS path's own floor (``_prepare_time_window`` widens a window
+    under 60s), scaled to the collector's poll interval instead.
+
+    Only for checks that need a sample to produce a value. Checks that assert
+    the *absence* of an event (unclean exits, inactive units) must keep the
+    caller's window: widening theirs would attribute the previous playbook's
+    event to this one.
+    """
+    min_window_sec = MIN_WINDOW_POLL_INTERVALS * poll_interval_sec
+    if window_end - window_start < min_window_sec:
+        return window_end - min_window_sec
+    return window_start
+
+
+# A just-started collector gets this many poll intervals to produce a measurable
+# sample before a measurement check gives up and SKIPs. CPU% is a delta against
+# the previous poll, so its first measurable value needs two polls.
+FIRST_SAMPLE_WAIT_POLL_INTERVALS: float = 3.0
+# How often to re-check while waiting; well under any collector's poll interval
+# so the wait ends with the sample, not an interval after it.
+FIRST_SAMPLE_WAIT_STEP_SEC: float = 0.5
+
+
+async def await_first_collector_sample(
+    collector: t.Any,
+    services: t.Sequence[str],
+    window_end: float,
+    logger: t.Optional[logging.Logger] = None,
+) -> float:
+    """Give a just-started collector time to produce its first measurable sample.
+
+    ``floor_collector_window`` only widens a window backwards, which covers a
+    precheck that fires a few poll intervals after the collector started. A
+    config whose setup tasks are all no-ops runs its prechecks right after
+    collector start, before the first poll (an SSH round trip) returns, and
+    no backward widening can find a row that does not exist yet. The CPU
+    collector needs one poll more than that: its first row carries ``None`` for
+    every service because CPU% is a delta against the previous poll.
+
+    Applies only to a collector whose polling thread is alive and that has
+    fewer than two rows, i.e. one that started moments ago. Waits up to
+    ``FIRST_SAMPLE_WAIT_POLL_INTERVALS`` poll intervals for a non-``None``
+    value for any of ``services``, polling every ``FIRST_SAMPLE_WAIT_STEP_SEC``,
+    and returns ``time.time()`` as the window end so the rows that landed are
+    inside the window. Anything else returns the caller's ``window_end``
+    untouched: a collector that was never started, or one with a history whose
+    rows fall outside the window (services masked or inactive), keeps its SKIP.
+    """
+    thread = getattr(collector, "_thread", None)
+    if thread is None or not thread.is_alive() or len(collector.rows) >= 2:
+        return window_end
+    wait_sec = FIRST_SAMPLE_WAIT_POLL_INTERVALS * collector.interval_sec
+
+    def measurable() -> bool:
+        now = time.time()
+        got = collector.max_per_service_in_window(now - wait_sec, now)
+        return any(service in got for service in services)
+
+    if not measurable():
+        if logger is not None:
+            logger.info(
+                f"[{collector.__class__.__name__}] no measurable sample yet; "
+                f"waiting up to {wait_sec:.0f}s for its first poll(s)"
+            )
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            await asyncio.sleep(FIRST_SAMPLE_WAIT_STEP_SEC)
+            if measurable():
+                break
+    return time.time()
 
 
 def generate_prefix_nh_list_map(

@@ -606,6 +606,8 @@ def create_ixia_packet_loss_check_traffic_split(
                 expect_packet_loss=True,
             )
         )
+    # An empty names list is a catch-all over every stat (expect-loss items
+    # included), so an empty no_loss_traffic must add no threshold at all.
     if no_loss_traffic:
         thresholds.append(
             hc_types.PacketLossThreshold(
@@ -2076,15 +2078,18 @@ def create_port_queue_rate_check(
 def create_port_transceiver_check(
     json_params: t.Optional[t.Dict[str, t.Any]] = None,
 ) -> PointInTimeHealthCheck:
-    """Create a point-in-time check of optical transceiver presence and state.
+    """Create a point-in-time check of optical transceiver presence.
 
-    Inspects qsfp_service for each port's transceiver and asserts presence /
-    detected state matches expectations. Used in transceiver-removal /
+    Inspects qsfp_service for each interface and asserts transceiver
+    presence matches `expected_present`. Used in transceiver-removal /
     insertion tests and as a precheck around firmware upgrade stages.
 
     Args:
-        json_params: Opaque dict mapping port → expected transceiver
-            attributes (presence, type, vendor). Bare check when omitted.
+        json_params: Opaque dict with `interfaces` (list of interface names
+            to check; overrides the device's topology interfaces when
+            given, e.g. to target the one interface a snake test just
+            manipulated) and `expected_present` (bool, default True).
+            Bare check when omitted.
 
     Returns:
         A `PointInTimeHealthCheck` with `name=PORT_TRANSCEIVER_CHECK`.
@@ -2129,6 +2134,7 @@ def create_lldp_check(
     retry_count: t.Optional[int] = None,
     retry_delay_seconds: t.Optional[float] = None,
     retry_delay_multiplier: t.Optional[float] = None,
+    disabled_interfaces: t.Optional[t.List[t.Dict[str, str]]] = None,
 ) -> PointInTimeHealthCheck:
     """LLDP_CHECK — LLDP neighbor verification.
 
@@ -2145,8 +2151,13 @@ def create_lldp_check(
         retry_count: Number of retries after an initial failed LLDP check.
         retry_delay_seconds: Delay before the first retry.
         retry_delay_multiplier: Multiplier applied to each successive delay.
+        disabled_interfaces: `{switch_name, interface_name}` entries expected to
+            have no neighbor (links shut on purpose); the far end of each, as
+            the topology knows it, is skipped too.
     """
     payload: t.Dict[str, t.Any] = {}
+    if disabled_interfaces is not None:
+        payload["disabled_interfaces"] = disabled_interfaces
     if retry_count is not None:
         payload["retry_count"] = retry_count
     if retry_delay_seconds is not None:
@@ -2530,6 +2541,9 @@ def create_service_restart_check(
     restart_start_time_jq_var: t.Optional[str] = None,
     extra_json_params: t.Optional[t.Dict[str, t.Any]] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
+    retry_count: t.Optional[int] = None,
+    retry_delay_seconds: t.Optional[float] = None,
+    retry_delay_multiplier: t.Optional[float] = None,
 ) -> PointInTimeHealthCheck:
     """SERVICE_RESTART_CHECK — verifies expected services restarted in the lookback window.
 
@@ -2553,6 +2567,12 @@ def create_service_restart_check(
         json_payload["daemons"] = daemons
     if expected_restarted_services is not None:
         json_payload["expected_restarted_services"] = expected_restarted_services
+    if retry_count is not None:
+        json_payload["retry_count"] = retry_count
+    if retry_delay_seconds is not None:
+        json_payload["retry_delay_seconds"] = retry_delay_seconds
+    if retry_delay_multiplier is not None:
+        json_payload["retry_delay_multiplier"] = retry_delay_multiplier
     if extra_json_params:
         json_payload.update(extra_json_params)
     jq_params: t.Dict[str, str] = {}
@@ -2684,17 +2704,18 @@ def create_systemctl_active_state_check(
 
     Bare by default. Two variants for scoping to specific services:
     - `services`: thrift `SystemctlActiveStateHealthCheckIn` input_json variant
-      (typed Service enum list).
+      (typed Service enum list). Takes precedence in
+      `SystemctlActiveStateHealthCheck._run`.
     - `services_json`: check_params.json_params variant (string list).
-    Mutually exclusive — pass at most one.
+    Mutually exclusive — pass at most one. With neither, the check evaluates
+    DEFAULT_SERVICE_NAMES.
 
     `expected_restarted_services` (OSS collector path): services allowed to go
     inactive during the window — for them only end-of-window recovery is
     verified, not full-window activity. Use for playbooks that intentionally
-    restart a service. check_params variant only (incompatible with
-    `services`). Passing it WITHOUT `services_json` is valid: the check's
-    consumer falls back to DEFAULT_SERVICE_NAMES when no `services` key is
-    present in check_params — the allowlist still applies to that set.
+    restart a service. It travels in check_params, independently of the
+    monitored set, so it combines with either variant. Passing it alone is
+    valid too: the allowlist then applies to DEFAULT_SERVICE_NAMES.
 
     `min_active_seconds` (internal path): each unit must also have been active
     for at least this long, so a crash-looping unit that is briefly active
@@ -2703,11 +2724,6 @@ def create_systemctl_active_state_check(
     if services is not None and services_json is not None:
         raise ValueError(
             "services and services_json are mutually exclusive — pass at most one."
-        )
-    if services is not None and expected_restarted_services is not None:
-        raise ValueError(
-            "expected_restarted_services requires the check_params variant — "
-            "pass services_json (or neither), not services."
         )
     retry_params: t.Dict[str, t.Any] = {}
     if retry_count is not None:
@@ -2730,13 +2746,18 @@ def create_systemctl_active_state_check(
             ),
         )
     if services is not None:
+        # The allowlist rides in check_params while the monitored set rides in
+        # input_json; the check reads them from those two places independently.
+        typed_params: t.Dict[str, t.Any] = dict(retry_params)
+        if expected_restarted_services is not None:
+            typed_params["expected_restarted_services"] = expected_restarted_services
         return PointInTimeHealthCheck(
             name=hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK,
             input_json=thrift_to_json(
                 hc_types.SystemctlActiveStateHealthCheckIn(services=services)
             ),
             check_params=(
-                Params(json_params=json.dumps(retry_params)) if retry_params else None
+                Params(json_params=json.dumps(typed_params)) if typed_params else None
             ),
         )
     params: t.Dict[str, t.Any] = dict(retry_params)

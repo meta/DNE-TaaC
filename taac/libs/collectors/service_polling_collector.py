@@ -127,6 +127,13 @@ class ServicePollingCollector(BaseCollector):
 
     # -- Subclass hooks (optional) ------------------------------------------
 
+    def _shell_command(self, units: str, props: str) -> str:
+        """The one shell command run per poll. Subclasses that need data
+        systemd does not expose as a property append to it; any extra output
+        must be more ``Id=<unit>`` blocks (blank-line separated) so
+        ``_parse_blocks_by_unit`` merges it into that unit's dict."""
+        return f"systemctl show {units} -p {props} --no-page"
+
     def _format_value(self, value: t.Any) -> str:
         return str(value)
 
@@ -148,8 +155,8 @@ class ServicePollingCollector(BaseCollector):
 
         Default is identity — override for stateful transforms (e.g. CPU's
         cumulative-ns-to-percent delta, which needs ``poll_wall`` and prior
-        state). ``poll_wall`` is the wall-clock time captured just before
-        this poll's SSH round trip, for consistent delta timing.
+        state). ``poll_wall`` is the wall-clock time this poll's SSH reply
+        arrived, i.e. when the DUT read the values being transformed.
         """
         return raw_per_service
 
@@ -185,7 +192,9 @@ class ServicePollingCollector(BaseCollector):
                     unit_data[key] = value
             unit_id = unit_data.get("Id")
             if unit_id:
-                blocks_by_unit[unit_id] = unit_data
+                # Merge, don't replace: a subclass's appended shell output
+                # arrives as a second block for the same Id.
+                blocks_by_unit.setdefault(unit_id, {}).update(unit_data)
         return blocks_by_unit
 
     async def _sample_all(self) -> t.Tuple[t.Dict[str, t.Any], t.List[str]]:
@@ -212,7 +221,7 @@ class ServicePollingCollector(BaseCollector):
             # "every unit missing" instead, i.e. per-service ssh-error notes.
             output = (
                 await self.driver.async_run_cmd_on_shell(
-                    f"systemctl show {units} -p {props} --no-page"
+                    self._shell_command(units, props)
                 )
                 or ""
             )
@@ -258,8 +267,19 @@ class ServicePollingCollector(BaseCollector):
         return raw_per_service, notes
 
     async def _poll_once(self) -> None:
-        poll_wall = time.time()
+        sent = time.time()
         raw_per_service, notes = await self._sample_all()
+        # Stamp the poll when the reply arrives, not when it starts. The DUT
+        # reads its counters as the command runs, and the slow part of a poll
+        # is the fresh SSH connection before it. A stamp taken before the round
+        # trip makes one slow poll count its whole delay as CPU time against a
+        # normal interval. Stamped at the reply, a delay long enough to matter
+        # trips the CPU collector's gap check and resets its baseline instead
+        # of reporting.
+        poll_wall = time.time()
+        ssh_s = poll_wall - sent
+        if ssh_s > self.interval_sec:
+            notes.append(f"slow-ssh={ssh_s:.1f}s")
         per_service = self._transform_per_service(raw_per_service, poll_wall)
 
         sample = self._make_sample(

@@ -61,6 +61,35 @@ _NON_OSS_TEST_FILES = [
 # after `run_tests.sh -- <path>` passes on its own.
 # ---------------------------------------------------------------------------
 _OSS_READY_TEST_FILES = [
+    "taac/health_checks/device_health_checks/test_cpu_utilization_report_only.py",
+    "taac/health_checks/device_health_checks/test_new_characterization_health_checks.py",
+    "taac/health_checks/device_health_checks/test_l2_entry_threshold_observe_deadline.py",
+    "taac/health_checks/device_health_checks/tests/test_pfc_counter_health_checks.py",
+    # Pure unit test of dlb_resource_analysis.analyze with SimpleNamespace routes.
+    "taac/health_checks/device_health_checks/tests/test_dlb_resource_analysis_snapshot.py",
+    "taac/health_checks/tests/test_collector_max_summary.py",
+    "taac/health_checks/ixia_health_checks/test_ixia_port_stats_health_check.py",
+    "taac/health_checks/snapshot_health_checks/test_qos_queue_byte_counters.py",
+    "taac/health_checks/snapshot_health_checks/test_bgp_peers_pre_snapshot_settle.py",
+    "taac/health_checks/snapshot_health_checks/test_port_speed_health_check.py",
+    "taac/health_checks/tests/test_healthcheck_definitions_systemctl.py",
+    # Runs the production grep-window command against a local fixture log; only
+    # the remote transport is mocked, so no non-OSS import.
+    "taac/health_checks/device_health_checks/test_oomd_kill_health_check.py",
+    # Drives IxiaPacketLossHealthCheck._run with a MagicMock traffic generator
+    # and a patched clock -- no IXIA, no non-OSS import.
+    "taac/health_checks/ixia_health_checks/test_ixia_loss_recovery_window.py",
+    "taac/health_checks/ixia_health_checks/test_ixia_frames_flowed.py",
+    "taac/health_checks/device_health_checks/tests/test_port_transceiver_health_check.py",
+    # BGP state / core-dump coverage: OSS-clean tests for these checks, since
+    # their existing test files import neteng.netcastle.
+    "taac/health_checks/device_health_checks/test_bgp_session_allowlist_guard.py",
+    "taac/health_checks/device_health_checks/test_bgp_route_count_report_only.py",
+    "taac/health_checks/device_health_checks/test_ecmp_group_count_report.py",
+    "taac/health_checks/device_health_checks/test_core_dump_path_oss.py",
+    "taac/health_checks/device_health_checks/test_lldp_paced_retry_window.py",
+    # Pure unit tests: mocked driver and IXIA, Ixia built with __init__ patched.
+    "taac/health_checks/device_health_checks/test_route_convergence_time_health_check.py",
     "taac/health_checks/device_health_checks/test_bgp_rib_fib_consistency_health_check.py",
     "taac/health_checks/tests/test_common_utils.py",
     "taac/health_checks/tests/test_convergence_observer.py",

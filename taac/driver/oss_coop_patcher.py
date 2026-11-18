@@ -498,7 +498,19 @@ async def _async_activate(
     methods = taac_types.ApplyPatcherMethod
     agent_changed = "agent" in changed
     bgp_changed = bool(changed & _BGP_CONFIGS)
-    agent_restarted = True
+    activate_bgp = bgp_changed or method == methods.BGP_RESTART
+    agent_restarts = (
+        coldboot
+        or method in (methods.AGENT_WARMBOOT, methods.AGENT_RELOAD_AND_WARMBOOT)
+        or (method is None and agent_changed and bgp_changed)
+    )
+    # Only an agent restart can take bgpd with it, so only then is bgpd's start
+    # time worth comparing.
+    bgpd_started = (
+        await _async_bgpd_start_time(switch)
+        if activate_bgp and agent_restarts
+        else None
+    )
     if coldboot:
         await switch.async_create_cold_boot_file()
         await _async_restart_agent(switch)
@@ -512,24 +524,43 @@ async def _async_activate(
         await _async_restart_agent(switch)
     elif method == methods.AGENT_RELOAD or (method is None and agent_changed):
         await switch.async_try_agent_config_reload()
-        agent_restarted = False
-    else:
-        agent_restarted = False
-        if agent_changed:
-            switch.logger.warning(
-                f"[oss-patcher] agent config installed on {switch.hostname} but "
-                f"not activated: {method} does not touch the agent"
-            )
-    if bgp_changed or method == methods.BGP_RESTART:
-        await _async_activate_bgp(switch, agent_restarted)
+    elif agent_changed:
+        switch.logger.warning(
+            f"[oss-patcher] agent config installed on {switch.hostname} but "
+            f"not activated: {method} does not touch the agent"
+        )
+    if activate_bgp:
+        await _async_activate_bgp(switch, agent_restarts, bgpd_started)
 
 
-async def _async_activate_bgp(switch: t.Any, agent_restarted: bool) -> None:
-    # bgpd's unit has BindsTo=wedge_agent.service, so an agent restart already
-    # restarted it.
-    if not agent_restarted:
-        await switch.async_restart_service(FbossSystemctlServiceName.BGP)
+async def _async_activate_bgp(
+    switch: t.Any, agent_restarted: bool, started_before: t.Optional[int]
+) -> None:
+    # An agent restart restarts bgpd only where bgpd's unit is bound to the
+    # agent's (e.g. BindsTo=wedge_agent.service); split-agent units are not, so
+    # restart it unless it demonstrably started again. On a bound unit bgpd's
+    # restart can still be queued when the agent's finishes; an unchanged start
+    # time then costs one extra, harmless restart.
+    if agent_restarted and started_before is not None:
+        after = await _async_bgpd_start_time(switch)
+        if after is not None and after != started_before:
+            await switch.async_wait_for_bgp_convergence()
+            return
+    await switch.async_restart_service(FbossSystemctlServiceName.BGP)
     await switch.async_wait_for_bgp_convergence()
+
+
+async def _async_bgpd_start_time(switch: t.Any) -> t.Optional[int]:
+    try:
+        return await switch.async_get_service_monotonic_start_time(
+            FbossSystemctlServiceName.BGP
+        )
+    except Exception as ex:
+        switch.logger.warning(
+            f"[oss-patcher] could not read bgpd's start time on {switch.hostname} "
+            f"({ex}); bgpd will be restarted"
+        )
+        return None
 
 
 async def _async_restart_agent(switch: t.Any) -> None:

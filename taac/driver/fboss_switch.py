@@ -3883,6 +3883,7 @@ class FbossSwitch(AbstractSwitch):
         self,
         service: Service,
         agents: Optional[List[str]] = None,
+        clear_thrift_drain_exit: bool = False,
     ) -> None:
         """
         Restart service and validate restart process by comparing service uptime
@@ -3897,6 +3898,9 @@ class FbossSwitch(AbstractSwitch):
 
         Args:
             service: service to restart
+            clear_thrift_drain_exit: Passed to ``async_restart_split_agents``.
+                Only that split-agent ``Service.AGENT`` path honours it;
+                elsewhere a True value is logged and ignored.
         """
         if (
             oss_agent_restart_paths_enabled()
@@ -3911,9 +3915,17 @@ class FbossSwitch(AbstractSwitch):
             # surface as a failure. Retrying would restart from an already
             # cold-booted hw agent, which reliably "succeeds" and hides the
             # very regression this orchestration exists to catch.
-            await self.async_restart_split_agents()
+            if clear_thrift_drain_exit:
+                await self.async_restart_split_agents(clear_thrift_drain_exit=True)
+            else:
+                await self.async_restart_split_agents()
             return
 
+        if clear_thrift_drain_exit:
+            self.logger.warning(
+                f"clear_thrift_drain_exit has no effect on the systemctl restart "
+                f"of {service.value} on {self.hostname}"
+            )
         await self._async_restart_single_service(service)
 
     @async_retryable(retries=2, sleep_time=10, exceptions=(Exception,))
@@ -4144,7 +4156,9 @@ class FbossSwitch(AbstractSwitch):
         self,
         exit_timeout: int = 120,
         hw_ready_timeout: int = 300,
-        hw_settle_timeout: int = 120,
+        hw_settle_timeout: Optional[int] = None,
+        stop_bgpd: bool = True,
+        clear_thrift_drain_exit: bool = False,
     ) -> None:
         """Restart the split agents in warmboot-safe order.
 
@@ -4160,6 +4174,18 @@ class FbossSwitch(AbstractSwitch):
         lost. On a multi-NPU DUT this has to cover every NPU: leaving one
         hw agent running across the sw agent restart reintroduces the same
         ordering bug for that NPU alone.
+
+        ``stop_bgpd`` brackets all of that: bgpd is stopped before the sw agent
+        and started once the sw agent is CONFIGURED. Stopping while the sw
+        agent still punts lets the TCP close reach every peer, which puts them
+        in GR helper mode; with no bgpd during the blackout there is no local
+        hold-timer expiry to purge the FIB. A restart anywhere
+        later cannot do either.
+
+        ``clear_thrift_drain_exit`` makes that bgpd stop clear a thrift
+        drain-deadline exit (see ``_stop_clearing_thrift_drain_exit_cmd``).
+        Off by default: only a caller that knows bgpd is under a thrift load
+        it cannot drain should opt in.
         """
         sw_agent = FbossSystemctlServiceName.FBOSS_SW_AGENT
         switch_indices = await self.async_get_hw_agent_switch_indices()
@@ -4167,6 +4193,9 @@ class FbossSwitch(AbstractSwitch):
         all_services = [sw_agent] + hw_agents
         # Read before anything starts: an agent consumes its flag at startup.
         cold_boot_flags = await self._async_present_cold_boot_flags()
+        if hw_settle_timeout is None:
+            # A cold boot can take longer than 120 s to reach CONFIGURED.
+            hw_settle_timeout = 600 if cold_boot_flags else 120
 
         # Only the sw agent needs a before/after uptime check: each hw
         # agent's pid is tracked continuously from its own start through
@@ -4175,6 +4204,18 @@ class FbossSwitch(AbstractSwitch):
         sw_agent_start_time_before_restart = (
             await self.async_get_service_monotonic_start_time(sw_agent)
         )
+
+        bgpd = FbossSystemctlServiceName.BGP
+        if stop_bgpd:
+            self.logger.debug(f"Stopping {bgpd.value} on {self.hostname}...")
+            if clear_thrift_drain_exit:
+                await self._async_stop_clearing_thrift_drain_exit(bgpd)
+            else:
+                await self.async_run_cmd_on_shell(f"systemctl stop {bgpd.value}")
+            await self.async_wait_for_service_exit(bgpd, timeout=exit_timeout)
+            # The FIN/ACK exchange has to finish before the sw agent takes the
+            # TUN interfaces down with it.
+            await asyncio.sleep(self.BGPD_STOP_SETTLE_S)
 
         for svc in all_services:
             self.logger.debug(f"Stopping {svc.value} on {self.hostname}...")
@@ -4218,6 +4259,61 @@ class FbossSwitch(AbstractSwitch):
             self.logger.debug(
                 f"Successfully restarted service {svc.value} on {self.hostname} "
             )
+
+        if stop_bgpd:
+            # Peers can only reconnect once the TUN interfaces are back, which
+            # happens at CONFIGURED; starting earlier just burns their GR
+            # restart time on failed dials.
+            await self.async_wait_for_agent_state_configured()
+            self.logger.debug(f"Starting {bgpd.value} on {self.hostname}...")
+            await self.async_run_cmd_on_shell(f"systemctl start {bgpd.value}")
+
+    # Seconds between bgpd's exit and the sw agent stop (see stop_bgpd).
+    BGPD_STOP_SETTLE_S: t.ClassVar[float] = 2.0
+    # fbthrift quick-exits with this status when a server cannot drain its
+    # in-flight requests inside its shutdown deadline, and logs this line.
+    THRIFT_DRAIN_EXIT_STATUS: t.ClassVar[int] = 124
+    THRIFT_DRAIN_JOURNAL_MARKER: t.ClassVar[str] = (
+        "Could not drain active requests within allotted deadline"
+    )
+    THRIFT_DRAIN_CLEARED_MARKER: t.ClassVar[str] = "__TAAC_THRIFT_DRAIN_EXIT_CLEARED__"
+
+    def _stop_clearing_thrift_drain_exit_cmd(self, service: Service) -> str:
+        """``systemctl stop`` followed, on the box and in the same shell, by a
+        ``reset-failed`` when the only failure is the service's thrift server
+        missing its drain deadline: exit status 124 and fbthrift's journal line
+        since the stop. Doing it on the box keeps the unit's ``failed`` window
+        to milliseconds, below the state collector's sampling period. Any
+        other failure (a signal, a core dump, a timeout, a 124 without the
+        drain line) is left for the unclean-exit check."""
+        unit = service.value
+        return (
+            "t=$(date +%s); "
+            f"systemctl stop {unit}; "
+            f'if [ "$(systemctl show -p Result --value {unit})" = exit-code ] && '
+            f'[ "$(systemctl show -p ExecMainStatus --value {unit})" = '
+            f'{self.THRIFT_DRAIN_EXIT_STATUS} ] && '
+            f"journalctl -u {unit} --since @$t -q --no-pager | "
+            f"grep -q '{self.THRIFT_DRAIN_JOURNAL_MARKER}'; then "
+            f"systemctl reset-failed {unit}; "
+            f"echo {self.THRIFT_DRAIN_CLEARED_MARKER}; fi"
+        )
+
+    async def _async_stop_clearing_thrift_drain_exit(self, service: Service) -> bool:
+        """Stop ``service``; see ``_stop_clearing_thrift_drain_exit_cmd``.
+        Returns True when a drain-deadline exit was cleared."""
+        output = await self.async_run_cmd_on_shell(
+            self._stop_clearing_thrift_drain_exit_cmd(service)
+        )
+        cleared = self.THRIFT_DRAIN_CLEARED_MARKER in (output or "")
+        if cleared:
+            self.logger.warning(
+                f"{service.value} on {self.hostname} missed its thrift drain "
+                f"deadline on stop (exit {self.THRIFT_DRAIN_EXIT_STATUS}); cleared "
+                "the failed state so the stop reads as clean. Not a crash: see "
+                "the unit's journal."
+            )
+        return cleared
 
     async def _async_present_cold_boot_flags(self) -> t.Set[str]:
         output = await self.async_run_cmd_on_shell(

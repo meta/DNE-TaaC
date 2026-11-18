@@ -3517,7 +3517,14 @@ class FbossSwitch(AbstractSwitch):
             reraise=True,
         )(read_state)
 
-    @async_retryable(retries=3, sleep_time=5, exceptions=(Exception,))
+    # The thrift client's own timeout does not cover a reply that stalls mid-stream
+    # (e.g. on a half-open connection), which would otherwise hang forever.
+    @async_retryable(
+        retries=3,
+        sleep_time=5,
+        exceptions=(Exception,),
+        attempt_timeout=DEFAULT_THRIFT_TIMEOUT,
+    )
     async def async_get_all_port_info(self) -> Dict[int, PortInfoThrift]:
         """
         Makes a thrift call to agent to get all the port info
@@ -3606,6 +3613,7 @@ class FbossSwitch(AbstractSwitch):
         *args,
         ssh_port: int = 22,
         username: t.Optional[str] = None,
+        connect_timeout: t.Optional[float] = None,
         **kwargs,
     ) -> str:
         """
@@ -3634,7 +3642,10 @@ class FbossSwitch(AbstractSwitch):
             # TAAC_SSH_PASSWORD when set. See oss_driver_utils for the
             # supported env vars.
             async with AsyncSSHClient(
-                self.hostname, port=ssh_port, username=username
+                self.hostname,
+                port=ssh_port,
+                username=username,
+                connect_timeout=connect_timeout,
             ) as client:
                 result = await client.async_run(
                     cmd=cmd,

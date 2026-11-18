@@ -15102,6 +15102,64 @@ def create_spillover_testing_playbooks(
 # the first hardware run on a given platform (W400/IcePack derived theirs
 # empirically).
 # =============================================================================
+def _ecmp_post_churn_recovery_stage(
+    main_traffic: str, rouge_traffic: str, settle_seconds: int
+) -> Stage:
+    """Strict recovery check for the overcommit churn playbooks.
+
+    Their postcheck loss thresholds are record-only. This stage runs after
+    flapping is disarmed, waits ``settle_seconds``, snapshots the hardware ECMP
+    table, and requires the steady state the plain overcommit playbook asserts
+    on freshly cleared counters: Main 0% loss and Rouge fully rejected.
+    """
+    recovery_loss_check = create_ixia_packet_loss_check(
+        clear_traffic_stats=True,
+        sleep_time=30,
+        thresholds=[
+            hc_types.PacketLossThreshold(
+                names=[main_traffic],
+                str_value="0",
+                metric=hc_types.PacketLossMetric.PERCENTAGE,
+            ),
+            hc_types.PacketLossThreshold(
+                names=[rouge_traffic],
+                str_value="100",
+                metric=hc_types.PacketLossMetric.PERCENTAGE,
+                comparison=hc_types.ComparisonType.GREATER_THAN_EQUAL_TO,
+            ),
+        ],
+    )
+    return create_steps_stage(
+        stage_id="post_churn_recovery",
+        steps=[
+            create_longevity_step(
+                duration=settle_seconds, description="Post-churn recovery settle"
+            ),
+            create_run_ssh_command_step(
+                cmd=(
+                    "o=$(fboss2 show hw-object NEXT_HOP_GROUP 2>/dev/null); "
+                    'echo "post-churn groups=$(echo "$o" | grep -c '
+                    "'^NextHopGroupSaiId') members=$(echo \"$o\" | grep -c "
+                    "'^NextHopGroupMemberSaiId')\""
+                ),
+                description="Snapshot hardware ECMP table after churn",
+                log_output=True,
+            ),
+            create_validation_step(
+                point_in_time_checks=[recovery_loss_check],
+                description="Post-churn recovery: Main 0% loss, Rouge fully rejected",
+                fail_on_failure=True,
+            ),
+            # The loss check stops traffic; the playbook postchecks need it.
+            create_ixia_api_step(
+                api_name="start_traffic",
+                args_dict={},
+                description="Restart traffic for postchecks",
+            ),
+        ],
+    )
+
+
 def create_ecmp_only_groups_playbooks(
     source_interface: str,
     asic: EcmpAsic = EcmpAsic.G200,
@@ -15110,6 +15168,7 @@ def create_ecmp_only_groups_playbooks(
     disruptive_iterations: int = 5,
     disruptive_settle_seconds: int = 300,
     overflow_settle_seconds: int = 180,
+    post_churn_recovery_seconds: int | None = None,
 ) -> list[Playbook]:
     """ECMP-ONLY Group-utilization playbooks (fill the GROUP table).
 
@@ -15424,7 +15483,16 @@ def create_ecmp_only_groups_playbooks(
             setup_steps=_configure_steps(overcommit),
             stages=_admit_overflow_stages(overcommit)
             + ra_stages
-            + _disruptive_stages(service, cold_boot),
+            + _disruptive_stages(service, cold_boot)
+            + (
+                [
+                    _ecmp_post_churn_recovery_stage(
+                        main_traffic, rouge_traffic, post_churn_recovery_seconds
+                    )
+                ]
+                if overcommit and post_churn_recovery_seconds is not None
+                else []
+            ),
             skip_test_config_snapshot_checks=True,
             # Only overcommit churns: Full_Utilization flaps too, but with Rouge
             # disabled there is no second pool to contend for the freed
@@ -15464,6 +15532,7 @@ def create_ecmp_only_members_playbooks(
     disruptive_iterations: int = 5,
     disruptive_settle_seconds: int = 300,
     overflow_settle_seconds: int = 180,
+    post_churn_recovery_seconds: int | None = None,
 ) -> list[Playbook]:
     """ECMP-ONLY Member-utilization playbooks (fill the MEMBER table).
 
@@ -15776,7 +15845,16 @@ def create_ecmp_only_members_playbooks(
             setup_steps=_configure_steps(overcommit),
             stages=_admit_overflow_stages(overcommit)
             + ra_stages
-            + _disruptive_stages(service, cold_boot),
+            + _disruptive_stages(service, cold_boot)
+            + (
+                [
+                    _ecmp_post_churn_recovery_stage(
+                        main_traffic, rouge_traffic, post_churn_recovery_seconds
+                    )
+                ]
+                if overcommit and post_churn_recovery_seconds is not None
+                else []
+            ),
             skip_test_config_snapshot_checks=True,
             # Only overcommit churns: Full_Utilization flaps too, but with Rouge
             # disabled there is no second pool to contend for the freed

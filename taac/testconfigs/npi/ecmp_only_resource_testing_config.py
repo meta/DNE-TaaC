@@ -309,6 +309,9 @@ def test_config_for_ecmp_only_resource_testing(
     ndp_flap_iterations=60,
     cold_start_iterations=13,
     longevity_stabilization_seconds=300,
+    # When set, each overcommit churn playbook ends with a strict post-churn
+    # recovery stage (Main 0% loss, Rouge fully rejected) after this settle.
+    post_churn_recovery_seconds=None,
     playbooks=None,
     direct_ixia_connections=None,
     basset_pool=None,
@@ -719,6 +722,7 @@ def test_config_for_ecmp_only_resource_testing(
                 main_pool_name=pool.pool_name,
                 disruptive_iterations=disruptive_iterations,
                 disruptive_settle_seconds=disruptive_settle_seconds,
+                post_churn_recovery_seconds=post_churn_recovery_seconds,
             )
             + create_ecmp_only_members_playbooks(
                 ixia_source_interface,
@@ -727,6 +731,7 @@ def test_config_for_ecmp_only_resource_testing(
                 main_pool_name=pool.pool_name,
                 disruptive_iterations=disruptive_iterations,
                 disruptive_settle_seconds=disruptive_settle_seconds,
+                post_churn_recovery_seconds=post_churn_recovery_seconds,
             )
             # NDP-flap and cold-start longevity both run against the GROUP CSV
             # with Rouge disabled: a full in-budget ECMP group table, which is

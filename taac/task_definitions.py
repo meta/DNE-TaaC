@@ -26,6 +26,7 @@ from taac.constants import (
     OpenRRouteAction,
 )
 from taac.tasks.thrift_stress_payloads import ThriftStressCall
+from taac.utils.common import get_bgp_peer_configs
 from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.types import Params, PeriodicTask, Task
 
@@ -2164,9 +2165,13 @@ def create_allow_all_v4_peer_group_patcher_tasks(
     is_confed_peer: str = "False",
     per_peer_max_route_limit: str = "25000",
     policy_entries_json: str = "[]",
+    hold_time_seconds: str = "15",
+    keep_alive_seconds: str = "5",
 ) -> t.List[Task]:
     """
     Create tasks to add a V4 BGP peer group with allow-all ingress/egress policies.
+
+    Registered to the same COOP configs as the BGP peers that use the group.
 
     Args:
         hostname: Hostname of the device
@@ -2175,17 +2180,20 @@ def create_allow_all_v4_peer_group_patcher_tasks(
         is_confed_peer: Whether peer is confederation peer
         per_peer_max_route_limit: Max routes per peer
         policy_entries_json: JSON-serialized policy entries for the allow-all policy
+        hold_time_seconds: BGP hold time for the peer group
+        keep_alive_seconds: BGP keepalive interval for the peer group
 
     Returns:
         List of tasks to register the allow-all peer group
     """
+    config_names = get_bgp_peer_configs(hostname)
     ingress_policy = f"PROPAGATE_EVERYTHING_{peer_group_name}_IN"
     egress_policy = f"PROPAGATE_EVERYTHING_{peer_group_name}_OUT"
 
     return [
         create_coop_register_patcher_task(
             hostname=hostname,
-            config_name="bgpcpp",
+            config_names=config_names,
             patcher_name=f"a_add_bgp_policy_statement_{ingress_policy}",
             task_name="coop_register_patcher",
             patcher_args={
@@ -2197,7 +2205,7 @@ def create_allow_all_v4_peer_group_patcher_tasks(
         ),
         create_coop_register_patcher_task(
             hostname=hostname,
-            config_name="bgpcpp",
+            config_names=config_names,
             patcher_name=f"a_add_bgp_policy_statement_{egress_policy}",
             task_name="coop_register_patcher",
             patcher_args={
@@ -2209,7 +2217,7 @@ def create_allow_all_v4_peer_group_patcher_tasks(
         ),
         create_coop_register_patcher_task(
             hostname=hostname,
-            config_name="bgpcpp",
+            config_names=config_names,
             patcher_name=f"a_add_peer_group_patcher_{peer_group_name}",
             task_name="coop_register_patcher",
             patcher_args={
@@ -2222,8 +2230,8 @@ def create_allow_all_v4_peer_group_patcher_tasks(
                 "peer_tag": peer_tag,
                 "ingress_policy_name": ingress_policy,
                 "egress_policy_name": egress_policy,
-                "bgp_peer_timers_hold_time_seconds": "15",
-                "bgp_peer_timers_keep_alive_seconds": "5",
+                "bgp_peer_timers_hold_time_seconds": hold_time_seconds,
+                "bgp_peer_timers_keep_alive_seconds": keep_alive_seconds,
                 "bgp_peer_timers_out_delay_seconds": "2",
                 "bgp_peer_timers_withdraw_unprog_delay_seconds": "0",
                 "max_routes": per_peer_max_route_limit,

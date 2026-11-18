@@ -467,6 +467,17 @@ def is_host_drainable(hostname: str) -> bool:
     return not any(role in hostname for role in non_drainable_roles)
 
 
+def get_bgp_peer_configs(hostname: str) -> t.List[str]:
+    """COOP configs that `configure_parallel_bgp_peers` registers BGP peers to.
+
+    Patchers that define what those peers reference (peer groups, policies) must
+    go to the same configs: a drained device boots bgpd from `bgpcpp_softdrain`.
+    """
+    if is_host_drainable(hostname):
+        return ["bgpcpp", "bgpcpp_softdrain"]
+    return ["bgpcpp"]
+
+
 def get_default_configs(hostname: str) -> t.List[str]:
     return ["agent"] + get_default_bgp_configs(hostname)
 

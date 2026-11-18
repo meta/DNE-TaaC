@@ -39,9 +39,9 @@ from taac.tasks.base_task import BaseTask
 from taac.utils import arista_utils
 from taac.utils.bgpcpp_log_level_marker import record_configured
 from taac.utils.common import (
+    get_bgp_peer_configs,
     get_default_bgp_configs,
     get_default_configs,
-    is_host_drainable,
     run_in_thread,
 )
 from taac.utils.driver_factory import async_get_device_driver
@@ -534,10 +534,7 @@ class ConfigureParallelBgpPeers(BaseTask):
             "patcher_args": {"peer_configs": json.dumps(add_bgp_peer_configs)},
             "patcher_desc": "",
         }
-        if is_host_drainable(hostname):
-            configs = ["bgpcpp", "bgpcpp_softdrain"]
-        else:
-            configs = ["bgpcpp"]
+        configs = get_bgp_peer_configs(hostname)
         await asyncio.gather(
             *[
                 # pyre-fixme[16]: `AbstractSwitch` has no attribute

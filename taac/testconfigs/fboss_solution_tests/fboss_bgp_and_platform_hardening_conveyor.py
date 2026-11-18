@@ -530,6 +530,8 @@ def build_bgp_dc_setup_tasks(
                 is_confed_peer=is_uplink_peer_confed,
                 per_peer_max_route_limit=per_peer_max_route_limit,
                 policy_entries_json=json.dumps([_PERMIT_ALL_POLICY_TERM]),
+                hold_time_seconds="30",
+                keep_alive_seconds="10",
             )
             + create_allow_all_v4_peer_group_patcher_tasks(
                 hostname=device_name,
@@ -538,6 +540,8 @@ def build_bgp_dc_setup_tasks(
                 is_confed_peer=is_downlink_peer_confed,
                 per_peer_max_route_limit=per_peer_max_route_limit,
                 policy_entries_json=json.dumps([_PERMIT_ALL_POLICY_TERM]),
+                hold_time_seconds="30",
+                keep_alive_seconds="10",
             )
             if allow_all_v4_policies
             else [
@@ -1572,6 +1576,7 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
     validate_test_bgp_sessions=False,
     fsdb_memory_threshold_bytes=None,
     fail_on_bgp_route_collection_error=False,
+    configure_induced_ecmp_2_peers=True,
 ):
     """Build the conveyor TestConfig for combined BGP++ and FBOSS platform hardening.
 
@@ -1669,6 +1674,11 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
         fail_on_bgp_route_collection_error: Opt into raising filtered-RIB
             collection failures when peer-route snapshots are enabled. Defaults
             to the legacy zero-count fallback.
+        configure_induced_ecmp_2_peers: Configure the DUT peers for the
+            UPLINK_BGP_INDUCED_ECMP_2 IXIA device group, which only the ECMP
+            overload playbooks enable. Leave it off when those playbooks are not
+            selected: a peer that never establishes keeps bgpd waiting the full
+            EoR timer after an ungraceful restart.
 
     Returns:
         TestConfig: The fully-built conveyor TestConfig.
@@ -1990,6 +2000,8 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
                         is_confed_peer=is_uplink_peer_confed,
                         per_peer_max_route_limit=per_peer_max_route_limit,
                         policy_entries_json=json.dumps([_PERMIT_ALL_POLICY_TERM]),
+                        hold_time_seconds="30",
+                        keep_alive_seconds="10",
                     )
                     + create_allow_all_v4_peer_group_patcher_tasks(
                         hostname=device_name,
@@ -1998,6 +2010,8 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
                         is_confed_peer=is_downlink_peer_confed,
                         per_peer_max_route_limit=per_peer_max_route_limit,
                         policy_entries_json=json.dumps([_PERMIT_ALL_POLICY_TERM]),
+                        hold_time_seconds="30",
+                        keep_alive_seconds="10",
                     )
                     if allow_all_v4_policies
                     else [
@@ -2208,18 +2222,24 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
                                             "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::401",
                                             "gateway_increment_ip": "0:0:0:0::2",
                                         },
-                                        {
-                                            "starting_ip": f"{ixia_uplink_ic_parent_network_v6}::500",
-                                            "increment_ip": "0:0:0:0::2",
-                                            "prefix_length": 127,
-                                            "description": "Uplink IPv6 Peers - for BGP Induced ECMP - 2",
-                                            "peer_group_name": peergroup_uplink_mimic_v6,
-                                            "num_sessions": bgp_induced_ecmp_group_count,
-                                            "remote_as_4_byte": remote_uplink_as_4byte,
-                                            "remote_as_4_byte_step": 0,
-                                            "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::501",
-                                            "gateway_increment_ip": "0:0:0:0::2",
-                                        },
+                                        *(
+                                            [
+                                                {
+                                                    "starting_ip": f"{ixia_uplink_ic_parent_network_v6}::500",
+                                                    "increment_ip": "0:0:0:0::2",
+                                                    "prefix_length": 127,
+                                                    "description": "Uplink IPv6 Peers - for BGP Induced ECMP - 2",
+                                                    "peer_group_name": peergroup_uplink_mimic_v6,
+                                                    "num_sessions": bgp_induced_ecmp_group_count,
+                                                    "remote_as_4_byte": remote_uplink_as_4byte,
+                                                    "remote_as_4_byte_step": 0,
+                                                    "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::501",
+                                                    "gateway_increment_ip": "0:0:0:0::2",
+                                                },
+                                            ]
+                                            if configure_induced_ecmp_2_peers
+                                            else []
+                                        ),
                                     ]
                                 ),
                                 {

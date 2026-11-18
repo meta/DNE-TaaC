@@ -62,6 +62,13 @@ from taac.runner.testbed_topology import (
     LinkType,
 )
 from taac.test_as_a_config.thrift_types import Endpoint
+from taac.utils.run_artifacts import (
+    ArtifactKind,
+    get_artifacts,
+    is_dump_disabled,
+    read_artifact_lines,
+    select_artifacts,
+)
 
 
 def _classify_link(
@@ -77,6 +84,51 @@ def _classify_link(
     if a_host.lower() in dut_set and z_host.lower() in dut_set:
         return LinkType.DUT
     return LinkType.UNKNOWN
+
+
+def dump_run_artifacts(logger: logging.Logger, selector: str) -> None:
+    """Emit declared run artifacts inline into the run log.
+
+    Producers write these to a bare file handle outside the logging framework
+    (e.g. ``BaseCollector._run_loop``), so nothing else surfaces them. Called
+    after the result summary and outside any ``suppress_console_logs`` scope,
+    so the rows land on the same stream as the rest of the run.
+    """
+    if is_dump_disabled(selector):
+        return
+
+    artifacts = select_artifacts(selector)
+    if not artifacts:
+        # The artifact set is only knowable after a run, so a selector cannot
+        # be validated upfront; a near-miss is far more likely a typo than an
+        # empty run, and listing what was available is the only discovery
+        # mechanism there is. Never fatal - this is diagnostic output.
+        known = sorted({a.label for a in get_artifacts()})
+        logger.warning(
+            f"--dump-artifacts={selector!r} matched no artifacts. "
+            f"Available labels: {known or 'none declared'}"
+        )
+        return
+
+    logger.info(f"\n{'=' * 70}")
+    logger.info(f"RUN ARTIFACTS ({len(artifacts)} matched: {selector})")
+    logger.info(f"{'=' * 70}")
+    for artifact in artifacts:
+        header = f"----- {artifact.label} ({artifact.path}) -----"
+        if artifact.kind is ArtifactKind.BINARY:
+            logger.info(f"\n{header} [binary, not inlined]")
+            continue
+        try:
+            lines, omitted = read_artifact_lines(artifact)
+        except OSError as e:
+            # A vanished or unreadable artifact must not turn a passing run
+            # into a failing one.
+            logger.warning(f"Could not read artifact {artifact.path}: {e}")
+            continue
+        if omitted:
+            header += f" [showing last {len(lines)} of {len(lines) + omitted} lines]"
+        logger.info("\n" + header + "\n" + "\n".join(lines))
+    logger.info(f"{'=' * 70}\n")
 
 
 def build_testbed_topology(duts: List[str]) -> ConfigTopology:
@@ -559,6 +611,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # Print summary
         aggregator.print_summary(logger)
+
+        # The flag wins when passed; the env var lets a wrapper enable
+        # dumping by default without rewriting per-run command lines (same
+        # plumbing as --skip-health-checks / TAAC_SKIP_HEALTH_CHECKS).
+        dump_selector = args.dump_artifacts or os.environ.get(
+            "TAAC_DUMP_ARTIFACTS", ""
+        )
+        if dump_selector:
+            dump_run_artifacts(logger, dump_selector)
 
         # Write output files based on format
         if args.output_format == "json" or args.json_output:

@@ -30,6 +30,17 @@ def create_argument_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path(s) to Python test config files",
     )
+    parser.add_argument(
+        "--test-name",
+        dest="test_name",
+        help=(
+            "Name of the TestConfig attribute to pick from the loaded "
+            "module. Use for modules that expose multiple named "
+            "TestConfig constants. When omitted, the runner falls back to the default "
+            "lookup order: test_config, TEST_CONFIG, config, CONFIG. "
+            "Applies to every --test-configs path."
+        ),
+    )
 
     # Topology fixtures. Exposed as CLI flags rather than env vars so a user
     # running the entry point against a live environment doesn't need to

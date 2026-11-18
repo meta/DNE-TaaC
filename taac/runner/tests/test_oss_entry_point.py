@@ -129,6 +129,143 @@ class TestCLIParser(TestCase):
         self.assertTrue(hasattr(args, "json_output"))
         self.assertTrue(hasattr(args, "junit_output"))
 
+    def test_test_name_defaults_to_none(self):
+        """--test-name is optional; when omitted, args.test_name is None
+        so ``load_test_config`` falls back to the default 4-symbol lookup."""
+        parser = create_argument_parser()
+        args = parser.parse_args(
+            ["--test-configs", "test.py", "--dut", "device1"]
+        )
+        self.assertTrue(hasattr(args, "test_name"))
+        self.assertIsNone(args.test_name)
+
+    def test_test_name_parses(self):
+        """--test-name <NAME> populates args.test_name verbatim."""
+        parser = create_argument_parser()
+        args = parser.parse_args(
+            [
+                "--test-configs",
+                "test.py",
+                "--dut",
+                "device1",
+                "--test-name",
+                "SAMPLE_CPU_QUEUE_TEST_CONFIG",
+            ]
+        )
+        self.assertEqual(args.test_name, "SAMPLE_CPU_QUEUE_TEST_CONFIG")
+
+
+class TestLoadTestConfigTestName(TestCase):
+    """Cover ``load_test_config``'s ``attr_name`` lookup path — the code
+    behind ``--test-name``. Tests write a small synthetic Python module
+    to a temp file and load it, matching the real flow (imports via
+    ``importlib.util.spec_from_file_location``)."""
+
+    def _write_module(self, body: str) -> str:
+        """Write ``body`` to a temp .py file and return its path. Caller
+        is responsible for cleanup — but pytest/temp filesystem tears it
+        down between runs anyway."""
+        fd, path = tempfile.mkstemp(suffix=".py", prefix="taac_test_")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write(body)
+        return path
+
+    def test_named_constant_selected(self):
+        """A module exposing multiple named TestConfig constants: the
+        one matching ``attr_name`` is returned; others are ignored."""
+        module_body = """
+from taac.test_as_a_config import types as taac_types
+
+SAMPLE_CPU_QUEUE_TEST_CONFIG = taac_types.TestConfig(
+    name="SAMPLE_CPU_QUEUE", playbooks=[], endpoints=[],
+    host_os_type_map={}, startup_checks=[],
+)
+SAMPLE_BGP_TEST_CONFIG = taac_types.TestConfig(
+    name="SAMPLE_BGP", playbooks=[], endpoints=[],
+    host_os_type_map={}, startup_checks=[],
+)
+"""
+        path = self._write_module(module_body)
+        try:
+            config = oss_entry_point.load_test_config(
+                path, attr_name="SAMPLE_CPU_QUEUE_TEST_CONFIG"
+            )
+            self.assertEqual(config.name, "SAMPLE_CPU_QUEUE")
+        finally:
+            os.unlink(path)
+
+    def test_named_callable_invoked(self):
+        """If the named symbol is a callable (factory function), it is
+        called — same semantics the default 4-symbol path applies to
+        ``test_config()``."""
+        module_body = """
+from taac.test_as_a_config import types as taac_types
+
+def SAMPLE_FACTORY():
+    return taac_types.TestConfig(
+        name="BUILT_FROM_FACTORY", playbooks=[], endpoints=[],
+        host_os_type_map={}, startup_checks=[],
+    )
+"""
+        path = self._write_module(module_body)
+        try:
+            config = oss_entry_point.load_test_config(
+                path, attr_name="SAMPLE_FACTORY"
+            )
+            self.assertEqual(config.name, "BUILT_FROM_FACTORY")
+        finally:
+            os.unlink(path)
+
+    def test_missing_named_symbol_raises_distinct_error(self):
+        """A typo in ``--test-name`` must raise a DISTINCT error message
+        from the "module has no test config at all" case — the fix is
+        different (rename the flag vs add a symbol to the module), so
+        the two failures must be diagnosable apart."""
+        module_body = """
+from taac.test_as_a_config import types as taac_types
+
+SAMPLE_ONE = taac_types.TestConfig(
+    name="ONE", playbooks=[], endpoints=[],
+    host_os_type_map={}, startup_checks=[],
+)
+"""
+        path = self._write_module(module_body)
+        try:
+            with self.assertRaises(oss_entry_point.OSSConfigError) as ctx:
+                oss_entry_point.load_test_config(
+                    path, attr_name="SAMPLE_TYPO"
+                )
+            msg = str(ctx.exception)
+            # Must name the typo'd attribute so the user can spot the fix.
+            self.assertIn("SAMPLE_TYPO", msg)
+            # Must NOT confusingly mention the default fallback names as
+            # "expected" candidates — the user asked for a specific name.
+            self.assertNotIn("Expected one of: test_config", msg)
+            # Must point at where to look.
+            self.assertIn(path, msg)
+        finally:
+            os.unlink(path)
+
+    def test_default_fallback_still_works_when_attr_name_none(self):
+        """Passing ``attr_name=None`` (the default when --test-name is
+        omitted) preserves the existing 4-symbol fallback — regression
+        guard against breaking every existing OSS config file."""
+        module_body = """
+from taac.test_as_a_config import types as taac_types
+
+test_config = taac_types.TestConfig(
+    name="default_fallback", playbooks=[], endpoints=[],
+    host_os_type_map={}, startup_checks=[],
+)
+"""
+        path = self._write_module(module_body)
+        try:
+            config = oss_entry_point.load_test_config(path, attr_name=None)
+            self.assertEqual(config.name, "default_fallback")
+        finally:
+            os.unlink(path)
+
 
 class TestExitCodes(TestCase):
     """Test that exit codes match specification."""

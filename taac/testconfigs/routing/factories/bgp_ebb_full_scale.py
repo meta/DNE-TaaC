@@ -1553,6 +1553,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
             expected_established_sessions=session_count,
+            expected_peer_identity=expected_peer_identity,
             profile=profile,
             precheck_thresholds=full_scale_precheck_thresholds,
             tcp_dump_capture_interface_ebgp=ixia_interface_mimic_ebgp,
@@ -1566,6 +1567,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             else ibgp_pnh_start_ipv6s,
             ibgp_pnh_count=None if scale == EBB_FY26_SCALE else openr_pnh_count,
             ibgp_pnh_step=None if scale == EBB_FY26_SCALE else openr_pnh_step,
+            require_stable_restoration_baseline=scale != EBB_FY26_SCALE,
             bgp_mon_parent_network=bound_bgp_mon_network,
             characterization=OBSERVE_ONLY_ON_DEVICE,
             characterization_gates=_characterization_gates(
@@ -1669,6 +1671,9 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ),
             prefix_pool_names_by_afi=automation.ebgp_route_item_names_by_afi,
             prefix_end_index=scale.fa_routes_per_peer,
+            advertise_transition_soft_threshold_seconds=(
+                scale.route_oscillation_advertise_threshold_seconds
+            ),
             bgp_mon_parent_network=bound_bgp_mon_network,
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
@@ -1708,6 +1713,9 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             peergroup_ibgp_v4=peergroup_ibgp_v4,
             expected_established_sessions=session_count,
             profile=profile,
+            advertise_transition_soft_threshold_seconds=(
+                scale.route_oscillation_advertise_threshold_seconds
+            ),
             precheck_thresholds=full_scale_precheck_thresholds,
             expected_peer_identity=expected_peer_identity,
             bgp_mon_parent_network=bound_bgp_mon_network,

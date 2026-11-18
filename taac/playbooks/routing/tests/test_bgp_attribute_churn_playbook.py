@@ -1259,6 +1259,9 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         payload = _step_payload(playbook.stages[0].steps[0])
         self.assertEqual(100, payload["peer_count_per_plane"])
         self.assertEqual(1_000, payload["routes_per_block"])
+        self.assertEqual(240, payload["cadence_seconds"])
+        self.assertEqual(150, payload["transition_timeout_seconds"])
+        self.assertEqual(150, payload["ixia_apply_timeout_seconds"])
         self.assertEqual(prefix_sources, payload["prefix_sources"])
         self.assertEqual(
             prefix_sources, AttributeChurn.from_step_params(payload).prefix_sources

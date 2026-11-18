@@ -689,7 +689,7 @@ def _bgp_ebb_attribute_churn(
             ),
             execution=ExecutionPolicy(
                 duration_seconds=duration_seconds,
-                cadence_seconds=60.0,
+                cadence_seconds=scale.attribute_churn_cadence_seconds,
                 max_iterations=100_000,
             ),
             recovery=RecoveryPolicy(
@@ -725,6 +725,7 @@ def _bgp_ebb_attribute_churn(
             )
         ),
         prefix_sources=prefix_sources or {},
+        ixia_apply_timeout_seconds=scale.attribute_churn_ixia_apply_timeout_seconds,
     )
 
 
@@ -839,7 +840,9 @@ def get_bgp_ebb_attribute_churn_playbook(
                             ibgp_prefix_sources,
                         ),
                         poll_interval_seconds=5,
-                        transition_timeout_seconds=60,
+                        transition_timeout_seconds=_ebb_scale(
+                            scale
+                        ).attribute_churn_transition_timeout_seconds,
                         reference_setup_timeout_seconds=120,
                         quiet_window_seconds=120,
                         max_lookup_concurrency=8,
@@ -1688,6 +1691,7 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
     peergroup_ibgp_v6: str,
     peergroup_ibgp_v4: str,
     expected_established_sessions: int = 0,
+    expected_peer_identity: t.Mapping[str, str] | None = None,
     profile: BgpPlusPlusProfile = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     memory_threshold: int = Gigabyte.GIG_5.value,
@@ -1708,6 +1712,7 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
     ibgp_pnh_start_ipv6s: t.Sequence[str] | None = None,
     ibgp_pnh_count: int | None = None,
     ibgp_pnh_step: int | None = None,
+    require_stable_restoration_baseline: bool = False,
 ) -> Playbook:
     """
     Build CICD-EBB-13: FAUU drain and undrain.
@@ -1788,6 +1793,15 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
                     tcp_dump_capture_interface_ibgp=tcp_dump_capture_interface_ibgp,
                     tcp_dump_capture_interfaces_ibgp=tcp_dump_capture_interfaces_ibgp,
                     soak_time_seconds=soak_time_seconds,
+                    require_stable_restoration_baseline=(
+                        require_stable_restoration_baseline
+                    ),
+                    expected_established_sessions=expected_established_sessions,
+                    expected_peer_addresses=(
+                        tuple(sorted(expected_peer_identity))
+                        if expected_peer_identity is not None
+                        else None
+                    ),
                     drained_prefix_descriptors=_ebb_drained_prefix_descriptors(
                         prefix_end_index, prefix_pool_regex=prefix_pool_regex
                     ),
@@ -1994,6 +2008,7 @@ def get_bgp_ebb_ebgp_route_oscillation_playbook(
     prefix_pool_names_by_afi: t.Mapping[str, str] | None = None,
     prefix_start_index: int = 0,
     prefix_end_index: int = 750,
+    advertise_transition_soft_threshold_seconds: float | None = None,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
@@ -2088,6 +2103,9 @@ def get_bgp_ebb_ebgp_route_oscillation_playbook(
                                 ),
                                 "prefix_start_index": prefix_start_index,
                                 "prefix_end_index": prefix_end_index,
+                                "advertise_transition_soft_threshold_seconds": (
+                                    advertise_transition_soft_threshold_seconds
+                                ),
                                 "test_duration_seconds": 3600,
                                 "withdraw_time": 60,
                                 "readvertise_time": 60,
@@ -2133,6 +2151,7 @@ def get_bgp_ebb_ibgp_route_oscillation_playbook(
     ),
     prefix_start_index: int = 0,
     prefix_end_index: int = 750,
+    advertise_transition_soft_threshold_seconds: float | None = None,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
@@ -2226,6 +2245,9 @@ def get_bgp_ebb_ibgp_route_oscillation_playbook(
                                 ),
                                 "prefix_start_index": prefix_start_index,
                                 "prefix_end_index": prefix_end_index,
+                                "advertise_transition_soft_threshold_seconds": (
+                                    advertise_transition_soft_threshold_seconds
+                                ),
                                 "test_duration_seconds": 3600,
                                 "withdraw_time": 60,
                                 "readvertise_time": 60,

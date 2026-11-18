@@ -250,6 +250,77 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
                     )
                 )
 
+    def test_fy27_fauu_waits_for_stable_full_peer_baseline_only(self) -> None:
+        def baseline_params(config: taac_types.TestConfig) -> dict[str, t.Any]:
+            playbook = next(
+                playbook
+                for playbook in config.playbooks or []
+                if playbook.name == "bgp_ebb_fauu_drain_undrain_playbook"
+            )
+            matches = [
+                params
+                for stage in playbook.stages or []
+                for step in stage.steps or []
+                if (params := _json_params(step.step_params)).get("custom_step_name")
+                == "snapshot_bgp_restoration_baseline"
+            ]
+            self.assertEqual(1, len(matches))
+            return matches[0]
+
+        fy27 = baseline_params(
+            cicd_ebb_int_tc.NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG
+        )
+        self.assertTrue(fy27["require_stable_baseline"])
+        self.assertEqual(1880, fy27["expected_peer_count"])
+        self.assertEqual(1880, len(fy27["expected_peer_addresses"]))
+        self.assertEqual(
+            sorted(fy27["expected_peer_addresses"]),
+            fy27["expected_peer_addresses"],
+        )
+        self.assertEqual(480, fy27["stability_timeout_seconds"])
+
+        fy26 = baseline_params(
+            cicd_ebb_int_tc.NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG
+        )
+        self.assertNotIn("require_stable_baseline", fy26)
+        self.assertNotIn("expected_peer_count", fy26)
+        self.assertNotIn("expected_peer_addresses", fy26)
+        self.assertNotIn("stability_timeout_seconds", fy26)
+
+    def test_fy27_route_oscillation_uses_advertise_only_threshold(self) -> None:
+        def route_oscillation_params(
+            config: taac_types.TestConfig,
+        ) -> dict[str, t.Any]:
+            playbook = next(
+                playbook
+                for playbook in config.playbooks or []
+                if playbook.name == "bgp_ebb_ebgp_route_oscillation_playbook"
+            )
+            matches = [
+                params
+                for stage in playbook.stages or []
+                for step in stage.steps or []
+                if (params := _json_params(step.step_params)).get("custom_step_name")
+                == "bgp_route_oscillation"
+            ]
+            self.assertEqual(1, len(matches))
+            return matches[0]
+
+        fy27 = route_oscillation_params(
+            cicd_ebb_int_tc.NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG
+        )
+        self.assertEqual(
+            120,
+            fy27["advertise_transition_soft_threshold_seconds"],
+        )
+        self.assertNotIn("transition_soft_threshold_seconds", fy27)
+
+        fy26 = route_oscillation_params(
+            cicd_ebb_int_tc.NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG
+        )
+        self.assertNotIn("advertise_transition_soft_threshold_seconds", fy26)
+        self.assertNotIn("transition_soft_threshold_seconds", fy26)
+
     def test_non_fy26_forces_ebb_platform_before_bgpcpp_enable(self) -> None:
         topology = _compiled_topology()
         with mock.patch.object(factory, "ebb_topology", return_value=topology):
@@ -1846,6 +1917,9 @@ class EbbFy27AttributeChurnFactoryTest(unittest.TestCase):
         ]
         self.assertEqual(100, payload["peer_count_per_plane"])
         self.assertEqual(1_000, payload["routes_per_block"])
+        self.assertEqual(240, payload["cadence_seconds"])
+        self.assertEqual(150, payload["transition_timeout_seconds"])
+        self.assertEqual(150, payload["ixia_apply_timeout_seconds"])
         self.assertEqual(100_000, payload["prefix_sources"]["ipv4"]["count"])
         self.assertEqual(100_000, payload["prefix_sources"]["ipv6"]["count"])
         self.assertEqual(

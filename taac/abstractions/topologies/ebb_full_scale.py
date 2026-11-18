@@ -157,6 +157,14 @@ class EbbScaleProfile:
             advertise the same per-peer windows, so this times the peer count
             is the unique HE route demand per AFI.
         fa_routes_per_peer: Baseline routes each eBGP (FA) peer advertises.
+        attribute_churn_cadence_seconds: Wall-clock budget for each attribute-churn
+            cycle, including the IXIA mutation and convergence observation.
+        attribute_churn_transition_timeout_seconds: Soft convergence threshold for
+            each attribute-churn transition.
+        attribute_churn_ixia_apply_timeout_seconds: Bound for applying and reading
+            back one attribute mutation on IXIA.
+        route_oscillation_advertise_threshold_seconds: Soft SLA for restoring
+            advertised routes after each oscillation withdrawal.
         openr_injection_headroom: Injected rows per range beyond the advertised
             population. Explicit so that zero headroom is an enforced
             equality, not two numbers that happen to match.
@@ -196,6 +204,10 @@ class EbbScaleProfile:
     allows_dense_unvetted_route_tail: bool
     ibgp_planes_by_link: tuple[tuple[int, ...], ...]
     fa_diverse_nhg_memberships: bool
+    attribute_churn_cadence_seconds: int = 60
+    attribute_churn_transition_timeout_seconds: int = 60
+    attribute_churn_ixia_apply_timeout_seconds: int = 60
+    route_oscillation_advertise_threshold_seconds: int | None = None
     next_hop_step: int = 2
     bgp_total_path_limit: int | None = None
     device_state_guard_namespace: str | None = None
@@ -222,8 +234,17 @@ class EbbScaleProfile:
             "advertised_pnh_count",
             "routes_per_he_peer",
             "fa_routes_per_peer",
+            "attribute_churn_cadence_seconds",
+            "attribute_churn_transition_timeout_seconds",
+            "attribute_churn_ixia_apply_timeout_seconds",
         ):
             _require_count(field_name, getattr(self, field_name), minimum=1)
+        if self.route_oscillation_advertise_threshold_seconds is not None:
+            _require_count(
+                "route_oscillation_advertise_threshold_seconds",
+                self.route_oscillation_advertise_threshold_seconds,
+                minimum=1,
+            )
         _require_count(
             "openr_injection_headroom", self.openr_injection_headroom, minimum=0
         )
@@ -326,6 +347,10 @@ EBB_FY27_SCALE = EbbScaleProfile(
     allows_dense_unvetted_route_tail=True,
     ibgp_planes_by_link=((1, 2), (3, 4)),
     fa_diverse_nhg_memberships=False,
+    attribute_churn_cadence_seconds=240,
+    attribute_churn_transition_timeout_seconds=150,
+    attribute_churn_ixia_apply_timeout_seconds=150,
+    route_oscillation_advertise_threshold_seconds=120,
 )
 
 

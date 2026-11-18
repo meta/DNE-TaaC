@@ -66,9 +66,12 @@ class AttributeChurn:
     prefix_sources: t.Mapping[str, t.Mapping[str, object]] = dataclasses.field(
         default_factory=dict
     )
+    ixia_apply_timeout_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         self._attribute_families()
+        if self.ixia_apply_timeout_seconds <= 0:
+            raise ValueError("attribute churn IXIA apply timeout must be positive")
         if self.prefix_sources:
             expected_afis = {"ipv4", "ipv6"}
             if set(self.prefix_sources) != expected_afis:
@@ -141,6 +144,8 @@ class AttributeChurn:
             params["prefix_sources"] = {
                 afi: dict(source) for afi, source in self.prefix_sources.items()
             }
+        if self.ixia_apply_timeout_seconds != 60.0:
+            params["ixia_apply_timeout_seconds"] = self.ixia_apply_timeout_seconds
         return params
 
     @classmethod
@@ -253,4 +258,7 @@ class AttributeChurn:
                     params.get("prefix_sources", {}),
                 ).items()
             },
+            ixia_apply_timeout_seconds=float(
+                params.get("ixia_apply_timeout_seconds", 60.0)
+            ),
         )

@@ -2168,15 +2168,16 @@ def create_validated_bgp_route_oscillations_stage(
     test_duration_seconds: int = 3600,
     parent_prefixes_to_ignore: Sequence[str] = (),
     transition_soft_threshold_seconds: Optional[float] = None,
+    advertise_transition_soft_threshold_seconds: Optional[float] = None,
     fail_on_session_flap: Optional[bool] = None,
     description: str = "Run validated dual-stack BGP route oscillations",
 ) -> Stage:
     """Create BGP route oscillations with a verdict for every trigger.
 
-    See ``create_validated_bgp_route_oscillation_step`` for why
-    ``transition_soft_threshold_seconds`` matters: it is enforced as a hard
-    pass/fail on BOTH transitions, and its 60s runtime default is shorter than
-    some topologies take to restore.
+    See ``create_validated_bgp_route_oscillation_step`` for the transition SLA
+    contract. The shared threshold gates both directions unless the optional
+    advertise threshold overrides only readvertisement; late convergence remains
+    blocking in either direction.
     """
     return Stage(
         steps=[
@@ -2192,6 +2193,9 @@ def create_validated_bgp_route_oscillations_stage(
                 test_duration_seconds=test_duration_seconds,
                 parent_prefixes_to_ignore=parent_prefixes_to_ignore,
                 transition_soft_threshold_seconds=transition_soft_threshold_seconds,
+                advertise_transition_soft_threshold_seconds=(
+                    advertise_transition_soft_threshold_seconds
+                ),
                 fail_on_session_flap=fail_on_session_flap,
                 description=description,
             )
@@ -2633,6 +2637,9 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     peer_convergence_scope: dict | None = None,
     expected_min_peers: int | None = None,
     verify_restoration: bool = True,
+    require_stable_restoration_baseline: bool = False,
+    expected_established_sessions: int | None = None,
+    expected_peer_addresses: Sequence[str] | None = None,
     restoration_settle_timeout_seconds: int = 300,
     drained_prefix_descriptors: Sequence[dict] | None = None,
     tcp_dump_capture_interfaces_ibgp: Sequence[str] | None = None,
@@ -2683,6 +2690,12 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
             the undrain (default: True). Closes the case where sessions are up
             and the RIB, FIB Agent and hardware FIB agree with each other while
             the restored view itself is wrong.
+        require_stable_restoration_baseline: Require the full raw peer view to
+            remain unchanged before recording the restoration baseline.
+        expected_established_sessions: Exact peer count required by the stable
+            baseline path.
+        expected_peer_addresses: Exact topology-derived peer identities required
+            by the stable baseline path.
         restoration_settle_timeout_seconds: How long the restoration check keeps
             re-reading before failing (default: 300)
 
@@ -2793,6 +2806,17 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
             create_bgp_restoration_baseline_step(
                 snapshot_key="fauu_drain_undrain",
                 expected_min_peers=expected_min_peers,
+                require_stable_baseline=require_stable_restoration_baseline,
+                expected_peer_count=(
+                    expected_established_sessions
+                    if require_stable_restoration_baseline
+                    else None
+                ),
+                expected_peer_addresses=(
+                    expected_peer_addresses
+                    if require_stable_restoration_baseline
+                    else None
+                ),
             ),
         )
 

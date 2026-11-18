@@ -1289,6 +1289,11 @@ def create_bgp_attribute_churn_step(
         "quiet_window_seconds": quiet_window_seconds,
         "max_lookup_concurrency": max_lookup_concurrency,
     }
+    if "ixia_apply_timeout_seconds" in churn_params:
+        numeric_params["ixia_apply_timeout_seconds"] = _bgp_attribute_churn_integer(
+            churn_params["ixia_apply_timeout_seconds"],
+            "ixia_apply_timeout_seconds",
+        )
     if not hostname:
         raise ValueError("hostname must be non-empty")
     scenario_id = churn_params["scenario_id"]
@@ -7917,19 +7922,20 @@ def create_validated_bgp_route_oscillation_step(
     test_duration_seconds: int,
     parent_prefixes_to_ignore: t.Sequence[str] = (),
     transition_soft_threshold_seconds: t.Optional[float] = None,
+    advertise_transition_soft_threshold_seconds: t.Optional[float] = None,
     fail_on_session_flap: t.Optional[bool] = None,
     description: t.Optional[str] = None,
 ) -> Step:
     """Create route oscillations with IXIA, source, and exact-RIB verdicts.
 
     ``transition_soft_threshold_seconds`` is a HARD gate despite the name:
-    ``_wait_transition`` demands ``ConvergenceOutcome.WITHIN_SLA`` and raises
-    ``TestCaseFailure`` on anything else, so a transition that converges LATE
-    fails the run exactly like one that never converges. The runtime default is
-    60s and it applies to BOTH transitions -- the withdraw and the
-    re-advertise -- so any topology whose restore takes longer than that must
-    raise it or the step fails a healthy device. Omitted = the runtime default,
-    byte-identical for existing callers.
+    ``_wait_transition`` waits until the route state converges or hits the hard
+    timeout. ``_require_transition_within_sla`` then raises ``TestCaseFailure``
+    unless the outcome is ``ConvergenceOutcome.WITHIN_SLA``, preserving detailed
+    evidence for a transition that converged late. The runtime default is 60s
+    and applies to both transitions unless
+    ``advertise_transition_soft_threshold_seconds`` overrides only the
+    readvertisement. Omitted values preserve the existing payload and defaults.
     """
     return create_custom_step(
         params_dict={
@@ -7951,6 +7957,15 @@ def create_validated_bgp_route_oscillation_step(
                     )
                 }
                 if transition_soft_threshold_seconds is not None
+                else {}
+            ),
+            **(
+                {
+                    "advertise_transition_soft_threshold_seconds": (
+                        advertise_transition_soft_threshold_seconds
+                    )
+                }
+                if advertise_transition_soft_threshold_seconds is not None
                 else {}
             ),
             # Emitted only when set, so existing callers stay byte-identical.
@@ -8385,6 +8400,12 @@ def create_bgp_restoration_baseline_step(
     peer_scope: t.Optional[t.Dict[str, t.Any]] = None,
     expected_min_peers: int = 1,
     compare_route_count: bool = True,
+    require_stable_baseline: bool = False,
+    expected_peer_count: int | None = None,
+    expected_peer_addresses: t.Optional[t.Sequence[str]] = None,
+    stability_window_seconds: int = 30,
+    stability_timeout_seconds: int | None = None,
+    poll_interval_seconds: int = 10,
     description: t.Optional[str] = None,
 ) -> Step:
     """
@@ -8403,18 +8424,84 @@ def create_bgp_restoration_baseline_step(
             trivially, so this is the anti-vacuousness floor.
         compare_route_count: Also record the BGP++ RIB entry count (default
             True). Must match the verify step's value.
+        require_stable_baseline: Poll the raw peer view until it remains unchanged
+            before recording the complete baseline.
+        expected_peer_count: Exact peer inventory size required by the stable
+            path when explicit identities are unavailable.
+        expected_peer_addresses: Exact topology-derived identities required by
+            the stable path; when set, their size must match expected_peer_count.
+        stability_window_seconds: Required unchanged interval.
+        stability_timeout_seconds: Optional bounded wait; when omitted, scales
+            from the expected peer count with a 300-second floor.
+        poll_interval_seconds: Delay between peer-view samples.
         description: Custom description for the step.
 
     Returns:
         Step object for the pre-drain restoration baseline
     """
-    params = {
+    params: t.Dict[str, t.Any] = {
         "custom_step_name": "snapshot_bgp_restoration_baseline",
         "snapshot_key": snapshot_key,
         "peer_scope": peer_scope or {},
         "expected_min_peers": expected_min_peers,
         "compare_route_count": compare_route_count,
     }
+    if require_stable_baseline:
+        try:
+            normalized_peer_addresses = tuple(
+                sorted(
+                    str(ipaddress.ip_address(peer.split("/", 1)[0]))
+                    for peer in (str(value) for value in (expected_peer_addresses or ()))
+                )
+            )
+        except ValueError as error:
+            raise ValueError(
+                "stable BGP restoration peer identities must be IP addresses"
+            ) from error
+        if len(set(normalized_peer_addresses)) != len(normalized_peer_addresses):
+            raise ValueError("stable BGP restoration peer identities must be unique")
+        if normalized_peer_addresses:
+            if (
+                expected_peer_count is not None
+                and expected_peer_count != len(normalized_peer_addresses)
+            ):
+                raise ValueError(
+                    "stable BGP restoration peer count must match the exact "
+                    "peer identities"
+                )
+            expected_peer_count = len(normalized_peer_addresses)
+        if expected_peer_count is None or expected_peer_count <= 0:
+            raise ValueError(
+                "stable BGP restoration baseline requires exact peer identities "
+                "or a positive expected_peer_count"
+            )
+        if stability_window_seconds <= 0 or poll_interval_seconds <= 0:
+            raise ValueError(
+                "baseline stability window and poll interval must be positive"
+            )
+        derived_timeout = max(300, 60 * math.ceil(expected_peer_count / 250))
+        timeout = (
+            derived_timeout
+            if stability_timeout_seconds is None
+            else stability_timeout_seconds
+        )
+        if timeout < stability_window_seconds:
+            raise ValueError(
+                "baseline stability timeout must cover the stability window"
+            )
+        params.update(
+            {
+                "require_stable_baseline": True,
+                "expected_peer_count": expected_peer_count,
+                "stability_timeout_seconds": timeout,
+            }
+        )
+        if normalized_peer_addresses:
+            params["expected_peer_addresses"] = list(normalized_peer_addresses)
+        if stability_window_seconds != 30:
+            params["stability_window_seconds"] = stability_window_seconds
+        if poll_interval_seconds != 10:
+            params["poll_interval_seconds"] = poll_interval_seconds
     return Step(
         name=StepName.CUSTOM_STEP,
         step_params=Params(json_params=json.dumps(params)),

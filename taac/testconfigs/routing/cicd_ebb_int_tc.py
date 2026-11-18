@@ -80,6 +80,7 @@ NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG = create_bgp_ebb_full_scale_test_co
     enable_update_group=False,
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
+    scale=EBB_FY27_SCALE,
 )
 
 NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_config(
@@ -141,6 +142,7 @@ NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG = create_bgp_ebb_full_scale_test_co
     enable_update_group=False,
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
+    scale=EBB_FY27_SCALE,
 )
 
 NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_config(

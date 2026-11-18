@@ -204,11 +204,27 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
     def test_nrq_non_ug_canaries_select_fy27_without_changing_ug(self) -> None:
         for non_ug, ug, expected_playbooks in (
             (
+                cicd_ebb_int_tc.NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
+                cicd_ebb_int_tc.NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+                [
+                    "bgp_ebb_route_registry_runtime_update_playbook",
+                    "bgp_ebb_daemon_restart_playbook",
+                ],
+            ),
+            (
                 cicd_ebb_int_tc.NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
                 cicd_ebb_int_tc.NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
                 [
                     "bgp_ebb_attribute_churn_playbook",
                     "bgp_ebb_fauu_drain_undrain_playbook",
+                ],
+            ),
+            (
+                cicd_ebb_int_tc.NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
+                cicd_ebb_int_tc.NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+                [
+                    "bgp_ebb_ebgp_session_oscillation_playbook",
+                    "bgp_ebb_cold_start_playbook",
                 ],
             ),
             (
@@ -1011,7 +1027,9 @@ def _bgp_peer_names(device_group: taac_types.DeviceGroupConfig) -> list[str]:
 _COLD_START_PLAYBOOK = "bgp_ebb_cold_start_playbook"
 _FY27_NON_UG_CANARY_NAMES = frozenset(
     {
+        "NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
         "NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
+        "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
         "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
     }
 )

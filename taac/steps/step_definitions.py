@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# pyre-unsafe
 """
 Consolidated step definitions for TAAC test configurations.
 
@@ -22,7 +21,6 @@ from dataclasses import dataclass
 
 import paramiko
 from taac.abstractions.churn.attribute import AttributeChurn
-from neteng.test_infra.dne.taac.abstractions.churn.route import RouteChurn, RouteStorm
 from taac.abstractions.churn.session import SessionChurn
 from taac.abstractions.churn.workloads import (
     IgpMetricChurn,
@@ -30,8 +28,17 @@ from taac.abstractions.churn.workloads import (
     LongevityCommunityChurn,
     MultipathChurn,
 )
+from taac.abstractions.eos_bgpcpp_setup_tasks import (
+    build_bgpcpp_policy_overlay_cmd,
+    POLICY_EVALUATION_SOURCE_CONFIG_PATH,
+)
 
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+from taac.abstractions.churn.route import (  # oss-rewrite (force ShipIt re-export to taac.* root)
+    RouteChurn,
+    RouteStorm,
+)
 
 if not TAAC_OSS:
     from libfb.py.asyncio.await_utils import convert_to_async
@@ -207,10 +214,21 @@ else:
 
 
 if not TAAC_OSS:
+    from taac.internal.driver.lab_ssh_transport import (
+        async_exec as lab_ssh_async_exec,
+        lab_ssh_transport_enabled,
+    )
     from service_automation.fboss.remediations.utils.bmc_helper import (
         run_bmc_cmd_hwcontrol,
     )
 else:
+
+    def lab_ssh_transport_enabled() -> bool:  # type: ignore
+        """OSS has no lab-ssh daemon; BMC commands use run_bmc_cmd_hwcontrol."""
+        return False
+
+    async def lab_ssh_async_exec(*args, **kwargs):  # type: ignore
+        raise NotImplementedError("The lab-ssh transport is Meta-internal")
 
     def run_bmc_cmd_hwcontrol(hostname: str, cmd: str) -> str:  # type: ignore
         """OSS replacement - run a BMC command on the device's BMC via SSH.
@@ -293,6 +311,106 @@ def create_custom_step(
         name=StepName.CUSTOM_STEP,
         step_params=Params(json_params=json.dumps(params_dict)),
         description=description,
+    )
+
+
+def create_cbag_acacia_transceiver_reset_step(
+    reset_device: str = "cbag001.qzp1",
+    traffic_items: t.Optional[t.List[str]] = None,
+    measured_interfaces_by_device: t.Optional[t.Dict[str, t.List[str]]] = None,
+    expected_bgp_sessions_by_device: t.Optional[t.Dict[str, int]] = None,
+    bgp_sessions_blocking: bool = False,
+    removal_hold_seconds: int = 120,
+    recovery_timeout_seconds: int = 600,
+    recovery_poll_interval_seconds: int = 10,
+    stability_window_seconds: int = 30,
+    traffic_observation_seconds: int = 240,
+    loss_settle_seconds: int = 60,
+    iteration_count: int = 50,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Create a fail-fast CBAG Acacia reset and traffic-measurement loop."""
+    traffic_items = traffic_items or [
+        "RDMA_CBAG001_TO_BAG001",
+        "RDMA_CBAG001_TO_BAG002",
+    ]
+    measured_interfaces_by_device = measured_interfaces_by_device or {
+        hostname: [
+            "Ethernet4/32/1",
+            "Ethernet4/32/5",
+            "Ethernet4/36/1",
+            "Ethernet4/36/5",
+        ]
+        for hostname in ("cbag001.qzp1", "bag001.qzq1", "bag002.qzq1")
+    }
+    expected_bgp_sessions_by_device = expected_bgp_sessions_by_device or {
+        "cbag001.qzp1": 404,
+        "bag001.qzq1": 204,
+        "bag002.qzq1": 204,
+    }
+    if not reset_device:
+        raise ValueError("reset_device must be non-empty")
+    if not traffic_items or any(not item for item in traffic_items):
+        raise ValueError("traffic_items must contain at least one non-empty name")
+    if not measured_interfaces_by_device or any(
+        not hostname or not interfaces or any(not interface for interface in interfaces)
+        for hostname, interfaces in measured_interfaces_by_device.items()
+    ):
+        raise ValueError("measured_interfaces_by_device must be non-empty")
+    if not expected_bgp_sessions_by_device or any(
+        not hostname
+        or isinstance(expected, bool)
+        or not isinstance(expected, int)
+        or expected < 0
+        for hostname, expected in expected_bgp_sessions_by_device.items()
+    ):
+        raise ValueError("expected_bgp_sessions_by_device must be non-negative")
+    if (
+        isinstance(iteration_count, bool)
+        or not isinstance(iteration_count, int)
+        or not 1 <= iteration_count <= 50
+    ):
+        raise ValueError("iteration_count must be an integer in [1, 50]")
+    positive_values = {
+        "recovery_timeout_seconds": recovery_timeout_seconds,
+        "recovery_poll_interval_seconds": recovery_poll_interval_seconds,
+        "traffic_observation_seconds": traffic_observation_seconds,
+    }
+    nonnegative_values = {
+        "removal_hold_seconds": removal_hold_seconds,
+        "stability_window_seconds": stability_window_seconds,
+        "loss_settle_seconds": loss_settle_seconds,
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in positive_values.values()
+    ):
+        raise ValueError(f"Timing values must be positive integers: {positive_values}")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in nonnegative_values.values()
+    ):
+        raise ValueError(
+            f"Timing values must be non-negative integers: {nonnegative_values}"
+        )
+    return create_custom_step(
+        {
+            "custom_step_name": "cbag_acacia_transceiver_reset",
+            "hostname": reset_device,
+            "reset_device": reset_device,
+            "traffic_items": traffic_items,
+            "measured_interfaces_by_device": measured_interfaces_by_device,
+            "expected_bgp_sessions_by_device": expected_bgp_sessions_by_device,
+            "bgp_sessions_blocking": bgp_sessions_blocking,
+            "removal_hold_seconds": removal_hold_seconds,
+            "recovery_timeout_seconds": recovery_timeout_seconds,
+            "recovery_poll_interval_seconds": recovery_poll_interval_seconds,
+            "stability_window_seconds": stability_window_seconds,
+            "traffic_observation_seconds": traffic_observation_seconds,
+            "loss_settle_seconds": loss_settle_seconds,
+            "iteration_count": iteration_count,
+        },
+        description=description or "Reset all Acacia optics and validate PCS/IXIA loss",
     )
 
 
@@ -488,6 +606,7 @@ def create_bgp_update_group_state_step(
 
 _DEFAULT_MAX_HARDWARE_CURRENT_DELTA = 100
 _DEFAULT_MAX_HARDWARE_HIGH_WATERMARK_INCREASE = 100
+_DEFAULT_HARDWARE_HIGH_WATERMARK_RESOURCES = ("fec", "ecmp")
 
 # Settle time after admin-enabling ports, before their state is asserted.
 # Testbeds on coherent ZR optics must raise this: ZR takes 120-180s to acquire
@@ -511,6 +630,9 @@ def create_hardware_capacity_delta_step(
     *,
     max_current_delta: int = _DEFAULT_MAX_HARDWARE_CURRENT_DELTA,
     max_high_watermark_increase: int = (_DEFAULT_MAX_HARDWARE_HIGH_WATERMARK_INCREASE),
+    high_watermark_resources: tuple[str, ...] = (
+        _DEFAULT_HARDWARE_HIGH_WATERMARK_RESOURCES
+    ),
     description: t.Optional[str] = None,
 ) -> Step:
     """Create a keyed capture, compare, or clear capacity-delta action."""
@@ -534,22 +656,74 @@ def create_hardware_capacity_delta_step(
     for name, value in thresholds:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
+    supported_resources = set(_DEFAULT_HARDWARE_HIGH_WATERMARK_RESOURCES)
+    if (
+        not isinstance(high_watermark_resources, tuple)
+        or not high_watermark_resources
+        or any(
+            not isinstance(resource, str) or resource not in supported_resources
+            for resource in high_watermark_resources
+        )
+        or len(set(high_watermark_resources)) != len(high_watermark_resources)
+    ):
+        raise ValueError(
+            "high_watermark_resources must be a non-empty tuple containing "
+            "only 'fec' and/or 'ecmp', without duplicates"
+        )
+    is_default_high_watermark_scope = (
+        set(high_watermark_resources) == supported_resources
+    )
     default_thresholds = {
         "max_current_delta": _DEFAULT_MAX_HARDWARE_CURRENT_DELTA,
         "max_high_watermark_increase": (_DEFAULT_MAX_HARDWARE_HIGH_WATERMARK_INCREASE),
     }
-    if action != "compare" and any(
-        value != default_thresholds[name] for name, value in thresholds
+    if action != "compare" and (
+        any(value != default_thresholds[name] for name, value in thresholds)
+        or not is_default_high_watermark_scope
     ):
         raise ValueError(
-            "hardware-capacity thresholds are supported only for compare actions"
+            "hardware-capacity comparison options are supported only for compare actions"
         )
     if action == "compare":
         for name, value in thresholds:
             payload[name] = value
+        if not is_default_high_watermark_scope:
+            payload["high_watermark_resources"] = high_watermark_resources
     return create_custom_step(
         params_dict=payload,
         description=description or f"Hardware-capacity delta: {action}",
+    )
+
+
+def create_bgp_ixia_session_recovery_step(
+    device_name: str,
+    ixia_bgp_peer_regex: str,
+    *,
+    initial_wait_seconds: int = 300,
+    restart_wait_seconds: int = 120,
+    poll_interval_seconds: int = 15,
+    max_restart_rounds: int = 3,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Gate on every IXIA session matching the regex reaching ESTABLISHED,
+    restarting stuck sessions between bounded waits and resetting their full
+    peer objects once if a sparse restart leaves the down set unchanged."""
+    if max_restart_rounds < 0:
+        raise ValueError("max_restart_rounds must be non-negative")
+    if min(initial_wait_seconds, restart_wait_seconds, poll_interval_seconds) <= 0:
+        raise ValueError("wait and poll intervals must be positive")
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "bgp_ixia_session_recovery",
+            "hostname": device_name,
+            "ixia_bgp_peer_regex": ixia_bgp_peer_regex,
+            "initial_wait_seconds": initial_wait_seconds,
+            "restart_wait_seconds": restart_wait_seconds,
+            "poll_interval_seconds": poll_interval_seconds,
+            "max_restart_rounds": max_restart_rounds,
+        },
+        description=description
+        or f"Wait for IXIA BGP sessions matching {ixia_bgp_peer_regex!r} to establish",
     )
 
 
@@ -1115,6 +1289,11 @@ def create_bgp_attribute_churn_step(
         "quiet_window_seconds": quiet_window_seconds,
         "max_lookup_concurrency": max_lookup_concurrency,
     }
+    if "ixia_apply_timeout_seconds" in churn_params:
+        numeric_params["ixia_apply_timeout_seconds"] = _bgp_attribute_churn_integer(
+            churn_params["ixia_apply_timeout_seconds"],
+            "ixia_apply_timeout_seconds",
+        )
     if not hostname:
         raise ValueError("hostname must be non-empty")
     scenario_id = churn_params["scenario_id"]
@@ -1147,6 +1326,14 @@ def create_bgp_attribute_churn_step(
         },
         **numeric_params,
     }
+    if "prefix_sources" in churn_params:
+        params["prefix_sources"] = {
+            afi: dict(source)
+            for afi, source in t.cast(
+                t.Mapping[str, t.Mapping[str, object]],
+                churn_params["prefix_sources"],
+            ).items()
+        }
     if transient_observation_logging == "extended":
         params["transient_observation_logging"] = transient_observation_logging
     return create_custom_step(
@@ -1268,6 +1455,8 @@ def create_bgp_nhg_random_storm_step(
     minimum_changed_paths_per_epoch: int = 5_000,
     epoch_count: int = 48,
     epoch_interval_seconds: int = 25,
+    restoration_stage_prefix_count: int | None = None,
+    fibagent_restart_after_epoch: int | None = None,
     description: str | None = None,
 ) -> Step:
     """Create the topology-bound CICD-EBB-16 peer-by-prefix random storm."""
@@ -1353,6 +1542,28 @@ def create_bgp_nhg_random_storm_step(
         raise ValueError("NHG random-storm seed must be an integer")
     if not isinstance(enable_control_plane_validation, bool):
         raise ValueError("enable_control_plane_validation must be a boolean")
+    staged_restore: dict[str, int] = {}
+    if restoration_stage_prefix_count is not None:
+        if (
+            isinstance(restoration_stage_prefix_count, bool)
+            or not isinstance(restoration_stage_prefix_count, int)
+            or restoration_stage_prefix_count <= 0
+        ):
+            raise ValueError("restoration_stage_prefix_count must be a positive integer")
+        staged_restore["restoration_stage_prefix_count"] = (
+            restoration_stage_prefix_count
+        )
+    if fibagent_restart_after_epoch is not None:
+        if (
+            isinstance(fibagent_restart_after_epoch, bool)
+            or not isinstance(fibagent_restart_after_epoch, int)
+            or not 0 < fibagent_restart_after_epoch < epoch_count
+        ):
+            raise ValueError(
+                "fibagent_restart_after_epoch must be a positive integer below "
+                "epoch_count"
+            )
+        staged_restore["fibagent_restart_after_epoch"] = fibagent_restart_after_epoch
     return create_custom_step(
         params_dict={
             "custom_step_name": "bgp_nhg_random_storm",
@@ -1364,6 +1575,7 @@ def create_bgp_nhg_random_storm_step(
             "target_membership_width": target_membership_width,
             "enable_control_plane_validation": enable_control_plane_validation,
             **numeric,
+            **staged_restore,
         },
         description=description or "Run seeded dual-stack peer-by-prefix NHG storm",
     )
@@ -1668,6 +1880,130 @@ def create_openr_scale_performance_step(
     )
 
 
+def create_openr_fibagent_pause_step(
+    dut_name: str,
+    pause_seconds: float = 1.0,
+    metric_increments: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
+    metric_interval_seconds: float = 0.0,
+    agent: str = "FibAgent",
+    description: t.Optional[str] = None,
+) -> Step:
+    """Freeze an EOS daemon (FibAgent by default) with SIGSTOP.
+
+    While the daemon is frozen, each ``metric_increments`` entry
+    (``{"interfaces": [...], "increment": N}``, 0 clears) is applied through
+    Open/R's ctrl Thrift API, ``metric_interval_seconds`` apart; the daemon
+    stays frozen ``pause_seconds`` longer, then gets SIGCONT. Fails if the
+    daemon's PID or start time changed.
+    """
+    params_dict: t.Dict[str, t.Any] = {
+        "custom_step_name": "openr_fibagent_pause",
+        "dut_name": dut_name,
+        "agent": agent,
+        "pause_seconds": pause_seconds,
+    }
+    if metric_increments:
+        params_dict["metric_increments"] = metric_increments
+        params_dict["metric_interval_seconds"] = metric_interval_seconds
+    return create_custom_step(
+        params_dict=params_dict,
+        description=description or f"Pause {agent} on {dut_name}",
+    )
+
+
+def create_openr_fib_pause_validation_step(
+    dut_name: str,
+    action: t.Literal["ready", "start", "validate", "burst_start", "burst_check"],
+    state_key: str = "fibagent_pause",
+    max_thrift_failures: int = 0,
+    max_sync_fib_calls: int = 0,
+    min_route_updates: int = 1,
+    max_route_updates: t.Optional[int] = None,
+    timeout_seconds: int = 120,
+    expected_routes: t.Optional[int] = None,
+    allowed_interfaces: t.Optional[t.List[str]] = None,
+    threshold_profile: t.Optional[str] = None,
+) -> Step:
+    """Bracket FibAgent pauses with Open/R Fib counter and programming checks.
+
+    ``ready`` waits until Open/R holds ``expected_routes`` routes, FibAgent has
+    programmed all of them, and every next hop is on ``allowed_interfaces``.
+    ``burst_start``/``burst_check`` bracket one pause: ``burst_check`` waits for
+    recovery, checks EOS, and gates the burst on the configerator threshold
+    ``threshold_profile`` (default ``fibagent_pause``): CPU, RSS, FibAgent route
+    sets per stall, and backlog drain time.
+    ``start`` records the Open/R Fib counters. ``validate`` waits until
+    ``fib.synced`` is 1 and FibAgent has programmed every Open/R route, then
+    asserts the thrift-failure and syncFib deltas stay within bounds and that at
+    least ``min_route_updates`` (and, when set, at most ``max_route_updates``)
+    route updates reached FibAgent.
+    """
+    if action not in {"ready", "start", "validate", "burst_start", "burst_check"}:
+        raise ValueError(f"Unsupported Open/R FIB pause validation action {action!r}")
+    if action in {"ready", "burst_check"} and expected_routes is None:
+        raise ValueError(f"{action} requires expected_routes")
+    params_dict: t.Dict[str, t.Any] = {
+        "custom_step_name": "openr_fib_pause_validation",
+        "action": action,
+        "dut_name": dut_name,
+        "state_key": state_key,
+        "max_thrift_failures": max_thrift_failures,
+        "max_sync_fib_calls": max_sync_fib_calls,
+        "min_route_updates": min_route_updates,
+        "timeout_seconds": timeout_seconds,
+    }
+    if max_route_updates is not None:
+        params_dict["max_route_updates"] = max_route_updates
+    if threshold_profile is not None:
+        params_dict["threshold_profile"] = threshold_profile
+    if expected_routes is not None:
+        params_dict["expected_routes"] = expected_routes
+        params_dict["allowed_interfaces"] = allowed_interfaces or []
+    return create_custom_step(
+        params_dict=params_dict,
+        description=f"{action.title()} Open/R FIB pause validation on {dut_name}",
+    )
+
+
+def create_openr_update_loss_validation_step(
+    dut_name: str,
+    action: t.Literal["ready", "validate"],
+    state_key: str = "update_loss",
+    timeout_seconds: int = 600,
+    min_moved_prefixes: int = 1,
+    stimulus_cmd: t.Optional[str] = None,
+    metric_interfaces: t.Optional[t.List[str]] = None,
+) -> Step:
+    """Bracket a FibAgent stall with Decision/Fib/EOS value comparison.
+
+    ``ready`` waits for a stable programmed fabric and snapshots the baseline
+    per-prefix Decision/Fib/EOS state. ``validate`` fails when Decision moved
+    (stimulus landed) but Fib or EOS kept stale values -- a route update lost
+    in the Decision->Fib queue -- and also fails when Decision never moved
+    (broken stimulus). ``stimulus_cmd`` is echoed into the failure evidence.
+    Open/R link-metric increments on ``metric_interfaces`` are cleared before
+    ``ready`` and after ``validate``.
+    """
+    if action not in {"ready", "validate"}:
+        raise ValueError(f"Unsupported Open/R update-loss action {action!r}")
+    params_dict: t.Dict[str, t.Any] = {
+        "custom_step_name": "openr_update_loss_validation",
+        "action": action,
+        "dut_name": dut_name,
+        "state_key": state_key,
+        "timeout_seconds": timeout_seconds,
+        "min_moved_prefixes": min_moved_prefixes,
+    }
+    if stimulus_cmd is not None:
+        params_dict["stimulus_cmd"] = stimulus_cmd
+    if metric_interfaces:
+        params_dict["metric_interfaces"] = metric_interfaces
+    return create_custom_step(
+        params_dict=params_dict,
+        description=f"{action.title()} Open/R update-loss validation on {dut_name}",
+    )
+
+
 def create_openr_scale_performance_cleanup_step(
     dut_name: str,
     profile: str,
@@ -1713,8 +2049,13 @@ def create_openr_scale_cold_boot_step(
     profile: str = "cold_boot_64_256_leaf",
     poll_interval_seconds: float = 1.0,
     baseline_timeout_seconds: float = 120.0,
+    memory_settle_seconds: float = 60.0,
 ) -> Step:
-    """Create one phase of full-fabric DUT cold-boot validation."""
+    """Create one phase of full-fabric DUT cold-boot validation.
+
+    ``memory_settle_seconds`` after recovery, Open/R memory warnings are
+    reported but not gated; crashes and allocation failures always are.
+    """
     if action not in {
         "baseline",
         "mark_reboot",
@@ -1748,6 +2089,8 @@ def create_openr_scale_cold_boot_step(
         raise ValueError("poll_interval_seconds must be positive")
     if baseline_timeout_seconds <= 0:
         raise ValueError("baseline_timeout_seconds must be positive")
+    if memory_settle_seconds < 0:
+        raise ValueError("memory_settle_seconds must be nonnegative")
     return create_custom_step(
         params_dict={
             "custom_step_name": "openr_scale_cold_boot",
@@ -1769,6 +2112,7 @@ def create_openr_scale_cold_boot_step(
             "profile": profile,
             "poll_interval_seconds": poll_interval_seconds,
             "baseline_timeout_seconds": baseline_timeout_seconds,
+            "memory_settle_seconds": memory_settle_seconds,
         },
         description=f"{action.title()} Open/R full-fabric DUT cold boot on {dut_name}",
     )
@@ -4677,6 +5021,61 @@ def create_fpf_restart_hrt_step(
     )
 
 
+def create_fpf_wait_hrt_warmboot_step(
+    host: str,
+    phase: str = "complete",
+    timeout_sec: float = 180.0,
+    poll_interval_sec: float = 0.5,
+    expected_devices: int = 8,
+    expected_subscribers: int = 32,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Poll HRT counters until a specific warmboot phase is proven."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or f"Wait for HRT warmboot phase {phase} on {host}",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_wait_hrt_warmboot",
+                    "host": host,
+                    "phase": phase,
+                    "timeout_sec": timeout_sec,
+                    "poll_interval_sec": poll_interval_sec,
+                    "expected_devices": expected_devices,
+                    "expected_subscribers": expected_subscribers,
+                }
+            )
+        ),
+    )
+
+
+def create_fpf_restart_hrt_and_link_drain_step(
+    host: str,
+    target_device: str,
+    interfaces: t.List[str],
+    mutation_token: str,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Start HRT restart and link drain concurrently for WB-14."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or f"Restart HRT on {host} and drain {target_device} {interfaces} concurrently",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_restart_hrt_and_link_drain",
+                    "host": host,
+                    "target_device": target_device,
+                    "interfaces": interfaces,
+                    "mutation_token": mutation_token,
+                }
+            )
+        ),
+    )
+
+
 def create_fpf_up_port_baseline_step(
     *,
     action: str,
@@ -5144,9 +5543,38 @@ def create_ixia_device_group_toggle_step(
     )
 
 
+def create_ixia_gateway_resolution_step(
+    device_group_names: t.Sequence[str],
+    description: t.Optional[str] = None,
+) -> Step:
+    """
+    Create a step that re-resolves the gateway MAC of every named device group.
+
+    Place it right after the device groups are enabled and before a step that
+    needs their BGP sessions: IXIA does not re-resolve a gateway that stayed
+    unresolved, and BGP Stop/Start leaves the IP layer alone. The step fails
+    while any gateway MAC is unresolved.
+
+    Args:
+        device_group_names: Exact IXIA device group names to check
+        description: Custom description for the step
+
+    Returns:
+        Step object calling Ixia.refresh_and_verify_gateway_resolution
+    """
+    if not device_group_names:
+        raise ValueError("device_group_names must name at least one device group")
+    return create_ixia_api_step(
+        api_name="refresh_and_verify_gateway_resolution",
+        args_dict={"device_group_names": list(device_group_names)},
+        description=description
+        or f"Re-resolve gateway MACs of {len(device_group_names)} IXIA device group(s)",
+    )
+
+
 def create_daemon_control_step(
     device_name: str,
-    daemon_name: str = "Bgp",
+    daemon_name: str = "Bgpcpp",
     action: str = "enable",
     description: t.Optional[str] = None,
 ) -> Step:
@@ -5486,6 +5914,7 @@ def create_validation_step(
     description: t.Optional[str] = None,
     start_traffic: bool = True,
     fail_on_failure: bool = False,
+    fail_fast: bool = False,
 ) -> Step:
     """
     Create a validation step with point-in-time health checks.
@@ -5498,6 +5927,7 @@ def create_validation_step(
             traffic is running. Set False for recovery validation that must run
             while traffic remains stopped.
         fail_on_failure: Whether a failed MID_TEST check must stop the workload.
+        fail_fast: Report the validation step as failed as soon as a check fails
 
     Returns:
         Step object for validation
@@ -5512,6 +5942,7 @@ def create_validation_step(
             taac_types.ValidationInput(
                 point_in_time_checks=point_in_time_checks,
                 stage=stage,
+                fail_fast=fail_fast,
             )
         ),
         description=description,
@@ -5526,6 +5957,7 @@ def create_verify_port_operational_state_step(
     operational_state: bool,
     description: t.Optional[str] = None,
     device_regexes: t.Optional[t.List[str]] = None,
+    start_traffic: bool = True,
 ) -> Step:
     """
     Create a step to verify port operational state.
@@ -5535,20 +5967,19 @@ def create_verify_port_operational_state_step(
         operational_state: Expected operational state (True=up, False=down)
         description: Custom description for the step
         device_regexes: Optional device patterns that scope the verification
+        start_traffic: Whether the generic step pre-hook should start IXIA traffic.
 
     Returns:
         Step object for port state verification
     """
+    params_dict = {
+        "interfaces": interfaces,
+        "operational_state": operational_state,
+    }
+    _add_skip_start_traffic_param(params_dict, start_traffic)
     return Step(
         name=StepName.VERIFY_PORT_OPERATIONAL_STATE,
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "interfaces": interfaces,
-                    "operational_state": operational_state,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params_dict)),
         description=description,
         device_regexes=device_regexes,
     )
@@ -6574,6 +7005,7 @@ def create_set_route_filter_step(
     config_path: t.Optional[str] = None,
     source: str = "configerator",
     json_file_path: t.Optional[str] = None,
+    formulaic_prefix_sources: t.Mapping[str, t.Mapping[str, object]] | None = None,
     description: t.Optional[str] = None,
     verify_readback: bool = False,
 ) -> Step:
@@ -6617,6 +7049,11 @@ def create_set_route_filter_step(
 
     if json_file_path is not None:
         params_dict["json_file_path"] = json_file_path
+    if formulaic_prefix_sources is not None:
+        params_dict["formulaic_prefix_sources"] = {
+            statement: dict(prefix_source)
+            for statement, prefix_source in formulaic_prefix_sources.items()
+        }
     if verify_readback:
         params_dict["verify_readback"] = True
 
@@ -6953,10 +7390,42 @@ def create_file_from_config_step(
     )
 
 
+def create_validate_bgpcpp_config_step(
+    *,
+    device_name: str,
+    config_path: str = "/mnt/flash/bgpcpp_config",
+    description: str | None = None,
+) -> Step:
+    return create_run_task_step(
+        task_name="validate_bgpcpp_config_on_device",
+        params_dict={"hostname": device_name, "config_path": config_path},
+        description=description or f"Validate BGP++ config on {device_name}",
+    )
+
+
+def create_validate_bgpcpp_update_group_state_step(
+    *,
+    device_name: str,
+    expect_enabled: bool,
+    description: str | None = None,
+) -> Step:
+    return create_run_task_step(
+        task_name="validate_bgpcpp_update_group_state",
+        params_dict={
+            "hostname": device_name,
+            "expect_enabled": expect_enabled,
+        },
+        description=(
+            description or f"Validate BGP++ update-group state on {device_name}"
+        ),
+    )
+
+
 def create_run_commands_on_shell_step(
     device_name: str,
     cmds: t.List[str],
     description: t.Optional[str] = None,
+    validate_output: bool = False,
 ) -> Step:
     """
     Create a step to run shell commands on a device.
@@ -6965,6 +7434,7 @@ def create_run_commands_on_shell_step(
         device_name: Name of the device (hostname)
         cmds: List of shell commands to execute
         description: Custom description for the step
+        validate_output: Fail the step when a shell command fails
 
     Returns:
         Step object for running shell commands
@@ -6972,12 +7442,15 @@ def create_run_commands_on_shell_step(
     if description is None:
         description = f"Run shell commands on {device_name}"
 
+    params_dict: dict[str, t.Any] = {
+        "hostname": device_name,
+        "cmds": cmds,
+    }
+    if validate_output:
+        params_dict["validate_output"] = True
     return create_run_task_step(
         task_name="run_commands_on_shell",
-        params_dict={
-            "hostname": device_name,
-            "cmds": cmds,
-        },
+        params_dict=params_dict,
         description=description,
     )
 
@@ -7360,6 +7833,8 @@ def create_route_registry_cleanup_step(
     ebgp_peer_description: str,
     expected_established_sessions: int | None,
     parent_prefixes_to_ignore: t.Sequence[str],
+    expanded_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
     exact_peer_group_names: t.Sequence[str] | None = None,
     convergence_soft_threshold_seconds: float = 60,
     convergence_hard_timeout_seconds: float = 300,
@@ -7415,6 +7890,11 @@ def create_route_registry_cleanup_step(
             "session_poll_interval_seconds": convergence_poll_interval_seconds,
         }
     )
+    if expanded_policy_prefix_sources is not None:
+        params_dict["expanded_policy_prefix_sources"] = {
+            statement: dict(prefix_source)
+            for statement, prefix_source in expanded_policy_prefix_sources.items()
+        }
     if peer_prefix_exclusion_blocks_by_pool is not None:
         params_dict["peer_prefix_exclusion_blocks_by_pool"] = {
             pool_name: [dict(block) for block in blocks]
@@ -7442,19 +7922,20 @@ def create_validated_bgp_route_oscillation_step(
     test_duration_seconds: int,
     parent_prefixes_to_ignore: t.Sequence[str] = (),
     transition_soft_threshold_seconds: t.Optional[float] = None,
+    advertise_transition_soft_threshold_seconds: t.Optional[float] = None,
     fail_on_session_flap: t.Optional[bool] = None,
     description: t.Optional[str] = None,
 ) -> Step:
     """Create route oscillations with IXIA, source, and exact-RIB verdicts.
 
     ``transition_soft_threshold_seconds`` is a HARD gate despite the name:
-    ``_wait_transition`` demands ``ConvergenceOutcome.WITHIN_SLA`` and raises
-    ``TestCaseFailure`` on anything else, so a transition that converges LATE
-    fails the run exactly like one that never converges. The runtime default is
-    60s and it applies to BOTH transitions -- the withdraw and the
-    re-advertise -- so any topology whose restore takes longer than that must
-    raise it or the step fails a healthy device. Omitted = the runtime default,
-    byte-identical for existing callers.
+    ``_wait_transition`` waits until the route state converges or hits the hard
+    timeout. ``_require_transition_within_sla`` then raises ``TestCaseFailure``
+    unless the outcome is ``ConvergenceOutcome.WITHIN_SLA``, preserving detailed
+    evidence for a transition that converged late. The runtime default is 60s
+    and applies to both transitions unless
+    ``advertise_transition_soft_threshold_seconds`` overrides only the
+    readvertisement. Omitted values preserve the existing payload and defaults.
     """
     return create_custom_step(
         params_dict={
@@ -7476,6 +7957,15 @@ def create_validated_bgp_route_oscillation_step(
                     )
                 }
                 if transition_soft_threshold_seconds is not None
+                else {}
+            ),
+            **(
+                {
+                    "advertise_transition_soft_threshold_seconds": (
+                        advertise_transition_soft_threshold_seconds
+                    )
+                }
+                if advertise_transition_soft_threshold_seconds is not None
                 else {}
             ),
             # Emitted only when set, so existing callers stay byte-identical.
@@ -7910,6 +8400,12 @@ def create_bgp_restoration_baseline_step(
     peer_scope: t.Optional[t.Dict[str, t.Any]] = None,
     expected_min_peers: int = 1,
     compare_route_count: bool = True,
+    require_stable_baseline: bool = False,
+    expected_peer_count: int | None = None,
+    expected_peer_addresses: t.Optional[t.Sequence[str]] = None,
+    stability_window_seconds: int = 30,
+    stability_timeout_seconds: int | None = None,
+    poll_interval_seconds: int = 10,
     description: t.Optional[str] = None,
 ) -> Step:
     """
@@ -7928,18 +8424,84 @@ def create_bgp_restoration_baseline_step(
             trivially, so this is the anti-vacuousness floor.
         compare_route_count: Also record the BGP++ RIB entry count (default
             True). Must match the verify step's value.
+        require_stable_baseline: Poll the raw peer view until it remains unchanged
+            before recording the complete baseline.
+        expected_peer_count: Exact peer inventory size required by the stable
+            path when explicit identities are unavailable.
+        expected_peer_addresses: Exact topology-derived identities required by
+            the stable path; when set, their size must match expected_peer_count.
+        stability_window_seconds: Required unchanged interval.
+        stability_timeout_seconds: Optional bounded wait; when omitted, scales
+            from the expected peer count with a 300-second floor.
+        poll_interval_seconds: Delay between peer-view samples.
         description: Custom description for the step.
 
     Returns:
         Step object for the pre-drain restoration baseline
     """
-    params = {
+    params: t.Dict[str, t.Any] = {
         "custom_step_name": "snapshot_bgp_restoration_baseline",
         "snapshot_key": snapshot_key,
         "peer_scope": peer_scope or {},
         "expected_min_peers": expected_min_peers,
         "compare_route_count": compare_route_count,
     }
+    if require_stable_baseline:
+        try:
+            normalized_peer_addresses = tuple(
+                sorted(
+                    str(ipaddress.ip_address(peer.split("/", 1)[0]))
+                    for peer in (str(value) for value in (expected_peer_addresses or ()))
+                )
+            )
+        except ValueError as error:
+            raise ValueError(
+                "stable BGP restoration peer identities must be IP addresses"
+            ) from error
+        if len(set(normalized_peer_addresses)) != len(normalized_peer_addresses):
+            raise ValueError("stable BGP restoration peer identities must be unique")
+        if normalized_peer_addresses:
+            if (
+                expected_peer_count is not None
+                and expected_peer_count != len(normalized_peer_addresses)
+            ):
+                raise ValueError(
+                    "stable BGP restoration peer count must match the exact "
+                    "peer identities"
+                )
+            expected_peer_count = len(normalized_peer_addresses)
+        if expected_peer_count is None or expected_peer_count <= 0:
+            raise ValueError(
+                "stable BGP restoration baseline requires exact peer identities "
+                "or a positive expected_peer_count"
+            )
+        if stability_window_seconds <= 0 or poll_interval_seconds <= 0:
+            raise ValueError(
+                "baseline stability window and poll interval must be positive"
+            )
+        derived_timeout = max(300, 60 * math.ceil(expected_peer_count / 250))
+        timeout = (
+            derived_timeout
+            if stability_timeout_seconds is None
+            else stability_timeout_seconds
+        )
+        if timeout < stability_window_seconds:
+            raise ValueError(
+                "baseline stability timeout must cover the stability window"
+            )
+        params.update(
+            {
+                "require_stable_baseline": True,
+                "expected_peer_count": expected_peer_count,
+                "stability_timeout_seconds": timeout,
+            }
+        )
+        if normalized_peer_addresses:
+            params["expected_peer_addresses"] = list(normalized_peer_addresses)
+        if stability_window_seconds != 30:
+            params["stability_window_seconds"] = stability_window_seconds
+        if poll_interval_seconds != 10:
+            params["poll_interval_seconds"] = poll_interval_seconds
     return Step(
         name=StepName.CUSTOM_STEP,
         step_params=Params(json_params=json.dumps(params)),
@@ -8472,7 +9034,7 @@ def create_standard_setup_steps(
     disable_all_device_groups: bool = True,
     enable_all_device_groups: bool = False,
     enable_bgp_daemon: bool = True,
-    daemon_name: str = "Bgp",
+    daemon_name: str = "Bgpcpp",
     validate_device_group_toggle: bool = False,
 ) -> t.List[Step]:
     """
@@ -8582,7 +9144,9 @@ def create_bgp_restart_setup_steps(
 
 
 def create_bgp_instability_setup_steps(
-    device_name: str, convergence_wait_seconds: int = 300
+    device_name: str,
+    convergence_wait_seconds: int = 300,
+    start_device_groups_after_enable: bool = False,
 ) -> t.List[Step]:
     """
     Create setup steps for BGP instability tests where sessions should be pre-established.
@@ -8593,6 +9157,9 @@ def create_bgp_instability_setup_steps(
     Args:
         device_name: Name of the device
         convergence_wait_seconds: Time to wait for BGP convergence (default: 5 minutes)
+        start_device_groups_after_enable: Start newly enabled IXIA device groups
+            and resolve their next-hops. Required when the declarative IXIA
+            config initializes the groups disabled.
 
     Returns:
         List of setup steps for BGP instability tests
@@ -8602,6 +9169,15 @@ def create_bgp_instability_setup_steps(
         enable_all_device_groups=True,
         enable_bgp_daemon=True,
     )
+    if start_device_groups_after_enable:
+        steps.insert(
+            1,
+            create_ixia_api_step(
+                api_name="start_device_groups",
+                args_dict={"device_group_name_regex": ".*"},
+                description="Start all device groups and resolve next-hops",
+            ),
+        )
 
     steps.append(
         create_longevity_step(
@@ -8619,6 +9195,8 @@ def create_route_registry_prefix_list_setup_steps(
     prefix_start_index: int = 0,
     prefix_end_index: int = 100,
     baseline_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_650.json",
+    baseline_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
     expected_route_count: int | None = None,
     expected_route_count_histogram_by_afi: t.Optional[
         t.Mapping[str, t.Mapping[int, int]]
@@ -8727,6 +9305,7 @@ def create_route_registry_prefix_list_setup_steps(
     baseline_policy_step = create_set_route_filter_step(
         device_name=device_name,
         config_path=baseline_policy_path,
+        formulaic_prefix_sources=baseline_policy_prefix_sources,
         verify_readback=verify_policy_readback,
         description=policy_description,
     )
@@ -8844,6 +9423,232 @@ def create_sc_8_setup_steps(
     return steps
 
 
+def create_policy_evaluation_sweep_control_step(
+    *,
+    action: str,
+    state_key: str,
+    prefix_counts: t.Sequence[int] | None = None,
+    max_absolute_overhead_us: float | None = None,
+    max_slope_overhead_us_per_10k: float | None = None,
+    check_name: str = "policy_evaluation_overhead",
+    description: str | None = None,
+) -> Step:
+    """Create the initialize or final paired policy-verdict step."""
+    if action not in {"initialize", "evaluate"}:
+        raise ValueError("policy-evaluation control action must be initialize or evaluate")
+    params: dict[str, t.Any] = {
+        "custom_step_name": "policy_evaluation_sweep",
+        "action": action,
+        "state_key": state_key,
+    }
+    if action == "evaluate":
+        if (
+            prefix_counts is None
+            or max_absolute_overhead_us is None
+            or max_slope_overhead_us_per_10k is None
+        ):
+            raise ValueError("policy-evaluation evaluate action requires all gate inputs")
+        if not check_name.strip():
+            raise ValueError("policy-evaluation check_name must be non-empty")
+        params.update(
+            {
+                "prefix_counts": list(prefix_counts),
+                "max_absolute_overhead_us": max_absolute_overhead_us,
+                "max_slope_overhead_us_per_10k": (
+                    max_slope_overhead_us_per_10k
+                ),
+                "check_name": check_name,
+            }
+        )
+    return create_custom_step(params_dict=params, description=description)
+
+
+def create_policy_evaluation_point_steps(
+    *,
+    device_name: str,
+    arm: str,
+    policy_name: str,
+    policy_configerator_path: str,
+    prefix_count: int,
+    prefix_capacity: int,
+    prefix_pool_names_by_afi: t.Mapping[str, str],
+    peer_group_names_by_afi: t.Mapping[str, str],
+    peer_counts_by_afi: t.Mapping[str, int],
+    expected_peers: t.Sequence[t.Mapping[str, t.Any]],
+    expected_local_as_4_byte: int,
+    expect_update_group_enabled: bool,
+    allowed_prefix_counts: t.Sequence[int],
+    state_key: str,
+    evidence_label_prefix: str = "policy-evaluation",
+) -> t.List[Step]:
+    """Create one fresh, exact-route policy measurement point."""
+    if arm not in {"baseline", "candidate"}:
+        raise ValueError("policy-evaluation arm must be baseline or candidate")
+    if not 0 < prefix_count <= prefix_capacity:
+        raise ValueError("policy-evaluation prefix_count exceeds pool capacity")
+    required_afis = ("ipv4", "ipv6")
+    for label, handles in (
+        ("prefix_pool_names_by_afi", prefix_pool_names_by_afi),
+        ("peer_group_names_by_afi", peer_group_names_by_afi),
+        ("peer_counts_by_afi", peer_counts_by_afi),
+    ):
+        if set(handles) != set(required_afis):
+            raise ValueError(
+                f"policy-evaluation {label} must contain exactly {required_afis}"
+            )
+    if any(
+        not prefix_pool_names_by_afi[afi] or not peer_group_names_by_afi[afi]
+        for afi in required_afis
+    ):
+        raise ValueError("policy-evaluation runtime handles must be non-empty")
+    if len({prefix_pool_names_by_afi[afi] for afi in required_afis}) != 2 or len(
+        {peer_group_names_by_afi[afi] for afi in required_afis}
+    ) != 2:
+        raise ValueError("policy-evaluation runtime handles must be distinct by AFI")
+    if any(peer_counts_by_afi[afi] <= 0 for afi in required_afis):
+        raise ValueError("policy-evaluation peer counts must be positive")
+    if not evidence_label_prefix.strip():
+        raise ValueError("policy-evaluation evidence_label_prefix must be non-empty")
+    normalized_allowed_counts = tuple(dict.fromkeys(allowed_prefix_counts))
+    if (
+        prefix_capacity not in normalized_allowed_counts
+        or prefix_count not in normalized_allowed_counts
+        or any(
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 0 < count <= prefix_capacity
+            for count in normalized_allowed_counts
+        )
+    ):
+        raise ValueError(
+            "policy-evaluation allowed_prefix_counts must contain the point and "
+            "capacity and consist of positive counts within capacity"
+        )
+
+    steps: list[Step] = [
+        create_daemon_control_step(
+            device_name=device_name,
+            daemon_name="Bgpcpp",
+            action="disable",
+            description=f"Reset BGP policy counters for {arm} {prefix_count:,}",
+        )
+    ]
+    for afi in required_afis:
+        pool_name = prefix_pool_names_by_afi[afi]
+        steps.append(
+            create_prepare_compact_bgp_prefix_pool_step(
+                device_name=device_name,
+                prefix_pool_regex=rf"^{re.escape(pool_name)}$",
+                target_number_of_addresses=prefix_count,
+                allowed_current_number_of_addresses=normalized_allowed_counts,
+                safe_number_of_addresses=prefix_capacity,
+                description=(
+                    f"Withdraw and resize {afi} pool to {prefix_count:,}"
+                ),
+            )
+        )
+
+    steps.extend(
+        [
+            create_file_from_config_step(
+                device_name=device_name,
+                configerator_path=policy_configerator_path,
+                file_path=POLICY_EVALUATION_SOURCE_CONFIG_PATH,
+                description=f"Stage {arm} BGP policy source",
+            ),
+            create_run_commands_on_shell_step(
+                device_name=device_name,
+                cmds=[
+                    build_bgpcpp_policy_overlay_cmd(
+                        source_config_path=POLICY_EVALUATION_SOURCE_CONFIG_PATH,
+                        policy_name=policy_name,
+                        peer_group_names=tuple(
+                            peer_group_names_by_afi[afi] for afi in required_afis
+                        ),
+                        expected_peers=expected_peers,
+                        expected_local_as_4_byte=expected_local_as_4_byte,
+                        expect_update_group_enabled=expect_update_group_enabled,
+                    )
+                ],
+                description=f"Apply {arm} policy-only BGP config overlay",
+                validate_output=True,
+            ),
+            create_validate_bgpcpp_config_step(
+                device_name=device_name,
+                description=f"Validate {arm} policy-only BGP config",
+            ),
+        ]
+    )
+    for afi in required_afis:
+        pool_name = prefix_pool_names_by_afi[afi]
+        steps.append(
+            create_advertise_withdraw_prefixes_step(
+                device_name=device_name,
+                advertise=True,
+                prefix_pool_regex=rf"^{re.escape(pool_name)}$",
+                prefix_start_index=0,
+                prefix_end_index=prefix_count,
+                expected_prefix_pool_count=1,
+                expected_number_of_addresses=prefix_count,
+                expected_prefix_pool_names=[pool_name],
+                strict_range=True,
+                verify_readback=True,
+                evidence_label=(
+                    f"{evidence_label_prefix}-{arm}-{prefix_count}-{afi}-advertise"
+                ),
+                description=f"Advertise {prefix_count:,} {afi} routes",
+            )
+        )
+    steps.extend(
+        [
+            create_daemon_control_step(
+                device_name=device_name,
+                daemon_name="Bgpcpp",
+                action="enable",
+                description=f"Start BGP for {arm} {prefix_count:,} measurement",
+            ),
+            create_validate_bgpcpp_update_group_state_step(
+                device_name=device_name,
+                expect_enabled=expect_update_group_enabled,
+                description=(
+                    f"Verify {arm} update-group state after policy overlay"
+                ),
+            ),
+            create_verify_received_routes_step(
+                device_name=device_name,
+                expected_count_histogram_by_afi={
+                    afi: {prefix_count: peer_counts_by_afi[afi]}
+                    for afi in required_afis
+                },
+                exact_peer_group_names=[
+                    peer_group_names_by_afi[afi] for afi in required_afis
+                ],
+                convergence_soft_threshold_seconds=300,
+                convergence_hard_timeout_seconds=600,
+                convergence_poll_interval_seconds=10,
+                description=(
+                    f"Prove exact dual-stack {prefix_count:,}-route {arm} workload"
+                ),
+            ),
+            create_custom_step(
+                params_dict={
+                    "custom_step_name": "policy_evaluation_sweep",
+                    "action": "collect",
+                    "state_key": state_key,
+                    "hostname": device_name,
+                    "arm": arm,
+                    "policy_name": policy_name,
+                    "prefix_count": prefix_count,
+                },
+                description=(
+                    f"Collect {arm} policy cost at {prefix_count:,} routes per AFI"
+                ),
+            ),
+        ]
+    )
+    return steps
+
+
 def create_sc_8_steps(
     device_name: str,
     prefix_count: int = 10000,
@@ -8866,7 +9671,7 @@ def create_sc_8_steps(
         List of test steps
     """
     steps = []
-    daemon_name = "Bgp"
+    daemon_name = "Bgpcpp"
 
     steps.append(
         create_daemon_control_step(
@@ -11038,20 +11843,23 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             )
         if taac_types.Service.OPENR in input.services and self.is_fboss:
             fboss_driver = t.cast(FbossSwitch, self.driver)
+            timeout = (
+                input.service_convergence_timeout.get(taac_types.Service.OPENR)
+                or input.timeout
+            )
             start_time = time.time()
             if TAAC_OSS:
                 # OpenR initialization events need the Meta-internal OpenR client.
-                timeout = (
-                    input.service_convergence_timeout.get(taac_types.Service.OPENR)
-                    or input.timeout
-                )
                 await self._async_wait_for_systemd_active(
                     fboss_driver, FbossSystemctlServiceName.OPENR, timeout
                 )
                 openr_state = "systemd active"
             else:
                 await fboss_driver.async_wait_for_openr_initialized()
-                openr_state = "initialized"
+                await self._async_wait_for_systemd_active(
+                    fboss_driver, FbossSystemctlServiceName.OPENR, timeout
+                )
+                openr_state = "initialized and systemd active"
             end_time = time.time()
             self.logger.info(
                 f"OpenR reached {openr_state} state in {end_time - start_time} seconds"
@@ -11075,6 +11883,11 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             start_time = time.time()
             # pyre-ignore
             await self.driver.async_wait_for_qsfp_service_state_active(timeout)
+            await self._async_wait_for_systemd_active(
+                t.cast(FbossSwitch, self.driver),
+                FbossSystemctlServiceName.QSFP,
+                timeout,
+            )
             end_time = time.time()
             self.logger.info(
                 f"qsfp_service reached active state in {end_time - start_time} seconds"
@@ -11087,6 +11900,11 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             start_time = time.time()
             # pyre-ignore
             await self.driver.async_wait_for_fsdb_state_active(timeout)
+            await self._async_wait_for_systemd_active(
+                t.cast(FbossSwitch, self.driver),
+                FbossSystemctlServiceName.FSDB,
+                timeout,
+            )
             end_time = time.time()
             self.logger.info(
                 f"fsdb reached active state in {end_time - start_time} seconds"
@@ -11208,9 +12026,22 @@ class RunTaskStep(StepBase[taac_types.RunTaskInput]):
         task = input.task
         dict_params = self.parameter_evaluator.evaluate(task.params)
         if input.blocking:
-            await run_task(task, dict_params, self.ixia, self.logger)
+            await run_task(
+                task,
+                dict_params,
+                self.ixia,
+                self.logger,
+                self.shared_data,
+            )
         else:
-            run_in_thread(run_task, task, dict_params, self.ixia, self.logger)
+            run_in_thread(
+                run_task,
+                task,
+                dict_params,
+                self.ixia,
+                self.logger,
+                self.shared_data,
+            )
 
 
 _PERCENT_ECMP_MEMBERS_VALID_BGP = 0.25
@@ -12500,6 +13331,15 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
 # =============================================================================
 
 _WEDGE_POWER_CMD: str = "/usr/local/bin/wedge_power.sh"
+_BOOT_ID_CMD: str = "cat /proc/sys/kernel/random/boot_id"
+_REBOOT_VERIFY_TIMEOUT_S: int = 900
+_REBOOT_VERIFY_INTERVAL_S: int = 10
+
+
+def _bmc_hostname(hostname: str) -> str:
+    """``<short>-oob.<domain>``, the BMC naming the OSS BMC helper also uses."""
+    short, _, domain = hostname.partition(".")
+    return f"{short}-oob.{domain}" if domain else f"{short}-oob"
 
 
 class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
@@ -12512,6 +13352,7 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
     ) -> None:
         start_time = time.time()
         sleep_time_after_reboot = params.get("sleep_time_after_reboot", 0)
+        boot_id_before = await self._async_read_boot_id() if self.is_fboss else None
         if input.trigger == taac_types.SystemRebootTrigger.FULL_SYSTEM_REBOOT:
             await self.driver.async_full_system_reboot()
             self.logger.info(
@@ -12523,42 +13364,12 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
             and self.is_fboss
         ):
             # `reset -s` power-cycles the whole chassis; bare `reset` is microserver-only.
-            wedge_power_system_reset = f"{_WEDGE_POWER_CMD} reset -s"
-            try:
-                run_bmc_cmd_hwcontrol(self.device.name, wedge_power_system_reset)
-                self.logger.info(
-                    f"Successfully initiated the system reboot via the BMC command: {wedge_power_system_reset}"
-                )
-            except (
-                EOFError,
-                OSError,
-                paramiko.SSHException,
-                RuntimeError,
-            ) as e:
-                self.logger.info(
-                    f"BMC command {wedge_power_system_reset!r} raised {type(e).__name__} "
-                    f"(expected post-reboot disconnect): {e}"
-                )
+            await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset -s")
         elif (
             input.trigger == taac_types.SystemRebootTrigger.BMC_MICROSERVER_ONLY_RESET
             and self.is_fboss
         ):
-            wedge_power_microserver_reset = f"{_WEDGE_POWER_CMD} reset"
-            try:
-                run_bmc_cmd_hwcontrol(self.device.name, wedge_power_microserver_reset)
-                self.logger.info(
-                    f"Successfully initiated the system reboot via the BMC command: {wedge_power_microserver_reset}"
-                )
-            except (
-                EOFError,
-                OSError,
-                paramiko.SSHException,
-                RuntimeError,
-            ) as e:
-                self.logger.info(
-                    f"BMC command {wedge_power_microserver_reset!r} raised {type(e).__name__} "
-                    f"(expected post-reboot disconnect): {e}"
-                )
+            await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset")
         if sleep_time_after_reboot > 0:
             self.logger.info(
                 f"Waiting for {sleep_time_after_reboot} seconds after reboot"
@@ -12585,6 +13396,93 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
         await self.driver.wait_for_ssh_reachable()
         self.logger.debug(
             f"{self.device.name} is ssh-able {time.time() - start_time} seconds after {input.trigger.name}"
+        )
+        if boot_id_before is not None:
+            await self._async_wait_for_new_boot_id(
+                boot_id_before,
+                start_time,
+                input.trigger,
+                params.get("reboot_verify_timeout", _REBOOT_VERIFY_TIMEOUT_S),
+            )
+
+    async def _async_read_boot_id(self) -> str:
+        boot_id = (await self.driver.async_run_cmd_on_shell(_BOOT_ID_CMD)).strip()
+        if not boot_id:
+            raise RuntimeError(f"{self.device.name} returned an empty boot_id")
+        return boot_id
+
+    async def _async_run_bmc_reset(self, cmd: str) -> None:
+        if lab_ssh_transport_enabled():
+            # The lab-ssh daemon authenticates to the BMC with the caller's
+            # certificate; the hwcontrol path needs a Rotor password instead.
+            bmc = _bmc_hostname(self.device.name)
+            result = await lab_ssh_async_exec(
+                host=bmc, command=cmd, timeout_sec=60, username="root"
+            )
+            # The daemon encodes remote BMC SSH disconnects as exit -1;
+            # local daemon/RPC errors still propagate from lab_ssh_async_exec.
+            # A real non-zero command exit status is a failure.
+            if result.exit_code > 0:
+                raise RuntimeError(
+                    f"BMC command {cmd!r} failed on {bmc} (exit {result.exit_code}): "
+                    f"{result.stderr or result.stdout}"
+                )
+            self.logger.info(
+                f"BMC command {cmd!r} on {bmc}: exit {result.exit_code}, "
+                f"output {result.stdout.strip()!r}"
+            )
+            return
+        try:
+            output = run_bmc_cmd_hwcontrol(self.device.name, cmd)
+            self.logger.info(f"BMC command {cmd!r} returned {output!r}")
+        except (
+            EOFError,
+            OSError,
+            paramiko.SSHException,
+            RuntimeError,
+        ) as e:
+            self.logger.info(
+                f"BMC command {cmd!r} raised {type(e).__name__} "
+                f"(expected post-reboot disconnect): {e}"
+            )
+
+    async def _async_wait_for_new_boot_id(
+        self,
+        boot_id_before: str,
+        start_time: float,
+        trigger: taac_types.SystemRebootTrigger,
+        timeout: int,
+    ) -> None:
+        """Fail unless the device came back with a new kernel boot ID.
+
+        Ping and SSH cannot tell a reboot from a reset that never happened: a
+        host that stayed up answers both at once. The BMC helper also returns
+        an empty result instead of raising when it cannot run the command.
+        """
+        deadline = start_time + timeout
+        last_error = None
+        while True:
+            try:
+                boot_id = await self._async_read_boot_id()
+            except Exception as e:
+                # Down, or not serving SSH yet, partway through the reboot.
+                last_error = e
+            else:
+                if boot_id and boot_id != boot_id_before:
+                    self.logger.info(
+                        f"{self.device.name} rebooted: boot_id {boot_id_before} -> "
+                        f"{boot_id} ({time.time() - start_time:.0f}s after "
+                        f"{trigger.name})"
+                    )
+                    return
+                last_error = None
+            if time.time() >= deadline:
+                break
+            await asyncio.sleep(_REBOOT_VERIFY_INTERVAL_S)
+        raise RuntimeError(
+            f"{self.device.name} did not reboot after {trigger.name}: no new "
+            f"boot_id within {timeout}s (before: {boot_id_before})"
+            + (f"; last error: {last_error}" if last_error else "")
         )
 
 

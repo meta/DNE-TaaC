@@ -38,6 +38,7 @@ _FACTORY_MODULES = (
     "bgp_features",
     "cte_ucmp",
     "qual_bgp_update_group",
+    "qual_rbb",
 )
 
 for _name in _FACTORY_MODULES:

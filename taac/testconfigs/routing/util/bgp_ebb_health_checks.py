@@ -24,10 +24,12 @@ from taac.health_checks.healthcheck_definitions import (
     create_system_cpu_load_average_check,
     create_unclean_exit_check,
 )
+from taac.health_checks.retry_policy import get_retry_kwargs
 from taac.utils.hardware_capacity_utils import (
     get_postcheck_thresholds,
     get_precheck_thresholds,
 )
+from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config.types import PointInTimeHealthCheck, SnapshotHealthCheck
 
 _MEMORY_THRESHOLD_BY_SERVICE_PRECHECK = {
@@ -179,6 +181,8 @@ def create_standard_prechecks(
     check_ibgp_pnh: bool = False,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
     check_bgp_convergence: bool = True,
     check_hardware_capacity: bool = True,
     rp_file_path: str | None = None,
@@ -216,11 +220,15 @@ def create_standard_prechecks(
         check_ibgp_pnh: Enable iBGP PNH metric check (only for Open/R profiles)
         ibgp_pnh_start_ipv4s: IPv4 route-range starts from the bound topology.
         ibgp_pnh_start_ipv6s: IPv6 route-range starts from the bound topology.
+        ibgp_pnh_count: Synthetic nodes per range, from the resolved Open/R
+            injection plan, so readiness covers the whole injected range
+            rather than its first address.
+        ibgp_pnh_step: Address stride within a range, from the same plan.
         check_bgp_convergence: Add the BGP++ initialization-events convergence
             precheck (default True). Asserts the device reached INITIALIZED
             within the convergence threshold (self-waits up to it). The strict
-            canonical-sequence and EOR-timer-expiry assertions are temporarily
-            disabled pending the BGP++ cold-start EOR-timer fix.
+            canonical-sequence and EOR-timer-expiry assertions stay relaxed;
+            see the comment at the check for why.
         check_hardware_capacity: Add the startup FEC/ECMP capacity gate.
             Defaults to True for existing EBB callers. Set False when the
             qualification case does not define hardware-capacity preconditions.
@@ -322,6 +330,7 @@ def create_standard_prechecks(
                 watermark_delta_threshold=precheck_thresholds.watermark_delta_threshold,
                 check_watermarks=precheck_thresholds.check_watermarks,
                 check_id="startup_hardware_capacity_baseline",
+                **get_retry_kwargs(hc_types.CheckName.HARDWARE_CAPACITY_CHECK),
             )
         )
 
@@ -329,12 +338,13 @@ def create_standard_prechecks(
     # device reached INITIALIZED within the threshold. Self-waits up to the
     # threshold for post-restart convergence.
     #
-    # The strict canonical-sequence and EOR-timer-expiry assertions are
-    # TEMPORARILY relaxed (fail_on_eor_expired/validate_sequence=False): on a
-    # cold start the EOR timer is started prematurely at PeerManager startup
-    # (rather than on first session up), so it always expires before all peers'
-    # EoRs arrive — emitting EOR_TIMER_EXPIRED plus an out-of-order late
-    # ALL_EOR_RECEIVED. Re-enable both once the BGP++ EOR-timer fix lands.
+    # The strict canonical-sequence and EOR-timer-expiry assertions are relaxed
+    # (fail_on_eor_expired/validate_sequence=False). They were relaxed for a
+    # premature EoR timer that BGP++ has since fixed (D109742699, PeerManagerBB:
+    # the wait now starts at the first established session). The timer can
+    # still expire when an IXIA peer never establishes -- ixia03 peers stall
+    # after OPEN, BGP-MON included -- which also emits an out-of-order late
+    # ALL_EOR_RECEIVED. Re-enable both once runs converge without expiry.
     if check_bgp_convergence:
         prechecks.append(
             create_bgp_convergence_check(
@@ -354,6 +364,8 @@ def create_standard_prechecks(
                 check_id="startup_ibgp_pnh_verification",
                 start_ipv4s=ibgp_pnh_start_ipv4s,
                 start_ipv6s=ibgp_pnh_start_ipv6s,
+                count=ibgp_pnh_count,
+                step=ibgp_pnh_step,
             )
         )
 
@@ -425,7 +437,7 @@ def create_standard_postchecks(
             breach remains a failure while observation continues to capture the
             actual convergence time.
         services_to_check: List of EOS Sand agents to check via 'show agent uptime'
-            (optional, defaults to ["Bgp", "FibAgent", "FibAgentBgp"])
+            (optional, defaults to ["Bgpcpp", "FibAgent", "FibAgentBgp"])
         daemons_to_check: List of EOS daemons to check via 'show daemon'. Daemons
             are distinct from Sand agents and must be checked with a different EOS
             command. (optional, defaults to ["FibBgpGrpc"])
@@ -487,7 +499,7 @@ def create_standard_postchecks(
         postcheck_thresholds = get_postcheck_thresholds()
 
     if services_to_check is None:
-        services_to_check = ["Bgp", "FibAgent", "FibAgentBgp"]
+        services_to_check = ["Bgpcpp", "FibAgent", "FibAgentBgp"]
 
     if daemons_to_check is None:
         daemons_to_check = ["FibBgpGrpc"]
@@ -496,10 +508,11 @@ def create_standard_postchecks(
 
     postchecks: list[PointInTimeHealthCheck] = []
 
-    # Conditionally add BGP convergence check. validate_sequence is temporarily
-    # disabled: cold start / restart can emit an out-of-order late
-    # ALL_EOR_RECEIVED once the prematurely-started EOR timer expires. Re-enable
-    # once the BGP++ EOR-timer fix lands.
+    # Conditionally add BGP convergence check. validate_sequence is disabled: a
+    # peer that never sends End-of-RIB (e.g. an IXIA peer that never establishes)
+    # lets the EoR timer expire and emits an out-of-order late ALL_EOR_RECEIVED.
+    # The BGP++ premature-timer fix (D109742699) has landed; re-enable once runs
+    # converge without expiry.
     if check_bgp_convergence:
         postchecks.append(
             create_bgp_convergence_check(
@@ -534,7 +547,7 @@ def create_standard_postchecks(
             # System-level log parsing check
             create_log_parsing_check(
                 json_params={
-                    "agent_name": "Bgp",
+                    "agent_name": "Bgpcpp",
                     "exclude_regex": "Memory Limit Reached",
                 },
                 start_time_jq_var="test_case_start_time",

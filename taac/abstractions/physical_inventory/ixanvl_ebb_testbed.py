@@ -61,6 +61,12 @@ which link a test's ``<DIface-N>`` resolves to.
       card 11 port 2 ●────────────────────────────●  Ethernet3/36/3   DIface-1
       card 11 port 1 ●────────────────────────────●  Ethernet3/36/1   DIface-2
 
+    IXIA11_ASH6 (knc_chassis 192.168.124.1)          nrqeb010.ash6
+    ───────────────────────────────────────          ─────────────
+      card 7 port 2  ●────────────────────────────●  Ethernet3/36/2   DIface-0
+      card 7 port 3  ●────────────────────────────●  Ethernet3/36/3   DIface-1
+      card 7 port 4  ●────────────────────────────●  Ethernet3/36/4   DIface-2
+
 eb01, eb02 and eb04 sit on the same chassis on different ports and are not
 part of the conformance rig; see ``routing_ebb_testbed.py``.
 
@@ -68,8 +74,9 @@ part of the conformance rig; see ``routing_ebb_testbed.py``.
  §6  See also
 ──────────────────────────────────────────────────────────────────────────
 - ``routing_ebb_testbed.py`` — the ``PhysicalInventory`` artifacts this
-  module resolves against. ``EB03_LAB_ASH6`` already declares the cabling
-  and the lab credentials; nothing here redefines them.
+  module resolves against. ``EB03_LAB_ASH6`` and ``NRQEB010_ASH6`` already
+  declare the cabling there (and, for ``EB03_LAB_ASH6``, the lab
+  credentials); nothing here redefines them.
 - ``README.md`` — the ``<domain>_<testbed>_testbed.py`` file shape, and the
   rule that a DICE consumer adds its own module rather than pushing domain
   policy into the ``PhysicalInventory`` schema. This module follows that:
@@ -88,6 +95,7 @@ from taac.abstractions.physical_inventory.physical_inventory import (
 from taac.abstractions.physical_inventory.routing_ebb_testbed import (
     EB03_LAB_ASH6,
     IXIA11_ASH6,
+    NRQEB010_ASH6,
 )
 
 
@@ -183,6 +191,7 @@ class IxanvlRig:
 
 
 IXANVL_EB03_ASH6 = IxanvlRig(chassis=IXIA11, inventory=EB03_LAB_ASH6)
+IXANVL_NRQEB010_ASH6 = IxanvlRig(chassis=IXIA11, inventory=NRQEB010_ASH6)
 
 # Keyed by the two names the CLI is given. A DUT can appear under more than
 # one chassis once a secondary is cabled, which is why the key is the pair
@@ -191,6 +200,10 @@ IXANVL_RIGS: dict[tuple[str, str], IxanvlRig] = {
     (IXANVL_EB03_ASH6.chassis.knc_host, IXANVL_EB03_ASH6.device_name): (
         IXANVL_EB03_ASH6
     ),
+    (
+        IXANVL_NRQEB010_ASH6.chassis.knc_host,
+        IXANVL_NRQEB010_ASH6.device_name,
+    ): IXANVL_NRQEB010_ASH6,
 }
 
 

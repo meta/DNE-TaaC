@@ -10,6 +10,7 @@ import typing as t
 
 from taac.constants import (  # oss-rewrite (force ShipIt re-export to taac.* root)
     FbossPackage,
+    TESTBED_ISOLATION_BYPASS_TAG,
     TestTopology,
 )
 from taac.ixia.abstract_traffic_generator import (
@@ -69,6 +70,13 @@ _DEFAULT_IXIA_RECOVERY: taac_types.IxiaRecovery = taac_types.IxiaRecovery(
 )
 
 
+def test_config_skips_testbed_isolation(
+    test_config: taac_types.TestConfig,
+) -> bool:
+    """Return whether the TestConfig owns an isolation-bypass policy."""
+    return TESTBED_ISOLATION_BYPASS_TAG in (test_config.tags or ())
+
+
 class TestSetupOrchestrator:
     def __init__(
         self,
@@ -80,6 +88,7 @@ class TestSetupOrchestrator:
         skip_ixia_cleanup: bool = False,
         skip_post_setup_wait: bool = False,
         skip_basset_reservation: bool = False,
+        fail_on_foreign_basset_reservation: bool = False,
         skip_testbed_isolation: bool = True,
         desired_pkg_versions: t.Optional[t.Dict[FbossPackage, str]] = None,
         dsf_sequential_update: bool = False,
@@ -92,12 +101,19 @@ class TestSetupOrchestrator:
         ixia_candidates: t.Optional[t.Sequence[IxiaCandidate]] = None,
         ixia_profile: str = "auto",
         trace_ixia_api: bool = False,
+        ixia_primary_chassis: t.Optional[str] = None,
+        force_take_ixia_port_ownership: bool = True,
+        ixia_use_tx_rx_sync: bool = True,
     ) -> None:
         self.test_config = test_config
         self.logger = logger
         # Ixia specific parameters and knobs
         # Ixia chassis ip address
         self._ixia_api_server = ixia_api_server
+        # Chassis-chain primary, when it differs from the API server
+        self._ixia_primary_chassis = ixia_primary_chassis
+        self._force_take_ixia_port_ownership = force_take_ixia_port_ownership
+        self._ixia_use_tx_rx_sync = ixia_use_tx_rx_sync
         # Ixia is required but the an ixia session has already been created.
         self._ixia_session_id = ixia_session_id
         # Ixia is not required. Primarily used for testing purposes
@@ -105,7 +121,13 @@ class TestSetupOrchestrator:
         self._skip_ixia_cleanup = skip_ixia_cleanup
         self._skip_post_setup_wait = skip_post_setup_wait
         self._skip_basset_reservation = skip_basset_reservation
-        self._skip_testbed_isolation = skip_testbed_isolation
+        self._fail_on_foreign_basset_reservation = fail_on_foreign_basset_reservation
+        self._test_config_skips_testbed_isolation = test_config_skips_testbed_isolation(
+            test_config
+        )
+        self._skip_testbed_isolation = (
+            skip_testbed_isolation or self._test_config_skips_testbed_isolation
+        )
         self._desired_pkg_versions = desired_pkg_versions or {}
         self._dsf_sequential_update = dsf_sequential_update
         self._allow_disruptive_configs = allow_disruptive_configs
@@ -894,7 +916,10 @@ class TestSetupOrchestrator:
         )
 
         success, self.basset_butler = await async_reserve_devices_in_basset(
-            self.test_config, static_device_names, self.logger
+            self.test_config,
+            static_device_names,
+            self.logger,
+            self._fail_on_foreign_basset_reservation,
         )
         if not success:
             raise Exception("Failed to reserve test devices in Basset")
@@ -995,7 +1020,10 @@ class TestSetupOrchestrator:
                 _log("\033[36m[SETUP]\033[0m Phase 1: Reserving devices in Basset...")
                 with timed_phase("Basset device reservation", logger=self.logger):
                     success, self.basset_butler = await async_reserve_devices_in_basset(
-                        self.test_config, static_device_names, self.logger
+                        self.test_config,
+                        static_device_names,
+                        self.logger,
+                        self._fail_on_foreign_basset_reservation,
                     )
                     if not success:
                         raise Exception("Failed to reserve test devices in Basset")
@@ -1034,7 +1062,14 @@ class TestSetupOrchestrator:
                 f"\033[33m{time.time() - _iso_start:.0f}s\033[0m"
             )
         else:
-            _log("\033[2m[SETUP] Phase 3: Skipping test bed isolation\033[0m")
+            reason = (
+                "TestConfig policy"
+                if self._test_config_skips_testbed_isolation
+                else "runner option"
+            )
+            _log(
+                f"\033[2m[SETUP] Phase 3: Skipping test bed isolation ({reason})\033[0m"
+            )
 
         # Step 4: EOS image deployment + Package updates
         if self._eos_image_id:
@@ -1247,12 +1282,30 @@ class TestSetupOrchestrator:
             raise ExceptionGroup("Multiple TAAC resources failed to clean up", errors)
 
     async def async_wait_for_interfaces_to_stabilize(self) -> None:
+        # Discovery returns every Ixia-cabled port on the device, but a config
+        # may drive only some of them. When the config declares its Ixia ports,
+        # wait on just those so an unused (and possibly disabled) Ixia port
+        # does not block setup.
+        declared_ixia_interfaces = self._get_ixia_interface_names()
         coroutines = []
         for test_device in self.test_topology.devices:
-            interfaces = [
-                interface.interface_name
-                for interface in test_device.interfaces + test_device.ixia_interfaces
+            ixia_interfaces = [
+                interface.interface_name for interface in test_device.ixia_interfaces
             ]
+            declared = declared_ixia_interfaces.get(test_device.name)
+            if declared:
+                skipped = sorted(set(ixia_interfaces) - declared)
+                if skipped:
+                    self.logger.info(
+                        f"Not waiting on Ixia interfaces unused by this test config "
+                        f"on {test_device.name}: {skipped}"
+                    )
+                ixia_interfaces = [
+                    interface for interface in ixia_interfaces if interface in declared
+                ]
+            interfaces = [
+                interface.interface_name for interface in test_device.interfaces
+            ] + ixia_interfaces
             driver = await async_get_device_driver(test_device.name)
             coroutines.append(driver.async_check_interfaces_status(interfaces, True))
         await asyncio.gather(*coroutines)
@@ -1336,6 +1389,9 @@ class TestSetupOrchestrator:
             cleanup_config=True if not ixia_session_id else False,
             tear_down_session=not skip_ixia_cleanup,
             primary_chassis_ip=candidate.api_server_ip,
+            ixia_primary_chassis=self._ixia_primary_chassis,
+            force_take_port_ownership=self._force_take_ixia_port_ownership,
+            use_tx_rx_sync=self._ixia_use_tx_rx_sync,
             session_id=ixia_session_id,
             user_defined_traffic_items=candidate.user_defined_traffic_items,
             basic_traffic_item_configs=candidate.basic_traffic_item_configs,

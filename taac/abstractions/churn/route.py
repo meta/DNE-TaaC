@@ -87,6 +87,7 @@ class RouteObservationPolicy:
     transition_soft_threshold_seconds: float = (
         DEFAULT_ROUTE_CHURN_TRANSITION_SOFT_THRESHOLD_SECONDS
     )
+    advertise_transition_soft_threshold_seconds: float | None = None
     transition_hard_timeout_seconds: float = (
         DEFAULT_ROUTE_CHURN_TRANSITION_HARD_TIMEOUT_SECONDS
     )
@@ -149,6 +150,11 @@ class RouteChurn:
                 "transition_soft_threshold_seconds",
                 self.observation.transition_soft_threshold_seconds,
                 DEFAULT_ROUTE_CHURN_TRANSITION_SOFT_THRESHOLD_SECONDS,
+            ),
+            (
+                "advertise_transition_soft_threshold_seconds",
+                self.observation.advertise_transition_soft_threshold_seconds,
+                None,
             ),
             (
                 "transition_hard_timeout_seconds",
@@ -306,6 +312,12 @@ class RouteChurn:
                         "transition_soft_threshold_seconds",
                         DEFAULT_ROUTE_CHURN_TRANSITION_SOFT_THRESHOLD_SECONDS,
                     )
+                ),
+                advertise_transition_soft_threshold_seconds=(
+                    float(params["advertise_transition_soft_threshold_seconds"])
+                    if params.get("advertise_transition_soft_threshold_seconds")
+                    is not None
+                    else None
                 ),
                 transition_hard_timeout_seconds=transition_timeout,
                 confirmation_seconds=float(

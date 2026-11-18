@@ -71,6 +71,15 @@ from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.types import TestConfig
 
 
+# Playbooks that enable the UPLINK_BGP_INDUCED_ECMP_2 IXIA device group. The DUT
+# peers for that group exist only when one of them is selected: a configured
+# peer that never establishes keeps bgpd waiting the full EoR timer after an
+# ungraceful restart.
+_INDUCED_ECMP_2_PLAYBOOKS = frozenset(
+    {"test_ecmp_member_overload_limit", "test_ecmp_group_overload_limit"}
+)
+
+
 # =============================================================================
 # Playbook Category Registry
 # =============================================================================
@@ -257,6 +266,9 @@ def build_bgp_dc_test_config(
         playbooks = [
             playbook for playbook in playbooks if playbook.name in playbooks_selected
         ]
+    configure_induced_ecmp_2_peers = any(
+        playbook.name in _INDUCED_ECMP_2_PLAYBOOKS for playbook in playbooks
+    )
 
     ixia_downlink_source_ipv6 = f"{ixia_downlink_ic_parent_network_v6}::11"
 
@@ -663,18 +675,24 @@ def build_bgp_dc_test_config(
                                 "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::401",
                                 "gateway_increment_ip": "0:0:0:0::2",
                             },
-                            {
-                                "starting_ip": f"{ixia_uplink_ic_parent_network_v6}::500",
-                                "increment_ip": "0:0:0:0::2",
-                                "prefix_length": 127,
-                                "description": "Uplink IPv6 Peers - for BGP Induced ECMP - 2",
-                                "peer_group_name": peergroup_uplink_mimic_v6,
-                                "num_sessions": bgp_induced_ecmp_group_count,
-                                "remote_as_4_byte": remote_uplink_as_4byte,
-                                "remote_as_4_byte_step": 0,
-                                "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::501",
-                                "gateway_increment_ip": "0:0:0:0::2",
-                            },
+                            *(
+                                [
+                                    {
+                                        "starting_ip": f"{ixia_uplink_ic_parent_network_v6}::500",
+                                        "increment_ip": "0:0:0:0::2",
+                                        "prefix_length": 127,
+                                        "description": "Uplink IPv6 Peers - for BGP Induced ECMP - 2",
+                                        "peer_group_name": peergroup_uplink_mimic_v6,
+                                        "num_sessions": bgp_induced_ecmp_group_count,
+                                        "remote_as_4_byte": remote_uplink_as_4byte,
+                                        "remote_as_4_byte_step": 0,
+                                        "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::501",
+                                        "gateway_increment_ip": "0:0:0:0::2",
+                                    }
+                                ]
+                                if configure_induced_ecmp_2_peers
+                                else []
+                            ),
                             {
                                 "starting_ip": f"{ixia_uplink_ic_parent_network_v4}.0",
                                 "increment_ip": "0.0.0.2",

@@ -279,6 +279,27 @@ class BeginTestCaseTest(unittest.TestCase):
         self.assertEqual(["^missing$"], self.ixia._pending_traffic_regexes)
 
 
+class TrafficRunningStateTest(unittest.TestCase):
+    def setUp(self):
+        self.ixia = _create_taac_ixia()
+
+    def test_started_waiting_for_stats_counts_as_running(self):
+        self.ixia.ixnetwork.Traffic.IsTrafficRunning = False
+        golden = MagicMock(Enabled=True, State="startedWaitingForStats")
+        rogue = MagicMock(Enabled=True, State="startedWaitingForStats")
+        self.ixia.get_traffic_items = MagicMock(return_value=[golden, rogue])
+
+        self.assertTrue(self.ixia.is_traffic_running())
+
+    def test_mixed_started_waiting_and_stopped_is_not_running(self):
+        self.ixia.ixnetwork.Traffic.IsTrafficRunning = False
+        golden = MagicMock(Enabled=True, State="startedWaitingForStats")
+        rogue = MagicMock(Enabled=True, State="stopped")
+        self.ixia.get_traffic_items = MagicMock(return_value=[golden, rogue])
+
+        self.assertFalse(self.ixia.is_traffic_running())
+
+
 class GetOrCreateStatViewTest(unittest.TestCase):
     """Tests for TaacIxia.get_or_create_stat_view."""
 

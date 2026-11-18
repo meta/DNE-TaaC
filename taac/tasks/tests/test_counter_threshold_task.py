@@ -56,6 +56,22 @@ class CounterThresholdTaskTest(unittest.IsolatedAsyncioTestCase):
         self.logger.warning.assert_called()
         self.assertEqual(len(self.task._data), 1)
 
+    async def test_observe_only_breach_passes_final_check(self) -> None:
+        params = self._params(fail_on_breach=False)
+        params["observe_only"] = True
+        with patch(
+            f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+            AsyncMock(return_value=_driver_returning(_FIVE_GB + 1)),
+        ):
+            await self.task._run(params)
+
+        result = await self.task.run_final_check()
+        if result is None:
+            raise AssertionError("counter final check returned no result")
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn("observe-only", result.message)
+        self.assertIn(str(_FIVE_GB + 1), result.message)
+
     async def test_within_threshold_no_raise(self) -> None:
         # Under threshold: no raise even with the flag on; sample recorded.
         await self._run_with_counter(_FIVE_GB - 1, fail_on_breach=True)

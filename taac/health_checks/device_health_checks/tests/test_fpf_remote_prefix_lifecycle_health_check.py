@@ -78,6 +78,30 @@ class FpfRemotePrefixLifecycleHealthCheckTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
         self.assertIn("No recorded anchor timestamp", str(result.message))
 
+    async def test_disruption_mode_uses_recorded_disruption_anchor(self) -> None:
+        collector = SimpleNamespace(
+            rows=[
+                SimpleNamespace(
+                    timestamp=_ts(5),
+                    gtsw=RUNNER,
+                    matched=0,
+                    valid=True,
+                    notes="",
+                )
+            ]
+        )
+        with patch(f"{HC_MODULE}.get_disruption_time", return_value=WINDOW_START):
+            result = await self._run(
+                {
+                    "mode": "disruption",
+                    "deadline_sec": 10,
+                    "scalar_expectations": [["bgp_prod_route", RUNNER, 0]],
+                },
+                collector=collector,
+            )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
+
     async def test_missing_collector_fails(self) -> None:
         result = await self._run(
             {

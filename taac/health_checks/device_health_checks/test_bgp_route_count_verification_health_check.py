@@ -2,16 +2,20 @@
 
 # pyre-unsafe
 
+import ipaddress
 import unittest
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, call, MagicMock, patch
 
+from neteng.fboss.bgp_attr.types import TBgpAfi, TIpPrefix
+from neteng.fboss.bgp_route_types.types import TBgpPath, TRibEntry
 from neteng.netcastle.logger import ConsoleFileLogger
 from taac.constants import TestDevice
 from taac.health_checks.device_health_checks.bgp_route_count_verification_health_check import (
     BgpRouteCountVerificationHealthCheck,
 )
 from taac.health_check.health_check import types as hc_types
+from taac.test_as_a_config import types as taac_types
 
 _MODULE = (
     "neteng.test_infra.dne.taac.health_checks.device_health_checks."
@@ -30,9 +34,156 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
         health_check.driver = driver
         return health_check, driver
 
-    async def test_bgp_inactive_falls_back_before_peer_group_resolution(self) -> None:
+    @staticmethod
+    def _rib_entry(prefix: str, path_counts: list[int]) -> SimpleNamespace:
+        network = ipaddress.ip_network(prefix)
+        return SimpleNamespace(
+            prefix=SimpleNamespace(
+                prefix_bin=network.network_address.packed,
+                num_bits=network.prefixlen,
+            ),
+            paths={
+                f"group-{index}": [object()] * count
+                for index, count in enumerate(path_counts)
+            },
+        )
+
+    async def test_rib_path_scale_counts_every_addpath_entry_in_ranges(self) -> None:
         health_check, driver = self._health_check()
-        driver.async_execute_show_json_on_shell.side_effect = Exception("BGP inactive")
+        driver.async_get_bgp_rib_entries.return_value = [
+            self._rib_entry("5000:dd::/64", [2, 1]),
+            self._rib_entry("5000:dd:0:1::/64", [4]),
+            self._rib_entry("5000:ee::/64", [5]),
+            self._rib_entry("6000::/64", [999]),
+        ]
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["5000:dd::/32", "5000:ee::/32"],
+                "expected_rib_prefix_count": 3,
+                "expected_rib_path_count": 12,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn("3 prefixes, 12 paths", result.message or "")
+        driver.async_get_bgp_rib_entries.assert_awaited_once()
+        driver.async_get_bgp_sessions.assert_not_awaited()
+
+    async def test_rib_path_scale_selects_only_matching_address_family_ranges(
+        self,
+    ) -> None:
+        health_check, driver = self._health_check()
+        entries = []
+        for cidr in (
+            "192.0.2.0/25",
+            "198.51.100.0/24",
+            "2001:db8::/64",
+            "2001:db9::/64",
+        ):
+            network = ipaddress.ip_network(cidr)
+            prefix = TIpPrefix(
+                afi=(
+                    TBgpAfi.AFI_IPV4
+                    if isinstance(network, ipaddress.IPv4Network)
+                    else TBgpAfi.AFI_IPV6
+                ),
+                prefix_bin=network.network_address.packed,
+                num_bits=network.prefixlen,
+            )
+            entries.append(
+                TRibEntry(prefix=prefix, paths={"group": [TBgpPath(next_hop=prefix)]})
+            )
+        driver.async_get_bgp_rib_entries.return_value = entries
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["192.0.2.0/24", "2001:db8::/32"],
+                "expected_rib_prefix_count": 2,
+                "expected_rib_path_count": 2,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn("2 prefixes, 2 paths", result.message or "")
+        driver.async_get_bgp_rib_entries.assert_awaited_once()
+        driver.async_get_bgp_sessions.assert_not_awaited()
+
+    async def test_rib_path_scale_accepts_immutable_thrift_style_mapping(
+        self,
+    ) -> None:
+        health_check, driver = self._health_check()
+        entry = self._rib_entry("5000:dd::/64", [2, 3])
+        entry.paths = MappingProxyType(entry.paths)
+        driver.async_get_bgp_rib_entries.return_value = [entry]
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["5000:dd::/32"],
+                "expected_rib_prefix_count": 1,
+                "expected_rib_path_count": 5,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+
+    async def test_rib_path_scale_reports_both_absolute_mismatches(self) -> None:
+        health_check, driver = self._health_check()
+        driver.async_get_bgp_rib_entries.return_value = [
+            self._rib_entry("5000:dd::/64", [3]),
+        ]
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["5000::/16"],
+                "expected_rib_prefix_count": 26,
+                "expected_rib_path_count": 79872,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("expected_prefixes=26, actual_prefixes=1", result.message or "")
+        self.assertIn("expected_paths=79872, actual_paths=3", result.message or "")
+
+    async def test_rib_path_scale_query_failure_is_error(self) -> None:
+        health_check, driver = self._health_check()
+        driver.async_get_bgp_rib_entries.side_effect = RuntimeError("RIB unavailable")
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        result = await health_check._run(
+            device,
+            hc_types.BaseHealthCheckIn(),
+            {
+                "rib_prefix_ranges": ["5000::/16"],
+                "expected_rib_prefix_count": 26,
+                "expected_rib_path_count": 79872,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.ERROR, result.status)
+        self.assertIn("authoritative bgpcpp RIB path counts", result.message or "")
+
+    async def test_arista_declared_bgpcpp_reads_thrift_not_eos_cli(self) -> None:
+        """Native EOS BGP can run with an empty table beside BGP++; a device the
+        TestConfig declares ARISTA_FBOSS must be read through thrift."""
+        health_check, driver = self._health_check()
         device = MagicMock(spec=TestDevice)
         device.name = "dut.example.com"
         health_input = hc_types.BaseHealthCheckIn()
@@ -40,11 +191,17 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
             status=hc_types.HealthCheckStatus.PASS,
         )
 
-        with patch.object(
-            health_check,
-            "_run",
-            new=AsyncMock(return_value=expected),
-        ) as thrift_check:
+        with (
+            patch.dict(
+                "neteng.test_infra.dne.taac.utils.driver_factory.HOST_TO_DEVICE_OS_TYPE_MAP",
+                {device.name: taac_types.DeviceOsType.ARISTA_FBOSS},
+            ),
+            patch.object(
+                health_check,
+                "_run",
+                new=AsyncMock(return_value=expected),
+            ) as thrift_check,
+        ):
             result = await health_check._run_arista(
                 device,
                 health_input,
@@ -56,6 +213,7 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
 
         self.assertEqual(expected, result)
         thrift_check.assert_awaited_once()
+        driver.async_execute_show_json_on_shell.assert_not_awaited()
         driver.bgp.assert_not_awaited()
 
     async def test_raw_payload_rejects_mixed_peer_selectors(self) -> None:
@@ -81,6 +239,45 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
             self.assertIn("mutually exclusive", result.message)
             driver.async_get_bgp_sessions.assert_not_awaited()
             driver.async_execute_show_json_on_shell.assert_not_awaited()
+
+    async def test_thrift_exact_peer_address_selector(self) -> None:
+        health_check, driver = self._health_check()
+        peer = "2001:db8::1"
+        driver.async_get_bgp_sessions.return_value = [object()]
+        device = MagicMock(spec=TestDevice)
+        device.name = "dut.example.com"
+
+        with (
+            patch(
+                f"{_MODULE}.filter_bgp_sessions",
+                return_value=[peer],
+            ) as filter_sessions,
+            patch(
+                f"{_MODULE}.get_route_counts_for_peers",
+                new=AsyncMock(return_value={peer: 10}),
+            ),
+            patch(
+                f"{_MODULE}.validate_all_peer_route_counts",
+                return_value=[],
+            ),
+        ):
+            result = await health_check._run(
+                device,
+                hc_types.BaseHealthCheckIn(),
+                {
+                    "peer_addresses_to_check": [peer],
+                    "expected_count": 10,
+                    "policy_type": "post_policy",
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        filter_sessions.assert_called_once_with(
+            bgp_sessions=driver.async_get_bgp_sessions.return_value,
+            descriptions_to_ignore=[],
+            descriptions_to_check=[],
+            peer_addresses_to_check={peer},
+        )
 
     async def test_thrift_histogram_is_compared_per_afi(self) -> None:
         health_check, driver = self._health_check()
@@ -232,7 +429,7 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
                 "expected_count_histogram_by_afi": {
                     "ipv4": {"720": 1, "750": 1},
                     "ipv6": {"720": 1, "750": 1},
-                }
+                },
             },
         )
 
@@ -283,7 +480,7 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
                 "expected_count_histogram_by_afi": {
                     "ipv4": {"720": 1},
                     "ipv6": {"750": 1},
-                }
+                },
             },
         )
 
@@ -319,7 +516,7 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
                 "expected_count_histogram_by_afi": {
                     "ipv4": {"720": 1},
                     "ipv6": {"750": 1},
-                }
+                },
             },
         )
 
@@ -374,7 +571,10 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
                     result = await health_check._run_arista(
                         device,
                         hc_types.BaseHealthCheckIn(),
-                        {"address_family": "ipv4", **count_check},
+                        {
+                            "address_family": "ipv4",
+                            **count_check,
+                        },
                     )
 
                     self.assertEqual(hc_types.HealthCheckStatus.ERROR, result.status)
@@ -428,7 +628,7 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
                 "expected_count_histogram_by_afi": {
                     "ipv4": {720: 1},
                     "ipv6": {750: 1},
-                }
+                },
             },
         )
 
@@ -467,7 +667,10 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
         result = await health_check._run_arista(
             device,
             hc_types.BaseHealthCheckIn(),
-            {"address_family": "ipv4", "expected_count": 0},
+            {
+                "address_family": "ipv4",
+                "expected_count": 0,
+            },
         )
 
         self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
@@ -501,7 +704,10 @@ class BgpRouteCountVerificationHealthCheckTest(unittest.IsolatedAsyncioTestCase)
                 result = await health_check._run_arista(
                     device,
                     hc_types.BaseHealthCheckIn(),
-                    {"address_family": "ipv4", **count_check},
+                    {
+                        "address_family": "ipv4",
+                        **count_check,
+                    },
                 )
 
                 self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)

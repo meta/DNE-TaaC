@@ -26,7 +26,7 @@ from taac.abstractions import PhysicalInventory
 Use concrete inventories through the package or their owning family module:
 
 ```python
-from taac.abstractions.physical_inventory import BAG010_ASH6
+from taac.abstractions.physical_inventory import NRQEB006_ASH6
 from taac.abstractions.physical_inventory.routing_dcn_testbed import (
     FSW_FUJI_QZD1,
 )

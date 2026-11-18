@@ -158,6 +158,9 @@ class FpfRemotePrefixLifecycleHealthCheck(
         elif mode == "withdrawn":
             anchor = get_restart_completion_time()
             transition = True
+        elif mode == "disruption":
+            anchor = get_disruption_time()
+            transition = True
         elif mode == "recovery":
             anchor = get_recovery_start_time()
             transition = True

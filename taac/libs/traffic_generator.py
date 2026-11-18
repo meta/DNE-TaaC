@@ -34,6 +34,7 @@ from taac.utils.ixia_utils import (
     async_create_optical_switch_ixia_connection_assets,
     async_get_ixia_logical_port,
     fetch_ixia_password,
+    fetch_ixia_username,
     get_attr_value,
     get_next_available_ipv6_address,
 )
@@ -99,6 +100,7 @@ class TrafficGenerator:
         basset_pool: t.Optional[str] = None,
         session_name: t.Optional[str] = None,
         primary_chassis_ip: t.Optional[str] = None,
+        ixia_primary_chassis: t.Optional[str] = None,
         cleanup_config: bool = True,
         tear_down_session: bool = True,
         session_id: t.Optional[int] = None,
@@ -124,6 +126,8 @@ class TrafficGenerator:
         cache_candidate_name: t.Optional[str] = None,
         trace_api_calls: bool = False,
         wait_for_lldp_reconvergence: bool = False,
+        force_take_port_ownership: bool = True,
+        use_tx_rx_sync: bool = True,
         *args,
         **kwargs,
     ) -> None:
@@ -131,6 +135,9 @@ class TrafficGenerator:
         self.name_to_endpoint = {endpoint.name: endpoint for endpoint in self.endpoints}
         self.endpoint_names = list(self.name_to_endpoint.keys())
         self.primary_chassis_ip = primary_chassis_ip
+        self.ixia_primary_chassis = ixia_primary_chassis
+        self.force_take_port_ownership = force_take_port_ownership
+        self.use_tx_rx_sync = use_tx_rx_sync
         self.cleanup_config: bool = cleanup_config
         self.session_id = session_id
         self.tear_down_session = tear_down_session
@@ -274,9 +281,11 @@ class TrafficGenerator:
                 session_name=self.get_session_name(),
                 cleanup_config=False if self.session_id else self.cleanup_config,
                 teardown_session=self.tear_down_session,
-                force_take_port_ownership=True,
+                force_take_port_ownership=self.force_take_port_ownership,
+                use_tx_rx_sync=self.use_tx_rx_sync,
                 session_id=self.session_id,
                 password=fetch_ixia_password(),
+                username=fetch_ixia_username(),
                 chassis_ip=(
                     await self.async_get_ixia_api_server() if self.session_id else None
                 ),
@@ -291,6 +300,7 @@ class TrafficGenerator:
                 ixia_protocol_verification_timeout=self.ixia_protocol_verification_timeout,
                 ixia_recovery=self.ixia_recovery,
                 trace_api_calls=self.trace_api_calls,
+                ixia_primary_chassis=self.ixia_primary_chassis,
             )
 
             # Topology cache is only for newly-created sessions. An explicit
@@ -420,7 +430,8 @@ class TrafficGenerator:
                 is_logical_port=direct_ixia_connection.is_logical_port,
             )
             direct_ixia_connection_assets.append(ixia_endpoint)
-        return list(set(direct_ixia_connection_assets))
+        # The declared order decides which port IXIA creates first.
+        return list(dict.fromkeys(direct_ixia_connection_assets))
 
     def create_ixia_endpoint(
         self, endpoint: taac_types.TrafficEndpoint
@@ -868,7 +879,7 @@ class TrafficGenerator:
                     f"[OSS Mode] Using {len(direct_ixia_connection_assets)} direct IXIA connection(s) "
                     f"for endpoint {endpoint.name}"
                 )
-                desired_ixia_assets = list(set(direct_ixia_connection_assets))
+                desired_ixia_assets = direct_ixia_connection_assets
                 self._ixia_asset_snapshot_by_endpoint[endpoint.name] = (
                     desired_ixia_assets
                 )
@@ -889,7 +900,7 @@ class TrafficGenerator:
                 f"Using {len(direct_ixia_connection_assets)} direct IXIA connection(s) "
                 f"for endpoint {endpoint.name}, skipping LLDP/optical switch discovery"
             )
-            desired_ixia_assets = list(set(direct_ixia_connection_assets))
+            desired_ixia_assets = direct_ixia_connection_assets
             self._ixia_asset_snapshot_by_endpoint[endpoint.name] = desired_ixia_assets
             return desired_ixia_assets
 
@@ -985,7 +996,10 @@ class TrafficGenerator:
             if self.is_standalone:
                 port_configs.append(
                     self.create_standalone_port_config(
-                        endpoint_str, asset, logical_port_num
+                        endpoint_str,
+                        asset,
+                        logical_port_num,
+                        l1_config=basic_port_config.l1_config,
                     )
                 )
             elif basic_port_config.device_group_configs:
@@ -1057,6 +1071,7 @@ class TrafficGenerator:
         endpoint_str: str,
         ixia_asset: IxiaEndpointInfo,
         ixia_logical_port_num: int,
+        l1_config: t.Optional[ixia_types.L1Config] = None,
     ) -> ixia_types.PortConfig:
         ixia_starting_ip, prefix_v6, prefix_len = self.get_standalone_ip_fields(
             endpoint_str
@@ -1086,6 +1101,7 @@ class TrafficGenerator:
                 slot_number=int(ixia_asset.ixia_slot_num),
                 port_number=ixia_logical_port_num,
             ),
+            l1_config=l1_config,
             device_group_configs=device_group_configs,
         )
         return port_config

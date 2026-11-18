@@ -14,6 +14,7 @@ Import from this module instead of creating inline Task objects in test configs.
 import base64
 import json
 import typing as t
+from collections.abc import Iterable
 
 from taac.constants import (
     ARISTA_7808_CPU_COUNT,
@@ -25,8 +26,34 @@ from taac.constants import (
     OpenRRouteAction,
 )
 from taac.tasks.thrift_stress_payloads import ThriftStressCall
+from taac.utils.common import get_bgp_peer_configs
 from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.types import Params, PeriodicTask, Task
+
+
+def create_openr_fib_programming_task(
+    dut_name: str,
+    action: t.Literal["enable", "disable"],
+    drain_timeout: int = 300,
+) -> Task:
+    """Toggle a lab EOS DUT's Open/R between dryrun and FIB programming.
+
+    ``enable`` snapshots ``/etc/openr_config``, sets ``dryrun: false`` and
+    restarts Open/R. ``disable`` waits up to ``drain_timeout`` seconds for Open/R
+    to withdraw its routes (it can only while programming), then always restores
+    the snapshot, restarts Open/R and removes any routes Open/R left in FibAgent,
+    so even a failed run leaves the DUT in dryrun with no Open/R routes.
+    """
+    if action not in {"enable", "disable"}:
+        raise ValueError(f"Unsupported Open/R FIB programming action {action!r}")
+    return Task(
+        task_name="openr_fib_programming",
+        params=Params(
+            json_params=json.dumps(
+                {"dut_name": dut_name, "action": action, "drain_timeout": drain_timeout}
+            )
+        ),
+    )
 
 
 def create_openr_scale_isolation_task(
@@ -341,17 +368,113 @@ def create_ixia_stop_traffic_and_wait_task(wait_seconds: int = 0) -> Task:
     )
 
 
-def create_ixia_sync_raw_source_macs_task(traffic_item_regex: str = ".*") -> Task:
+def create_ixia_sync_raw_source_macs_task(
+    traffic_item_regex: str = ".*",
+    sync_destination_macs: bool = False,
+) -> Task:
     """Create a post-IXIA task that gives RAW traffic items a valid source MAC.
 
     RAW items carry a placeholder source MAC; this rewrites each one to the
     MAC of its tx port's IXIA device group so the DUT accepts the frames.
     """
+    params: t.Dict[str, t.Any] = {"traffic_item_regex": traffic_item_regex}
+    if sync_destination_macs:
+        params["sync_destination_macs"] = True
     return Task(
         task_name="ixia_sync_raw_source_macs",
         ixia_needed=True,
+        params=Params(json_params=json.dumps(params)),
+    )
+
+
+def create_assert_agent_warm_boot_task(
+    hostname: str,
+    hw_switch_indices: t.Optional[t.List[int]] = None,
+) -> Task:
+    """Require SW and the selected HW agents to report an actual warm boot."""
+    return Task(
+        task_name="assert_agent_warm_boot",
+        hostname=hostname,
         params=Params(
-            json_params=json.dumps({"traffic_item_regex": traffic_item_regex})
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "hw_switch_indices": hw_switch_indices
+                    if hw_switch_indices is not None
+                    else [0],
+                }
+            )
+        ),
+    )
+
+
+def create_assert_process_vmhwm_task(
+    hostname: str,
+    services: t.List[str],
+    threshold_bytes: int,
+) -> Task:
+    """Verify actual process peak RSS independently of memory.current metrics."""
+    return Task(
+        task_name="assert_process_vmhwm",
+        hostname=hostname,
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "services": services,
+                    "threshold_bytes": threshold_bytes,
+                }
+            )
+        ),
+    )
+
+
+def create_verify_selected_forwarding_task(
+    hostname: str,
+    routes: t.List[t.Dict[str, t.Any]],
+    interface_ports: t.Dict[str, int],
+    timeout_seconds: int = 60,
+) -> Task:
+    """Verify exact resolved FIB next hops on known physical PORT RIFs."""
+    return Task(
+        task_name="verify_selected_forwarding",
+        hostname=hostname,
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "routes": routes,
+                    "interface_ports": interface_ports,
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+        ),
+    )
+
+
+def create_verify_selected_bgp_routes_task(
+    hostname: str,
+    peer_prefixes: t.Dict[str, t.List[str]],
+    selected_prefixes: t.List[str],
+    timeout_seconds: int = 60,
+    allowed_extra_prefixes: t.Optional[t.Dict[str, t.List[str]]] = None,
+    path_expectations: t.Optional[t.Dict[str, t.Dict[str, t.Dict[str, t.Any]]]] = None,
+) -> Task:
+    """Audit the exact selected NLRI set per peer in the received post-policy RIB."""
+    return Task(
+        task_name="verify_selected_bgp_routes",
+        hostname=hostname,
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "peer_prefixes": peer_prefixes,
+                    "selected_prefixes": selected_prefixes,
+                    "timeout_seconds": timeout_seconds,
+                    "allowed_extra_prefixes": allowed_extra_prefixes or {},
+                    "path_expectations": path_expectations or {},
+                }
+            )
         ),
     )
 
@@ -397,6 +520,7 @@ def create_coop_register_patcher_task(
     task_name: t.Optional[str] = None,
     patcher_args: t.Optional[t.Dict[str, t.Any]] = None,
     py_func_name: t.Optional[str] = None,
+    jq_program: t.Optional[str] = None,
 ) -> Task:
     """
     Create a task to register a coop patcher on a device.
@@ -410,10 +534,17 @@ def create_coop_register_patcher_task(
             and rely on py_func_name as the dispatch key).
         patcher_args: Optional arguments for the patcher (serialized via inner json.dumps)
         py_func_name: Optional Python function name for the patcher
+        jq_program: Optional jq expression for a generic COOP patcher. Mutually
+            exclusive with py_func_name and patcher_args.
 
     Returns:
         Task object to register the patcher
     """
+    if jq_program is not None and (
+        py_func_name is not None or patcher_args is not None
+    ):
+        raise ValueError("jq_program is mutually exclusive with Python patcher fields")
+
     # Preserve original key insertion order (hostname, config_name, patcher_name,
     # task_name) for byte-equivalence with pre-Phase-8 callers' JSON serialization.
     params: t.Dict[str, t.Any] = {"hostname": hostname}
@@ -428,10 +559,62 @@ def create_coop_register_patcher_task(
         params["patcher_args"] = json.dumps(patcher_args)
     if py_func_name is not None:
         params["py_func_name"] = py_func_name
+    if jq_program is not None:
+        params["jq_program"] = jq_program
 
     return Task(
         task_name="coop_register_patcher",
         params=Params(json_params=json.dumps(params)),
+    )
+
+
+def create_enable_ixia_ports_patcher_task(
+    hostname: str,
+    interfaces: Iterable[str],
+) -> Task:
+    """Register an agent patcher for the test's configured IXIA interfaces."""
+    if isinstance(interfaces, str):
+        raise ValueError("IXIA interfaces must be a collection of port names")
+    interface_names = list(interfaces)
+    if not interface_names or any(
+        not isinstance(interface, str)
+        or not interface.strip()
+        or interface != interface.strip()
+        for interface in interface_names
+    ):
+        raise ValueError("IXIA interfaces must contain nonempty unpadded port names")
+    return create_coop_register_patcher_task(
+        hostname=hostname,
+        config_name="agent",
+        patcher_name="a_enable_ixia_ports",
+        patcher_args=dict.fromkeys(interface_names, "enable"),
+        py_func_name="change_port_admin_state",
+    )
+
+
+def create_coop_register_jq_patcher_task(
+    hostname: str,
+    patcher_name: str,
+    jq_program: str,
+    config_names: t.Optional[t.List[str]] = None,
+) -> Task:
+    """Register a whole-config jq transform through internal COOP."""
+    if not jq_program.strip():
+        raise ValueError("jq_program must be nonempty")
+    return Task(
+        task_name="coop_register_patcher",
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "patcher_name": patcher_name,
+                    "jq_program": jq_program,
+                    "config_names": ["bgpcpp"]
+                    if config_names is None
+                    else config_names,
+                }
+            )
+        ),
     )
 
 
@@ -440,6 +623,7 @@ def create_coop_apply_patchers_task(
     config_name: str = "bgpcpp",
     do_warmboot: bool = False,
     do_coldboot: bool = False,
+    fail_on_agent_reload_error: bool = False,
 ) -> Task:
     """
     Create a task to apply registered patchers on device(s).
@@ -450,6 +634,9 @@ def create_coop_apply_patchers_task(
         do_warmboot: Whether to perform a warmboot after applying (default: False)
         do_coldboot: Whether to perform a coldboot after applying (default: False).
             Required for port-channel agent patchers (min-link, agg-port creation, etc.)
+        fail_on_agent_reload_error: Report reload failures after all reload attempts
+            finish. Defaults to the existing best-effort reload behavior. Boot
+            paths already propagate failures and do not use this flag.
 
     Returns:
         Task object to apply patchers
@@ -458,6 +645,8 @@ def create_coop_apply_patchers_task(
         "hostnames": hostnames,
         "config_name": config_name,
     }
+    if fail_on_agent_reload_error:
+        params["fail_on_agent_reload_error"] = True
     if do_coldboot:
         params["do_coldboot"] = True
     elif do_warmboot:
@@ -1262,9 +1451,18 @@ def create_ixia_modify_communities_task(
     )
 
 
+def create_verify_bgpcpp_stack_task(hostname: str, ixia_needed: bool = True) -> Task:
+    """Fail setup unless BGP++ is the only BGP stack enabled on ``hostname``."""
+    return Task(
+        task_name="verify_bgpcpp_stack",
+        ixia_needed=ixia_needed,
+        params=Params(json_params=json.dumps({"hostname": hostname})),
+    )
+
+
 def create_arista_daemon_control_task(
     hostname: str,
-    daemon_name: str = "Bgp",
+    daemon_name: str = "Bgpcpp",
     action: str = "enable",
     ixia_needed: bool = False,
 ) -> Task:
@@ -1273,7 +1471,7 @@ def create_arista_daemon_control_task(
 
     Args:
         hostname: Hostname of the Arista device
-        daemon_name: Name of the daemon (default: "Bgp")
+        daemon_name: Name of the daemon (default: "Bgpcpp")
         action: Action to perform ("enable", "disable", "restart")
         ixia_needed: If True, task runs after IXIA setup (default: False).
             BGP++ conveyor configs set this to True so daemon enable runs
@@ -1334,6 +1532,7 @@ def create_counter_utilization_task(
     enable_plotting: bool = True,
     cpu_count: t.Optional[int] = None,
     fail_on_breach: bool = False,
+    observe_only: bool = False,
 ) -> Task:
     """
     Create a task to check counter utilization.
@@ -1347,8 +1546,11 @@ def create_counter_utilization_task(
         fail_on_breach: When True, the task raises the moment a sampled value
             exceeds ``threshold`` mid-run. Combined with the PeriodicTask's
             ``terminate_on_error=True`` this fails the test immediately instead
-            of only recording a non-gating final-check result. Left out of the
-            serialized params when False to preserve golden byte-equivalence.
+            of only recording a final-check result. Left out of the serialized
+            params when False to preserve golden byte-equivalence.
+        observe_only: Collect and plot samples against ``threshold`` without
+            failing the final check when the reference is exceeded. Mutually
+            exclusive with ``fail_on_breach`` and omitted when False.
 
     Returns:
         Task object to check counter utilization
@@ -1361,8 +1563,12 @@ def create_counter_utilization_task(
     }
     if cpu_count is not None:
         params["cpu_count"] = cpu_count
+    if fail_on_breach and observe_only:
+        raise ValueError("fail_on_breach and observe_only are mutually exclusive")
     if fail_on_breach:
         params["fail_on_breach"] = fail_on_breach
+    if observe_only:
+        params["observe_only"] = observe_only
 
     return Task(
         task_name="counter_utilization",
@@ -1869,6 +2075,7 @@ def create_bgp_peer_group_patcher_task(
             "name": peer_group_name,
             "attributes_to_update_json": json.dumps(attributes_to_update),
         },
+        py_func_name="configure_bgp_peer_group",
     )
 
 
@@ -1920,6 +2127,7 @@ def create_remove_bgp_peers_patcher_task(
         patcher_name=patcher_name,
         task_name="remove_bgp_peers",
         patcher_args={"delete_all": str(delete_all)},
+        py_func_name="remove_bgp_peers",
     )
 
 
@@ -1957,9 +2165,13 @@ def create_allow_all_v4_peer_group_patcher_tasks(
     is_confed_peer: str = "False",
     per_peer_max_route_limit: str = "25000",
     policy_entries_json: str = "[]",
+    hold_time_seconds: str = "15",
+    keep_alive_seconds: str = "5",
 ) -> t.List[Task]:
     """
     Create tasks to add a V4 BGP peer group with allow-all ingress/egress policies.
+
+    Registered to the same COOP configs as the BGP peers that use the group.
 
     Args:
         hostname: Hostname of the device
@@ -1968,17 +2180,20 @@ def create_allow_all_v4_peer_group_patcher_tasks(
         is_confed_peer: Whether peer is confederation peer
         per_peer_max_route_limit: Max routes per peer
         policy_entries_json: JSON-serialized policy entries for the allow-all policy
+        hold_time_seconds: BGP hold time for the peer group
+        keep_alive_seconds: BGP keepalive interval for the peer group
 
     Returns:
         List of tasks to register the allow-all peer group
     """
+    config_names = get_bgp_peer_configs(hostname)
     ingress_policy = f"PROPAGATE_EVERYTHING_{peer_group_name}_IN"
     egress_policy = f"PROPAGATE_EVERYTHING_{peer_group_name}_OUT"
 
     return [
         create_coop_register_patcher_task(
             hostname=hostname,
-            config_name="bgpcpp",
+            config_names=config_names,
             patcher_name=f"a_add_bgp_policy_statement_{ingress_policy}",
             task_name="coop_register_patcher",
             patcher_args={
@@ -1990,7 +2205,7 @@ def create_allow_all_v4_peer_group_patcher_tasks(
         ),
         create_coop_register_patcher_task(
             hostname=hostname,
-            config_name="bgpcpp",
+            config_names=config_names,
             patcher_name=f"a_add_bgp_policy_statement_{egress_policy}",
             task_name="coop_register_patcher",
             patcher_args={
@@ -2002,7 +2217,7 @@ def create_allow_all_v4_peer_group_patcher_tasks(
         ),
         create_coop_register_patcher_task(
             hostname=hostname,
-            config_name="bgpcpp",
+            config_names=config_names,
             patcher_name=f"a_add_peer_group_patcher_{peer_group_name}",
             task_name="coop_register_patcher",
             patcher_args={
@@ -2015,8 +2230,8 @@ def create_allow_all_v4_peer_group_patcher_tasks(
                 "peer_tag": peer_tag,
                 "ingress_policy_name": ingress_policy,
                 "egress_policy_name": egress_policy,
-                "bgp_peer_timers_hold_time_seconds": "15",
-                "bgp_peer_timers_keep_alive_seconds": "5",
+                "bgp_peer_timers_hold_time_seconds": hold_time_seconds,
+                "bgp_peer_timers_keep_alive_seconds": keep_alive_seconds,
                 "bgp_peer_timers_out_delay_seconds": "2",
                 "bgp_peer_timers_withdraw_unprog_delay_seconds": "0",
                 "max_routes": per_peer_max_route_limit,
@@ -3016,6 +3231,39 @@ def create_cleanup_exabgp_task(
     )
 
 
+def create_wait_for_eos_interfaces_task(
+    hostname: str,
+    interfaces: t.Sequence[str],
+    timeout_seconds: int = 120,
+    poll_interval_seconds: int = 5,
+) -> Task:
+    """Wait for a bounded set of EOS interfaces to appear after breakout."""
+    if not hostname:
+        raise ValueError("hostname must be non-empty")
+    if not interfaces or any(not interface for interface in interfaces):
+        raise ValueError("interfaces must contain non-empty interface names")
+    for name, value in (
+        ("timeout_seconds", timeout_seconds),
+        ("poll_interval_seconds", poll_interval_seconds),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    return Task(
+        task_name="wait_for_eos_interfaces",
+        hostname=hostname,
+        params=Params(
+            json_params=json.dumps(
+                {
+                    "hostname": hostname,
+                    "interfaces": list(interfaces),
+                    "timeout_seconds": timeout_seconds,
+                    "poll_interval_seconds": poll_interval_seconds,
+                }
+            )
+        ),
+    )
+
+
 def create_backup_running_config_task(
     hostname: str,
     backup_file: t.Optional[str] = None,
@@ -3719,6 +3967,7 @@ def create_nexthop_group_poll_periodic_task(
     min_bgp_multiway_consecutive_samples: t.Optional[int] = None,
     min_programmed_groups: t.Optional[int] = None,
     max_programmed_groups: t.Optional[int] = None,
+    max_converged_unprogrammed: t.Optional[int] = None,
 ) -> PeriodicTask:
     """Periodic task to poll nexthop-group count against a threshold.
 
@@ -3796,6 +4045,10 @@ def create_nexthop_group_poll_periodic_task(
             median of an even window is the AVERAGE of its two middle samples,
             so a window straddling two values yields a half-integer that can
             never equal the integer expectation and a healthy device breaches.
+        max_converged_unprogrammed: Optional ceiling for the maximum
+            `num_unprogrammed_groups` value in the closing window. This permits
+            expected transition-time rebuilds while requiring the device to be
+            fully programmed after the final soak. Omitted = not asserted.
         min_samples: Optional floor on how many samples the run collected. The
             poll swallows every collection failure and only an ENTIRELY empty
             series fails, so without this a run that lost most of its reads
@@ -3869,6 +4122,7 @@ def create_nexthop_group_poll_periodic_task(
         ("min_bgp_groups", min_bgp_groups),
         ("min_programmed_groups", min_programmed_groups),
         ("max_programmed_groups", max_programmed_groups),
+        ("max_converged_unprogrammed", max_converged_unprogrammed),
         (
             "min_bgp_groups_consecutive_samples",
             min_bgp_groups_consecutive_samples,
@@ -4066,6 +4320,8 @@ def create_fpf_start_collectors_task(
     hrt_device_ids: t.Optional[t.List[int]] = None,
     hrt_plane_ids: t.Optional[t.List[int]] = None,
     additional_namespaces: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
+    prod_prefix_gtsws: t.Optional[t.List[str]] = None,
+    prod_prefix_poll_interval_sec: t.Optional[float] = None,
 ) -> Task:
     """Create a setup task that starts long-lived FPF collectors.
 
@@ -4129,6 +4385,10 @@ def create_fpf_start_collectors_task(
         params["hrt_device_ids"] = hrt_device_ids
     if hrt_plane_ids and hrt_plane_ids != list(range(8)):
         params["hrt_plane_ids"] = hrt_plane_ids
+    if prod_prefix_gtsws is not None:
+        params["prod_prefix_gtsws"] = prod_prefix_gtsws
+    if prod_prefix_poll_interval_sec is not None:
+        params["prod_prefix_poll_interval_sec"] = prod_prefix_poll_interval_sec
     if additional_namespaces:
         params["additional_namespaces"] = additional_namespaces
     if fsdb_session_hosts:
@@ -4409,4 +4669,103 @@ def create_setup_base_configs_task(
         task_name="setup_base_configs",
         hostname=hostname,
         params=Params(json_params=json.dumps({"restart_bgp": restart_bgp})),
+    )
+
+
+# =============================================================================
+# RBB SRv6 QUALIFICATION TASKS (see taac/testconfigs/routing/qual_rbb.py)
+# =============================================================================
+
+
+def create_rbb_srv6_verify_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = False,
+) -> Task:
+    """Build an ``rbb_srv6_verify`` Task.
+
+    ``params_dict`` is the gate spec (``show_cmd`` plus one of
+    ``expect_contains`` / ``interfaces_up`` / ``bgp_peers_established`` /
+    ``fib_prefixes``); see the ``verify_*_spec`` builders in
+    ``bgp_rbb_scenario_profiles``.
+    """
+    return create_run_task(
+        task_name="rbb_srv6_verify",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
+    )
+
+
+def create_rbb_srv6_counter_delta_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = True,
+) -> Task:
+    """Build an ``rbb_srv6_counter_delta`` Task.
+
+    ``params_dict`` is the counter spec (``action``, ``counter_cmd``,
+    ``counter_regex``, ``direction``); see ``srv6_encap_counter_spec`` and
+    ``srv6_decap_counter_spec`` in ``bgp_rbb_scenario_profiles``.
+    """
+    return create_run_task(
+        task_name="rbb_srv6_counter_delta",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
+    )
+
+
+def create_rbb_srv6_direct_route_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = False,
+) -> Task:
+    """Build an ``rbb_srv6_direct_route`` Task.
+
+    ``params_dict`` carries ``action`` (``"install"`` / ``"delete"``),
+    ``prefix``, and the install-time ``client`` / ``srv6_segments`` /
+    ``srv6_tunnel_id`` fields.
+    """
+    return create_run_task(
+        task_name="rbb_srv6_direct_route",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
+    )
+
+
+def create_rbb_edge_ebgp_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = False,
+) -> Task:
+    """Build an ``rbb_edge_ebgp`` Task.
+
+    ``params_dict`` carries ``action`` (``"apply"`` / ``"restore"``) and the
+    edge peer / local-address fields the playbook and test config build.
+    """
+    return create_run_task(
+        task_name="rbb_edge_ebgp",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
+    )
+
+
+def create_rbb_dut_bootstrap_task(
+    hostname: str,
+    params_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    ixia_needed: bool = False,
+) -> Task:
+    """Build an ``rbb_dut_bootstrap`` Task.
+
+    ``params_dict`` carries ``action`` (``"apply"`` / ``"restore"``) and, for
+    ``"apply"``, ``role`` and the other bootstrap-document fields.
+    """
+    return create_run_task(
+        task_name="rbb_dut_bootstrap",
+        params_dict={"hostname": hostname, **(params_dict or {})},
+        hostname=hostname,
+        ixia_needed=ixia_needed,
     )

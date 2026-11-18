@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+import ipaddress
 import unittest
 
 from taac.libs.fpf.fpf_prod_prefix_map import (
@@ -11,6 +12,21 @@ from taac.libs.fpf.fpf_prod_prefix_map import (
 
 
 class FpfProdPrefixMapTest(unittest.TestCase):
+    def test_current_warmboot_pair_has_distinct_valid_gpu_networks(self) -> None:
+        networks_by_host = []
+        for host in ("twshared1354.03.mwg2", "twshared1379.03.mwg2"):
+            with self.subTest(host=host):
+                devices = get_host_prefixes(host)
+                self.assertEqual(set(devices), {0, 1, 2, 3})
+                networks = {
+                    ipaddress.IPv6Network(prefix, strict=True)
+                    for prefix in get_all_prefixes(host)
+                }
+                self.assertEqual(len(networks), 4)
+                self.assertTrue(all(network.prefixlen == 64 for network in networks))
+                networks_by_host.append(networks)
+        self.assertTrue(networks_by_host[0].isdisjoint(networks_by_host[1]))
+
     def test_twshared1375_has_all_four_physical_gpu_vf1_prefixes(self) -> None:
         host = "twshared1375.03.mwg2"
         expected = [

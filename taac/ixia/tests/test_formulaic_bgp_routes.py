@@ -4,10 +4,11 @@ import logging
 import threading
 import typing as t
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from ixia.ixia import types as ixia_types
-from taac.ixia.ixia import IxiaSessionQuarantinedError
+from neteng.test_infra.dne.taac.ixia.ixia import Ixia, IxiaSessionQuarantinedError
 from taac.ixia.taac_ixia import TaacIxia
 
 
@@ -1512,3 +1513,200 @@ class FormulaicBgpRoutesTest(unittest.TestCase):
 
         self.assertEqual(0, device_group.stop_count)
         self.assertEqual(0, network_group.stop_count)
+
+
+class SplitCommunityValuesTest(unittest.TestCase):
+    """The splitter feeds AsNumber/LastTwoOctets value lists directly; a
+    mis-parse silently programs the wrong AS into every route in the pool."""
+
+    def _split(self, values: list[str]) -> tuple[list[str], list[str]]:
+        splitter = object.__new__(Ixia)
+        return Ixia._split_community_values(splitter, values)
+
+    def test_standard_and_route_target_forms_split_the_same_way(self) -> None:
+        self.assertEqual(
+            self._split(["65531:50300", "rt:65529:40001"]),
+            (["65531", "65529"], ["50300", "40001"]),
+        )
+
+    def test_an_empty_list_splits_to_empty_lists(self) -> None:
+        self.assertEqual(self._split([]), ([], []))
+
+    def test_a_value_with_no_colon_fails_loudly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not '<as>:<number>'"):
+            self._split(["65531"])
+
+    def test_a_value_with_four_parts_fails_loudly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not '<as>:<number>'"):
+            self._split(["65529:1:2:3"])
+
+    def test_a_numeric_prefix_with_three_parts_fails_loudly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not '<as>:<number>'"):
+            self._split(["65529:1:2"])
+
+    def test_a_non_rt_alphabetic_prefix_fails_loudly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not '<as>:<number>'"):
+            self._split(["soo:65529:40001"])
+
+
+class _RecordingValue:
+    def __init__(self) -> None:
+        self.singles: list[t.Any] = []
+        self.lists: list[list[str]] = []
+
+    def Single(self, value: t.Any) -> None:
+        self.singles.append(value)
+
+    def ValueList(self, values: list[str]) -> None:
+        self.lists.append(list(values))
+
+
+class _FakeCommunityObj:
+    Count = 1
+
+    def __init__(self) -> None:
+        self.Type = _RecordingValue()
+        self.AsNumber = _RecordingValue()
+        self.LastTwoOctets = _RecordingValue()
+        self.AsNumber2Bytes = _RecordingValue()
+        self.AsNumber4Bytes = _RecordingValue()
+        self.AssignedNumber2Bytes = _RecordingValue()
+        self.AssignedNumber4Bytes = _RecordingValue()
+
+
+class _FakeRouteProperty:
+    def __init__(self, community_obj: _FakeCommunityObj) -> None:
+        self.EnableCommunity = _RecordingValue()
+        self.NoOfCommunities = 0
+        self.NoOfExternalCommunities = 0
+        self._community_obj = community_obj
+        self.BgpCommunitiesList = SimpleNamespace(find=self._find)
+        self.BgpExtendedCommunitiesList = SimpleNamespace(find=self._find)
+
+    def _find(self) -> list[_FakeCommunityObj]:
+        return [self._community_obj]
+
+
+class ConfigureBgpAttributesExtTest(unittest.TestCase):
+    """Extended communities need the administrator Type and the field
+    pair that matches the administrator width; the standard-community
+    map value ``manual`` is rejected by the extended object outright."""
+
+    def _configure(
+        self, attribute: t.Any, value_lists: list[list[str]]
+    ) -> tuple[_FakeCommunityObj, _FakeRouteProperty]:
+        community_obj = _FakeCommunityObj()
+        route_property = _FakeRouteProperty(community_obj)
+        config = ixia_types.BgpAttributeConfig(
+            attribute=attribute,
+            distribution_type=ixia_types.DistribitionType.ROUND_ROBIN,
+            value_lists=value_lists,
+        )
+        splitter = object.__new__(Ixia)
+        Ixia.configure_bgp_attributes(splitter, t.cast(t.Any, route_property), [config])
+        return community_obj, route_property
+
+    def test_route_target_uses_two_octet_fields(self) -> None:
+        community_obj, route_property = self._configure(
+            ixia_types.BgpAttribute.EXT_COMMUNITIES, [["rt:65529:40001"]]
+        )
+        self.assertEqual(community_obj.Type.singles, ["administratoras2octet"])
+        self.assertEqual(community_obj.AsNumber2Bytes.lists, [["65529"]])
+        self.assertEqual(community_obj.AssignedNumber4Bytes.lists, [["40001"]])
+        self.assertEqual(community_obj.AsNumber4Bytes.lists, [])
+        self.assertEqual(community_obj.AssignedNumber2Bytes.lists, [])
+        self.assertEqual(route_property.EnableCommunity.singles, [True])
+        self.assertEqual(route_property.NoOfExternalCommunities, 1)
+
+    def test_four_octet_administrator_uses_four_octet_fields(self) -> None:
+        community_obj, _route_property = self._configure(
+            ixia_types.BgpAttribute.EXT_COMMUNITIES, [["rt:131072:40001"]]
+        )
+        self.assertEqual(community_obj.Type.singles, ["administratoras4octet"])
+        self.assertEqual(community_obj.AsNumber4Bytes.lists, [["131072"]])
+        self.assertEqual(community_obj.AssignedNumber2Bytes.lists, [["40001"]])
+
+    def test_a_non_route_target_prefix_fails_loudly(self) -> None:
+        # The splitter rejects it before the extended-community field
+        # choice runs: one validator, one failure, at the parse step.
+        with self.assertRaisesRegex(ValueError, "not '<as>:<number>'"):
+            self._configure(
+                ixia_types.BgpAttribute.EXT_COMMUNITIES, [["soo:65529:40001"]]
+            )
+
+    def test_the_field_choice_still_rejects_a_non_rt_prefix_directly(self) -> None:
+        splitter = object.__new__(Ixia)
+        with self.assertRaisesRegex(ValueError, "unsupported prefix"):
+            Ixia._extended_community_fields(
+                splitter, ["soo:65529:40001"], ["65529"], ["40001"]
+            )
+
+    def test_a_mixed_width_list_takes_the_four_octet_form(self) -> None:
+        # One object carries one Type: a mixed list cannot take the
+        # 2-octet form (its field cannot hold the 4-octet AS), so it
+        # takes the 4-octet form, whose AS field holds every value.
+        splitter = object.__new__(Ixia)
+        self.assertEqual(
+            Ixia._extended_community_fields(
+                splitter,
+                ["rt:65529:40001", "rt:131072:40002"],
+                ["65529", "131072"],
+                ["40001", "40002"],
+            ),
+            ("administratoras4octet", "AsNumber4Bytes", "AssignedNumber2Bytes"),
+        )
+
+    def test_a_large_assigned_number_with_a_small_as_takes_the_two_octet_form(
+        self,
+    ) -> None:
+        # The 2-octet form's assigned field is 4 bytes, so it holds a
+        # large assigned number when the AS itself fits in 2 octets.
+        splitter = object.__new__(Ixia)
+        self.assertEqual(
+            Ixia._extended_community_fields(
+                splitter, ["rt:65529:200000"], ["65529"], ["200000"]
+            ),
+            ("administratoras2octet", "AsNumber2Bytes", "AssignedNumber4Bytes"),
+        )
+
+    def test_a_large_assigned_number_with_a_large_as_fails_loudly(self) -> None:
+        # No single form holds a 4-octet AS and an assigned number over
+        # 65535: the 4-octet form's assigned field is only 2 bytes.
+        splitter = object.__new__(Ixia)
+        with self.assertRaisesRegex(ValueError, "does not fit in AssignedNumber2Bytes"):
+            Ixia._extended_community_fields(
+                splitter, ["rt:131072:200000"], ["131072"], ["200000"]
+            )
+
+    def test_a_non_numeric_assigned_number_fails_with_a_named_error(self) -> None:
+        splitter = object.__new__(Ixia)
+        with self.assertRaisesRegex(ValueError, "is not a decimal number"):
+            Ixia._extended_community_fields(
+                splitter, ["rt:65529:xyz"], ["65529"], ["xyz"]
+            )
+
+    def test_a_non_numeric_as_fails_with_a_named_error(self) -> None:
+        splitter = object.__new__(Ixia)
+        with self.assertRaisesRegex(ValueError, "is not a decimal number"):
+            Ixia._extended_community_fields(
+                splitter, ["rt:abc:40001"], ["abc"], ["40001"]
+            )
+
+    def test_a_non_numeric_as_fails_loudly_end_to_end(self) -> None:
+        with self.assertRaisesRegex(ValueError, "is not a decimal number"):
+            self._configure(ixia_types.BgpAttribute.EXT_COMMUNITIES, [["rt:abc:40001"]])
+
+    def test_an_overflowing_assigned_number_fails_loudly_end_to_end(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not fit in AssignedNumber2Bytes"):
+            self._configure(
+                ixia_types.BgpAttribute.EXT_COMMUNITIES, [["rt:131072:200000"]]
+            )
+
+    def test_standard_communities_keep_the_map_value(self) -> None:
+        community_obj, route_property = self._configure(
+            ixia_types.BgpAttribute.COMMUNITIES, [["65531:50300"]]
+        )
+        self.assertEqual(community_obj.Type.singles, ["manual"])
+        self.assertEqual(community_obj.AsNumber.lists, [["65531"]])
+        self.assertEqual(community_obj.LastTwoOctets.lists, [["50300"]])
+        self.assertEqual(route_property.NoOfCommunities, 1)

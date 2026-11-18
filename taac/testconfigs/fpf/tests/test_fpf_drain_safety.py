@@ -292,6 +292,10 @@ class FpfDrainSafetyTest(unittest.TestCase):
                     "fpf_tc35_",
                     "fpf_tc54_",
                     "fpf_tc55_",
+                    "fpf_wb11_",
+                    "fpf_wb12_",
+                    "fpf_wb13_",
+                    "fpf_wb14_",
                 )
             ):
                 continue

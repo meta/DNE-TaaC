@@ -108,12 +108,22 @@ class PeerPrefixActivation:
 
 @dataclass(frozen=True)
 class FormulaicPrefixSource:
+    """An arithmetic prefix progression with optional excluded candidates.
+
+    ``extension_parent_networks`` lets one progression continue past the end
+    of ``parent_network`` into adjacent space without widening the parent to
+    a supernet that would also cover unrelated addresses. Together with
+    ``parent_network`` they must form one contiguous range containing every
+    candidate.
+    """
+
     start_prefix: str
     prefix_step: int | str
     prefix_length: int
     count: int
     parent_network: str
     excluded_indices: tuple[int, ...] = ()
+    extension_parent_networks: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,10 @@ from taac.libs.fpf.fpf_collector_registry import (
     everpaste_details_suffix,
     get_collector,
     get_disruption_time,
+    get_restart_completion_time,
+    get_restart_time,
     get_test_case_start_time,
+    restart_tolerant_collector_view,
 )
 from taac.health_check.health_check import types as hc_types
 
@@ -95,6 +98,13 @@ class FpfHrtPlaneStatusHealthCheck(
         impacted_tuples_by_host_device: t.Optional[
             t.Dict[str, t.Dict[str, t.List[int]]]
         ] = check_params.get("impacted_tuples_by_host_device")
+        restart_tolerant_hosts = set(
+            check_params.get("restart_tolerant_hosts", []) or []
+        )
+        restart_ts = get_restart_time() if restart_tolerant_hosts else 0.0
+        restart_completion_ts = (
+            get_restart_completion_time() if restart_tolerant_hosts else 0.0
+        )
 
         if mode == "drain":
             _skip = disruption_inconclusive_skip()
@@ -122,15 +132,38 @@ class FpfHrtPlaneStatusHealthCheck(
 
         # The single collector holds all hosts (each row carries its host); the
         # hosts to evaluate are those present in the in-window rows.
-        hosts = collector.hosts_in_window(window_start, window_end)
-        if not hosts:
-            hosts = list(getattr(collector, "hosts", []) or [])
+        hosts = collector.hosts_in_window(window_start, window_end) or list(
+            getattr(collector, "hosts", []) or []
+        )
 
         host_results: t.List[_HostPlaneResult] = []
         for host in hosts:
+            host_collector = collector
+            recovery_detail = ""
+            if host in restart_tolerant_hosts:
+                host_collector, recovery_detail = restart_tolerant_collector_view(
+                    collector,
+                    host=host,
+                    restart_ts=restart_ts,
+                    restart_completion_ts=restart_completion_ts,
+                    row_is_error=lambda row: (
+                        not bool(getattr(row, "valid", True))
+                        or str(getattr(row, "notes", "") or "").startswith("error:")
+                        or not bool(getattr(row, "plane_states", {}))
+                    ),
+                )
+            if host_collector is None:
+                hr = _HostPlaneResult(host)
+                hr.status = "FAIL"
+                hr.results = []
+                self.logger.error(
+                    f"[HRT plane-status][{host}] restart recovery: {recovery_detail}"
+                )
+                host_results.append(hr)
+                continue
             hr = self._evaluate_host(
                 host,
-                collector,
+                host_collector,
                 mode,
                 stability_mode,
                 expected_planes,
@@ -144,6 +177,10 @@ class FpfHrtPlaneStatusHealthCheck(
                 window_start,
                 window_end,
             )
+            if recovery_detail:
+                self.logger.info(
+                    f"[HRT plane-status][{host}] restart recovery: {recovery_detail}"
+                )
             host_results.append(hr)
 
         if not host_results or all(hr.status == "SKIP" for hr in host_results):

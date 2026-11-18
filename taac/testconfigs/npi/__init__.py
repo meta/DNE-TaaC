@@ -55,6 +55,9 @@ from taac.testconfigs.npi.minipack_fsw004_p003_qzd1_cpu_queue_test_config import
 from taac.testconfigs.npi.minipack_fsw004_p004_qzd1_cpu_queue_test_config import (
     MINIPACK_FSW004_P004_QZD1_CPU_QUEUE_TEST_CONFIG,
 )
+from taac.testconfigs.npi.mp3ba_fa002_du001_qza1_cpu_queue_test_config import (
+    MP3BA_FA002_DU001_QZA1_CPU_QUEUE_TEST_CONFIG,
+)
 from taac.testconfigs.npi.multinode_pfc_test_config import (
     NPI_DVT_ICEPACK_GTSW__MULTI_NODE_PFC_TEST_CONFIG,
     NPI_DVT_ICEPACK_GTSW__PFC002_TEST_CONFIG,
@@ -70,6 +73,9 @@ from taac.testconfigs.npi.multinode_pfc_test_config import (
     NPI_DVT_ICEPACK_GTSW__PFC019_TEST_CONFIG,
     NPI_DVT_ICEPACK_GTSW__PFC8_TEST_CONFIG,
     NPI_DVT_ICEPACK_GTSW__PFC_RERUN_TEST_CONFIG,
+)
+from taac.testconfigs.npi.qza_rtsw_dlb_case18_test_config import (
+    QZA_RTSW001_CHENAB_DLB_CASE18_QUICK_TEST_CONFIG,
 )
 from taac.testconfigs.npi.thrift_hardening_test_config import (
     create_npi_thrift_hardening_test_config,
@@ -118,6 +124,7 @@ __all__ = [
     "NPI_DVT_ICEPACK_GTSW__PFC8_TEST_CONFIG",
     "NPI_DVT_ICEPACK_GTSW__THRIFT_HARDENING_TEST_CONFIG",
     "NPI_ICEPACK_GTSW007_WARMBOOT_TROUBLESHOOTING_TEST_CONFIG",
+    "QZA_RTSW001_CHENAB_DLB_CASE18_QUICK_TEST_CONFIG",
     "RSW001_P001_F01_QZD1_SYSTEM_REBOOT_TEST_CONFIG",
     "RSW001_P001_F01_QZD1_TEST_CONFIGS",
     "RSW001_P001_F01_QZD1_THRIFT_HARDENING_TEST_CONFIG",
@@ -125,6 +132,7 @@ __all__ = [
     "W800_CPU_QUEUE_TEST_CONFIG",
     "MINIPACK_FSW004_P003_QZD1_CPU_QUEUE_TEST_CONFIG",
     "MINIPACK_FSW004_P004_QZD1_CPU_QUEUE_TEST_CONFIG",
+    "MP3BA_FA002_DU001_QZA1_CPU_QUEUE_TEST_CONFIG",
     "W800_LONGEVITY_TEST_CONFIG",
     "W800_SPEED_FLIP_SUBSUME_CHURN_TEST_CONFIG",
     "W800_TEST_CONFIGS",

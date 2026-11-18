@@ -686,6 +686,29 @@ class TestTc54StswDeviceDrain(unittest.TestCase):
         self.assertIn("fpf_remote_failure_stable_vf1", ids)
         self.assertIn("fpf_remote_failure_stable_vf2", ids)
         self.assertIn("fpf_prod_hrt_prefix_stability", ids)
+        for check_id in (
+            "fpf_remote_failure_stable_vf1",
+            "fpf_remote_failure_stable_vf2",
+        ):
+            check = next(
+                candidate
+                for candidate in playbook.postchecks or []
+                if candidate.check_id == check_id
+            )
+            self.assertEqual(
+                json.loads(check.check_params.json_params)["direction"],
+                "stable_last_sample",
+                check_id,
+            )
+        prod_check = next(
+            candidate
+            for candidate in playbook.postchecks or []
+            if candidate.check_id == "fpf_prod_hrt_prefix_stability"
+        )
+        self.assertEqual(
+            json.loads(prod_check.check_params.json_params)["settle_sec"],
+            300,
+        )
         spray_check = next(
             check
             for check in playbook.postchecks or []

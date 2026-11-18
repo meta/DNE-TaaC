@@ -89,8 +89,8 @@ class UnhPuntCheckpointTest(unittest.TestCase):
             ],
         )
         self.assertLess(convergence_indices[1], ixia_api_steps[0][0])
-        self.assertLess(ixia_api_steps[-1][0], mtu_verify_indices[9000])
         self.assertLess(convergence_indices[1], mtu_verify_indices[9000])
+        self.assertLess(mtu_verify_indices[9000], ixia_api_steps[0][0])
 
         (queue_check,) = [
             check
@@ -107,6 +107,55 @@ class UnhPuntCheckpointTest(unittest.TestCase):
             "stage.npi_cpu_039_mtu_exceed_to_low_queue."
             "step.mtu_exceed_traffic_window_end.end",
         )
+
+    def test_cpu_039_restoration_guards_precede_protocol_verification(self) -> None:
+        for interfaces in (None, ["eth1/14/1", "eth1/15/1"]):
+            with self.subTest(interfaces=interfaces):
+                (playbook,) = [
+                    pb
+                    for pb in create_cpu_queue_playbooks(
+                        0, 2, 9, "eth1/14/1", ixia_interfaces=interfaces
+                    )
+                    if pb.name == "npi_cpu_039_mtu_exceed_to_low_queue"
+                ]
+                steps = playbook.stages[0].steps
+                (guard_index,) = [
+                    index
+                    for index, step in enumerate(steps)
+                    if step.name == taac_types.StepName.VERIFY_PORT_OPERATIONAL_STATE
+                ]
+                guard = steps[guard_index]
+                assert guard.step_params is not None
+                self.assertEqual(
+                    {
+                        "interfaces": interfaces or ["eth1/14/1"],
+                        "operational_state": True,
+                        "skip_start_traffic": True,
+                    },
+                    json.loads(guard.step_params.json_params or "{}"),
+                )
+                self.assertEqual(
+                    "restore_mtu_agent_convergence", steps[guard_index - 1].id
+                )
+                mtu_guard = steps[guard_index + 1]
+                assert mtu_guard.step_params is not None
+                self.assertEqual(
+                    {
+                        "custom_step_name": "verify_interface_mtu",
+                        "interface": "eth1/14/1",
+                        "expected_mtu": 9000,
+                        "skip_start_traffic": True,
+                    },
+                    json.loads(mtu_guard.step_params.json_params or "{}"),
+                )
+                self.assertEqual(
+                    taac_types.StepName.INVOKE_IXIA_API_STEP,
+                    steps[guard_index + 2].name,
+                )
+
+    def test_cpu_039_rejects_empty_explicit_port_scope(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-empty IXIA interface list"):
+            create_cpu_queue_playbooks(0, 2, 9, "eth1/14/1", ixia_interfaces=[])
 
     def test_asic_drop_cases_do_not_expect_cpu_punts(self) -> None:
         playbooks = {

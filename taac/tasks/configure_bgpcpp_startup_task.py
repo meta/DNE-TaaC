@@ -43,6 +43,13 @@ from taac.utils.driver_factory import async_get_device_driver
 # Path to bgpcpp startup script on EOS devices
 RUN_BGPCPP_SCRIPT_PATH = "/usr/sbin/run_bgpcpp.sh"
 _FLAG_VERIFIED_SENTINEL = "TAAC_BGPCPP_FLAG_VERIFIED"
+_FLAG_NOT_EXACT_SENTINEL = "TAAC_BGPCPP_FLAG_NOT_EXACT"
+
+
+class _ManagedEosShell(t.Protocol):
+    async def async_execute_show_or_configure_cmd_on_shell(
+        self, command: str
+    ) -> str: ...
 
 
 def _build_flag_sed_commands(flag_name: str, flag_value: str) -> t.List[str]:
@@ -80,7 +87,21 @@ def _build_flag_verify_command(flag_name: str, flag_value: str) -> str:
     return (
         f"bash grep -F -- {shlex.quote(expected)} "
         f"{shlex.quote(RUN_BGPCPP_SCRIPT_PATH)} >/dev/null && "
-        f"printf %s {shlex.quote(_FLAG_VERIFIED_SENTINEL)}"
+        f"printf '%s\\n' {shlex.quote(_FLAG_VERIFIED_SENTINEL)}"
+    )
+
+
+def _build_flag_exact_command(flag_name: str, flag_value: str) -> str:
+    """Return a non-mutating probe with explicit exact/not-exact output."""
+    expected_line = f"      --{flag_name}={flag_value} \\"
+    assignment_pattern = f"^[[:space:]]*--{flag_name}="
+    path = shlex.quote(RUN_BGPCPP_SCRIPT_PATH)
+    return (
+        "bash "
+        f'test "$(grep -Fxc -- {shlex.quote(expected_line)} {path})" -eq 1 && '
+        f'test "$(grep -c -E -- {shlex.quote(assignment_pattern)} {path})" -eq 1 '
+        f"&& printf '%s\\n' {shlex.quote(_FLAG_VERIFIED_SENTINEL)} "
+        f"|| printf '%s\\n' {shlex.quote(_FLAG_NOT_EXACT_SENTINEL)}"
     )
 
 
@@ -147,17 +168,28 @@ class ConfigureBgpcppStartupTask(BaseTask):
             raise ValueError(
                 "restart_bgp=True is not supported in managed-shell mode: the "
                 "flags are written to run_bgpcpp.sh but bgpd is never restarted, "
-                "so they take no effect. Order this task before an existing Bgp "
+                "so they take no effect. Order this task before an existing Bgpcpp "
                 "enable or add an explicit daemon-control task after it."
             )
 
-        driver = await async_get_device_driver(hostname)
+        driver = t.cast(_ManagedEosShell, await async_get_device_driver(hostname))
         for flag_name, flag_value in flags.items():
             self.logger.info(f"  Setting --{flag_name}={flag_value}")
+            current = await driver.async_execute_show_or_configure_cmd_on_shell(
+                _build_flag_exact_command(flag_name, flag_value)
+            )
+            if _FLAG_VERIFIED_SENTINEL in str(current):
+                self.logger.info(f"  Keeping exact --{flag_name}={flag_value}")
+                continue
+            if _FLAG_NOT_EXACT_SENTINEL not in str(current):
+                raise RuntimeError(
+                    f"Failed to inspect --{flag_name} in "
+                    f"{RUN_BGPCPP_SCRIPT_PATH}: unexpected probe output"
+                )
             for cmd in _build_flag_sed_commands(flag_name, flag_value):
-                await driver.async_run_cmd_on_shell(cmd)
+                await driver.async_execute_show_or_configure_cmd_on_shell(cmd)
             try:
-                output = await driver.async_run_cmd_on_shell(
+                output = await driver.async_execute_show_or_configure_cmd_on_shell(
                     _build_flag_verify_command(flag_name, flag_value)
                 )
             except Exception as error:
@@ -195,6 +227,22 @@ class ConfigureBgpcppStartupTask(BaseTask):
 
         for flag_name, flag_value in flags.items():
             self.logger.info(f"  Setting --{flag_name}={flag_value}")
+            exact, output = ssh_helper.run_command(
+                _build_flag_exact_command(flag_name, flag_value)
+            )
+            if not exact:
+                raise RuntimeError(
+                    f"Failed to inspect --{flag_name} in "
+                    f"{RUN_BGPCPP_SCRIPT_PATH}: {output}"
+                )
+            if _FLAG_VERIFIED_SENTINEL in str(output):
+                self.logger.info(f"  Keeping exact --{flag_name}={flag_value}")
+                continue
+            if _FLAG_NOT_EXACT_SENTINEL not in str(output):
+                raise RuntimeError(
+                    f"Failed to inspect --{flag_name} in "
+                    f"{RUN_BGPCPP_SCRIPT_PATH}: unexpected probe output"
+                )
             remove_cmd, insert_cmd = _build_flag_sed_commands(flag_name, flag_value)
 
             # Step 1: Remove any existing line with this flag (idempotent cleanup)

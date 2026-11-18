@@ -12,9 +12,6 @@ Playbook list. Catalog governance lives in
 """
 
 from taac.abstractions.physical_inventory import (
-    BAG011_ASH6,
-    BAG012_ASH6,
-    BAG013_ASH6,
     NRQEB006_ASH6,
     NRQEB007_ASH6,
     NRQEB008_ASH6,
@@ -24,6 +21,7 @@ from taac.abstractions.topologies.bounded_ecmp import (
     BOUNDED_ECMP_PARENT_NETWORKS_IXIA03,
 )
 from taac.abstractions.topologies.ebb_full_scale import (
+    EBB_FY27_SCALE,
     EBB_NEXT_HOPS_IXIA03,
     EBB_PARENT_NETWORKS_IXIA03,
 )
@@ -33,24 +31,37 @@ from taac.abstractions.topologies.egress_peer_scale import (
 from taac.abstractions.topologies.ipv6_update_packing import (
     IPV6_UPDATE_PACKING_PARENT_NETWORKS_IXIA03,
 )
-from taac.constants import BgpPlusPlusProfile
+from taac.constants import (
+    BgpPlusPlusProfile,
+    TESTBED_ISOLATION_BYPASS_TAG,
+)
 from taac.testconfigs.routing.factories.bgp_ebb_characteristic import (
     create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config,
-    create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config,
     create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config,
     create_bgp_ebb_characteristic_performance_scaling_test_config,
     create_bgp_ebb_characteristic_route_churn_processing_test_config,
     create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config,
     create_bgp_ebb_characteristic_transient_memory_route_scale_test_config,
-    create_bgp_ebb_queue_memory_monitor_test_config,
+    create_bgp_ebb_separable_policy_evaluation_test_config,
     create_bgp_ebb_update_packing_test_config,
 )
 from taac.testconfigs.routing.factories.bgp_ebb_full_scale import (
     create_bgp_ebb_full_scale_test_config,
 )
+from taac.test_as_a_config.types import TestConfig
 
 
 _OPENR_STANDALONE = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R
+
+
+def _with_testbed_isolation_bypass(config: TestConfig) -> TestConfig:
+    """Skip test-bed isolation for characteristic runs on the NRQEB pairs.
+
+    Each pair's nightlies overlap, and isolation on one device shuts ports and
+    runs ``write memory`` underneath the peer's in-flight test (T295699836).
+    """
+    return config(tags=[*(config.tags or []), TESTBED_ISOLATION_BYPASS_TAG])
+
 
 # Stage 1: retain only the reviewed Non-UG cases selected for daily execution.
 # Each config lists its playbooks inline so what a Conveyor node runs is
@@ -69,6 +80,7 @@ NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG = create_bgp_ebb_full_scale_test_co
     enable_update_group=False,
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
+    scale=EBB_FY27_SCALE,
 )
 
 NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_config(
@@ -100,6 +112,7 @@ NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG = create_bgp_ebb_full_scale_test_co
     enable_update_group=False,
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
+    scale=EBB_FY27_SCALE,
 )
 
 NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_config(
@@ -129,6 +142,7 @@ NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG = create_bgp_ebb_full_scale_test_co
     enable_update_group=False,
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
+    scale=EBB_FY27_SCALE,
 )
 
 NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_config(
@@ -156,8 +170,18 @@ NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG = create_bgp_ebb_full_scale_test_co
     ],
     profile=_OPENR_STANDALONE,
     enable_update_group=False,
+    # Nexthop-tracker and FIB-programming DBG3 for T295699836 (BGP and Open/R
+    # routes leaving the EOS RIB after churn). RibBase stays at DBG1: at DBG3
+    # it filled the 6.3 GB /var/log in about 10 minutes.
+    bgpcpp_logging_config_override=(
+        "DBG1, neteng.fboss.bgp.cpp.nexthopTracker.NexthopHandler=DBG3, "
+        "neteng.fboss.bgp.cpp.nexthopTracker.NexthopCache=DBG3, "
+        "neteng.fboss.bgp.cpp.nexthopTracker.NexthopInfo=DBG3, "
+        "neteng.fboss.bgp.cpp.rib.facebook.FibEbb=DBG3; default:async=true"
+    ),
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
+    scale=EBB_FY27_SCALE,
 )
 
 NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_config(
@@ -171,6 +195,9 @@ NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_confi
     ],
     profile=_OPENR_STANDALONE,
     enable_update_group=True,
+    # Production EBB runs DBG1; DBG5 keepalive tracing grew past the log
+    # check's FCR read limit (5.9 GB in one EBB16 run).
+    bgpcpp_logging_config_override="DBG1;default:async=true",
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
 )
@@ -180,7 +207,7 @@ NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_confi
 # These TestConfigs intentionally use runtime selectors that do not encode the
 # inventory's site suffix.
 # CONVEYOR: dne_routing / nrqeb006_characteristics_wave1_node
-NRQEB006_SC2_CONSTANT_ATTRIBUTE_STORAGE_INGRESS_TEST_CONFIG_UG = (
+NRQEB006_SC2_CONSTANT_ATTRIBUTE_STORAGE_INGRESS_TEST_CONFIG_UG = _with_testbed_isolation_bypass(
     create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
         NRQEB006_ASH6,
         enable_update_group=True,
@@ -191,32 +218,36 @@ NRQEB006_SC2_CONSTANT_ATTRIBUTE_STORAGE_INGRESS_TEST_CONFIG_UG = (
 
 # CONVEYOR: dne_routing / nrqeb007_characteristics_wave1_node
 NRQEB007_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST_CONFIG_UG = (
-    create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
-        NRQEB007_ASH6,
-        enable_update_group=True,
-        name_override="NRQEB007_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST_CONFIG_UG",
-        parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
-        include_direct_ixia_connections=True,
+    _with_testbed_isolation_bypass(
+        create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
+            NRQEB007_ASH6,
+            enable_update_group=True,
+            name_override="NRQEB007_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST_CONFIG_UG",
+            parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
+            include_direct_ixia_connections=True,
+        )
     )
 )
 
 # CONVEYOR: dne_routing / nrqeb008_characteristics_wave1_node
-NRQEB008_SC1_EGRESS_PEER_SCALE_TEST_CONFIG_UG = (
+NRQEB008_SC1_EGRESS_PEER_SCALE_TEST_CONFIG_UG = _with_testbed_isolation_bypass(
     create_bgp_ebb_characteristic_performance_scaling_test_config(
-        NRQEB008_ASH6,
+        NRQEB008_ASH6.for_secondary_ixia(),
         enable_update_group=True,
         name_override="NRQEB008_SC1_EGRESS_PEER_SCALE_TEST_CONFIG_UG",
-        parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
     )
 )
 
 # CONVEYOR: dne_routing / nrqeb009_characteristics_wave1_node
-NRQEB009_SC9_BOUNDED_ECMP_SETS_TEST_CONFIG_UG = (
+NRQEB009_SC9_BOUNDED_ECMP_SETS_TEST_CONFIG_UG = _with_testbed_isolation_bypass(
     create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config(
         NRQEB009_ASH6,
         enable_update_group=True,
         name_override="NRQEB009_SC9_BOUNDED_ECMP_SETS_TEST_CONFIG_UG",
         parent_networks=BOUNDED_ECMP_PARENT_NETWORKS_IXIA03,
+        # DBG5 keepalive tracing filled nrqeb009's 6.3 GB /var/log tmpfs in one
+        # SC9 run; production EBB runs DBG1.
+        bgpcpp_logging_config_override="DBG1;default:async=true",
     )
 )
 
@@ -225,27 +256,31 @@ NRQEB009_SC9_BOUNDED_ECMP_SETS_TEST_CONFIG_UG = (
 # NRQEB008 Wave 1 node. The no-OpenR profile keeps this binding on one device;
 # directly connected IXIA next hops are resolved from interface state.
 # CONVEYOR: dne_routing / nrqeb008_characteristics_wave2_node
-NRQEB008_SC5_UPDATE_PACKING_TEST_CONFIG_UG = create_bgp_ebb_update_packing_test_config(
-    NRQEB008_ASH6,
-    enable_update_group=True,
-    name_override="NRQEB008_SC5_UPDATE_PACKING_TEST_CONFIG_UG",
-    profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
-    min_advertised_nlri=50000,
-    parent_networks=IPV6_UPDATE_PACKING_PARENT_NETWORKS_IXIA03,
+NRQEB008_SC5_UPDATE_PACKING_TEST_CONFIG_UG = _with_testbed_isolation_bypass(
+    create_bgp_ebb_update_packing_test_config(
+        NRQEB008_ASH6,
+        enable_update_group=True,
+        name_override="NRQEB008_SC5_UPDATE_PACKING_TEST_CONFIG_UG",
+        profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
+        min_advertised_nlri=50000,
+        parent_networks=IPV6_UPDATE_PACKING_PARENT_NETWORKS_IXIA03,
+    )
 )
 
 # CONVEYOR: dne_routing / nrqeb006_characteristics_wave2_node
 NRQEB006_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_CONFIG_UG = (
-    create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
-        NRQEB006_ASH6,
-        enable_update_group=True,
-        name_override="NRQEB006_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_CONFIG_UG",
-        parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
+    _with_testbed_isolation_bypass(
+        create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
+            NRQEB006_ASH6,
+            enable_update_group=True,
+            name_override="NRQEB006_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST_CONFIG_UG",
+            parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
+        )
     )
 )
 
 # CONVEYOR: dne_routing / nrqeb007_characteristics_wave2_node
-NRQEB007_SC6_CHURN_PROCESSING_TEST_CONFIG_UG = (
+NRQEB007_SC6_CHURN_PROCESSING_TEST_CONFIG_UG = _with_testbed_isolation_bypass(
     create_bgp_ebb_characteristic_route_churn_processing_test_config(
         NRQEB007_ASH6,
         enable_update_group=True,
@@ -254,37 +289,18 @@ NRQEB007_SC6_CHURN_PROCESSING_TEST_CONFIG_UG = (
     )
 )
 
-
-# Legacy retained scale-and-characteristic selectors. They stay registered for
-# compatibility but are not the first-wave Conveyor bindings above.
-BAG011_QUEUE_MEMORY_MONITOR_TEST_CONFIG_UG = (
-    create_bgp_ebb_queue_memory_monitor_test_config(
-        BAG011_ASH6,
+# NRQEB009 onboarding target for EBB-23. Registered for ad-hoc E2E first; a
+# Conveyor node is intentionally deferred until repeated-run calibration.
+NRQEB009_SC8_POLICY_EVALUATION_TEST_CONFIG_UG = _with_testbed_isolation_bypass(
+    create_bgp_ebb_separable_policy_evaluation_test_config(
+        NRQEB009_ASH6,
         enable_update_group=True,
-        name_override="BAG011_QUEUE_MEMORY_MONITOR_TEST_CONFIG_UG",
-        profile=_OPENR_STANDALONE,
-    )
-)
-
-BAG012_UPDATE_PACKING_TEST_CONFIG_UG = create_bgp_ebb_update_packing_test_config(
-    BAG012_ASH6,
-    enable_update_group=True,
-    name_override="BAG012_UPDATE_PACKING_TEST_CONFIG_UG",
-    profile=_OPENR_STANDALONE,
-)
-
-BAG013_BOUNDED_ECMP_SETS_TEST_CONFIG_UG = (
-    create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
-        BAG013_ASH6,
-        enable_update_group=True,
-        name_override="BAG013_BOUNDED_ECMP_SETS_TEST_CONFIG_UG",
-        profile=_OPENR_STANDALONE,
+        name_override="NRQEB009_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
     )
 )
 
 
 __all__ = [
-    "BAG011_QUEUE_MEMORY_MONITOR_TEST_CONFIG_UG",
     "NRQEB007_SC6_CHURN_PROCESSING_TEST_CONFIG_UG",
     "NRQEB007_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST_CONFIG_UG",
     "NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
@@ -293,8 +309,7 @@ __all__ = [
     "NRQEB008_SC5_UPDATE_PACKING_TEST_CONFIG_UG",
     "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
     "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG",
-    "BAG012_UPDATE_PACKING_TEST_CONFIG_UG",
-    "BAG013_BOUNDED_ECMP_SETS_TEST_CONFIG_UG",
+    "NRQEB009_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
     "NRQEB009_SC9_BOUNDED_ECMP_SETS_TEST_CONFIG_UG",
     "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
     "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG",

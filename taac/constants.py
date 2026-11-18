@@ -126,6 +126,7 @@ FAILED_HC_STATUSES: t.List[hc_types.HealthCheckStatus] = [
 ]
 
 ISOLATE_TEST_BED_CONNECTIVITY_PATCHER_NAME: str = "isolate_test_bed_connectivity"
+TESTBED_ISOLATION_BYPASS_TAG: str = "testbed_isolation:bypass"
 TAAC_TEST_CONFIG_CONFIGERATOR_PATH: str = "neteng/taac/test_configs/{test_config_name}"
 
 
@@ -334,9 +335,18 @@ IXIA_LLDP_PEERS: t.Dict[str, str] = {
 #                  Arista Daemon Control                   #
 #############################################################
 
+# EOS daemon names that were renamed, mapped to the names they replace. The
+# bgpcpp daemon used "Bgp" in older TAAC configs and "bgpcpp" on some lab
+# devices before standardizing on the production "Bgpcpp" spelling. Enabling
+# the canonical name removes either old stanza first, otherwise two copies can
+# run against the same config and ports.
+RENAMED_ARISTA_DAEMONS: t.Dict[str, t.Tuple[str, ...]] = {
+    "Bgpcpp": ("Bgp", "bgpcpp"),
+}
+
 # Default execution scripts for Arista daemon control
 ARISTA_DAEMON_EXEC_SCRIPTS: t.Dict[str, str] = {
-    "Bgp": "/usr/sbin/run_bgpcpp.sh",
+    "Bgpcpp": "/usr/sbin/run_bgpcpp.sh",
     "FibAgent": "/usr/bin/AristaFibAgent --admin_distance=10 --net_acl_checker_module_enable --net_acl_checker_module_enforce=false --net_static_file_acl=/usr/facebook/thrift_acls/FibAgent.json --undefok=net_service_identity,net_static_file_acl,net_acl_checker_module_enable,net_acl_checker_module_enforce,net_auth_checker_kill_switch_file --use_agent_config=1 --net_service_identity=FibAgent_lab",
     "FibAgentBgp": "/usr/bin/AristaFibAgent --agent_config_path=/mnt/fb/agent_configs/fib_agent_bgp.conf --admin_distance=10 --net_acl_checker_module_enable --net_acl_checker_module_enforce=false --net_static_file_acl=/usr/facebook/thrift_acls/FibAgent.json --undefok=net_service_identity,net_static_file_acl,net_acl_checker_module_enable,net_acl_checker_module_enforce,net_auth_checker_kill_switch_file --use_agent_config=1 --net_service_identity=FibAgent_lab",
     "FibBgpGrpc": "/usr/bin/EosSdkRpc --listen 0.0.0.0:9545 --nobfd",
@@ -349,9 +359,9 @@ ARISTA_DAEMON_EXEC_SCRIPTS: t.Dict[str, str] = {
 # Arista BGP++ daemon mappings for EOS devices
 # Maps service names to their actual process names and log file patterns
 ARISTA_BGP_PLUS_PLUS_DAEMON_MAPPINGS: t.Dict[str, t.Dict[str, t.Any]] = {
-    "Bgp": {
+    "Bgpcpp": {
         "processes": ["bgpcpp"],
-        "log_pattern": "Bgp-{pid}",
+        "log_pattern": "Bgpcpp-{pid}",
     },
     "Fib": {
         "processes": ["AristaFibAgent"],

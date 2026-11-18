@@ -1,9 +1,20 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # pyre-unsafe
+import ipaddress
 import json
 import unittest
 
+from taac.abstractions.compatibility.legacy_ebb_binding import (
+    IXIA03_EBGP_IC_PARENT_NETWORK_V4,
+    IXIA03_EBGP_IC_PARENT_NETWORK_V6,
+    IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+    IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+    IXIA_EBGP_IC_PARENT_NETWORK_V4,
+    IXIA_EBGP_IC_PARENT_NETWORK_V6,
+    IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+    IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+)
 from taac.health_checks.healthcheck_definitions import (
     create_bgp_convergence_check,
     create_bgp_rib_fib_consistency_check,
@@ -18,6 +29,7 @@ from taac.health_checks.retry_policy import (
 from taac.testconfigs.routing.util.bgp_ebb_check_profiles import (
     CheckProfile,
     get_profile_checks,
+    IBGP_MIMIC_PARENTS,
     ProfileChecks,
     ProfileContext,
 )
@@ -83,6 +95,30 @@ class CheckProfileRegistryTest(unittest.TestCase):
         self.assertEqual(
             checks.snapshot_checks[0].name, hc_types.CheckName.CORE_DUMPS_CHECK
         )
+
+    def test_sc9_does_not_gate_on_boot_lifetime_ecmp_watermark(self):
+        checks = get_profile_checks(CheckProfile.SC9_BOUNDED_ECMP, ProfileContext())
+        hardware_checks = [
+            check
+            for check in [*checks.prechecks, *checks.postchecks]
+            if check.check_id
+            in {
+                "sc9_precheck_hw_capacity_baseline",
+                "sc9_postcheck_hw_capacity",
+            }
+        ]
+
+        self.assertEqual(
+            [
+                "sc9_precheck_hw_capacity_baseline",
+                "sc9_postcheck_hw_capacity",
+            ],
+            [check.check_id for check in hardware_checks],
+        )
+        for check in hardware_checks:
+            payload = json.loads(check.check_params.json_params)
+            self.assertFalse(payload["check_watermarks"])
+            self.assertIsNone(payload.get("ecmp_high_watermark_threshold"))
 
     def test_retry_is_baked_from_ssot(self):
         # Every postcheck must carry the uniform SSOT retry spec (P1/P3): the
@@ -177,7 +213,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 postcheck_thresholds=None,
                 convergence_hard_timeout_seconds=1200,
                 expected_established_session_count=42,
-                expected_restarted_services=["Bgp"],
+                expected_restarted_services=["Bgpcpp"],
                 restart_start_time_jq_var="daemon_restart_time",
                 bgp_mon=BgpMonScope(exclude=True),
             ),
@@ -227,7 +263,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 convergence_hard_timeout_seconds=1200,
                 fail_on_eor_expired=False,
                 expected_established_session_count=42,
-                expected_restarted_services=["Bgp"],
+                expected_restarted_services=["Bgpcpp"],
                 restart_start_time_jq_var="daemon_restart_time",
                 bgp_mon=BgpMonScope(exclude=True),
             ),
@@ -345,6 +381,24 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 bgp_mon=BgpMonScope(exclude=True),
             ),
         )
+
+    def test_drain_pnh_readiness_requires_both_profile_and_explicit_range(self) -> None:
+        for enabled, count, expected in (
+            (True, None, False),
+            (False, 100, False),
+            (True, 100, True),
+        ):
+            with self.subTest(enabled=enabled, count=count):
+                checks = get_profile_checks(
+                    CheckProfile.DRAIN_UNDRAIN,
+                    ProfileContext(check_ibgp_pnh=enabled, ibgp_pnh_count=count),
+                )
+                pnh = [
+                    check
+                    for check in checks.prechecks
+                    if check.check_id == "startup_ibgp_pnh_verification"
+                ]
+                self.assertEqual(expected, bool(pnh))
 
     def test_churn_storm_route_storm_matches_factory(self):
         """CICD-EBB-11 uses final session checks and in-workflow stability gates."""
@@ -811,3 +865,49 @@ class CheckProfileRegistryTest(unittest.TestCase):
                         f"{profile} {phase_name} still ignores the default "
                         f"chassis prefix despite a secondary chassis",
                     )
+
+
+def _bounded_ecmp_peer_addresses(v6_parent: str, v4_parent: str) -> list[str]:
+    # Mirrors the IXIA address pattern: 128 peers from .11 / ::11 stepping by 2,
+    # so v4 rolls past the /24 boundary while v6 stays inside the fifth hextet.
+    v4_base = ipaddress.ip_address(f"{v4_parent}.11")
+    return [f"{v6_parent}::{0x11 + 2 * i:x}" for i in range(128)] + [
+        str(v4_base + 2 * i) for i in range(128)
+    ]
+
+
+def _in_scope(address: str) -> bool:
+    # Same semantics as health_check_utils.is_parent_prefix (strict=False).
+    network = ipaddress.ip_network(address)
+    return not any(
+        network.network_address in parent and network.prefixlen >= parent.prefixlen
+        for parent in (
+            ipaddress.ip_network(mask, strict=False) for mask in IBGP_MIMIC_PARENTS
+        )
+    )
+
+
+class IbgpMimicParentsTest(unittest.TestCase):
+    def test_only_ebgp_sessions_stay_in_scope_on_every_chassis(self) -> None:
+        chassis = {
+            "ixia": (
+                (IXIA_EBGP_IC_PARENT_NETWORK_V6, IXIA_EBGP_IC_PARENT_NETWORK_V4),
+                (
+                    IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+                    IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+                ),
+            ),
+            "ixia03": (
+                (IXIA03_EBGP_IC_PARENT_NETWORK_V6, IXIA03_EBGP_IC_PARENT_NETWORK_V4),
+                (
+                    IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+                    IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+                ),
+            ),
+        }
+        for name, (ebgp, ibgp) in chassis.items():
+            with self.subTest(chassis=name):
+                ebgp_peers = _bounded_ecmp_peer_addresses(*ebgp)
+                ibgp_peers = _bounded_ecmp_peer_addresses(*ibgp)
+                self.assertEqual(256, sum(map(_in_scope, ebgp_peers)))
+                self.assertEqual(0, sum(map(_in_scope, ibgp_peers)))

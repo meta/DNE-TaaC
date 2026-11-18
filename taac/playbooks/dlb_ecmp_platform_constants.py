@@ -90,6 +90,7 @@ class EcmpAsic(Enum):
 
     G200 = "g200"  # Kodiak-3 (KO3) — ECMP only, no DLB
     TOMAHAWK4 = "tomahawk4"  # Elbert / Minipack2 — has DLB, tested ECMP-only here
+    TOMAHAWK5 = "tomahawk5"  # Wedge800 RSW — has DLB, tested ECMP-only here
     # The two members below are named after the PLATFORM, not an ASIC family:
     # neither box is in the lab yet and neither part is confirmed. Renaming to
     # the real family later is a one-line change, whereas guessing a family now
@@ -145,6 +146,20 @@ class EcmpResourceProfile:
     # every unique NH the CSV advertises, i.e. >= max_unique_next_hops (the
     # anchor-pair CSV draws NHs only from range(max_unique_next_hops)).
     ndp_pool_multiplier: int
+    # Headroom left for the DUT's own ECMP groups/members (fabric routes).
+    # ResourceAccountant charges them against the same ceilings, so Main is
+    # sized to the ceiling minus this reserve. The count checks keep the full
+    # ceilings.
+    reserved_ecmp_groups: int = 0
+    reserved_ecmp_members: int = 0
+
+    @property
+    def main_ecmp_groups(self) -> int:
+        return self.max_ecmp_groups - self.reserved_ecmp_groups
+
+    @property
+    def main_ecmp_members(self) -> int:
+        return self.max_ecmp_members - self.reserved_ecmp_members
 
 
 # Keyed by ASIC. Add new ECMP-only ASICs here rather than hardcoding numbers in
@@ -191,6 +206,35 @@ ECMP_RESOURCE_PROFILES: dict = {
         rouge_network_group_multiplier=24300,
         rouge_ecmp_width=27,
         ndp_pool_multiplier=512,
+    ),
+    # Tomahawk5 (Wedge800 RSW). Raw silicon (Tomahawk5Asic.h): 4096 groups,
+    # 64,000 members, getMaxWideEcmpSize()=128. Derated by the 75%
+    # ecmp_resource_percentage -> 3072 groups / 48,000 members. The W800 RSW's
+    # fabric routes hold 11 groups / 168 members, so Main leaves 32 / 512 for
+    # them (3072 + 11 was rejected on rsw005.p001.m001.qzr1).
+    # Width is capped at 64, not getMaxWideEcmpSize()=128: the agent truncates
+    # every route to FLAGS_ecmp_width (default 64, AgentFeatures.cpp), and the
+    # W800 RSW agent config does not override it.
+    #   GROUP-util:  47,488 members @ width 15 -> 3040 groups (max width 16).
+    #   MEMBER-util: 47,488 members @ width 64 -> 742x64 = 742 groups.
+    # max_unique_next_hops=512 (TH5's getMaxVariableWidthEcmpSize): 3040 groups
+    # need 79 anchors, leaving a body range of 433, coprime with _BODY_STRIDE=37.
+    EcmpAsic.TOMAHAWK5: EcmpResourceProfile(
+        max_ecmp_groups=3072,
+        max_ecmp_members=48000,
+        max_group_width=64,
+        max_unique_next_hops=512,
+        group_util_width=15,
+        group_util_counts={"total": 3040, "max_next_hops": 16},
+        member_util_width=64,
+        member_util_counts={"total": 742, "max_next_hops": 64},
+        # 1200 groups @ width 15. Main + Rouge = 4240 groups / 65,488 members,
+        # over both derated ceilings -> Rouge rejected in the overcommit runs.
+        rouge_network_group_multiplier=18000,
+        rouge_ecmp_width=15,
+        ndp_pool_multiplier=512,
+        reserved_ecmp_groups=32,
+        reserved_ecmp_members=512,
     ),
     # ---------------------------------------------------------------------
     # PLACEHOLDERS. w800 and ac100t are pre-hardware NPI platforms (every

@@ -5,6 +5,12 @@
 
 The active inventory is shared across planes and profiles; legacy CSV ordering
 is intentionally not retained.
+
+The excluded indices are candidate indices into the formulaic progression,
+not retained-prefix indices, and they were derived for the 46,500 retained
+prefixes the migration inventory held: 46,500 retained plus their 750 holes
+is a vetted span of 47,250 candidates. Candidates beyond that span were never
+compared with the migration inventory.
 """
 
 # fmt: off
@@ -145,7 +151,10 @@ EBB_IBGP_V6_EXCLUDED_PREFIX_INDICES = (
 
 # fmt: on
 
+EBB_IBGP_VETTED_CANDIDATE_SPAN = 47_250
+
 __all__ = (
     "EBB_IBGP_V4_EXCLUDED_PREFIX_INDICES",
     "EBB_IBGP_V6_EXCLUDED_PREFIX_INDICES",
+    "EBB_IBGP_VETTED_CANDIDATE_SPAN",
 )

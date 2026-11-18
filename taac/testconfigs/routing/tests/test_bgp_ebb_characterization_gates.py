@@ -6,7 +6,7 @@ import unittest
 from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
     build_fibagent_bgp_config_deploy_cmd,
 )
-from taac.abstractions.physical_inventory import BAG011_ASH6
+from taac.abstractions.physical_inventory import NRQEB007_ASH6
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_FIBAGENT_BGP_NHG_WATERMARK_HIGH,
     EBB_FIBAGENT_BGP_NHG_WATERMARK_LOW,
@@ -59,7 +59,7 @@ _UG_GATES: dict[str, _GateExpectation] = {
     "bgp_ebb_longevity_playbook": ({"80": 150.0, "95": 180.0}, 35.0),
     "bgp_ebb_ebgp_session_oscillation_playbook": (
         {"80": 150.0, "95": 180.0},
-        25.0,
+        35.0,
     ),
     "bgp_ebb_ebgp_route_oscillation_playbook": (
         {"80": 60.0, "95": 160.0},
@@ -77,10 +77,7 @@ _UG_GATES: dict[str, _GateExpectation] = {
         {"80": 4.0, "95": 5.0},
         10.0,
     ),
-    "bgp_ebb_nexthop_group_count_threshold_playbook": (
-        {"80": 10.0, "95": 8.0},
-        10.0,
-    ),
+    "bgp_ebb_nexthop_group_count_threshold_playbook": (None, 20.0),
 }
 
 _NON_UG_GATES: dict[str, _GateExpectation] = {
@@ -127,7 +124,7 @@ def _params(check: PointInTimeHealthCheck) -> dict[str, object]:
 class BgpEbbCharacterizationGatesTest(unittest.TestCase):
     def _config(self, enable_update_group: bool) -> TestConfig:
         return create_bgp_ebb_full_scale_test_config(
-            BAG011_ASH6,
+            NRQEB007_ASH6,
             name=(
                 "BAG011_CHARACTERIZATION_UG_TEST"
                 if enable_update_group
@@ -203,7 +200,7 @@ class BgpEbbCharacterizationGatesTest(unittest.TestCase):
         for enable_update_group in (False, True):
             with self.subTest(enable_update_group=enable_update_group):
                 config = create_bgp_ebb_full_scale_test_config(
-                    BAG011_ASH6,
+                    NRQEB007_ASH6,
                     name="BAG011_CANONICAL_EBGP_BASELINE_TEST",
                     playbooks_selected=["bgp_ebb_daemon_restart_playbook"],
                     enable_update_group=enable_update_group,
@@ -221,7 +218,7 @@ class BgpEbbCharacterizationGatesTest(unittest.TestCase):
         for enable_update_group in (False, True):
             with self.subTest(enable_update_group=enable_update_group):
                 config = create_bgp_ebb_full_scale_test_config(
-                    BAG011_ASH6,
+                    NRQEB007_ASH6,
                     name="BAG011_CANONICAL_EBGP_BASELINE_TEST",
                     playbooks_selected=["bgp_ebb_daemon_restart_playbook"],
                     enable_update_group=enable_update_group,

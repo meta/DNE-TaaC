@@ -78,7 +78,13 @@ class BgpPeersHealthCheck(
         parent_prefixes_to_ignore = check_params.get("parent_prefixes_to_ignore", [])
         verbose = check_params.get("verbose", False)
         bgp_summary_data = await self.get_bgp_summary_data(
-            obj, parent_peers_to_ignore, parent_prefixes_to_ignore, verbose
+            obj,
+            parent_peers_to_ignore,
+            parent_prefixes_to_ignore,
+            verbose,
+            fail_on_collection_error=check_params.get(
+                "fail_on_collection_error", False
+            ),
         )
         self.logger.info(
             f"Pre-snapshot BGP data for {obj.name}: "
@@ -100,7 +106,13 @@ class BgpPeersHealthCheck(
         parent_prefixes_to_ignore = check_params.get("parent_prefixes_to_ignore", [])
         verbose = check_params.get("verbose", False)
         bgp_summary_data = await self.get_bgp_summary_data(
-            obj, parent_peers_to_ignore, parent_prefixes_to_ignore, verbose
+            obj,
+            parent_peers_to_ignore,
+            parent_prefixes_to_ignore,
+            verbose,
+            fail_on_collection_error=check_params.get(
+                "fail_on_collection_error", False
+            ),
         )
         self.logger.info(
             f"Post-snapshot BGP data for {obj.name}: "
@@ -194,6 +206,7 @@ class BgpPeersHealthCheck(
         parent_peers_to_ignore: t.Optional[t.List[str]] = None,
         parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
         verbose: bool = False,
+        fail_on_collection_error: bool = False,
     ) -> BgpSummaryData:
         """
         Get BGP summary data using Thrift API to extract total paths and per-peer PS/PR/uptime data.
@@ -241,7 +254,10 @@ class BgpPeersHealthCheck(
                     prefixes_received,
                     prefixes_sent,
                 ) = await self._get_filtered_prefix_counts(
-                    peer_ip, parent_prefixes_to_ignore, verbose
+                    peer_ip,
+                    parent_prefixes_to_ignore,
+                    verbose,
+                    fail_on_collection_error=fail_on_collection_error,
                 )
             else:
                 # Use session counters for backward compatibility
@@ -289,6 +305,7 @@ class BgpPeersHealthCheck(
         peer_ip: str,
         parent_prefixes_to_ignore: t.List[str],
         verbose: bool = False,
+        fail_on_collection_error: bool = False,
     ) -> t.Tuple[int, int]:
         """
         Get filtered prefix counts for a peer by calling thrift APIs and filtering out ignored prefixes.
@@ -373,7 +390,8 @@ class BgpPeersHealthCheck(
             self.logger.error(
                 f"Error getting filtered prefix counts for peer {peer_ip}: {e}"
             )
-            # Fall back to 0 counts on error
+            if fail_on_collection_error:
+                raise
             return 0, 0
 
     def _prefix_matches_ignore_pattern(self, prefix: str, ignore_pattern: str) -> bool:

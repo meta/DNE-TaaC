@@ -18,6 +18,7 @@ from datetime import datetime
 
 if t.TYPE_CHECKING:
     from confucius.analects.base.agentic_function import Function
+    from pydantic import BaseModel
 
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
@@ -72,12 +73,31 @@ from taac.libs.baseline_lifecycle import (
     BaselineScope,
     BaselineTimeouts,
 )
-from taac.libs.collectors.registry import set_test_case_start_time
-from taac.libs.investigation_report import (
-    InvestigationReport,
-    render_headline,
-    render_report_lines,
+from taac.libs.campaign_control import (
+    BoundaryAction,
+    CampaignControl,
+    NoopCampaignControl,
 )
+from taac.libs.collectors.registry import set_test_case_start_time
+
+if not TAAC_OSS:
+    from taac.libs.investigation_report import (
+        InvestigationReport,
+        render_headline,
+        render_report_lines,
+    )
+else:
+    # The investigation agent is unavailable in OSS. Keep its optional type
+    # annotations import-free so OSS does not need the agent's pydantic stack.
+    InvestigationReport = t.Any
+
+    def render_headline(_report: t.Any) -> str:
+        return ""
+
+    def render_report_lines(_report: t.Any) -> list[str]:
+        return []
+
+
 from taac.libs.ixia_candidate import (
     IxiaCandidate,
     normalize_ixia_candidates,
@@ -113,7 +133,6 @@ from taac.steps.all_steps import (  # oss-rewrite (force ShipIt re-export to taa
 from neteng.test_infra.dne.taac.steps.step import Step, TestbedError
 from taac.steps.step_definitions import ValidationStep
 from taac.tasks.utils import run_task
-from taac.test_configs import get_test_config
 from taac.utils.common import (
     async_everpaste_str,
     async_write_test_result,
@@ -203,6 +222,15 @@ if not TAAC_OSS:
     from taac.internal.utils import ondevice_sampler
     from taac.internal.utils.manifold_utils import (
         async_upload_file_to_manifold,
+    )
+else:
+    # OSS binding for the mock-device registration helper. ``_add_oss_mock_device_data``
+    # (called from ``async_test_setUp`` for any config that populates
+    # ``oss_mock_device_data``) invokes this unconditionally, so it must resolve
+    # under TAAC_OSS too — the OSS-safe implementation lives in taac.utils, not
+    # taac.internal. Without this the runner NameErrors before setup for such configs.
+    from taac.utils.netwhoami_utils import (
+        add_oss_mock_device_data,
     )
 
 DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID: str = "test_case_start"
@@ -375,6 +403,13 @@ _BASELINE_RESTORE_TIMEOUT_SECONDS = 900
 _BASELINE_VERIFY_TIMEOUT_SECONDS = 300
 _BASELINE_RELEASE_TIMEOUT_SECONDS = 30
 _CLEANUP_CANCELLATION_GRACE_SECONDS = 30
+# How long a cancelled teardown task may take to unwind through its
+# finalizers before TAAC treats it as still mutating its device.
+_CLEANUP_DRAIN_SECONDS = 30
+# A snapshot restore interrupted by cancellation reruns itself before it
+# yields, so it gets a longer grace and drain than ordinary cleanup.
+_TERMINAL_RESTORE_GRACE_SECONDS = 300
+_TERMINAL_RESTORE_DRAIN_SECONDS = 300
 _TASK_ATTEMPTS = 2
 _TASK_RETRY_SLEEP_SECONDS = 60
 _TEARDOWN_TASK_FAILURE_GROUP_MESSAGE = "TAAC test-config teardown tasks failed"
@@ -382,6 +417,121 @@ _TEARDOWN_TASK_FAILURE_GROUP_MESSAGE = "TAAC test-config teardown tasks failed"
 
 class _TeardownTaskFailureGroup(ExceptionGroup):
     pass
+
+
+_TERMINAL_RESTORE_ACTIONS = frozenset(
+    {"routing_component_restore", "interface_config_restore"}
+)
+
+
+_LIFECYCLE_METADATA_KEYS = ("action", "operation_id", "hostname")
+
+
+def _lifecycle_metadata_overrides(task: taac_types.Task) -> list[str]:
+    """Lifecycle metadata keys a non-literal parameter source would rewrite."""
+    params = task.params
+    if params is None:
+        return []
+    return sorted(
+        key
+        for source in (params.static_params, params.jq_params, params.transform_params)
+        if source
+        for key in source
+        if key in _LIFECYCLE_METADATA_KEYS
+    )
+
+
+def _lifecycle_params(task: taac_types.Task) -> dict[str, t.Any] | None:
+    """Literal lifecycle parameters, the same ones the task will execute with.
+
+    A task whose action or operation ID comes from a non-literal source is
+    never classified here; `_check_lifecycle_metadata` refuses to run it.
+    """
+    if (
+        task.task_name != "eos_compiler_lifecycle"
+        or task.params is None
+        or _lifecycle_metadata_overrides(task)
+    ):
+        return None
+    try:
+        params = json.loads(task.params.json_params or "")
+    except ValueError:
+        return None
+    return params if isinstance(params, dict) else None
+
+
+def _check_lifecycle_metadata(
+    task: taac_types.Task,
+    evaluated: t.Mapping[str, t.Any],
+) -> None:
+    if task.task_name != "eos_compiler_lifecycle":
+        return
+    overrides = _lifecycle_metadata_overrides(task)
+    literal = _lifecycle_params(task) or {}
+    mismatched = [
+        key
+        for key in _LIFECYCLE_METADATA_KEYS
+        if evaluated.get(key) != literal.get(key)
+    ]
+    if overrides or mismatched:
+        raise ValueError(
+            "eos_compiler_lifecycle action, operation_id and hostname must be "
+            f"literal json_params; overridden={overrides}, mismatched={mismatched}"
+        )
+
+
+def _is_terminal_restore(task: taac_types.Task) -> bool:
+    params = _lifecycle_params(task)
+    action = params.get("action") if params is not None else None
+    return isinstance(action, str) and action in _TERMINAL_RESTORE_ACTIONS
+
+
+def _task_target_hostname(task: taac_types.Task) -> str | None:
+    hostname = task.hostname
+    return hostname if isinstance(hostname, str) and hostname else None
+
+
+_UndrainedCleanup = tuple[asyncio.Future[t.Any], str | None]
+
+
+def _state_guard_arm_operation_id(task: taac_types.Task) -> str | None:
+    # Declaration reads the literal JSON even when other sources override it:
+    # such an arm refuses to run, so its guard stays unarmed.
+    params = None
+    if task.task_name == "eos_compiler_lifecycle" and task.params is not None:
+        try:
+            params = json.loads(task.params.json_params or "")
+        except ValueError:
+            params = None
+    if not isinstance(params, dict) or params.get("action") != "state_guard_arm":
+        return None
+    operation_id = params.get("operation_id")
+    return operation_id if isinstance(operation_id, str) and operation_id else None
+
+
+def _state_guard_arm_operation_ids(tasks: t.Iterable[taac_types.Task]) -> set[str]:
+    return {
+        operation_id
+        for task in tasks
+        if (operation_id := _state_guard_arm_operation_id(task)) is not None
+    }
+
+
+def _split_terminal_teardown_tasks(
+    tasks: t.Sequence[taac_types.Task],
+) -> tuple[list[tuple[int, taac_types.Task]], list[tuple[int, taac_types.Task]]]:
+    """Split off the trailing run of snapshot restores.
+
+    Those restores return devices to their pre-test snapshot, so an ordinary
+    cleanup retried after them would undo the restoration. Only the trailing
+    run is terminal: an earlier restore keeps its place relative to the
+    cleanups that follow it.
+    """
+    indexed = list(enumerate(tasks, 1))
+    split = len(indexed)
+    while split > 0 and _is_terminal_restore(indexed[split - 1][1]):
+        split -= 1
+    return indexed[:split], indexed[split:]
 
 
 @dataclass
@@ -416,6 +566,7 @@ class TaacRunner:
         skip_testbed_isolation: bool = True,
         # Use with CAUTION!!  Should only be used for debugging or development purposes
         skip_basset_reservation: bool = False,
+        fail_on_foreign_basset_reservation: bool = False,
         desired_pkg_versions: t.Optional[t.Dict[FbossPackage, str]] = None,
         dsf_sequential_update: bool = False,
         allow_disruptive_configs: bool = False,
@@ -460,13 +611,29 @@ class TaacRunner:
         trace_ixia_api: bool = True,
         ixia_profile: str = "auto",
         setup_only: bool = False,
+        ixia_primary_chassis: t.Optional[str] = None,
+        force_take_ixia_port_ownership: bool = True,
+        ixia_use_tx_rx_sync: bool = True,
+        campaign_control: CampaignControl | NoopCampaignControl | None = None,
     ) -> None:
-        self.test_config = (
-            get_test_config(test_config)
-            if isinstance(test_config, str)
-            else test_config
-        )
+        if isinstance(test_config, str):
+            # Registry discovery imports hardware-specific configs and can do
+            # network I/O. A supplied TestConfig must not discover other DUTs.
+            from taac.test_configs import get_test_config
+
+            self.test_config = get_test_config(test_config)
+        else:
+            self.test_config = test_config
         self._validate_no_test_config_level_checks()
+        self.campaign_control = campaign_control or CampaignControl.from_environment()
+        if (
+            self.campaign_control.is_enabled
+            and self.campaign_control.manifest is not None
+            and self.campaign_control.manifest.test_config != self.test_config.name
+        ):
+            raise ValueError(
+                "campaign manifest TestConfig does not match the TAAC TestConfig"
+            )
         # One entry per (playbook, dut, iteration) executed by this run.
         self.playbook_results: t.List[trr_types.PlaybookResult] = []
         self.logger = logger or get_root_logger()
@@ -480,6 +647,8 @@ class TaacRunner:
         self.skip_teardown_tasks = skip_teardown_tasks
         self.skip_all_tasks = skip_all_tasks
         self._skip_test_config_teardown_tasks = False
+        self._declared_state_guards: set[str] = set()
+        self._armed_state_guards: set[str] = set()
         self.skip_periodic_tasks = skip_periodic_tasks
         # EOS image ID for Arista device image deployment
         self.eos_image_id = eos_image_id or ""
@@ -531,6 +700,7 @@ class TaacRunner:
             skip_ixia_cleanup,
             skip_post_setup_wait=skip_post_setup_wait,
             skip_basset_reservation=skip_basset_reservation,
+            fail_on_foreign_basset_reservation=fail_on_foreign_basset_reservation,
             skip_testbed_isolation=skip_testbed_isolation,
             desired_pkg_versions=desired_pkg_versions,
             dsf_sequential_update=dsf_sequential_update,
@@ -543,6 +713,9 @@ class TaacRunner:
             ixia_candidates=self.ixia_candidates,
             ixia_profile=ixia_profile,
             trace_ixia_api=trace_ixia_api,
+            ixia_primary_chassis=ixia_primary_chassis,
+            force_take_ixia_port_ownership=force_take_ixia_port_ownership,
+            ixia_use_tx_rx_sync=ixia_use_tx_rx_sync,
         )
         self.test_case_uuid = ""
         self._test_case_investigation_attempted = False
@@ -562,9 +735,13 @@ class TaacRunner:
         self._test_case_cleanup_pending = False
         self._test_case_handlers_pending_cleanup: t.List[BaseCustomTestHandler] = []
         self._test_case_rsyslog_created = False
-        # Shared data dictionary that persists across all tasks (setup, test, teardown)
-        # This allows tasks to share information (e.g., backup filenames) across execution
+        # TestConfig-lifecycle task state. Setup/teardown tasks may use this to
+        # exchange recovery information across the outer config lifecycle.
         self.shared_task_data: t.Dict[t.Any, t.Any] = {}
+        # Registered steps use a narrower store. It is reset before every
+        # playbook execution so state can cross that playbook's iterations,
+        # setup, stages, and cleanup, but can never leak into another playbook.
+        self._playbook_shared_task_data: t.Dict[t.Any, t.Any] = {}
         self.test_summary = TaacTestSummary(self.logger)
         # The latest investigation, retained for the legacy Netcastle test-case
         # link integration. Reset per test case so a prior result is not reused.
@@ -643,6 +820,31 @@ class TaacRunner:
             pass
         return " | ".join(desc_parts)
 
+    @async_retryable(
+        retries=_TASK_ATTEMPTS,
+        sleep_time=_TASK_RETRY_SLEEP_SECONDS,
+        exceptions=(Exception,),
+    )
+    async def _run_task_with_retry(self, task: taac_types.Task) -> ValueError | None:
+        """Retry one task without replaying already completed stateful tasks.
+
+        A lifecycle-metadata refusal is returned rather than raised so it is
+        never retried.
+        """
+        dict_params = self.parameter_evaluator.evaluate(task.params)
+        try:
+            _check_lifecycle_metadata(task, dict_params)
+        except ValueError as refusal:
+            return refusal
+        await run_task(
+            task,
+            dict_params,
+            t.cast(TaacIxia, self.ixia),
+            self.logger,
+            self.shared_task_data,
+        )
+        return None
+
     async def _run_task_once(
         self,
         task: taac_types.Task,
@@ -655,28 +857,42 @@ class TaacRunner:
             f"[Task {index}/{total}] Running: {task_desc} (host: {task.hostname})"
         )
         start = time.time()
-        dict_params = self.parameter_evaluator.evaluate(task.params)
-        await run_task(
-            task,
-            dict_params,
-            t.cast(TaacIxia, self.ixia),
-            self.logger,
-            self.shared_task_data,
-        )
+        refusal = await self._run_task_with_retry(task)
+        if refusal is not None:
+            raise refusal
         elapsed = time.time() - start
         self.logger.warning(
             f"[Task {index}/{total}] Completed: {task_desc} ({elapsed:.1f}s)"
         )
 
-    @async_retryable(
-        retries=_TASK_ATTEMPTS,
-        sleep_time=_TASK_RETRY_SLEEP_SECONDS,
-        exceptions=(Exception,),
-    )
     async def run_tasks(self, tasks: t.Sequence[taac_types.Task]) -> None:
+        self._declared_state_guards.update(_state_guard_arm_operation_ids(tasks))
         total = len(tasks)
         for idx, task in enumerate(tasks, 1):
             await self._run_task_once(task, index=idx, total=total)
+            operation_id = _state_guard_arm_operation_id(task)
+            if operation_id is not None:
+                self._armed_state_guards.add(operation_id)
+
+    def _unarmed_state_guards(self) -> list[str]:
+        """State guards this run's setup declares but never armed.
+
+        Setup arms a guard only after snapshotting every device it will
+        mutate, so an unarmed guard means setup changed nothing that its
+        teardown tasks could clean up or restore. Guards are read from the
+        setup this run executed and from the candidate whose pre-IXIA setup
+        runs first, never from a fallback candidate that never ran.
+        """
+        declared = set(self._declared_state_guards)
+        candidates = self.test_setup_orchestrator.ixia_candidates_to_try
+        candidate = candidates[0] if candidates else None
+        if candidate is not None:
+            declared.update(
+                _state_guard_arm_operation_ids(
+                    task for task in candidate.setup_tasks if not task.ixia_needed
+                )
+            )
+        return sorted(declared - self._armed_state_guards)
 
     async def _await_cleanup_to_completion(  # noqa: C901
         self,
@@ -685,6 +901,9 @@ class TaacRunner:
         phase: str,
         cancellation_grace_seconds: float = _CLEANUP_CANCELLATION_GRACE_SECONDS,
         cancellation_budget: _CleanupCancellationBudget | None = None,
+        drain_seconds: float | None = None,
+        undrained: list[_UndrainedCleanup] | None = None,
+        undrained_hostname: str | None = None,
     ) -> tuple[asyncio.CancelledError | None, Exception | None]:
         try:
             cleanup_task = asyncio.ensure_future(cleanup)
@@ -725,20 +944,30 @@ class TaacRunner:
             except Exception as error:
                 if cleanup_task.done():
                     break
-                cleanup_task.cancel()
-                cleanup_task.add_done_callback(
-                    lambda task: self._log_abandoned_cleanup_result(task, phase=phase)
+                await self._abandon_cleanup(
+                    cleanup_task,
+                    phase=phase,
+                    drain_seconds=drain_seconds,
+                    undrained=undrained,
+                    undrained_hostname=undrained_hostname,
                 )
                 return cancellation, error
 
         if not cleanup_task.done():
-            cleanup_task.cancel()
-            cleanup_task.add_done_callback(
-                lambda task: self._log_abandoned_cleanup_result(task, phase=phase)
+            drained = await self._abandon_cleanup(
+                cleanup_task,
+                phase=phase,
+                drain_seconds=drain_seconds,
+                undrained=undrained,
+                undrained_hostname=undrained_hostname,
             )
             timeout_error = TimeoutError(
                 f"{phase} did not finish before the teardown cancellation deadline"
             )
+            if drain_seconds is not None and not drained:
+                timeout_error.add_note(
+                    f"{phase} was still running {drain_seconds}s after cancellation"
+                )
             return cancellation, timeout_error
 
         try:
@@ -758,20 +987,79 @@ class TaacRunner:
         *,
         phase: str,
         cancellation_budget: _CleanupCancellationBudget,
+        cancellation_grace_seconds: float | None = None,
+        drain_seconds: float | None = None,
+        undrained: list[_UndrainedCleanup] | None = None,
+        undrained_hostname: str | None = None,
     ) -> tuple[asyncio.CancelledError | None, Exception | None]:
+        grace_seconds = (
+            _CLEANUP_CANCELLATION_GRACE_SECONDS
+            if cancellation_grace_seconds is None
+            else cancellation_grace_seconds
+        )
         try:
             cleanup = cleanup_factory()
         except asyncio.CancelledError as error:
             if self._consume_current_task_cancellation():
-                cancellation_budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
+                cancellation_budget.arm(grace_seconds)
             return error, None
         except Exception as error:
             return None, error
         return await self._await_cleanup_to_completion(
             cleanup,
             phase=phase,
+            cancellation_grace_seconds=grace_seconds,
             cancellation_budget=cancellation_budget,
+            drain_seconds=drain_seconds,
+            undrained=undrained,
+            undrained_hostname=undrained_hostname,
         )
+
+    async def _abandon_cleanup(
+        self,
+        cleanup_task: asyncio.Future[t.Any],
+        *,
+        phase: str,
+        drain_seconds: float | None,
+        undrained: list[_UndrainedCleanup] | None,
+        undrained_hostname: str | None,
+    ) -> bool:
+        """Cancel a cleanup TAAC stopped waiting for; with ``drain_seconds``,
+        wait that long for it to unwind and report whether it did."""
+        cleanup_task.cancel()
+        drained = drain_seconds is not None and await self._drain_cancelled_cleanup(
+            cleanup_task, drain_seconds
+        )
+        if not drained:
+            cleanup_task.add_done_callback(
+                lambda task: self._log_abandoned_cleanup_result(task, phase=phase)
+            )
+            if drain_seconds is not None and undrained is not None:
+                undrained.append((cleanup_task, undrained_hostname))
+        return drained
+
+    async def _drain_cancelled_cleanup(
+        self,
+        cleanup_task: asyncio.Future[t.Any],
+        drain_seconds: float,
+    ) -> bool:
+        deadline = time.monotonic() + drain_seconds
+        while not cleanup_task.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(asyncio.shield(cleanup_task), timeout=remaining)
+            except asyncio.CancelledError:
+                if not cleanup_task.done():
+                    self._consume_current_task_cancellation()
+            except TimeoutError:
+                return cleanup_task.done()
+            except Exception:
+                pass
+        if not cleanup_task.cancelled() and cleanup_task.exception() is not None:
+            self._log_abandoned_cleanup_result(cleanup_task, phase="drained cleanup")
+        return True
 
     def _log_abandoned_cleanup_result(
         self, task: asyncio.Future[t.Any], *, phase: str
@@ -794,10 +1082,15 @@ class TaacRunner:
     @staticmethod
     def _new_cleanup_budget(
         previous_budget: _CleanupCancellationBudget,
+        grace_seconds: float | None = None,
     ) -> _CleanupCancellationBudget:
         budget = _CleanupCancellationBudget()
         if previous_budget.deadline is not None:
-            budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
+            budget.arm(
+                _CLEANUP_CANCELLATION_GRACE_SECONDS
+                if grace_seconds is None
+                else grace_seconds
+            )
         return budget
 
     @staticmethod
@@ -834,10 +1127,92 @@ class TaacRunner:
         cancellation_budget: _CleanupCancellationBudget | None = None,
     ) -> None:
         budget = cancellation_budget or _CleanupCancellationBudget()
-        pending = list(enumerate(tasks, 1))
-        total = len(pending)
+        total = len(tasks)
+        ordinary, terminal = _split_terminal_teardown_tasks(tasks)
+        undrained: list[_UndrainedCleanup] = []
+        failures, cancellation = await self._run_teardown_task_phase(
+            ordinary,
+            total=total,
+            cancellation_budget=budget,
+            allow_retry=True,
+            terminal=False,
+            undrained=undrained,
+        )
+        terminal_to_run = terminal
+        if terminal and undrained:
+            unknown_target = any(hostname is None for _future, hostname in undrained)
+            blocked_hostnames = {
+                hostname for _future, hostname in undrained if hostname is not None
+            }
+            blocked_terminal = [
+                (index, task)
+                for index, task in terminal
+                if unknown_target
+                or (hostname := _task_target_hostname(task)) is None
+                or hostname in blocked_hostnames
+            ]
+            blocked_indices = {index for index, _task in blocked_terminal}
+            terminal_to_run = [
+                entry for entry in terminal if entry[0] not in blocked_indices
+            ]
+            # A cancelled cleanup that has not unwound may still mutate its
+            # target; restoring that target now could be silently undone.
+            failures = [
+                *failures,
+                *(
+                    (
+                        index,
+                        task,
+                        RuntimeError(
+                            f"Test-config teardown task {index}/{total} not "
+                            f"attempted: {len(undrained)} cancelled cleanup "
+                            "task(s) targeting the same or an unknown device "
+                            "were still running"
+                        ),
+                    )
+                    for index, task in blocked_terminal
+                ),
+            ]
+        if terminal_to_run:
+            (
+                terminal_failures,
+                terminal_cancellation,
+            ) = await self._run_teardown_task_phase(
+                terminal_to_run,
+                total=total,
+                cancellation_budget=budget,
+                allow_retry=cancellation is None,
+                terminal=True,
+            )
+            failures = sorted(
+                (*failures, *terminal_failures),
+                key=lambda failure: failure[0],
+            )
+            cancellation = self._record_teardown_cancellation(
+                cancellation,
+                terminal_cancellation,
+                phase="terminal test-config teardown tasks",
+            )
+        self._raise_teardown_task_failures(failures, cancellation)
+
+    async def _run_teardown_task_phase(
+        self,
+        tasks: t.Sequence[tuple[int, taac_types.Task]],
+        *,
+        total: int,
+        cancellation_budget: _CleanupCancellationBudget,
+        allow_retry: bool,
+        terminal: bool,
+        undrained: list[_UndrainedCleanup] | None = None,
+    ) -> tuple[
+        list[tuple[int, taac_types.Task, Exception]],
+        asyncio.CancelledError | None,
+    ]:
+        pending = list(tasks)
         failures_by_index: dict[int, tuple[int, taac_types.Task, Exception]] = {}
         for attempt in range(_TASK_ATTEMPTS):
+            if not pending:
+                return [], None
             (
                 failures,
                 cancellation,
@@ -845,7 +1220,9 @@ class TaacRunner:
             ) = await self._attempt_teardown_tasks(
                 pending,
                 total=total,
-                cancellation_budget=budget,
+                cancellation_budget=cancellation_budget,
+                terminal=terminal,
+                undrained=undrained,
             )
             for index in successful_indices:
                 failures_by_index.pop(index, None)
@@ -854,29 +1231,24 @@ class TaacRunner:
             cumulative_failures = [
                 failures_by_index[index] for index in sorted(failures_by_index)
             ]
-            if cancellation is not None:
-                self._raise_teardown_task_failures(
-                    cumulative_failures,
-                    cancellation,
-                )
-                return
-            if not failures:
-                return
-            if attempt + 1 == _TASK_ATTEMPTS or budget.deadline is not None:
-                self._raise_teardown_task_failures(
-                    cumulative_failures,
-                    cancellation,
-                )
-                return
+            if (
+                cancellation is not None
+                or not failures
+                or not allow_retry
+                or attempt + 1 == _TASK_ATTEMPTS
+                or cancellation_budget.deadline is not None
+                or undrained
+            ):
+                return cumulative_failures, cancellation
 
             try:
                 await asyncio.sleep(_TASK_RETRY_SLEEP_SECONDS)
             except asyncio.CancelledError as error:
                 if self._consume_current_task_cancellation():
-                    budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
-                self._raise_teardown_task_failures(cumulative_failures, error)
-                return
+                    cancellation_budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
+                return cumulative_failures, error
             pending = [(index, task) for index, task, _error in failures]
+        return [], None
 
     async def _attempt_teardown_tasks(
         self,
@@ -884,16 +1256,37 @@ class TaacRunner:
         *,
         total: int,
         cancellation_budget: _CleanupCancellationBudget,
+        terminal: bool = False,
+        undrained: list[_UndrainedCleanup] | None = None,
     ) -> tuple[
         list[tuple[int, taac_types.Task, Exception]],
         asyncio.CancelledError | None,
         set[int],
     ]:
+        """Attempt each task once.
+
+        Every cancelled task is drained before the next starts. A terminal
+        restore also gets its own, longer cancellation grace, so a cleanup
+        that exhausted the shared grace cannot cancel it before it starts.
+        """
         failures: list[tuple[int, taac_types.Task, Exception]] = []
         cancellation: asyncio.CancelledError | None = None
         successful_indices: set[int] = set()
+        grace_seconds = (
+            _TERMINAL_RESTORE_GRACE_SECONDS
+            if terminal
+            else _CLEANUP_CANCELLATION_GRACE_SECONDS
+        )
+        drain_seconds = (
+            _TERMINAL_RESTORE_DRAIN_SECONDS if terminal else _CLEANUP_DRAIN_SECONDS
+        )
         for idx, task in indexed_tasks:
             description = self._get_task_description(task)
+            task_budget = (
+                self._new_cleanup_budget(cancellation_budget, grace_seconds)
+                if terminal
+                else cancellation_budget
+            )
             task_cancellation, error = await self._run_cleanup_phase(
                 lambda task=task, idx=idx: self._run_task_once(
                     task,
@@ -901,8 +1294,14 @@ class TaacRunner:
                     total=total,
                 ),
                 phase=f"test-config teardown task {idx}/{total}: {description}",
-                cancellation_budget=cancellation_budget,
+                cancellation_budget=task_budget,
+                cancellation_grace_seconds=grace_seconds,
+                drain_seconds=drain_seconds,
+                undrained=undrained,
+                undrained_hostname=_task_target_hostname(task),
             )
+            if task_budget.deadline is not None:
+                cancellation_budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
             cancellation = self._record_teardown_cancellation(
                 cancellation,
                 task_cancellation,
@@ -946,6 +1345,33 @@ class TaacRunner:
                 _TEARDOWN_TASK_FAILURE_GROUP_MESSAGE,
                 errors,
             )
+
+    async def _run_teardown_tasks_best_effort(
+        self, tasks: t.Sequence[taac_types.Task]
+    ) -> None:
+        """Run every teardown task even when an earlier cleanup fails.
+
+        Setup tasks intentionally fail fast, but teardown owns restoration of
+        independent DUTs and nested config snapshots.  Stopping at the first
+        error can strand later devices in the test configuration.  Keep the
+        existing per-task retry behavior by invoking ``run_tasks`` with one
+        task at a time, then surface all failures after every cleanup was
+        attempted.
+        """
+        errors: list[Exception] = []
+        for task in tasks:
+            try:
+                await self.run_tasks((task,))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+                self.logger.error(
+                    "Teardown task failed; continuing remaining cleanup: "
+                    f"{self._get_task_description(task)}: {exc}"
+                )
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("Multiple TAAC teardown tasks failed", errors)
 
     async def _async_run_oss_setup_tasks(self) -> None:
         """Run the OSS setup-task stage.
@@ -1282,6 +1708,10 @@ class TaacRunner:
             topology=self.topology,
             step=step,
         )
+        # Set after construction so third-party Step subclasses with explicit
+        # constructor signatures do not have to accept a new keyword merely to
+        # benefit from runner-owned registered-task state.
+        step_obj.shared_data = self._playbook_shared_task_data
         step_obj._input = (
             json_to_thrift(step.input_json, STEP_NAME_TO_INPUT[step.name])
             if step.input_json
@@ -1450,6 +1880,7 @@ class TaacRunner:
         test_case_results: t.List[trr_types.CheckResult] = []
         test_case_start_time = int(time.time())
         iteration_count = self._get_test_case_iteration_count(playbook)
+        self._playbook_shared_task_data = {}
 
         try:
             for _ in range(iteration_count):
@@ -2502,7 +2933,7 @@ class TaacRunner:
                 resolved_playbooks.append(playbook)
         return resolved_playbooks
 
-    async def run_tests(
+    async def run_tests(  # noqa: C901
         self,
         playbooks: t.Optional[t.List[t.Union[str, taac_types.Playbook]]] = None,
         duts: t.Optional[t.List[str]] = None,
@@ -2536,11 +2967,11 @@ class TaacRunner:
         duts = none_throws(duts or self.duts)
         enabled_playbooks = [p for p in resolved_playbooks if p.enabled]
         failed_playbooks: t.List[t.Tuple[str, str, Exception]] = []
+        stop_requested = False
         for dut in duts:
             # pyrefly: ignore [missing-attribute]
             test_device = self.topology.get_device_by_name(dut)
             dut_playbooks = self._playbooks_for_device(
-                # pyrefly: ignore [bad-argument-type]
                 enabled_playbooks,
                 test_device,
             )
@@ -2549,13 +2980,19 @@ class TaacRunner:
                 self.logger.info("")
                 self.logger.info(f"\033[1m\033[36m{'=' * 70}\033[0m")
                 self.logger.info(
-                    # pyrefly: ignore [missing-attribute]
                     f"\033[1m\033[36m  [{pb_idx}/{total_playbooks}] "
                     f"{playbook.name} | {dut}\033[0m"
                 )
                 self.logger.info(f"\033[1m\033[36m{'=' * 70}\033[0m")
-                # pyrefly: ignore [bad-assignment]
                 self._current_playbook = playbook
+                if self.campaign_control.is_enabled:
+                    self.campaign_control.publish_event(
+                        "PLAYBOOK_STARTED",
+                        playbook=playbook.name,
+                        dut=dut,
+                        index=pb_idx,
+                        total=total_playbooks,
+                    )
                 try:
                     # Cross-playbook IXIA health gate. Fires the in-band 5xx
                     # recovery if the chassis is in a Jetty-wedge state
@@ -2574,13 +3011,10 @@ class TaacRunner:
                             ),
                             testconfig_name=self.test_config.name,
                         )
-                    # pyrefly: ignore [bad-argument-type]
                     await self.run_test_case(playbook, test_device)
                 except Exception as e:
-                    # pyrefly: ignore [missing-attribute]
                     failed_playbooks.append((playbook.name, dut, e))
                     self.logger.error(
-                        # pyrefly: ignore [missing-attribute]
                         f"\033[31m  Playbook '{playbook.name}' failed on "
                         f"{dut}: {e}\033[0m"
                     )
@@ -2595,10 +3029,36 @@ class TaacRunner:
                             [error for _name, _dut, error in failed_playbooks],
                         )
                     self._ensure_baseline_safe_for_next_playbook(failed_playbooks)
+                    stop_requested = await self._campaign_boundary_requests_stop(
+                        playbook=playbook,
+                        dut=dut,
+                        outcome="FAILED",
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    if stop_requested:
+                        self.logger.warning(
+                            "Campaign requested normal teardown after failed "
+                            f"playbook {playbook.name!r}"
+                        )
+                        break
                     self.logger.info(
                         f"\033[33m  Continuing to next playbook "
                         f"({pb_idx}/{total_playbooks} complete)...\033[0m"
                     )
+                else:
+                    stop_requested = await self._campaign_boundary_requests_stop(
+                        playbook=playbook,
+                        dut=dut,
+                        outcome="PASSED",
+                    )
+                    if stop_requested:
+                        self.logger.warning(
+                            "Campaign requested normal teardown after successful "
+                            f"playbook {playbook.name!r}"
+                        )
+                        break
+            if stop_requested:
+                break
         if failed_playbooks:
             # Include each failed playbook's exception message in the outer
             # TestCaseFailure so the per-HC detail (introduced in D107926440
@@ -2617,6 +3077,49 @@ class TaacRunner:
                 f"{len(failed_playbooks)} playbook(s) failed:\n"
                 + "\n".join(detail_lines)
             ) from failed_playbooks[-1][2]
+
+    async def _campaign_boundary_requests_stop(
+        self,
+        *,
+        playbook: taac_types.Playbook,
+        dut: str,
+        outcome: str,
+        error: str | None = None,
+    ) -> bool:
+        if not self.campaign_control.is_enabled:
+            return False
+        self.campaign_control.publish_event(
+            "PLAYBOOK_FINISHED",
+            playbook=playbook.name,
+            dut=dut,
+            outcome=outcome,
+            error=error,
+        )
+        status = self.campaign_control.publish_status(
+            "WAITING_FOR_COMMAND",
+            playbook=playbook.name,
+            dut=dut,
+            outcome=outcome,
+            error=error,
+        )
+        action = await self.campaign_control.wait_for_boundary_action(
+            expected_state_version=status["state_version"],
+            allowed_actions={
+                BoundaryAction.CONTINUE,
+                BoundaryAction.STOP_FOR_PATCH,
+                BoundaryAction.ABORT_GRACEFULLY,
+            },
+        )
+        self.campaign_control.publish_event(
+            "BOUNDARY_DECISION",
+            playbook=playbook.name,
+            dut=dut,
+            action=action.value,
+        )
+        return action in {
+            BoundaryAction.STOP_FOR_PATCH,
+            BoundaryAction.ABORT_GRACEFULLY,
+        }
 
     def _ensure_baseline_safe_for_next_playbook(
         self, failed_playbooks: t.Sequence[t.Tuple[str, str, Exception]]
@@ -3466,7 +3969,10 @@ class TaacRunner:
                 task=task,
                 prompt=prompt,
                 tools=tools,
-                output_format=InvestigationReport,
+                # InvestigationReport is a real pydantic model
+                # internally; in OSS it is the Any placeholder, which the
+                # generic run_agent bound cannot accept unchecked.
+                output_format=t.cast("type[BaseModel]", InvestigationReport),
                 on_event=self._log_investigation_event,
                 config=AgentConfig(stats_label=INVESTIGATION_STATS_LABEL),
                 timeout_sec=timeout_sec,
@@ -4476,18 +4982,27 @@ class TaacRunner:
                 "Skipping test-config teardown tasks because endpoint resolution "
                 "did not complete"
             )
+        teardown_candidate = (
+            self.selected_ixia_candidate
+            if self.selected_ixia_candidate is not None
+            else self.ixia_candidates[0]
+        )
+        unarmed_state_guards = self._unarmed_state_guards()
+        if unarmed_state_guards:
+            self.logger.info(
+                "Skipping test-config teardown tasks because setup never armed "
+                f"state guards {unarmed_state_guards}; an unarmed guard means "
+                "setup did not reach its first device mutation"
+            )
         try:
             with suppress_console_logs(self.logger):
                 await self.run_teardown_tasks(
-                    (
-                        self.selected_ixia_candidate.teardown_tasks
-                        if self.selected_ixia_candidate is not None
-                        else self.ixia_candidates[0].teardown_tasks
-                    )
+                    teardown_candidate.teardown_tasks
                     if not (
                         self.skip_all_tasks
                         or self.skip_teardown_tasks
                         or self._skip_test_config_teardown_tasks
+                        or unarmed_state_guards
                     )
                     else [],
                     cancellation_budget=cancellation_budget,

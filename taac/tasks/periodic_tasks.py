@@ -26,6 +26,7 @@ from taac.utils.common import (
 )
 from taac.utils.driver_factory import async_get_device_driver
 from taac.health_check.health_check import types as hc_types
+from thrift.python.exceptions import TransportError
 
 try:
     from configerator.client import ConfigeratorClient
@@ -338,14 +339,18 @@ class CounterThresholdTask(PeriodicTask):
                 - fail_on_breach: When True, raise ``CounterThresholdBreach``
                     the moment a sample exceeds ``threshold`` so the
                     PeriodicTaskWorker (with ``terminate_on_error=True``) fails
-                    the test mid-run. When False (default), a breach only warns
-                    and is left to the non-gating final check. Default: False.
+                    the test mid-run. When False (default), a breach is left to
+                    the final check. Default: False.
+                - observe_only: When True, retain threshold warnings and plots
+                    but report the final check as PASS for calibration. Default:
+                    False.
         """
         hostname = params["hostname"]
         key = params["key"]
         threshold = params["threshold"]
         cpu_count = params.get("cpu_count", None)
         fail_on_breach = params.get("fail_on_breach", False)
+        observe_only = params.get("observe_only", False)
 
         counter = None
         try:
@@ -376,14 +381,17 @@ class CounterThresholdTask(PeriodicTask):
         # try/except: a fail_on_breach raise must propagate to the worker (which
         # terminates the test) rather than being swallowed as a collection error.
         if counter > threshold:
-            if fail_on_breach:
+            if fail_on_breach and not observe_only:
                 raise CounterThresholdBreach(
                     f"{key} value {counter} exceeded threshold {threshold} "
                     f"mid-run on {hostname}; failing test (fail_on_breach=True)."
                 )
 
+            verdict = (
+                "observe-only reference" if observe_only else "will check max at end"
+            )
             self.logger.warning(
-                f"{key} value {counter} exceeds threshold {threshold} (will check max at end)"
+                f"{key} value {counter} exceeds threshold {threshold} ({verdict})"
             )
         else:
             self.logger.info(f"{key} value {counter} is within threshold {threshold}")
@@ -424,9 +432,16 @@ class CounterThresholdTask(PeriodicTask):
             )
 
         key = self._params.get("key", "counter")
+        observe_only = self._params.get("observe_only", False)
 
         # Determine status and base message
-        if max_counter > threshold:
+        if observe_only:
+            status = hc_types.HealthCheckStatus.PASS
+            message = (
+                f"Observed max {key} value {max_counter} against reference "
+                f"threshold {threshold} (observe-only)"
+            )
+        elif max_counter > threshold:
             status = hc_types.HealthCheckStatus.FAIL
             message = f"Max {key} value {max_counter} exceeded threshold {threshold}"
         else:
@@ -542,6 +557,26 @@ def _unprogrammed_verdict(
         f"unprogrammed BREACH: {detail}, beyond the {tolerance_samples}-sample "
         f"tolerance -- groups STAYED unprogrammed rather than being momentarily "
         f"in flight, so the device is failing to program them",
+    )
+
+
+def _converged_unprogrammed_verdict(
+    series: t.Dict[float, int], maximum: int, window: int
+) -> t.Tuple[bool, str]:
+    ordered = sorted(series)
+    if len(ordered) < window:
+        return True, (
+            f"converged unprogrammed NOT EVALUATED: {len(ordered)} samples is "
+            f"fewer than the {window} needed for a closing window"
+        )
+    values = _series_window(series, window, last=True)
+    peak = max(values)
+    detail = f"closing-window peak {peak} across {window} samples"
+    if peak <= maximum:
+        return False, (f"converged unprogrammed OK: {detail}, within maximum {maximum}")
+    return True, (
+        f"converged unprogrammed BREACH: {detail}, above maximum {maximum} -- "
+        f"the device was left with an unprogrammed nexthop group after the soak"
     )
 
 
@@ -845,6 +880,7 @@ def _misconfigured_params(params: t.Dict[str, t.Any]) -> t.List[str]:  # noqa: C
             "so there is no unprogrammed ceiling for it to soften"
         )
     _checked_int(params, "expected_converged_multiway_groups", problems, minimum=0)
+    _checked_int(params, "max_converged_unprogrammed", problems, minimum=0)
     # The closing window must be ODD. statistics.median AVERAGES the two middle
     # values of an even-length window, so a window straddling 2 and 3 medians to
     # 2.5 -- and 2.5 never equals an integer expectation, so a HEALTHY device
@@ -1338,20 +1374,22 @@ class NexthopGroupPoll(PeriodicTask):
         2. ``max(num_unprogrammed_groups) <= max_unprogrammed`` -- the device's
            own "I could not program this group" signal, i.e. the closest thing
            the box reports to "the hardware table is full".
-        3. ``len(samples) >= min_samples`` -- the poll stayed alive.
-        4. multi-way ECMP-set count and ceiling (``min_ecmp_width`` /
+        3. ``max_converged_unprogrammed`` -- the closing post-soak window has
+           no persistent unprogrammed groups.
+        4. ``len(samples) >= min_samples`` -- the poll stayed alive.
+        5. multi-way ECMP-set count and ceiling (``min_ecmp_width`` /
            ``max_multiway_groups``).
-        5. the settled multi-way count (``expected_converged_multiway_groups``).
-        6. a floor on what was observed at all (``min_observed_groups``).
-        7. an optional same-sample aggregate count and multipath floor.
-        8. recovery to the opening baseline (``recovery_tolerance``).
-        9. BGP-only named-NHG creation across every width
+        6. the settled multi-way count (``expected_converged_multiway_groups``).
+        7. a floor on what was observed at all (``min_observed_groups``).
+        8. an optional same-sample aggregate count and multipath floor.
+        9. recovery to the opening baseline (``recovery_tolerance``).
+        10. BGP-only named-NHG creation across every width
            (``min_bgp_groups``).
-        10. sustained BGP-only multipath-NHG creation
+        11. sustained BGP-only multipath-NHG creation
            (``min_bgp_multiway_groups``).
-        11. a floor on the peak sampled EOS programmed-group count
+        12. a floor on the peak sampled EOS programmed-group count
             (``min_programmed_groups``).
-        12. an inclusive ceiling on every sampled EOS nexthop group whose
+        13. an inclusive ceiling on every sampled EOS nexthop group whose
             group-level programmed state is true (``max_programmed_groups``).
 
         Collecting no data is a FAILURE, not a SKIP. ``run`` swallows every
@@ -1481,6 +1519,20 @@ class NexthopGroupPoll(PeriodicTask):
                 num_unprogrammed_groups_data,
                 int(max_unprogrammed),
                 None if tolerance is None else int(tolerance),
+            )
+            (failures if failed else verdicts).append(text)
+
+        max_converged_unprogrammed = self._params.get("max_converged_unprogrammed")
+        if max_converged_unprogrammed is not None:
+            failed, text = _converged_unprogrammed_verdict(
+                num_unprogrammed_groups_data,
+                int(max_converged_unprogrammed),
+                int(
+                    self._params.get(
+                        "converged_window_samples",
+                        _DEFAULT_CONVERGED_WINDOW_SAMPLES,
+                    )
+                ),
             )
             (failures if failed else verdicts).append(text)
 
@@ -2605,20 +2657,43 @@ class ThriftStressPeriodicTask(PeriodicTask):
             )
             return
 
+        burst_timeout_s: float = float(
+            params.get("burst_timeout_s", self.DEFAULT_BURST_TIMEOUT_S)
+        )
         flap_interfaces: t.List[str] = []
         if params.get("resolve_flap_interfaces_from_lldp", False):
-            lldp_neighbors = await driver.async_get_lldp_neighbors()
-            flap_interfaces = sorted(
-                interface
-                for interface, neighbor in lldp_neighbors.items()
-                if "ixia"
-                not in str(getattr(neighbor, "remote_device_name", "")).lower()
-            )
-            if not flap_interfaces:
-                raise RuntimeError(
-                    f"thrift_stress: {hostname} has no non-IXIA LLDP interfaces "
-                    "eligible for the dynamic flap"
-                )
+            try:
+                async with asyncio.timeout(burst_timeout_s):
+                    while True:
+                        try:
+                            lldp_neighbors = await driver.async_get_lldp_neighbors()
+                        except TransportError as error:
+                            self.logger.warning(
+                                f"thrift_stress: LLDP transport failure on {hostname}: "
+                                f"{error}; retrying in 5s within {burst_timeout_s}s"
+                            )
+                            await asyncio.sleep(5)
+                            continue
+                        flap_interfaces = sorted(
+                            interface
+                            for interface, neighbor in lldp_neighbors.items()
+                            if "ixia"
+                            not in str(
+                                getattr(neighbor, "remote_device_name", "")
+                            ).lower()
+                        )
+                        if flap_interfaces:
+                            break
+                        self.logger.warning(
+                            f"thrift_stress: {hostname} has no non-IXIA LLDP "
+                            f"interfaces yet; retrying in 5s within {burst_timeout_s}s"
+                        )
+                        await asyncio.sleep(5)
+            except TimeoutError as error:
+                raise TimeoutError(
+                    f"thrift_stress: non-IXIA LLDP interface discovery on {hostname} "
+                    f"did not recover within {burst_timeout_s}s"
+                ) from error
             self.logger.info(
                 f"thrift_stress: dynamically selected {len(flap_interfaces)} "
                 f"non-IXIA LLDP interfaces for this flap cycle: {flap_interfaces}"
@@ -2658,9 +2733,6 @@ class ThriftStressPeriodicTask(PeriodicTask):
             )
             return
 
-        burst_timeout_s: float = float(
-            params.get("burst_timeout_s", self.DEFAULT_BURST_TIMEOUT_S)
-        )
         self.logger.info(
             f"thrift_stress: firing {len(coros)} concurrent calls "
             f"(timeout={burst_timeout_s:.0f}s) ({', '.join(scheduled_breakdown)})"

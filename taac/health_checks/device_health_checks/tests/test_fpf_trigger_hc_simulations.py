@@ -1,6 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
 """Trigger -> HC-expectation SIMULATION tests for the FPF disruption configs.
 
 Behaviour-level validation distinct from the structural config-build tests in
@@ -91,6 +90,7 @@ ODS_MODULE = (
 GPU_HOST = "rtptest1555.mwg2"
 REMOTE_GPU_HOST = "rtptest1575.mwg2"
 PROD_PREFIX = "2401:db00:eef0:1100::/56"
+PEER_PROD_PREFIX = "2401:db00:eef0:2200::/56"
 
 
 def _ts_str(epoch: float) -> str:
@@ -926,16 +926,24 @@ def _prefix_row(
     unreachable,
     host: str = GPU_HOST,
 ) -> ProdHrtPrefixRow:
-    rb = PrefixReachability(
+    rb = _prefix_reachability(reachable, drained, unreachable)
+    return ProdHrtPrefixRow(
+        timestamp=_ts_str(epoch), host=host, prefixes={PROD_PREFIX: rb}
+    )
+
+
+def _prefix_reachability(
+    reachable,
+    drained,
+    unreachable,
+) -> PrefixReachability:
+    return PrefixReachability(
         reachable_planes=list(reachable),
         drained_planes=list(drained),
         unreachable_planes=list(unreachable),
         plane_up=[0, 1, 2, 3, 4, 5, 6, 7],
         plane_down=[],
         device_ids=[0],
-    )
-    return ProdHrtPrefixRow(
-        timestamp=_ts_str(epoch), host=host, prefixes={PROD_PREFIX: rb}
     )
 
 
@@ -1042,6 +1050,8 @@ class Tc15MultiHostProdPrefixTransitionSimulationTest(unittest.IsolatedAsyncioTe
         *,
         mode: str = "transition",
         impacted_planes_by_host=None,
+        prefixes_by_host=None,
+        affected_prefixes_by_host=None,
     ):
         collector = MagicMock()
         collector.hosts = [GPU_HOST, REMOTE_GPU_HOST]
@@ -1062,11 +1072,13 @@ class Tc15MultiHostProdPrefixTransitionSimulationTest(unittest.IsolatedAsyncioTe
                     "mode": mode,
                     "window_start": WINDOW_START,
                     "window_end": WINDOW_END,
-                    "prefixes_by_host": {
+                    "prefixes_by_host": prefixes_by_host
+                    or {
                         GPU_HOST: [PROD_PREFIX],
                         REMOTE_GPU_HOST: [PROD_PREFIX],
                     },
-                    "affected_prefixes_by_host": {
+                    "affected_prefixes_by_host": affected_prefixes_by_host
+                    or {
                         GPU_HOST: [PROD_PREFIX],
                         REMOTE_GPU_HOST: [PROD_PREFIX],
                     },
@@ -1198,6 +1210,153 @@ class Tc15MultiHostProdPrefixTransitionSimulationTest(unittest.IsolatedAsyncioTe
         self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
         self.assertIn("configured-prefix sample", result.message)
         self.assertIn("no affected plane scope", result.message)
+
+    async def test_missing_required_peer_prefix_fails_closed(self):
+        rows = [
+            *_prefix_rows_for_host(GPU_HOST),
+            *_prefix_rows_for_host(REMOTE_GPU_HOST),
+        ]
+        required = {
+            GPU_HOST: [PROD_PREFIX, PEER_PROD_PREFIX],
+            REMOTE_GPU_HOST: [PROD_PREFIX, PEER_PROD_PREFIX],
+        }
+
+        result = await self._run(
+            rows,
+            mode="stability",
+            prefixes_by_host=required,
+            affected_prefixes_by_host={
+                GPU_HOST: [PROD_PREFIX],
+                REMOTE_GPU_HOST: [PROD_PREFIX],
+            },
+        )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("missing required prefix", result.message)
+        self.assertIn(PEER_PROD_PREFIX, result.message)
+
+    async def test_transition_checks_affected_and_stable_peer_prefixes(self):
+        rows = [
+            *_cross_prefix_transition_rows(GPU_HOST),
+            *_cross_prefix_transition_rows(REMOTE_GPU_HOST),
+        ]
+        required = {
+            GPU_HOST: [PROD_PREFIX, PEER_PROD_PREFIX],
+            REMOTE_GPU_HOST: [PROD_PREFIX, PEER_PROD_PREFIX],
+        }
+        affected = {
+            GPU_HOST: [PROD_PREFIX],
+            REMOTE_GPU_HOST: [PROD_PREFIX],
+        }
+
+        result = await self._run(
+            rows,
+            prefixes_by_host=required,
+            affected_prefixes_by_host=affected,
+        )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
+
+    async def test_cross_host_prefix_state_mismatch_fails(self):
+        required = {
+            GPU_HOST: [PROD_PREFIX, PEER_PROD_PREFIX],
+            REMOTE_GPU_HOST: [PROD_PREFIX, PEER_PROD_PREFIX],
+        }
+        rows = [
+            *_cross_prefix_stable_rows(GPU_HOST),
+            *_cross_prefix_stable_rows(
+                REMOTE_GPU_HOST,
+                first_prefix_reachable=[1, 2, 3],
+                first_prefix_drained=[0],
+                first_prefix_unreachable=[0, 4, 5, 6, 7],
+            ),
+        ]
+
+        result = await self._run(
+            rows,
+            mode="stability",
+            prefixes_by_host=required,
+            affected_prefixes_by_host={
+                GPU_HOST: [PROD_PREFIX],
+                REMOTE_GPU_HOST: [PROD_PREFIX],
+            },
+        )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("cross-host mismatch", result.message)
+        self.assertIn(PROD_PREFIX, result.message)
+
+
+def _prefix_rows_for_host(host: str) -> list[ProdHrtPrefixRow]:
+    return [
+        _prefix_row(
+            WINDOW_START + offset,
+            [0, 1, 2, 3],
+            [],
+            [4, 5, 6, 7],
+            host=host,
+        )
+        for offset in (5.0, 20.0, 200.0)
+    ]
+
+
+def _cross_prefix_transition_rows(host: str) -> list[ProdHrtPrefixRow]:
+    rows = []
+    for offset, affected_reachable, affected_unreachable in (
+        (5.0, [0, 1, 2, 3], [4, 5, 6, 7]),
+        (20.0, [1, 2, 3], [0, 4, 5, 6, 7]),
+        (200.0, [1, 2, 3], [0, 4, 5, 6, 7]),
+    ):
+        rows.append(
+            ProdHrtPrefixRow(
+                timestamp=_ts_str(WINDOW_START + offset),
+                host=host,
+                prefixes={
+                    PROD_PREFIX: _prefix_reachability(
+                        affected_reachable,
+                        [],
+                        affected_unreachable,
+                    ),
+                    PEER_PROD_PREFIX: _prefix_reachability(
+                        [0, 1, 2, 3],
+                        [],
+                        [4, 5, 6, 7],
+                    ),
+                },
+            )
+        )
+    return rows
+
+
+def _cross_prefix_stable_rows(
+    host: str,
+    *,
+    first_prefix_reachable: list[int] | None = None,
+    first_prefix_drained: list[int] | None = None,
+    first_prefix_unreachable: list[int] | None = None,
+) -> list[ProdHrtPrefixRow]:
+    reachable = first_prefix_reachable or [0, 1, 2, 3]
+    drained = first_prefix_drained or []
+    unreachable = first_prefix_unreachable or [4, 5, 6, 7]
+    return [
+        ProdHrtPrefixRow(
+            timestamp=_ts_str(WINDOW_START + offset),
+            host=host,
+            prefixes={
+                PROD_PREFIX: _prefix_reachability(
+                    reachable,
+                    drained,
+                    unreachable,
+                ),
+                PEER_PROD_PREFIX: _prefix_reachability(
+                    [0, 1, 2, 3],
+                    [],
+                    [4, 5, 6, 7],
+                ),
+            },
+        )
+        for offset in (5.0, 20.0, 200.0)
+    ]
 
 
 class Tc17ProdPrefixRecoveryTimestampSimulationTest(unittest.IsolatedAsyncioTestCase):

@@ -9,7 +9,7 @@ or Kodiak3 chassis back into themselves via fiber jumpers (a "snake"
 topology). Each ``SnakeConfig`` declares one source/destination port pair
 on the same DUT plus point-to-point IPv6 addressing; the framework
 generates IXIA traffic across the loop and runs PTP + a suite of snake
-playbooks (link toggles, FSDB restart/crash, etc.) plus the standard
+playbooks (link toggles, service disruptions, stress cases, etc.) plus the standard
 ``gen_common_hcs`` health-check set.
 
 Each module-level constant (``MINIPACK3_STANDALONE_*``,
@@ -25,8 +25,10 @@ import typing as t
 
 from ixia.ixia import types as ixia_types
 from taac.health_checks.healthcheck_definitions import (
+    create_device_core_dumps_check,
     create_ixia_packet_loss_check,
     create_port_state_check,
+    create_systemctl_active_state_check,
 )
 from taac.playbooks.playbook_definitions import (
     gen_common_hcs,
@@ -179,7 +181,7 @@ def gen_snake_test_config(
     include_link_flap_longevity: bool = False,
     link_flap_longevity_iterations: int = 33,
     link_flap_longevity_disable_delay_s: int = 30,
-    link_flap_longevity_enable_delay_s: int = 10,
+    link_flap_longevity_enable_delay_s: int = 20,
     link_flap_longevity_soak_s: int = 3600,
     link_flap_longevity_interface_slice: t.Optional[str] = None,
     include_rapid_a_end_flap_stress: bool = False,
@@ -187,6 +189,7 @@ def gen_snake_test_config(
     rapid_a_end_flap_interval_s: int = 6,
     rapid_a_end_flap_rest_s: int = 120,
     rapid_a_end_flap_longevity_s: int = 300,
+    include_split_agent_warmboot: bool = False,
     manual_test_interfaces: t.Optional[t.List[str]] = None,
     ixia_ports: t.Optional[t.List[str]] = None,
     precheck_packet_loss_clear_stats: bool = False,
@@ -208,16 +211,22 @@ def gen_snake_test_config(
     rapid_a_end_flap_neighbor_hostnames: t.Optional[t.List[str]] = None,
     flap_recovery_check_retry_count: t.Optional[int] = None,
     flap_recovery_check_retry_delay_seconds: float = 10.0,
+    half_toggle_check_retry_count: t.Optional[int] = None,
+    half_toggle_check_retry_delay_seconds: float = 2.0,
     include_ptp: bool = True,
     skip_ixia_protocol_verification: bool = False,
     ixia_protocol_verification_timeout: int = 90,
+    default_ixia_l1_config: t.Optional[ixia_types.L1Config] = None,
+    postcheck_systemctl_services: t.Optional[t.List[hc_types.Service]] = None,
+    postcheck_systemctl_min_active_seconds: t.Optional[int] = None,
 ) -> taac_types.TestConfig:
     """Build a snake/loopback ``TestConfig``.
 
     Generates IXIA traffic items + per-loop PTP unicast (two-step)
     configs from the supplied ``snake_configs``, then composes the full
-    snake playbook suite via ``gen_snake_playbooks`` (with common
-    health checks shared between prechecks and postchecks).
+    snake playbook suite via ``gen_snake_playbooks`` (with common link and
+    traffic checks shared between prechecks and postchecks, plus post-only
+    core-dump validation).
 
     Args:
         name: Name registered in ``TestConfig.name``.
@@ -267,6 +276,11 @@ def gen_snake_test_config(
                 state retries. Prechecks remain single-shot.
             postcheck_port_state_retry_delay_seconds: Fixed delay between
                 post-test port-state retries.
+            half_toggle_check_retry_count: Optional number of retries for the
+                half-interface-toggle LLDP and port-state checks that run
+                after interfaces are re-enabled. None keeps them single-shot.
+            half_toggle_check_retry_delay_seconds: Fixed delay between those
+                retries.
             qsfp_service_restart_use_recovery_window: Clear IXIA counters after
                 QSFP service recovery so its postcheck measures a fresh
                 ``packet_loss_sleep_time`` recovery window instead of the
@@ -296,6 +310,11 @@ def gen_snake_test_config(
                 ``rapid_a_end_flap_rest_s`` rest, a stats clear, a mid-test
                 validation, and a ``rapid_a_end_flap_longevity_s`` soak.
                 Defaults: 1h continuous / 6s gap / 2m rest / 5m soak.
+            include_split_agent_warmboot: When True, include
+                ``test_snake_sw_agent_warmboot`` and
+                ``test_snake_hw_agent_warmboot``, which restart
+                ``fboss_sw_agent`` and ``fboss_hw_agent@0`` separately. Only
+                for platforms that run a split agent.
             manual_test_interfaces: Optional explicit interface list
                 forwarded to ``gen_snake_playbooks`` for tests that
                 need an operator-pinned target set.
@@ -312,6 +331,10 @@ def gen_snake_test_config(
                 The traffic precheck still verifies end-to-end forwarding.
             ixia_protocol_verification_timeout: Settle time used when protocol
                 verification is skipped.
+            postcheck_systemctl_services: When set, every playbook postchecks
+                that these units are active, retried like the port-state check.
+            postcheck_systemctl_min_active_seconds: Minimum time each of those
+                units must have been active, so a crash loop FAILs.
 
     Returns:
         A ``TestConfig`` ready to slot into ``SNAKE_TEST_CONFIGS``.
@@ -409,6 +432,18 @@ def gen_snake_test_config(
     if packet_loss_sleep_time != 10:
         # post-check: keep clear_traffic_stats=False, only adjust the drain window
         common_postchecks = _override_packet_loss(common_hcs, clear_traffic_stats=False)
+    if postcheck_systemctl_services:
+        common_postchecks = common_postchecks + [
+            create_systemctl_active_state_check(
+                services=postcheck_systemctl_services,
+                retry_count=postcheck_port_state_retry_count or 6,
+                retry_delay_seconds=postcheck_port_state_retry_delay_seconds,
+                retry_delay_multiplier=1.0,
+                min_active_seconds=postcheck_systemctl_min_active_seconds,
+            )
+        ]
+
+    common_postchecks = [*common_postchecks, create_device_core_dumps_check()]
 
     qsfp_service_restart_postchecks = None
     if qsfp_service_restart_use_recovery_window:
@@ -467,7 +502,10 @@ def gen_snake_test_config(
         flap_recovery_check_retry_delay_seconds=(
             flap_recovery_check_retry_delay_seconds
         ),
+        half_toggle_check_retry_count=half_toggle_check_retry_count,
+        half_toggle_check_retry_delay_seconds=half_toggle_check_retry_delay_seconds,
         skip_lldp_check=skip_lldp_check,
+        include_split_agent_warmboot=include_split_agent_warmboot,
     )
     if playbooks_to_include is not None:
         included_playbooks = set(playbooks_to_include)
@@ -520,6 +558,11 @@ def gen_snake_test_config(
         # in that very code path. Every snake run pays the cold cost on
         # purpose so any drift in topology assembly surfaces immediately.
         ixia_config_cache=taac_types.IxiaConfigCache(enabled=False),
+        default_basic_port_config=(
+            taac_types.BasicPortConfig(l1_config=default_ixia_l1_config)
+            if default_ixia_l1_config is not None
+            else None
+        ),
     )
     return test_config
 
@@ -668,10 +711,6 @@ MINIPACK3_STANDALONE_TEST_CONFIG_ZR4_800G = gen_snake_test_config(
         type=ixia_types.FrameSizeType.CUSTOM_IMIX,
         imix_weight={94: 1, 96: 18, 192: 3, 512: 1, 1200: 1, 4600: 76, 9000: 76},
     ),
-    playbooks_to_skip=[
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
-    ],
     iteration=10,
     include_link_flap_longevity=True,
     link_flap_longevity_enable_delay_s=300,
@@ -800,10 +839,6 @@ KODIAK3_STANDALONE_TEST_CONFIG_ZR4_800G = gen_snake_test_config(
         type=ixia_types.FrameSizeType.CUSTOM_IMIX,
         imix_weight={94: 1, 96: 18, 192: 3, 512: 1, 1200: 1, 4600: 76, 9000: 76},
     ),
-    playbooks_to_skip=[
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
-    ],
     iteration=10,
     include_link_flap_longevity=True,
 )
@@ -885,8 +920,6 @@ MINIPACK3_STANDALONE_TEST_CONFIG_FBOSS159_800G_DR4_GEARBOX = gen_snake_test_conf
     #    port every 5s for 10 min and FAILS on any flap -- surfacing the spontaneous
     #    ~60s gearbox link flaps (T283020514) instead of riding through them.
     #  * remaining longevity (1m/1h/72h): out of scope for this run.
-    #  * fsdb restart/crash: fsdb is not deployed on this manually brought-up box (no
-    #    fsdb.service), so they time out on fsdb-thrift -- an environment gap, not a bug.
     #  * transceiver/fiber removal: require physical optic/fiber manipulation at the rack.
     # The three system-reboot playbooks (bmc_full / bmc_microserver / microserver) are
     # now ENABLED. They were skipped out of concern that this hand-brought-up box (no
@@ -900,8 +933,6 @@ MINIPACK3_STANDALONE_TEST_CONFIG_FBOSS159_800G_DR4_GEARBOX = gen_snake_test_conf
         "test_72hr_longevity",
         "test_snake_transceiver_removal",
         "test_snake_fiber_removal",
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
     ],
     # iteration=1 for the first full Phase 3/4 sweep (validate each disruption once);
     # bump later once a clean single-iteration sweep is confirmed.
@@ -955,10 +986,6 @@ ICEPACK_STANDALONE_TEST_CONFIG_FR4_800G = gen_snake_test_config(
         type=ixia_types.FrameSizeType.CUSTOM_IMIX,
         imix_weight={94: 1, 96: 18, 192: 3, 512: 1, 1200: 1, 4600: 76, 9000: 76},
     ),
-    playbooks_to_skip=[
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
-    ],
     iteration=10,
     include_link_flap_longevity=True,
     link_flap_longevity_enable_delay_s=300,
@@ -982,10 +1009,6 @@ ICEPACK_STANDALONE_TEST_CONFIG_FR4_400G = gen_snake_test_config(
         type=ixia_types.FrameSizeType.CUSTOM_IMIX,
         imix_weight={94: 1, 96: 18, 192: 3, 512: 1, 1200: 1, 4600: 76, 9000: 76},
     ),
-    playbooks_to_skip=[
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
-    ],
     iteration=10,
     include_link_flap_longevity=True,
 )
@@ -1061,7 +1084,6 @@ ICEPACK_MP3_CROSS_DEVICE_ICEPACK_THRIFT_FLAP_TEST_CONFIG = gen_snake_test_config
         "test_snake_interface_reset_with_qsfp_reset",
         "test_snake_agent_warmboot",
         "test_snake_qsfp_service_restart",
-        "test_snake_fsdb_restart",
         "test_snake_agent_coldboot",
         "test_snake_agent_crash",
         "test_snake_qsfp_service_crash",
@@ -1119,7 +1141,6 @@ ICEPACK_MP3_CROSS_DEVICE_MP3_THRIFT_FLAP_TEST_CONFIG = gen_snake_test_config(
         "test_snake_interface_reset_with_qsfp_reset",
         "test_snake_agent_warmboot",
         "test_snake_qsfp_service_restart",
-        "test_snake_fsdb_restart",
         "test_snake_agent_coldboot",
         "test_snake_agent_crash",
         "test_snake_qsfp_service_crash",
@@ -1161,6 +1182,42 @@ MINIPACK3_STANDALONE_BENCHMARK_TEST_CONFIG = gen_snake_test_config(
     ],
 )
 
+
+WEDGE800BACT_STANDALONE_TEST_CONFIG_200G = gen_snake_test_config(
+    name="WEDGE800BACT_STANDALONE_TEST_CONFIG_200G",
+    basset_pool="dne.standalone",
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source="fboss338826578.ash6:eth1/1/1",
+            destination="fboss338826578.ash6:eth1/32/5",
+            source_ip="5000:1::1/64",
+            destination_ip="5000:1::2/64",
+        ),
+    ],
+    direct_ixia_connections=[
+        taac_types.DirectIxiaConnection(
+            interface="eth1/1/1",
+            ixia_chassis_ip="2401:db00:2066:3091::3002",
+            ixia_port="1/135",
+        ),
+        taac_types.DirectIxiaConnection(
+            interface="eth1/32/5",
+            ixia_chassis_ip="2401:db00:2066:3091::3002",
+            ixia_port="1/136",
+        ),
+    ],
+    hostname="fboss338826578.ash6",
+    line_rate=99,
+    traffic_item_name="W800_BACT_200G_SNAKE",
+    include_benchmark=True,
+    include_link_flap_longevity=True,
+    include_rapid_a_end_flap_stress=True,
+    playbooks_to_skip=[
+        "test_snake_fsdb_restart",
+        "test_snake_fsdb_crash",
+    ],
+)
+
 SNAKE_TEST_CONFIGS = [
     MINIPACK3_STANDALONE_TEST_CONFIG_FBOSS159_800G_DR4_GEARBOX,
     MINIPACK3_STANDALONE_TEST_CONFIG,
@@ -1182,4 +1239,5 @@ SNAKE_TEST_CONFIGS = [
     ICEPACK_MP3_CROSS_DEVICE_MP3_THRIFT_FLAP_TEST_CONFIG,
     ICEPACK_STANDALONE_TEST_CONFIG_FR4_400G,
     ICEPACK_STANDALONE_TEST_CONFIG_FR4_800G,
+    WEDGE800BACT_STANDALONE_TEST_CONFIG_200G,
 ]

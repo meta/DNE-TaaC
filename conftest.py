@@ -10,10 +10,26 @@ When a test file is ported to work without internal dependencies, remove
 its entry (or its parent directory) from the appropriate list.
 """
 
+import importlib
 import os
 
 import pytest
 from taac.libs.collectors.registry import clear_collectors
+
+# Pytest's importlib mode may materialize the source-side ``taac`` namespace
+# before collection and omit namespace contributors from the generated thrift
+# install tree.  Preload the two generated roots while the full namespace path
+# is still intact so OSS tests can import their ``types``/``thrift_types``
+# children normally.  A source-only checkout can still collect the tests that
+# do not require generated bindings.
+for _generated_root in ("taac.health_check", "taac.test_as_a_config"):
+    try:
+        importlib.import_module(_generated_root)
+    except ModuleNotFoundError as exc:
+        # A source-only checkout legitimately lacks the generated root. Do not
+        # hide a missing transitive import inside a root that was found.
+        if exc.name != _generated_root:
+            raise
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +81,9 @@ _OSS_READY_TEST_FILES = [
     "taac/health_checks/tests/test_common_utils.py",
     "taac/health_checks/tests/test_convergence_observer.py",
     "taac/tasks/tests/test_oss_gating.py",
+    "taac/health_checks/snapshot_health_checks/test_cpu_queue_failure_window.py",
+    # Pure unit test: Ixia via __new__, config element mocked.
+    "taac/ixia/tests/test_ipv4_ecn_bits.py",
 ]
 
 # Build absolute paths relative to this conftest's directory (repo root).

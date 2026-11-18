@@ -6,6 +6,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import typing as t
+from collections import Counter
 from dataclasses import dataclass, replace
 
 from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
@@ -74,6 +75,7 @@ from taac.abstractions.routing_semantics import PeerRelationship
 from taac.abstractions.topologies.ebb_prefix_inventory import (
     EBB_IBGP_V4_EXCLUDED_PREFIX_INDICES,
     EBB_IBGP_V6_EXCLUDED_PREFIX_INDICES,
+    EBB_IBGP_VETTED_CANDIDATE_SPAN,
 )
 from taac.abstractions.topology import (
     AddressPlan,
@@ -91,6 +93,7 @@ from taac.abstractions.topology import (
     NextHopDistribution,
     NextHopIntent,
     NextHopMode,
+    OpenRInjectionScale,
     OpenRMode,
     PeerPrefixActivation,
     PeerPrefixDistribution,
@@ -105,6 +108,251 @@ from taac.abstractions.topology import (
     StandardCommunity,
     TaskCompatibilityProfile,
 )
+from taac.abstractions.validation import (
+    is_valid_device_state_guard_namespace,
+    TopologyValidationError,
+    ValidationIssue,
+)
+
+
+_EBB_TORNADO_PLANES = (1, 2, 3, 4)
+
+
+def _require_count(name: str, value: object, *, minimum: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(
+            f"EBB scale {name} must be an integer >= {minimum}; got {value!r}"
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class EbbScaleProfile:
+    """The EBB fleet scale one topology instance emulates.
+
+    A scale is a fiscal-year fleet target, not a chassis or a testbed: it says
+    how many HE sites each DC plane stands in for, how many emulated peers
+    stand in for them, and how many routes each of those peers carries. It
+    carries no addresses -- those come from the bound topology -- so the same
+    profile is correct on every chassis.
+
+    Every dimension is an explicit field, because each one is set by a
+    different owner decision and drives a different consumer. The dimensions
+    are not independent, though: the Open/R injection exists to make the
+    advertised route next hops resolvable, and each emulated HE peer row
+    advertises exactly one of them. ``__post_init__`` therefore binds the
+    injection, the advertised population and the peer fleet together, so a
+    profile that moves one without the others is rejected here rather than
+    compiling into a topology that injects headroom nothing uses, or leaves
+    advertised next hops unresolved.
+
+    Attributes:
+        name: Stable identifier for the profile, used in diagnostics.
+        he_sites_per_range: HE sites emulated per DC plane, which is also the
+            synthetic nodes and host routes injected per range, per AFI.
+        ibgp_peers_per_group: Emulated peers in every AF-specific HE and MP
+            iBGP device group.
+        advertised_pnh_count: Leading rows of each injected range that the HE
+            peers advertise as route next hops. One per HE peer row.
+        routes_per_he_peer: Routes each HE peer advertises. The four HE planes
+            advertise the same per-peer windows, so this times the peer count
+            is the unique HE route demand per AFI.
+        fa_routes_per_peer: Baseline routes each eBGP (FA) peer advertises.
+        attribute_churn_cadence_seconds: Wall-clock budget for each attribute-churn
+            cycle, including the IXIA mutation and convergence observation.
+        attribute_churn_transition_timeout_seconds: Soft convergence threshold for
+            each attribute-churn transition.
+        attribute_churn_ixia_apply_timeout_seconds: Bound for applying and reading
+            back one attribute mutation on IXIA.
+        route_oscillation_advertise_threshold_seconds: Soft SLA for restoring
+            advertised routes after each oscillation withdrawal.
+        openr_injection_headroom: Injected rows per range beyond the advertised
+            population. Explicit so that zero headroom is an enforced
+            equality, not two numbers that happen to match.
+        allows_bgp_monitor: Whether a topology at this scale may carry the
+            BGP-monitor session group.
+        allows_dense_unvetted_route_tail: Whether the HE route demand may
+            extend past the candidate span the migration exclusion inventory
+            vetted, into dense synthetic prefixes nothing vetted. Topology
+            construction fails when the demand needs that tail and this is
+            false.
+        ibgp_planes_by_link: Tornado planes carried by each iBGP IXIA link, in
+            port-map order. A plane's HE and MP groups always share its link,
+            so a plane disruption stays on one physical link.
+        fa_diverse_nhg_memberships: Whether two FA peers sit out of each of
+            the 25 diverse-NHG prefix blocks, producing 50 width-138 baseline
+            NHGs. When false, every FA peer advertises every FA route.
+        next_hop_step: Address stride between consecutive HE sites. Must match
+            the stride the plane's advertised route next hops use.
+        bgp_total_path_limit: BGP++ ``switch_limit_config.total_path_limit``
+            to configure before BGP++ starts, or None to keep the limit the
+            deployed EBB BGP++ config carries. BGP++ counts received and
+            advertised paths against it and drops prefixes past it.
+        device_state_guard_namespace: Operation-id namespace under which
+            delegated setup snapshots the DUT, and in Open/R STANDALONE mode
+            the helper, before mutating them, and teardown restores them last.
+            None emits no snapshot or restore.
+    """
+
+    name: str
+    he_sites_per_range: int
+    ibgp_peers_per_group: int
+    advertised_pnh_count: int
+    routes_per_he_peer: int
+    fa_routes_per_peer: int
+    openr_injection_headroom: int
+    allows_bgp_monitor: bool
+    allows_dense_unvetted_route_tail: bool
+    ibgp_planes_by_link: tuple[tuple[int, ...], ...]
+    fa_diverse_nhg_memberships: bool
+    attribute_churn_cadence_seconds: int = 60
+    attribute_churn_transition_timeout_seconds: int = 60
+    attribute_churn_ixia_apply_timeout_seconds: int = 60
+    route_oscillation_advertise_threshold_seconds: int | None = None
+    next_hop_step: int = 2
+    bgp_total_path_limit: int | None = None
+    device_state_guard_namespace: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("EBB scale profile requires a name")
+        if self.device_state_guard_namespace is not None and (
+            not is_valid_device_state_guard_namespace(self.device_state_guard_namespace)
+        ):
+            raise ValueError(
+                f"{self.name}: device_state_guard_namespace must be None or a "
+                "nonempty string of ASCII letters, digits, '_', '.' or '-'; got "
+                f"{self.device_state_guard_namespace!r}"
+            )
+        # Resolve once at construction so an invalid site count or stride is
+        # rejected here rather than at the first bind. Discarding the result
+        # is the point: OpenRInjectionScale owns the validation.
+        _ = self.openr_injection_scale
+        if self.bgp_total_path_limit is not None:
+            _require_count("bgp_total_path_limit", self.bgp_total_path_limit, minimum=1)
+        for field_name in (
+            "ibgp_peers_per_group",
+            "advertised_pnh_count",
+            "routes_per_he_peer",
+            "fa_routes_per_peer",
+            "attribute_churn_cadence_seconds",
+            "attribute_churn_transition_timeout_seconds",
+            "attribute_churn_ixia_apply_timeout_seconds",
+        ):
+            _require_count(field_name, getattr(self, field_name), minimum=1)
+        if self.route_oscillation_advertise_threshold_seconds is not None:
+            _require_count(
+                "route_oscillation_advertise_threshold_seconds",
+                self.route_oscillation_advertise_threshold_seconds,
+                minimum=1,
+            )
+        _require_count(
+            "openr_injection_headroom", self.openr_injection_headroom, minimum=0
+        )
+        for field_name in (
+            "allows_bgp_monitor",
+            "allows_dense_unvetted_route_tail",
+            "fa_diverse_nhg_memberships",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"EBB scale {field_name} must be a bool; got {value!r}"
+                )
+        if self.advertised_pnh_count != self.ibgp_peers_per_group:
+            raise ValueError(
+                f"{self.name}: advertised_pnh_count {self.advertised_pnh_count} "
+                f"must equal ibgp_peers_per_group {self.ibgp_peers_per_group}; "
+                "each HE peer row advertises exactly one route next hop"
+            )
+        injected = self.advertised_pnh_count + self.openr_injection_headroom
+        if self.he_sites_per_range != injected:
+            raise ValueError(
+                f"{self.name}: he_sites_per_range {self.he_sites_per_range} must "
+                f"equal advertised_pnh_count {self.advertised_pnh_count} plus "
+                f"openr_injection_headroom {self.openr_injection_headroom}"
+            )
+        links = self.ibgp_planes_by_link
+        if (
+            not isinstance(links, tuple)
+            or not links
+            or any(not isinstance(link, tuple) or not link for link in links)
+            or sorted(plane for link in links for plane in link)
+            != list(_EBB_TORNADO_PLANES)
+        ):
+            raise ValueError(
+                f"{self.name}: ibgp_planes_by_link must assign each Tornado plane "
+                f"{_EBB_TORNADO_PLANES} to exactly one nonempty link; got {links!r}"
+            )
+
+    @property
+    def openr_injection_scale(self) -> OpenRInjectionScale:
+        return OpenRInjectionScale(
+            count=self.he_sites_per_range,
+            step=self.next_hop_step,
+        )
+
+    @property
+    def he_routes_per_afi(self) -> int:
+        """Unique HE routes per AFI, shared by all four HE planes."""
+        return self.ibgp_peers_per_group * self.routes_per_he_peer
+
+    def ibgp_link_of_plane(self, plane: int) -> int:
+        return next(
+            link
+            for link, planes in enumerate(self.ibgp_planes_by_link)
+            if plane in planes
+        )
+
+
+# Scheduled: every EBB CICD binding runs this. 4 DC planes x 63 HE sites gives
+# 252 synthetic nodes and 504 injected host routes, one row of headroom over
+# the 62 advertised next hops; 62 peers x 750 routes is 46,500 HE routes/AFI.
+EBB_FY26_SCALE = EbbScaleProfile(
+    name="EBB_FY26",
+    he_sites_per_range=63,
+    ibgp_peers_per_group=IBGP_PEER_SCALE_PER_PLANE,
+    advertised_pnh_count=IBGP_PEER_SCALE_PER_PLANE,
+    routes_per_he_peer=750,
+    fa_routes_per_peer=750,
+    openr_injection_headroom=1,
+    allows_bgp_monitor=True,
+    allows_dense_unvetted_route_tail=False,
+    ibgp_planes_by_link=(_EBB_TORNADO_PLANES,),
+    fa_diverse_nhg_memberships=True,
+)
+
+# FY27 Scenario 1, from the owner's authoritative scale sheet. Not scheduled
+# anywhere: 100 peers per AF-specific HE/MP group, an injection of exactly the
+# 100 advertised next hops per range, 1,000 routes per HE peer (100,000 unique
+# HE routes/AFI) and per FA peer, and no BGP monitor. 100,000 retained routes
+# need 100,750 candidates; the first 47,250 keep the vetted FY26 exclusions,
+# and the remaining 53,500 are declared dense synthetic prefixes. Tornado
+# planes 1-2 and 3-4 split across two iBGP links so each carries 4 groups x
+# 100 = 400 addresses per AFI, inside the TAAC guard of 500. The sheet counts
+# 280,000 FA paths (280 sessions x 1,000 routes), so every FA peer advertises
+# every FA route; the FY26 diverse-NHG membership mask would leave 276,000.
+EBB_FY27_SCALE = EbbScaleProfile(
+    name="EBB_FY27",
+    he_sites_per_range=100,
+    ibgp_peers_per_group=100,
+    advertised_pnh_count=100,
+    routes_per_he_peer=1000,
+    fa_routes_per_peer=1000,
+    openr_injection_headroom=0,
+    # The sheet's 1.08M received plus 29.6M advertised paths exceed the
+    # 30,000,000 total-path limit the EBB BGP++ config deploys.
+    bgp_total_path_limit=32_000_000,
+    device_state_guard_namespace="ebb_fy27_stage1",
+    allows_bgp_monitor=False,
+    allows_dense_unvetted_route_tail=True,
+    ibgp_planes_by_link=((1, 2), (3, 4)),
+    fa_diverse_nhg_memberships=False,
+    attribute_churn_cadence_seconds=240,
+    attribute_churn_transition_timeout_seconds=150,
+    attribute_churn_ixia_apply_timeout_seconds=150,
+    route_oscillation_advertise_threshold_seconds=120,
+)
+
 
 EBB_PARENT_NETWORKS: dict[str, str] = {
     "ebgp_v6": IXIA_EBGP_IC_PARENT_NETWORK_V6,
@@ -195,10 +443,38 @@ EBB_BASELINE_ATTRIBUTES = (
 EBB_FIBAGENT_BGP_NHG_WATERMARK_HIGH = 1000
 EBB_FIBAGENT_BGP_NHG_WATERMARK_LOW = 1000
 
-EBB_ROUTE_STORM_SHARD_PEER_COUNTS = (21, 21, 20)
-EBB_ROUTE_STORM_SHARD_ROUTE_COUNTS = tuple(
-    peer_count * 750 for peer_count in EBB_ROUTE_STORM_SHARD_PEER_COUNTS
+_EBB_ROUTE_STORM_SHARD_COUNT = 3
+
+
+def ebb_route_storm_shard_peer_counts(peer_count: int) -> tuple[int, ...]:
+    """Split one plane's peers into the route-storm IXIA shards, largest first.
+
+    The shards are peer-aligned and as even as possible, so the heaviest shard
+    -- the unit IXIA programs at once -- is as small as the peer count allows.
+    """
+    _require_count("route-storm peer count", peer_count, minimum=1)
+    base, extra = divmod(peer_count, _EBB_ROUTE_STORM_SHARD_COUNT)
+    if base == 0:
+        raise ValueError(
+            f"route storm needs at least {_EBB_ROUTE_STORM_SHARD_COUNT} peers per "
+            f"plane to shard; got {peer_count}"
+        )
+    return tuple(
+        base + (ordinal < extra) for ordinal in range(_EBB_ROUTE_STORM_SHARD_COUNT)
+    )
+
+
+def ebb_route_storm_shard_route_counts(scale: EbbScaleProfile) -> tuple[int, ...]:
+    return tuple(
+        peer_count * scale.routes_per_he_peer
+        for peer_count in ebb_route_storm_shard_peer_counts(scale.ibgp_peers_per_group)
+    )
+
+
+EBB_ROUTE_STORM_SHARD_PEER_COUNTS = ebb_route_storm_shard_peer_counts(
+    EBB_FY26_SCALE.ibgp_peers_per_group
 )
+EBB_ROUTE_STORM_SHARD_ROUTE_COUNTS = ebb_route_storm_shard_route_counts(EBB_FY26_SCALE)
 
 EBB_DIVERSE_NHG_GROUP_COUNT = 25
 EBB_DIVERSE_NHG_PREFIXES_PER_GROUP = 30
@@ -243,12 +519,12 @@ EBB_PEER_GROUPS: dict[str, BgpPeerGroup] = {
     PEERGROUP_BGP_MON: BGP_MON_PEER_GROUP,
 }
 
-EBB_FULL_SCALE_PORT_MAP = {
+EBB_PORT_MAP = {
     "uplink": 0,
     "ibgp": 1,
 }
-EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON = {
-    **EBB_FULL_SCALE_PORT_MAP,
+EBB_PORT_MAP_WITH_BGPMON = {
+    **EBB_PORT_MAP,
     "bgpmon": 2,
 }
 
@@ -261,6 +537,49 @@ _EBB_IBGP_PORT_ASSIGNMENT = IxiaPortAssignment(
     reuse_group="ebb_ibgp",
 )
 _EBB_BGPMON_PORT_ASSIGNMENT = IxiaPortAssignment(logical_role="bgpmon")
+
+
+def ebb_ibgp_port_assignment(link: int) -> IxiaPortAssignment:
+    """The IXIA assignment for one iBGP link.
+
+    Link 0 keeps the FY26 role and reuse group. Each further link needs its
+    own logical role and its own reuse group, because a reuse group may claim
+    only one physical connection.
+    """
+    if link == 0:
+        return _EBB_IBGP_PORT_ASSIGNMENT
+    suffix = chr(ord("a") + link)
+    return IxiaPortAssignment(
+        logical_role=f"ibgp_{suffix}",
+        reuse_group=f"ebb_ibgp_{suffix}",
+    )
+
+
+def ebb_port_map(
+    scale: EbbScaleProfile,
+    *,
+    include_bgpmon: bool | None = None,
+) -> dict[str, int]:
+    """Map the EBB roles at ``scale`` onto ordered physical inventory entries.
+
+    The eBGP uplink takes entry 0, the iBGP links follow in order, and the BGP
+    monitor, when present, takes the next entry. FY26 therefore reproduces
+    ``EBB_PORT_MAP`` and ``EBB_PORT_MAP_WITH_BGPMON``; FY27's second iBGP link
+    takes entry 2, the lane the FY26 monitor uses.
+    """
+    if include_bgpmon is None:
+        include_bgpmon = scale.allows_bgp_monitor
+    if include_bgpmon and not scale.allows_bgp_monitor:
+        raise ValueError(f"{scale.name} models no BGP monitor")
+    port_map = {"uplink": 0}
+    for link in range(len(scale.ibgp_planes_by_link)):
+        port_map[ebb_ibgp_port_assignment(link).logical_role] = 1 + link
+    if include_bgpmon:
+        port_map["bgpmon"] = len(port_map)
+    return port_map
+
+
+EBB_FY27_PORT_MAP = ebb_port_map(EBB_FY27_SCALE)
 
 EBB_DEVICE_CONFIG = RoutingDeviceConfig(
     update_group_enable=False,
@@ -330,6 +649,208 @@ EBB_PREFIX_SETS = (
     EBB_IBGP_V6_PREFIX_SET,
     EBB_IBGP_V4_PREFIX_SET,
 )
+
+
+def _ebb_route_inventory_issues(
+    sized_names: t.AbstractSet[str],
+) -> list[ValidationIssue]:
+    """Name every way ``EBB_PREFIX_SETS`` differs from the sets the scale sizes.
+
+    A set nothing sizes would reach the topology at its checked-in count, and
+    a missing one would leave its advertisements without an inventory. Ad-hoc
+    inventories belong in ``extra_prefix_sets``, not here.
+    """
+    names = Counter(prefix_set.name for prefix_set in EBB_PREFIX_SETS)
+    issues = []
+    unsized = sorted(names.keys() - sized_names)
+    if unsized:
+        issues.append(
+            ValidationIssue(
+                path="prefix_sets",
+                code="ebb_route_inventory_unsized",
+                message=(
+                    f"EBB_PREFIX_SETS holds {unsized}, which no scale dimension "
+                    "sizes. Give each a scale-derived count, or pass it as "
+                    "extra_prefix_sets."
+                ),
+            )
+        )
+    missing = sorted(sized_names - names.keys())
+    if missing:
+        issues.append(
+            ValidationIssue(
+                path="prefix_sets",
+                code="ebb_route_inventory_missing",
+                message=(
+                    f"EBB_PREFIX_SETS lacks {missing}, which every EBB topology "
+                    "sizes and advertises."
+                ),
+            )
+        )
+    duplicated = sorted(name for name, count in names.items() if count > 1)
+    if duplicated:
+        issues.append(
+            ValidationIssue(
+                path="prefix_sets",
+                code="ebb_route_inventory_duplicated",
+                message=f"EBB_PREFIX_SETS names {duplicated} more than once.",
+            )
+        )
+    return issues
+
+
+# Adjacent spaces formulaic progressions continue into once demand outgrows
+# their FY26 parents. Neither iBGP parent widens to a supernet: the only
+# aligned /7 holding 11/8 is 10.0.0.0/7, which also holds session networks.
+_EBB_IBGP_EXTENSION_PARENT_NETWORKS: dict[str, str] = {
+    EBB_IBGP_V4_PREFIX_SET.name: "12.0.0.0/8",
+    EBB_IBGP_V6_PREFIX_SET.name: "2001:db8:1::/48",
+}
+_EBB_PREFIX_EXTENSION_PARENT_NETWORKS: dict[str, str] = {
+    **_EBB_IBGP_EXTENSION_PARENT_NETWORKS,
+    EBB_EBGP_V4_PREFIX_SET.name: "120.4.0.0/17",
+}
+
+
+def _exclusions_within(excluded: tuple[int, ...], count: int) -> tuple[int, ...]:
+    """The excluded candidates that fall before the last of ``count`` retained."""
+    retained = 0
+    while retained < len(excluded) and excluded[retained] < count + retained:
+        retained += 1
+    return excluded[:retained]
+
+
+def _formulaic_candidate_capacity(
+    start_prefix: str,
+    prefix_step: int,
+    parent_networks: t.Sequence[str],
+) -> int:
+    """Candidates from ``start_prefix`` to the end of its contiguous parents."""
+    start = int(ipaddress.ip_address(start_prefix))
+    end: int | None = None
+    for network in sorted(
+        (ipaddress.ip_network(parent) for parent in parent_networks),
+        key=lambda network: int(network.network_address),
+    ):
+        first, last = int(network.network_address), int(network.broadcast_address)
+        if end is None and first <= start <= last:
+            end = last
+        elif end is not None and first == end + 1:
+            end = last
+    return 0 if end is None else (end - start) // prefix_step + 1
+
+
+def _ebb_sized_prefix_set(
+    prefix_set: PrefixSet,
+    count: int,
+    *,
+    demand: str,
+    vetted_span: int | None = None,
+) -> tuple[PrefixSet, list[ValidationIssue]]:
+    """Size one EBB route inventory to ``count`` retained prefixes.
+
+    Every way the inventory can fall short is reported as a named issue
+    rather than left to surface later as an out-of-range index.
+    """
+    source = prefix_set.source
+    path = f"prefix_sets.{prefix_set.name}"
+    excluded = _exclusions_within(source.excluded_indices, count)
+    span = count + len(excluded)
+    issues = []
+    if vetted_span is not None and span > vetted_span:
+        issues.append(
+            ValidationIssue(
+                path=path,
+                code="ebb_route_window_unvetted",
+                message=(
+                    f"{demand} needs a {span:,}-candidate span from "
+                    f"{prefix_set.name}, but its exclusion inventory vetted only "
+                    f"the first {vetted_span:,} candidates against the migration "
+                    f"route inventory, leaving {span - vetted_span:,} unvetted. "
+                    "Regenerate the exclusion inventory for the larger span, or "
+                    "declare allows_dense_unvetted_route_tail on the scale profile."
+                ),
+            )
+        )
+    parents = (source.parent_network,)
+    step = int(source.prefix_step)
+    extension = _EBB_PREFIX_EXTENSION_PARENT_NETWORKS.get(prefix_set.name)
+    if extension and span > _formulaic_candidate_capacity(
+        source.start_prefix, step, parents
+    ):
+        parents = (*parents, extension)
+    capacity = _formulaic_candidate_capacity(source.start_prefix, step, parents)
+    if span > capacity:
+        issues.append(
+            ValidationIssue(
+                path=path,
+                code="ebb_route_prefix_capacity_exceeded",
+                message=(
+                    f"{demand} needs {count:,} prefixes from {prefix_set.name}, a "
+                    f"{span:,}-candidate span with {len(excluded):,} exclusions, "
+                    f"but {', '.join(parents)} hold {capacity:,} candidates from "
+                    f"{source.start_prefix}. Reduce the demand or extend the "
+                    "inventory with an adjacent parent network."
+                ),
+            )
+        )
+    sized = replace(
+        prefix_set,
+        source=replace(
+            source,
+            count=count,
+            excluded_indices=excluded,
+            extension_parent_networks=parents[1:],
+        ),
+    )
+    return sized, issues
+
+
+def _ebb_prefix_sets(
+    topology_name: str,
+    scale: EbbScaleProfile,
+    ebgp_prefix_count: int,
+) -> tuple[PrefixSet, ...]:
+    he_demand = (
+        f"{scale.name} ({scale.ibgp_peers_per_group} HE peers x "
+        f"{scale.routes_per_he_peer} routes)"
+    )
+    fa_demand = f"{scale.name} ({ebgp_prefix_count} FA routes per peer)"
+    vetted_span = (
+        None
+        if scale.allows_dense_unvetted_route_tail
+        else EBB_IBGP_VETTED_CANDIDATE_SPAN
+    )
+    issues = _ebb_route_inventory_issues(
+        {
+            EBB_EBGP_V4_PREFIX_SET.name,
+            EBB_EBGP_V6_PREFIX_SET.name,
+            *_EBB_IBGP_EXTENSION_PARENT_NETWORKS,
+        }
+    )
+    if issues:
+        raise TopologyValidationError(topology_name, issues)
+    # Past the check, a set that is not iBGP is one of the two eBGP sets.
+    sized_sets = []
+    for prefix_set in EBB_PREFIX_SETS:
+        if prefix_set.name in _EBB_IBGP_EXTENSION_PARENT_NETWORKS:
+            sized, set_issues = _ebb_sized_prefix_set(
+                prefix_set,
+                scale.he_routes_per_afi,
+                demand=he_demand,
+                vetted_span=vetted_span,
+            )
+        else:
+            sized, set_issues = _ebb_sized_prefix_set(
+                prefix_set, ebgp_prefix_count, demand=fa_demand
+            )
+        sized_sets.append(sized)
+        issues.extend(set_issues)
+    if issues:
+        raise TopologyValidationError(topology_name, issues)
+    return tuple(sized_sets)
+
+
 EBB_ACCEPT_POLICY = BgpPolicy(
     name="ebb_accept",
     communities=("65529:39744",),
@@ -806,6 +1327,8 @@ def _ebb_advertisement(
     *,
     prefix_sets_by_name: t.Mapping[str, PrefixSet],
     ebgp_static_prefix_count: int,
+    routes_per_he_peer: int,
+    fa_diverse_nhg_memberships: bool,
     next_hop_self: bool = False,
     include_legacy_community_rows: bool = False,
     next_hops: EbbNextHopScheme,
@@ -844,7 +1367,9 @@ def _ebb_advertisement(
         prefix_set=prefix_set.name,
         allocation=PrefixAllocation(
             prefixes_per_peer=(
-                advertised_prefix_count if device_group.role == "uplink" else 750
+                advertised_prefix_count
+                if device_group.role == "uplink"
+                else routes_per_he_peer
             ),
             peer_distribution=distribution,
             route_scale_mode=RouteScaleMode.FLAT,
@@ -865,7 +1390,7 @@ def _ebb_advertisement(
                 advertised_prefix_count,
                 peer_count=device_group.peer_count,
             )
-            if device_group.role == "uplink"
+            if device_group.role == "uplink" and fa_diverse_nhg_memberships
             else None
         ),
         route_attributes=(
@@ -905,11 +1430,12 @@ def _ebb_route_storm_ixia_children(
 
     children = []
     start_index = 0
-    additional_shard_count = len(EBB_ROUTE_STORM_SHARD_PEER_COUNTS) - 1
+    shard_peer_counts = ebb_route_storm_shard_peer_counts(device_group.peer_count)
+    additional_shard_count = len(shard_peer_counts) - 1
     extra_index_start = (
         16 if device_group.name == "dg_ibgp_v6_dc_p1" else 16 + additional_shard_count
     )
-    for ordinal, peer_count in enumerate(EBB_ROUTE_STORM_SHARD_PEER_COUNTS):
+    for ordinal, peer_count in enumerate(shard_peer_counts):
         suffix = "" if ordinal == 0 else f"_SHARD_{ordinal + 1}"
         children.append(
             IxiaDeviceGroupChild(
@@ -950,7 +1476,7 @@ def _with_ebb_route_storm_shards(
 # Variant A: with bgpmon - 3 physical interfaces, 19 DeviceGroups total.
 # Keep this first topology instance explicit so it can be reviewed against
 # Appendix 1 without following helper loops or generated DG lists.
-_EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
+_EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE = LogicalTopology(
     name="ebb_full_scale_with_bgpmon",
     legacy_profile="ebb_full_scale",
     endpoints=(
@@ -1003,6 +1529,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v6_dc_p1",
             role="ibgp_dc_p1",
+            openr_injection_range_ordinal=1,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v6",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1023,6 +1550,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v6_dc_p2",
             role="ibgp_dc_p2",
+            openr_injection_range_ordinal=2,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v6",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1043,6 +1571,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v6_dc_p3",
             role="ibgp_dc_p3",
+            openr_injection_range_ordinal=3,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v6",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1063,6 +1592,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v6_dc_p4",
             role="ibgp_dc_p4",
+            openr_injection_range_ordinal=4,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v6",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1084,6 +1614,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v4_dc_p1",
             role="ibgp_dc_p1",
+            openr_injection_range_ordinal=1,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v4",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1104,6 +1635,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v4_dc_p2",
             role="ibgp_dc_p2",
+            openr_injection_range_ordinal=2,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v4",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1124,6 +1656,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v4_dc_p3",
             role="ibgp_dc_p3",
+            openr_injection_range_ordinal=3,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v4",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1144,6 +1677,7 @@ _EBB_FULL_SCALE_WITH_BGPMON_BASE = LogicalTopology(
         DeviceGroupSpec(
             name="dg_ibgp_v4_dc_p4",
             role="ibgp_dc_p4",
+            openr_injection_range_ordinal=4,
             peer_relationship=PeerRelationship.INTERNAL,
             afi="v4",
             peer_count=IBGP_PEER_SCALE_PER_PLANE,
@@ -1357,15 +1891,25 @@ def _with_ebb_route_intent(
     ebgp_graceful_restart: bool = True,
     next_hop_self: bool = False,
     include_legacy_community_rows: bool = True,
-    ebgp_prefix_count: int = 750,
+    ebgp_prefix_count: int | None = None,
     ebgp_static_prefix_count: int | None = None,
     extra_prefix_sets: tuple[PrefixSet, ...] = (),
     extra_advertisements: t.Mapping[str, tuple[PrefixAdvertisement, ...]] | None = None,
     next_hops: EbbNextHopScheme,
     route_storm_shards: bool = False,
+    scale: EbbScaleProfile,
 ) -> LogicalTopology:
-    if ebgp_prefix_count < 750:
-        raise ValueError("ebgp_prefix_count must be at least 750")
+    if not scale.allows_bgp_monitor and any(
+        device_group.role == "bgpmon" for device_group in topology.device_groups
+    ):
+        raise ValueError(f"{scale.name} models no BGP monitor; drop the bgpmon group")
+    if ebgp_prefix_count is None:
+        ebgp_prefix_count = scale.fa_routes_per_peer
+    if ebgp_prefix_count < scale.fa_routes_per_peer:
+        raise ValueError(
+            f"ebgp_prefix_count must be at least {scale.fa_routes_per_peer}, "
+            f"{scale.name}'s FA routes per peer"
+        )
     static_prefix_count = (
         ebgp_prefix_count
         if ebgp_static_prefix_count is None
@@ -1378,16 +1922,19 @@ def _with_ebb_route_intent(
             "ebgp_static_prefix_count must be positive and no greater than "
             "ebgp_prefix_count"
         )
-    prefix_sets = tuple(
-        replace(prefix_set, source=replace(prefix_set.source, count=ebgp_prefix_count))
-        if prefix_set.name in {EBB_EBGP_V4_PREFIX_SET.name, EBB_EBGP_V6_PREFIX_SET.name}
-        else prefix_set
-        for prefix_set in EBB_PREFIX_SETS
-    )
+    prefix_sets = _ebb_prefix_sets(topology.name, scale, ebgp_prefix_count)
     prefix_sets_by_name = {prefix_set.name: prefix_set for prefix_set in prefix_sets}
     extra_advertisements = extra_advertisements or {}
     device_groups = []
     for device_group in topology.device_groups:
+        if device_group.role.startswith("ibgp_"):
+            device_group = replace(
+                device_group,
+                peer_count=scale.ibgp_peers_per_group,
+                port_assignment=ebb_ibgp_port_assignment(
+                    scale.ibgp_link_of_plane(_ebb_plane_number(device_group))
+                ),
+            )
         peer_group = device_group.peer_group
         if (
             device_group.role == "uplink"
@@ -1403,6 +1950,8 @@ def _with_ebb_route_intent(
             openr_mode,
             prefix_sets_by_name=prefix_sets_by_name,
             ebgp_static_prefix_count=static_prefix_count,
+            routes_per_he_peer=scale.routes_per_he_peer,
+            fa_diverse_nhg_memberships=scale.fa_diverse_nhg_memberships,
             next_hop_self=next_hop_self,
             include_legacy_community_rows=include_legacy_community_rows,
             next_hops=next_hops,
@@ -1427,31 +1976,35 @@ def _with_ebb_route_intent(
             if route_storm_shards
             else resolved_group
         )
-    # Only STANDALONE injects; leaving the other modes empty keeps the NONE-mode
-    # module topologies byte-identical to what they were before this field.
-    if openr_mode is OpenRMode.STANDALONE:
-        injected_v4, injected_v6 = ebb_openr_injected_next_hops(next_hops)
-    else:
-        injected_v4, injected_v6 = [], []
+    # Only STANDALONE injects. Leaving the scale unset in the other modes keeps
+    # the NONE-mode module topologies byte-identical to what they were before
+    # this field, and the injected addresses are resolved from the bound route
+    # advertisements at lowering time rather than recorded here.
     return replace(
         topology,
         device_groups=tuple(device_groups),
         device_config=replace(
             topology.device_config,
             openr_mode=openr_mode,
-            openr_injected_start_ipv4s=tuple(injected_v4),
-            openr_injected_start_ipv6s=tuple(injected_v6),
+            openr_injection_scale=(
+                scale.openr_injection_scale
+                if openr_mode is OpenRMode.STANDALONE
+                else None
+            ),
+            bgp_total_path_limit=scale.bgp_total_path_limit,
+            device_state_guard_namespace=scale.device_state_guard_namespace,
         ),
         policies=(EBB_ACCEPT_POLICY,),
         prefix_sets=(*prefix_sets, *extra_prefix_sets),
     )
 
 
-EBB_FULL_SCALE_WITH_BGPMON = replace(
+EBB_FY26_TOPOLOGY_WITH_BGPMON = replace(
     _with_ebb_route_intent(
-        _EBB_FULL_SCALE_WITH_BGPMON_BASE,
+        _EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE,
         openr_mode=OpenRMode.NONE,
         next_hops=EBB_NEXT_HOPS,
+        scale=EBB_FY26_SCALE,
     ),
     legacy_profile=None,
     task_compatibility_profile=TaskCompatibilityProfile.EBB_FULL_SCALE_WITH_BGPMON,
@@ -1460,13 +2013,13 @@ EBB_FULL_SCALE_WITH_BGPMON = replace(
 # Variant B: without bgpmon - 2 physical interfaces, 18 DeviceGroups total.
 # This small derived filter keeps the two variants consistent without hiding
 # the full Appendix-style listing above.
-_EBB_FULL_SCALE_NO_BGPMON_BASE = LogicalTopology(
+_EBB_FY26_TOPOLOGY_NO_BGPMON_BASE = LogicalTopology(
     name="ebb_full_scale_no_bgpmon",
     legacy_profile="ebb_full_scale",
-    endpoints=_EBB_FULL_SCALE_WITH_BGPMON_BASE.endpoints,
+    endpoints=_EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE.endpoints,
     device_groups=tuple(
         dg
-        for dg in _EBB_FULL_SCALE_WITH_BGPMON_BASE.device_groups
+        for dg in _EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE.device_groups
         if dg.role != "bgpmon" and dg.name != "dg_bgp_mon_v6"
     ),
     device_config=EBB_DEVICE_CONFIG,
@@ -1477,35 +2030,44 @@ _EBB_FULL_SCALE_NO_BGPMON_BASE = LogicalTopology(
     ),
 )
 
-EBB_FULL_SCALE_NO_BGPMON = replace(
+EBB_FY26_TOPOLOGY_NO_BGPMON = replace(
     _with_ebb_route_intent(
-        _EBB_FULL_SCALE_NO_BGPMON_BASE,
+        _EBB_FY26_TOPOLOGY_NO_BGPMON_BASE,
         openr_mode=OpenRMode.NONE,
         next_hops=EBB_NEXT_HOPS,
+        scale=EBB_FY26_SCALE,
     ),
     legacy_profile=None,
     task_compatibility_profile=TaskCompatibilityProfile.EBB_FULL_SCALE_NO_BGPMON,
 )
 
 
-def ebb_full_scale_topology(
+def ebb_topology(
     *,
     openr_mode: OpenRMode,
-    include_bgpmon: bool = True,
+    include_bgpmon: bool | None = None,
     ebgp_graceful_restart: bool = True,
     next_hop_self: bool = False,
     include_legacy_community_rows: bool = True,
-    ebgp_prefix_count: int = 750,
+    ebgp_prefix_count: int | None = None,
     ebgp_static_prefix_count: int | None = None,
     extra_prefix_sets: tuple[PrefixSet, ...] = (),
     extra_advertisements: t.Mapping[str, tuple[PrefixAdvertisement, ...]] | None = None,
     next_hops: EbbNextHopScheme = EBB_NEXT_HOPS,
     route_storm_shards: bool = False,
+    scale: EbbScaleProfile,
 ) -> LogicalTopology:
+    """Build the EBB topology at ``scale``.
+
+    ``include_bgpmon`` defaults to whether the scale allows a BGP monitor, and
+    ``ebgp_prefix_count`` to the scale's FA routes per peer.
+    """
+    if include_bgpmon is None:
+        include_bgpmon = scale.allows_bgp_monitor
     base = (
-        _EBB_FULL_SCALE_WITH_BGPMON_BASE
+        _EBB_FY26_TOPOLOGY_WITH_BGPMON_BASE
         if include_bgpmon
-        else _EBB_FULL_SCALE_NO_BGPMON_BASE
+        else _EBB_FY26_TOPOLOGY_NO_BGPMON_BASE
     )
     topology = _with_ebb_route_intent(
         base,
@@ -1519,6 +2081,7 @@ def ebb_full_scale_topology(
         extra_advertisements=extra_advertisements,
         next_hops=next_hops,
         route_storm_shards=route_storm_shards,
+        scale=scale,
     )
     if not route_storm_shards:
         return topology
@@ -1544,33 +2107,41 @@ __all__ = (
     "EBB_DIVERSE_NHG_PREFIXES_PER_GROUP",
     "EBB_EBGP_V4_PREFIX_SET",
     "EBB_EBGP_V6_PREFIX_SET",
-    "EBB_FULL_SCALE_NO_BGPMON",
-    "EBB_FULL_SCALE_PORT_MAP",
-    "EBB_FULL_SCALE_PORT_MAP_WITH_BGPMON",
-    "EBB_FULL_SCALE_WITH_BGPMON",
+    "EBB_FY26_SCALE",
+    "EBB_FY26_TOPOLOGY_NO_BGPMON",
+    "EBB_FY26_TOPOLOGY_WITH_BGPMON",
+    "EBB_FY27_PORT_MAP",
+    "EBB_FY27_SCALE",
+    "ebb_ibgp_port_assignment",
+    "ebb_ibgp_route_next_hop_starts",
+    "ebb_ibgp_route_next_hops",
+    "ebb_ibgp_route_next_hops_from_start",
     "EBB_IBGP_V4_PREFIX_SET",
     "EBB_IBGP_V6_PREFIX_SET",
     "EBB_LONGEVITY_COMMUNITY_BASELINE_COUNT",
     "EBB_NEXT_HOPS",
     "EBB_NEXT_HOPS_IXIA03",
+    "ebb_openr_injected_next_hops",
     "EBB_OPENR_INJECTED_START_IPV4S",
     "EBB_OPENR_INJECTED_START_IPV4S_IXIA03",
     "EBB_OPENR_INJECTED_START_IPV6S",
     "EBB_OPENR_INJECTED_START_IPV6S_IXIA03",
-    "EBB_PARENT_NETWORKS_IXIA03",
-    "EbbNextHopScheme",
     "EBB_PARENT_NETWORKS",
+    "EBB_PARENT_NETWORKS_IXIA03",
     "EBB_PEER_GROUPS",
+    "ebb_port_map",
+    "EBB_PORT_MAP",
+    "EBB_PORT_MAP_WITH_BGPMON",
     "EBB_PREFIX_SETS",
     "EBB_ROUTE_STORM_SHARD_PEER_COUNTS",
     "EBB_ROUTE_STORM_SHARD_ROUTE_COUNTS",
+    "ebb_route_storm_shard_peer_counts",
+    "ebb_route_storm_shard_route_counts",
+    "ebb_topology",
+    "EbbNextHopScheme",
+    "EbbScaleProfile",
     "EBGP_V4_PEER_GROUP",
     "EBGP_V6_PEER_GROUP",
     "IBGP_V4_PEER_GROUP",
     "IBGP_V6_PEER_GROUP",
-    "ebb_full_scale_topology",
-    "ebb_ibgp_route_next_hop_starts",
-    "ebb_ibgp_route_next_hops",
-    "ebb_ibgp_route_next_hops_from_start",
-    "ebb_openr_injected_next_hops",
 )

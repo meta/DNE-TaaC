@@ -584,6 +584,7 @@ class UcmpTrafficDistributionHealthCheck(
             # Build detailed error message with physical interface names
             error_details = "\n".join(
                 [
+                    # pyrefly: ignore [bad-argument-type]
                     f"  {vlan_to_physical[v['interface']]}: expected {v['expected']:.2f}%, "
                     f"got {v['actual']:.2f}% (deviation: {v['deviation']:.2f}%)"
                     for v in violations

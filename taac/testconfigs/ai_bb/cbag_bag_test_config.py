@@ -17,6 +17,7 @@ from taac.health_checks.healthcheck_definitions import (
 )
 from taac.packet_headers import DSF_RDMA_IB_PACKET_HEADERS
 from taac.playbooks.playbook_definitions import (
+    create_cbag_acacia_transceiver_reset_playbook,
     create_cbag_disruptive_playbooks,
     create_longevity_playbook,
 )
@@ -24,6 +25,9 @@ from taac.task_definitions import (
     create_backup_running_config_task,
     create_configure_eos_parallel_bgp_peers_task,
     create_eos_bgp_peer_group_task,
+    create_restore_running_config_task,
+    create_run_commands_on_shell_task,
+    create_wait_for_eos_interfaces_task,
 )
 from taac.utils.json_thrift_utils import thrift_to_json
 from taac.health_check.health_check import types as hc_types
@@ -38,6 +42,7 @@ from taac.test_as_a_config.types import (
     Params,
     RouteScale,
     RouteScaleSpec,
+    Task,
     TestConfig,
     TrafficEndpoint,
 )
@@ -449,6 +454,61 @@ def _build_ixia_bgp_peers_config(
     return json.dumps(config)
 
 
+def _create_ixia_port_breakout_task(hostname: str, ports: t.Sequence[str]) -> Task:
+    """Apply breakout speed only to each existing first lane/parent."""
+    commands = ["configure"]
+    first_lanes = [port for port in ports if port.endswith("/1")]
+    if not first_lanes:
+        raise ValueError("EOS breakout setup requires at least one first lane")
+    for port in first_lanes:
+        commands.extend(
+            [
+                f"interface {port}",
+                "speed 400g-4",
+                "!",
+            ]
+        )
+    commands.append("end")
+    return create_run_commands_on_shell_task(
+        hostname=hostname,
+        cmds=["\n".join(commands)],
+        set_outer_hostname=True,
+        ixia_needed=False,
+        validate_output=True,
+    )
+
+
+def _create_ixia_port_lane_configuration_task(
+    hostname: str, ports: t.Sequence[str]
+) -> Task:
+    """Configure all expected lanes only after breakout materializes them."""
+    commands = ["configure"]
+    for port in ports:
+        commands.extend(
+            [
+                f"interface {port}",
+                "mtu 9000",
+                "no switchport",
+                "ipv6 enable",
+                "no shutdown",
+                "!",
+            ]
+        )
+    commands.append("end")
+    return create_run_commands_on_shell_task(
+        hostname=hostname,
+        cmds=["\n".join(commands)],
+        set_outer_hostname=True,
+        ixia_needed=False,
+        validate_output=True,
+    )
+
+
+def _before_ixia_setup(task: Task) -> Task:
+    """Run EOS IP/BGP setup before IXIA verifies protocol convergence."""
+    return task(ixia_needed=False)
+
+
 CBAG_BAG_SETUP_TASKS = [
     # Backup EOS configs on all devices
     create_backup_running_config_task(
@@ -463,82 +523,106 @@ CBAG_BAG_SETUP_TASKS = [
         hostname="bag002.qzq1",
         backup_file="bag002_backup_config",
     ),
+    # Phase 1a (pre-IXIA): apply breakout only to existing first lanes/parents.
+    _create_ixia_port_breakout_task("cbag001.qzp1", CBAG001_PORTS),
+    _create_ixia_port_breakout_task("bag001.qzq1", BAG001_PORTS),
+    _create_ixia_port_breakout_task("bag002.qzq1", BAG002_PORTS),
+    # Phase 1b: fail closed unless every lane created by breakout materializes.
+    create_wait_for_eos_interfaces_task("cbag001.qzp1", CBAG001_PORTS),
+    create_wait_for_eos_interfaces_task("bag001.qzq1", BAG001_PORTS),
+    create_wait_for_eos_interfaces_task("bag002.qzq1", BAG002_PORTS),
+    # Phase 1c: configure the now-existing lanes for IXIA link discovery.
+    _create_ixia_port_lane_configuration_task("cbag001.qzp1", CBAG001_PORTS),
+    _create_ixia_port_lane_configuration_task("bag001.qzq1", BAG001_PORTS),
+    _create_ixia_port_lane_configuration_task("bag002.qzq1", BAG002_PORTS),
     # Create IXIA peer groups with PROPAGATE_EVERYTHING on all devices
-    create_eos_bgp_peer_group_task(
-        hostname="cbag001.qzp1",
-        peer_group_name=CBAG_IXIA_PEER_GROUP,
-        remote_as=65062,
-        activate=True,
-        ipv4_unicast=False,
-        ipv6_unicast=True,
-        route_map_in="PROPAGATE_EVERYTHING",
-        route_map_out="PROPAGATE_EVERYTHING",
+    _before_ixia_setup(
+        create_eos_bgp_peer_group_task(
+            hostname="cbag001.qzp1",
+            peer_group_name=CBAG_IXIA_PEER_GROUP,
+            remote_as=65062,
+            activate=True,
+            ipv4_unicast=False,
+            ipv6_unicast=True,
+            route_map_in="PROPAGATE_EVERYTHING",
+            route_map_out="PROPAGATE_EVERYTHING",
+        )
     ),
-    create_eos_bgp_peer_group_task(
-        hostname="bag001.qzq1",
-        peer_group_name=BAG_IXIA_PEER_GROUP,
-        remote_as=65063,
-        activate=True,
-        ipv4_unicast=False,
-        ipv6_unicast=True,
-        route_map_in="PROPAGATE_EVERYTHING",
-        route_map_out="PROPAGATE_EVERYTHING",
+    _before_ixia_setup(
+        create_eos_bgp_peer_group_task(
+            hostname="bag001.qzq1",
+            peer_group_name=BAG_IXIA_PEER_GROUP,
+            remote_as=65063,
+            activate=True,
+            ipv4_unicast=False,
+            ipv6_unicast=True,
+            route_map_in="PROPAGATE_EVERYTHING",
+            route_map_out="PROPAGATE_EVERYTHING",
+        )
     ),
-    create_eos_bgp_peer_group_task(
-        hostname="bag002.qzq1",
-        peer_group_name=BAG_IXIA_PEER_GROUP,
-        remote_as=65063,
-        activate=True,
-        ipv4_unicast=False,
-        ipv6_unicast=True,
-        route_map_in="PROPAGATE_EVERYTHING",
-        route_map_out="PROPAGATE_EVERYTHING",
+    _before_ixia_setup(
+        create_eos_bgp_peer_group_task(
+            hostname="bag002.qzq1",
+            peer_group_name=BAG_IXIA_PEER_GROUP,
+            remote_as=65063,
+            activate=True,
+            ipv4_unicast=False,
+            ipv6_unicast=True,
+            route_map_in="PROPAGATE_EVERYTHING",
+            route_map_out="PROPAGATE_EVERYTHING",
+        )
     ),
     # Create BGP peers for IXIA connections on all devices
-    create_configure_eos_parallel_bgp_peers_task(
-        hostname="cbag001.qzp1",
-        config_json=json.dumps(
-            {
-                **json.loads(
-                    _build_ixia_bgp_peers_config(
-                        CBAG001_PORT_CONFIG_DATA,
-                        CBAG_IXIA_PEER_GROUP,
-                        65062,
-                    )
-                ),
-                **json.loads(_build_cbag_bgp_peer_config()),
-            }
-        ),
+    _before_ixia_setup(
+        create_configure_eos_parallel_bgp_peers_task(
+            hostname="cbag001.qzp1",
+            config_json=json.dumps(
+                {
+                    **json.loads(
+                        _build_ixia_bgp_peers_config(
+                            CBAG001_PORT_CONFIG_DATA,
+                            CBAG_IXIA_PEER_GROUP,
+                            65062,
+                        )
+                    ),
+                    **json.loads(_build_cbag_bgp_peer_config()),
+                }
+            ),
+        )
     ),
-    create_configure_eos_parallel_bgp_peers_task(
-        hostname="bag001.qzq1",
-        config_json=json.dumps(
-            {
-                **json.loads(
-                    _build_ixia_bgp_peers_config(
-                        BAG001_PORT_CONFIG_DATA,
-                        BAG_IXIA_PEER_GROUP,
-                        65063,
-                    )
-                ),
-                **json.loads(_build_bag_bgp_peer_config(is_bag1=True)),
-            }
-        ),
+    _before_ixia_setup(
+        create_configure_eos_parallel_bgp_peers_task(
+            hostname="bag001.qzq1",
+            config_json=json.dumps(
+                {
+                    **json.loads(
+                        _build_ixia_bgp_peers_config(
+                            BAG001_PORT_CONFIG_DATA,
+                            BAG_IXIA_PEER_GROUP,
+                            65063,
+                        )
+                    ),
+                    **json.loads(_build_bag_bgp_peer_config(is_bag1=True)),
+                }
+            ),
+        )
     ),
-    create_configure_eos_parallel_bgp_peers_task(
-        hostname="bag002.qzq1",
-        config_json=json.dumps(
-            {
-                **json.loads(
-                    _build_ixia_bgp_peers_config(
-                        BAG002_PORT_CONFIG_DATA,
-                        BAG_IXIA_PEER_GROUP,
-                        65063,
-                    )
-                ),
-                **json.loads(_build_bag_bgp_peer_config(is_bag1=False)),
-            }
-        ),
+    _before_ixia_setup(
+        create_configure_eos_parallel_bgp_peers_task(
+            hostname="bag002.qzq1",
+            config_json=json.dumps(
+                {
+                    **json.loads(
+                        _build_ixia_bgp_peers_config(
+                            BAG002_PORT_CONFIG_DATA,
+                            BAG_IXIA_PEER_GROUP,
+                            65063,
+                        )
+                    ),
+                    **json.loads(_build_bag_bgp_peer_config(is_bag1=False)),
+                }
+            ),
+        )
     ),
     # Allow IXIA prefixes on CBAG-BAG inter-device peergroups (inbound only;
     # devices natively re-advertise eBGP-learned routes so no outbound filter needed)
@@ -577,6 +661,21 @@ CBAG_BAG_SETUP_TASKS = [
     #     direction="in",
     #     seq=10,
     # ),
+]
+
+CBAG_BAG_TEARDOWN_TASKS = [
+    create_restore_running_config_task(
+        hostname="cbag001.qzp1",
+        backup_file="flash:cbag001_backup_config",
+    ),
+    create_restore_running_config_task(
+        hostname="bag001.qzq1",
+        backup_file="flash:bag001_backup_config",
+    ),
+    create_restore_running_config_task(
+        hostname="bag002.qzq1",
+        backup_file="flash:bag002_backup_config",
+    ),
 ]
 
 
@@ -654,6 +753,7 @@ def create_cbag_bag_test_config(
         ixia_protocol_verification_timeout=300,
         endpoints=CBAG_BAG_ENDPOINTS,
         setup_tasks=CBAG_BAG_SETUP_TASKS,
+        teardown_tasks=CBAG_BAG_TEARDOWN_TASKS,
         basic_port_configs=CBAG_BAG_BASIC_PORT_CONFIGS,
         basic_traffic_item_configs=CBAG_BAG_TRAFFIC_ITEM_CONFIGS,
         playbooks=[
@@ -668,6 +768,7 @@ def create_cbag_bag_test_config(
                     "RDMA_CBAG001_TO_BAG002",
                 ],
             ),
+            create_cbag_acacia_transceiver_reset_playbook(),
             *_disruptive_playbooks,
         ],
     )

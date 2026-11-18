@@ -83,6 +83,7 @@ from taac.testconfigs.npi.ecmp_csvs import gen_ecmp_csv
 from taac.testconfigs.npi.ecmp_csvs.ecmp_nh_pools import (
     FUJI_SSW_MAIN_ECMP_POOL,
     KO3_MAIN_ECMP_POOL,
+    W800_RSW005_P001_QZR1_MAIN_ECMP_POOL,
 )
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
@@ -308,6 +309,9 @@ def test_config_for_ecmp_only_resource_testing(
     ndp_flap_iterations=60,
     cold_start_iterations=13,
     longevity_stabilization_seconds=300,
+    # When set, each overcommit churn playbook ends with a strict post-churn
+    # recovery stage (Main 0% loss, Rouge fully rejected) after this settle.
+    post_churn_recovery_seconds=None,
     playbooks=None,
     direct_ixia_connections=None,
     basset_pool=None,
@@ -718,6 +722,7 @@ def test_config_for_ecmp_only_resource_testing(
                 main_pool_name=pool.pool_name,
                 disruptive_iterations=disruptive_iterations,
                 disruptive_settle_seconds=disruptive_settle_seconds,
+                post_churn_recovery_seconds=post_churn_recovery_seconds,
             )
             + create_ecmp_only_members_playbooks(
                 ixia_source_interface,
@@ -726,6 +731,7 @@ def test_config_for_ecmp_only_resource_testing(
                 main_pool_name=pool.pool_name,
                 disruptive_iterations=disruptive_iterations,
                 disruptive_settle_seconds=disruptive_settle_seconds,
+                post_churn_recovery_seconds=post_churn_recovery_seconds,
             )
             # NDP-flap and cold-start longevity both run against the GROUP CSV
             # with Rouge disabled: a full in-budget ECMP group table, which is
@@ -865,6 +871,7 @@ if __name__ == "__main__":
     for _asic, _pool in (
         (EcmpAsic.G200, KO3_MAIN_ECMP_POOL),
         (EcmpAsic.TOMAHAWK4, FUJI_SSW_MAIN_ECMP_POOL),
+        (EcmpAsic.TOMAHAWK5, W800_RSW005_P001_QZR1_MAIN_ECMP_POOL),
     ):
         for _key, _path in generate_ecmp_csvs(_asic, _pool).items():
             print(f"{_asic.value:10s} {_key:11s} {_path}")

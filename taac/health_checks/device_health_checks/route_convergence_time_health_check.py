@@ -579,6 +579,11 @@ class RouteConvergenceTimeHealthCheck(
 
         return aggregated
 
+    @staticmethod
+    def _default_log_source_command(log_file: str) -> str:
+        decompressor = "zstdcat" if log_file.endswith(".zst") else "zcat -f"
+        return f"{decompressor} {shlex.quote(log_file)}"
+
     def _build_add_awk_command(
         self,
         log_file: str,
@@ -594,7 +599,9 @@ class RouteConvergenceTimeHealthCheck(
         """
         start_time = start_time_str or "00:00:00"
 
-        source_command = log_source_command or f"zcat -f {shlex.quote(log_file)}"
+        source_command = log_source_command or self._default_log_source_command(
+            log_file
+        )
         return f"""{source_command} | awk -v start="{start_time}" -v threshold="{time_threshold}" '
 function time_to_sec(t) {{
     split(t, a, ":");
@@ -650,7 +657,9 @@ END {{
         """
         start_time = start_time_str or "00:00:00"
 
-        source_command = log_source_command or f"zcat -f {shlex.quote(log_file)}"
+        source_command = log_source_command or self._default_log_source_command(
+            log_file
+        )
         return f"""{source_command} | awk -v start="{start_time}" -v threshold="{time_threshold}" '
 function time_to_sec(t) {{
     split(t, a, ":");
@@ -765,7 +774,7 @@ END {{
             try:
                 # pyrefly: ignore [missing-attribute]
                 out = await self.driver.async_run_cmd_on_shell(
-                    f"ls -1 {shlex.quote(archive_dir)}/wedge_agent.log-*.gz 2>/dev/null"
+                    f"ls -1 {shlex.quote(archive_dir)}/wedge_agent.log-* 2>/dev/null"
                 )
             except Exception as e:
                 self.logger.warning(f"Failed to list archive logs: {e}")
@@ -775,7 +784,7 @@ END {{
                 path = line.strip()
                 # Match only wedge_agent.log-<12 digits>.gz; this excludes
                 # wedge_agent_snapshots.log* by construction.
-                match = re.search(r"wedge_agent\.log-(\d{12})\.gz$", path)
+                match = re.search(r"wedge_agent\.log-(\d{12})\.(?:gz|zst)$", path)
                 if match and match.group(1) >= start_stamp:
                     archives.append((match.group(1), path))
 

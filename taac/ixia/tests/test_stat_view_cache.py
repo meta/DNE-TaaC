@@ -94,6 +94,7 @@ class BeginTestCaseTest(unittest.TestCase):
         self.ixia._pending_traffic_regexes = ["^traffic$"]
         self.ixia.is_traffic_running = MagicMock(side_effect=[False, True])
         self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia._regenerate_enabled_traffic_items = MagicMock()
         self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
         self.ixia.enable_traffic = MagicMock()
         self.ixia.wait_for_view_assistants_ready = MagicMock()
@@ -103,10 +104,15 @@ class BeginTestCaseTest(unittest.TestCase):
         ) as base_start:
             self.ixia.start_traffic(regenerate_traffic_items=True)
 
-        self.ixia.enable_traffic.assert_called_once_with(
-            ["^traffic$"], apply_changes=False
+        self.assertEqual(
+            [
+                call(apply_changes=False),
+                call(["^traffic$"], apply_changes=False),
+            ],
+            self.ixia.enable_traffic.call_args_list,
         )
-        self.assertEqual(2, self.ixia.regenerate_traffic_items.call_count)
+        self.ixia.regenerate_traffic_items.assert_called_once_with()
+        self.ixia._regenerate_enabled_traffic_items.assert_called_once_with()
         self.ixia.finalize_deferred_traffic_item_replacements.assert_called_once_with()
         base_start.assert_called_once_with(regenerate_traffic_items=False)
         self.ixia.wait_for_view_assistants_ready.assert_called_once_with()
@@ -122,6 +128,7 @@ class BeginTestCaseTest(unittest.TestCase):
         self.ixia.is_traffic_running = MagicMock(side_effect=[True, True])
         self.ixia.stop_traffic = MagicMock()
         self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia._regenerate_enabled_traffic_items = MagicMock()
         self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
         self.ixia.enable_traffic = MagicMock()
         self.ixia.wait_for_view_assistants_ready = MagicMock()
@@ -132,10 +139,15 @@ class BeginTestCaseTest(unittest.TestCase):
             self.ixia.start_traffic()
 
         self.ixia.stop_traffic.assert_called_once_with()
-        self.ixia.enable_traffic.assert_called_once_with(
-            ["^traffic$"], apply_changes=False
+        self.assertEqual(
+            [
+                call(apply_changes=False),
+                call(["^traffic$"], apply_changes=False),
+            ],
+            self.ixia.enable_traffic.call_args_list,
         )
-        self.assertEqual(2, self.ixia.regenerate_traffic_items.call_count)
+        self.ixia.regenerate_traffic_items.assert_called_once_with()
+        self.ixia._regenerate_enabled_traffic_items.assert_called_once_with()
         self.ixia.finalize_deferred_traffic_item_replacements.assert_called_once_with()
         base_start.assert_called_once_with(regenerate_traffic_items=False)
         self.assertFalse(self.ixia._traffic_preparation_pending)
@@ -150,6 +162,7 @@ class BeginTestCaseTest(unittest.TestCase):
             side_effect=[False, False, False, True]
         )
         self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia._regenerate_enabled_traffic_items = MagicMock()
         self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
         self.ixia.enable_traffic = MagicMock()
         self.ixia.wait_for_view_assistants_ready = MagicMock()
@@ -175,10 +188,15 @@ class BeginTestCaseTest(unittest.TestCase):
             ],
             base_start.call_args_list,
         )
-        self.assertEqual(2, self.ixia.regenerate_traffic_items.call_count)
+        self.ixia.regenerate_traffic_items.assert_called_once_with()
+        self.ixia._regenerate_enabled_traffic_items.assert_called_once_with()
         self.ixia.finalize_deferred_traffic_item_replacements.assert_called_once_with()
-        self.ixia.enable_traffic.assert_called_once_with(
-            ["^traffic$"], apply_changes=False
+        self.assertEqual(
+            [
+                call(apply_changes=False),
+                call(["^traffic$"], apply_changes=False),
+            ],
+            self.ixia.enable_traffic.call_args_list,
         )
         self.ixia.wait_for_view_assistants_ready.assert_called_once_with()
         self.assertFalse(self.ixia._traffic_preparation_pending)
@@ -193,6 +211,7 @@ class BeginTestCaseTest(unittest.TestCase):
         self.ixia._pending_traffic_regexes = ["^traffic$"]
         self.ixia.is_traffic_running = MagicMock(side_effect=[False, False, True])
         self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia._regenerate_enabled_traffic_items = MagicMock()
         self.ixia.finalize_deferred_traffic_item_replacements = MagicMock(
             side_effect=[RuntimeError("swap failed"), None]
         )
@@ -210,7 +229,8 @@ class BeginTestCaseTest(unittest.TestCase):
 
             self.ixia.start_traffic()
 
-        self.assertEqual(2, self.ixia.regenerate_traffic_items.call_count)
+        self.ixia.regenerate_traffic_items.assert_called_once_with()
+        self.ixia._regenerate_enabled_traffic_items.assert_called_once_with()
         self.assertEqual(
             2,
             self.ixia.finalize_deferred_traffic_item_replacements.call_count,
@@ -225,6 +245,7 @@ class BeginTestCaseTest(unittest.TestCase):
         self.ixia._pending_traffic_regexes = ["^traffic$"]
         self.ixia.is_traffic_running = MagicMock(side_effect=[False, True, True])
         self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia._regenerate_enabled_traffic_items = MagicMock()
         self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
         self.ixia.enable_traffic = MagicMock()
         self.ixia.wait_for_view_assistants_ready = MagicMock(
@@ -242,8 +263,12 @@ class BeginTestCaseTest(unittest.TestCase):
             [call(regenerate_traffic_items=False)],
             base_start.call_args_list,
         )
-        self.ixia.enable_traffic.assert_called_once_with(
-            ["^traffic$"], apply_changes=False
+        self.assertEqual(
+            [
+                call(apply_changes=False),
+                call(["^traffic$"], apply_changes=False),
+            ],
+            self.ixia.enable_traffic.call_args_list,
         )
         self.assertEqual(2, self.ixia.wait_for_view_assistants_ready.call_count)
         self.assertFalse(self.ixia._traffic_preparation_pending)
@@ -258,6 +283,7 @@ class BeginTestCaseTest(unittest.TestCase):
         self.ixia._pending_traffic_regexes = ["^missing$"]
         self.ixia.is_traffic_running = MagicMock(side_effect=[False, False])
         self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia._regenerate_enabled_traffic_items = MagicMock()
         self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
         self.ixia.enable_traffic = MagicMock()
         self.ixia.wait_for_view_assistants_ready = MagicMock()

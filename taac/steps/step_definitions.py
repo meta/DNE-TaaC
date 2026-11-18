@@ -11458,6 +11458,9 @@ class DummyStep(StepBase[taac_types.BaseInput]):
 
 class LongevityStep(StepBase[taac_types.BaseInput]):
     STEP_NAME = taac_types.StepName.LONGEVITY_STEP
+    # Above the driver's own worst case (3 attempts x 120s thrift deadline + 2 x 5s
+    # backoff), so its retries get to finish before the poll is abandoned.
+    PORT_STATE_POLL_TIMEOUT_S = 600
 
     async def run(
         self,
@@ -11534,10 +11537,19 @@ class LongevityStep(StepBase[taac_types.BaseInput]):
                 break
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             try:
-                oper = await self.driver.async_get_all_interfaces_operational_status()
+                # The hold's end is only checked between polls, so a poll that never
+                # returns would hold the step past `duration` indefinitely.
+                async with asyncio.timeout(
+                    min(self.PORT_STATE_POLL_TIMEOUT_S, duration - elapsed)
+                ):
+                    oper = (
+                        await self.driver.async_get_all_interfaces_operational_status()
+                    )
             except Exception as e:  # keep polling through transient agent errors
                 poll_errors += 1
-                self.logger.warning(f"[PortStateCollector] {ts} poll error: {e}")
+                self.logger.warning(
+                    f"[PortStateCollector] {ts} poll error: {type(e).__name__}: {e}"
+                )
                 await asyncio.sleep(poll_interval)
                 continue
 

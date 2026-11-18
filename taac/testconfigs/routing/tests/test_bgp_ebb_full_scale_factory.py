@@ -1778,6 +1778,40 @@ class EbbInjectionRangeAnchorWithRuntimeAdvertisementsTest(unittest.TestCase):
                 )
 
 
+class EbbDaemonRestartDualScaleFactoryTest(unittest.TestCase):
+    @staticmethod
+    def _config(scale: EbbScaleProfile) -> taac_types.TestConfig:
+        return factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB008_ASH6,
+            name=f"DAEMON_RESTART_{scale.name}",
+            playbooks_selected=["bgp_ebb_daemon_restart_playbook"],
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            enable_update_group=False,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            scale=scale,
+        )
+
+    @staticmethod
+    def _reactivation_steps(
+        config: taac_types.TestConfig,
+    ) -> list[taac_types.Step]:
+        return [
+            step
+            for playbook in config.playbooks or []
+            for stage in playbook.stages or []
+            for step in stage.steps or []
+            if step.name == taac_types.StepName.INVOKE_IXIA_API_STEP
+            and step.description == "Toggle all device groups back to active"
+        ]
+
+    def test_fy27_reactivates_ixia_peers_before_bgpcpp_restart(self) -> None:
+        self.assertEqual(1, len(self._reactivation_steps(self._config(EBB_FY27_SCALE))))
+
+    def test_fy26_preserves_restart_without_ixia_reactivation(self) -> None:
+        self.assertEqual([], self._reactivation_steps(self._config(EBB_FY26_SCALE)))
+
+
 class EbbFauuDualScaleFactoryTest(unittest.TestCase):
     @staticmethod
     def _config(scale: EbbScaleProfile) -> taac_types.TestConfig:

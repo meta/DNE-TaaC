@@ -1611,6 +1611,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
             ibgp_pnh_count=openr_pnh_count,
             ibgp_pnh_step=openr_pnh_step,
+            reactivate_device_groups=scale.restart_reactivate_device_groups,
             # Deliberately unmeasured. Restarting bgpcpp replaces the PID
             # mid-bracket, and both collectors resolve the PID once at START:
             # CPU then reads a dead /proc entry and silently drops every

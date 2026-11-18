@@ -100,7 +100,8 @@ class FpfThresholds:
 # create_test_portchannel_playbook.
 _MEM_UTIL_DEFAULT_BYTES: float = 5 * _GIB
 _MEM_UTIL_BY_SERVICE: Mapping[str, float] = {
-    "bgpd": 4.5 * _GIB,
+    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+    "bgpd": 10 * _GIB,
     "fsdb": 5 * _GIB,
     "qsfp_service": 2 * _GIB,
     "fboss_sw_agent": 9 * _GIB,

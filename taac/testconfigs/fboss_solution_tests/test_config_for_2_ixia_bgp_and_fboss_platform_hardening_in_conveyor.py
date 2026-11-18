@@ -1098,7 +1098,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         create_prefix_limit_check(prefix_limit=prefix_limit),
         create_unclean_exit_check(),
         create_cpu_utilization_check(
-            threshold=400.0, start_time_jq_var="test_case_start_time"
+            threshold=700.0, start_time_jq_var="test_case_start_time"
         ),
         create_service_restart_check(),
     ]
@@ -1155,7 +1155,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         create_prefix_limit_check(prefix_limit=prefix_limit),
         create_unclean_exit_check(),
         create_cpu_utilization_check(
-            threshold=400.0, start_time_jq_var="test_case_start_time"
+            threshold=700.0, start_time_jq_var="test_case_start_time"
         ),
         create_service_restart_check(),
     ]

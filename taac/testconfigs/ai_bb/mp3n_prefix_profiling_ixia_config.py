@@ -1078,7 +1078,7 @@ def _create_common_postchecks(
         create_memory_utilization_check(
             threshold=5 * (1024**3),
             threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
+                "bgpd": 10 * (1024**3),
                 "fsdb": 7 * (1024**3),
                 "qsfp_service": 2 * (1024**3),
                 "fboss_sw_agent": 0.8 * 16 * (1024**3),

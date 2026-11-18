@@ -250,7 +250,7 @@ def gen_for_profile_pool(profile, pool):
     """Profile-driven generation: ``{"max_groups": rows, "max_width": rows}``.
 
     Sizing (groups / members / width / unique-NH cap) comes from an ECMP profile
-    (duck-typed: ``max_ecmp_groups`` / ``max_ecmp_members`` / ``max_group_width``
+    (duck-typed: ``main_ecmp_groups`` / ``main_ecmp_members`` / ``max_group_width``
     / ``max_unique_next_hops`` -- i.e. ``ECMP_RESOURCE_PROFILES[asic]``), and
     addressing from an NhPool (``nh_network`` / ``nh_host_start`` /
     ``prefix_base``). This is the entry the KO3 testconfig uses so caps are never
@@ -274,14 +274,14 @@ def gen_for_profile_pool(profile, pool):
     return {
         "max_groups": gen_anchored(
             widths_max_groups(
-                profile.max_ecmp_groups,
-                profile.max_ecmp_members,
+                profile.main_ecmp_groups,
+                profile.main_ecmp_members,
                 profile.max_group_width,
             ),
             **kwargs,
         ),
         "max_width": gen_anchored(
-            widths_max_width(profile.max_ecmp_members, profile.max_group_width),
+            widths_max_width(profile.main_ecmp_members, profile.max_group_width),
             **kwargs,
         ),
     }

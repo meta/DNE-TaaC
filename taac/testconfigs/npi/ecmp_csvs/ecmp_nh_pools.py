@@ -114,6 +114,22 @@ W800_MAIN_ECMP_POOL: EcmpNhPool = EcmpNhPool(
 )
 
 
+# Wedge800 (Tomahawk5) Main ECMP pool for rsw005.p001.m001.qzr1 (rogue port
+# `eth1/7/1`, parent /80 `2401:db00:e717:0:453::`, which the QZR1 dne_lab_ixia
+# fixture already puts on that port). `size=512` matches
+# `ECMP_RESOURCE_PROFILES[EcmpAsic.TOMAHAWK5]`. `prefix_base` sits inside the
+# `5000::/16` range the QZR1 RSW policy patchers accept.
+W800_RSW005_P001_QZR1_MAIN_ECMP_POOL: EcmpNhPool = EcmpNhPool(
+    name="w800_rsw005_p001_qzr1_main",
+    prefix_base="5002:dd::",
+    nh_network="2401:db00:e717:0:453",
+    nh_host_start=0xA001,
+    size=512,
+    pool_name="MAIN_ECMP_PREFIXES",
+    csv_prefix="w800_rsw005_qzr1",
+)
+
+
 # Steller Eagle 100T air-cooled (ac100t) NPI Main ECMP pool, on the CPU-queue
 # DUT (DUT2). Same placeholder caveats as the w800 pool above; `nh_network`
 # copies `AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6` from ac100t_constants.py.

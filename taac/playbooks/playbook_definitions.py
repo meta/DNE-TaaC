@@ -15231,7 +15231,9 @@ def create_ecmp_only_groups_playbooks(
         # full complement of groups with ZERO members, because their next-hops
         # never re-resolved. Gating on groups only would green-light a device
         # that forwards nothing, so require resolved next-hops too.
-        expected = profile.max_ecmp_groups
+        # The dump also holds the DUT's own fabric groups and next-hops, so
+        # both are lower bounds.
+        expected = profile.main_ecmp_groups
         nh = profile.ndp_pool_multiplier
         return create_run_ssh_command_step(
             cmd=(
@@ -15240,7 +15242,7 @@ def create_ecmp_only_groups_playbooks(
                 "g=$(echo \"$o\" | grep -c '^NextHopGroupSaiId'); "
                 "m=$(echo \"$o\" | grep -c '^NextHopGroupMemberSaiId'); "
                 "h=$(echo \"$o\" | grep -oE 'NextHopId: [0-9]+' | sort -u | wc -l); "
-                f'if [ "$g" -eq {expected} ] && [ "$m" -gt 0 ] && [ "$h" -eq {nh} ]; '
+                f'if [ "$g" -ge {expected} ] && [ "$m" -gt 0 ] && [ "$h" -ge {nh} ]; '
                 f'then echo "Main programmed: groups=$g/{expected} members=$m '
                 f'next_hops=$h/{nh}"; exit 0; fi; '
                 "sleep 10; done; "
@@ -15557,11 +15559,11 @@ def create_ecmp_only_members_playbooks(
             args_dict={
                 "network_group_name_regex": ".*MAIN_ECMP_PREFIXES.*",
                 "ecmp_width": profile.member_util_width,
-                "network_group_multiplier": profile.max_ecmp_members,
+                "network_group_multiplier": profile.main_ecmp_members,
             },
             description=(
                 f"Set Main ECMP group to width {profile.member_util_width} / "
-                f"multiplier {profile.max_ecmp_members} "
+                f"multiplier {profile.main_ecmp_members} "
                 "for Member-util testing (fills member table)"
             ),
         )
@@ -15592,7 +15594,8 @@ def create_ecmp_only_members_playbooks(
         # because the dump is large and intermittently comes back empty.
         # See the Group-util gate: member count on its own can be satisfied
         # while next-hops are unresolved, so require the full next-hop pool too.
-        expected = profile.max_ecmp_members
+        # Lower bounds, as in the Group-util gate.
+        expected = profile.main_ecmp_members
         nh = profile.ndp_pool_multiplier
         return create_run_ssh_command_step(
             cmd=(
@@ -15600,7 +15603,7 @@ def create_ecmp_only_members_playbooks(
                 "o=$(fboss2 show hw-object NEXT_HOP_GROUP 2>/dev/null); "
                 "m=$(echo \"$o\" | grep -c '^NextHopGroupMemberSaiId'); "
                 "h=$(echo \"$o\" | grep -oE 'NextHopId: [0-9]+' | sort -u | wc -l); "
-                f'if [ "$m" -eq {expected} ] && [ "$h" -eq {nh} ]; then '
+                f'if [ "$m" -ge {expected} ] && [ "$h" -ge {nh} ]; then '
                 f'echo "Main programmed: members=$m/{expected} '
                 f'next_hops=$h/{nh}"; exit 0; fi; '
                 "sleep 10; done; "

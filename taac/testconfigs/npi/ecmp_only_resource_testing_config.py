@@ -83,6 +83,7 @@ from taac.testconfigs.npi.ecmp_csvs import gen_ecmp_csv
 from taac.testconfigs.npi.ecmp_csvs.ecmp_nh_pools import (
     FUJI_SSW_MAIN_ECMP_POOL,
     KO3_MAIN_ECMP_POOL,
+    W800_RSW005_P001_QZR1_MAIN_ECMP_POOL,
 )
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
@@ -865,6 +866,7 @@ if __name__ == "__main__":
     for _asic, _pool in (
         (EcmpAsic.G200, KO3_MAIN_ECMP_POOL),
         (EcmpAsic.TOMAHAWK4, FUJI_SSW_MAIN_ECMP_POOL),
+        (EcmpAsic.TOMAHAWK5, W800_RSW005_P001_QZR1_MAIN_ECMP_POOL),
     ):
         for _key, _path in generate_ecmp_csvs(_asic, _pool).items():
             print(f"{_asic.value:10s} {_key:11s} {_path}")

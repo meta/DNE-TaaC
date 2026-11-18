@@ -882,7 +882,7 @@ class CoopApplyPatchersTask(BaseTask):
             await asyncio.gather(*wait_for_convergence_coroutines)
         else:
             reload_agent_config_coroutines = []
-            restart_bgp_coroutines = []
+            bgp_drivers = []
             for hostname in hostnames:
                 config_names = config_names or get_default_configs(hostname)
                 driver = await async_get_device_driver(hostname)
@@ -893,13 +893,27 @@ class CoopApplyPatchersTask(BaseTask):
                         driver.async_agent_config_reload()
                     )
                 if "bgpcpp" in config_names:
-                    restart_bgp_coroutines.append(
-                        driver.async_restart_service(FbossSystemctlServiceName.BGP)
-                    )
-            await asyncio.gather(
+                    bgp_drivers.append(driver)
+            reload_results = await asyncio.gather(
                 *reload_agent_config_coroutines, return_exceptions=True
             )
-            await asyncio.gather(*restart_bgp_coroutines)
+            if params.get("fail_on_agent_reload_error", False):
+                for result in reload_results:
+                    if isinstance(result, asyncio.CancelledError):
+                        raise result
+                errors = [
+                    result for result in reload_results if isinstance(result, Exception)
+                ]
+                if errors:
+                    raise ExceptionGroup(
+                        "Failed to reload agent configurations", errors
+                    )
+            await asyncio.gather(
+                *[
+                    driver.async_restart_service(FbossSystemctlServiceName.BGP)
+                    for driver in bgp_drivers
+                ]
+            )
 
 
 class CoopApplyPatchersV2(BaseTask):

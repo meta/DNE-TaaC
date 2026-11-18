@@ -24124,6 +24124,7 @@ def create_cpu_queue_playbooks(
     ixia_downlink_interface: str,
     bgp_peer_count: int = 0,
     static_route_device_group_index: int = 0,
+    ixia_interfaces: list[str] | None = None,
 ) -> t.List[Playbook]:
     """Create all CPU queue test playbooks.
 
@@ -24141,10 +24142,17 @@ def create_cpu_queue_playbooks(
         static_route_device_group_index: IXIA device group on the downlink
             port whose IPv6 address and network group 0 feed the CPU_037/038
             static routes. It must carry both.
+        ixia_interfaces: Explicit DUT ports that must be UP after CPU_039 restores
+            MTU. Defaults to the downlink for callers that omit the port list.
 
     Returns:
         List of all CPU queue test Playbook objects
     """
+    if ixia_interfaces is None:
+        ixia_interfaces = [ixia_downlink_interface]
+    if not ixia_interfaces:
+        raise ValueError("CPU_039 requires a non-empty IXIA interface list")
+
     # Per-queue inactive-queue noise tolerances for the A2 leakage assertion.
     # These scale with `bgp_peer_count` because BGP control traffic dominates
     # CPU-queue background pps at multi-session test scale (each established
@@ -24910,6 +24918,19 @@ def create_cpu_queue_playbooks(
                         services=[Service.AGENT, Service.BGP],
                         step_id="restore_mtu_agent_convergence",
                     ),
+                    create_verify_port_operational_state_step(
+                        interfaces=ixia_interfaces,
+                        operational_state=True,
+                        start_traffic=False,
+                    ),
+                    create_custom_step(
+                        params_dict={
+                            "custom_step_name": "verify_interface_mtu",
+                            "interface": ixia_downlink_interface,
+                            "expected_mtu": 9000,
+                            "skip_start_traffic": True,
+                        },
+                    ),
                     # DUT warmboot interrupts its BGP adjacencies. IXIA does
                     # not reliably re-establish retained-session protocols on
                     # its own, so explicitly restart them before postchecks
@@ -24931,13 +24952,6 @@ def create_cpu_queue_playbooks(
                         args_dict={"wait_for_refresh": True},
                         description="Clear intentional MTU-drop traffic statistics",
                         start_traffic=False,
-                    ),
-                    create_custom_step(
-                        params_dict={
-                            "custom_step_name": "verify_interface_mtu",
-                            "interface": ixia_downlink_interface,
-                            "expected_mtu": 9000,
-                        },
                     ),
                 ],
             )

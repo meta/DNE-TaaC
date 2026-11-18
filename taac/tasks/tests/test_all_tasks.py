@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
+import asyncio
 import base64
 import contextlib
 import json
@@ -10,7 +11,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, MagicMock, patch
 
 import later.unittest
-from taac.task_definitions import create_coop_apply_patchers_task
+from coop_thrift.coop.types import CoopConfigPatcher
+from taac.task_definitions import (
+    create_coop_apply_patchers_task,
+    create_coop_unregister_patchers_task,
+    create_enable_ixia_ports_patcher_task,
+)
 from neteng.test_infra.dne.taac.tasks import all as tasks_all
 from taac.tasks.all import (
     AristaCreateFileFromConfig,
@@ -302,6 +308,145 @@ class ScpFileTest(later.unittest.TestCase):
 
 
 class CoopApplyPatchersTaskTest(later.unittest.TestCase):
+    async def test_strict_agent_reload_failure_propagates(self) -> None:
+        for config_name in ("agent", "bgpcpp"):
+            with self.subTest(config_name=config_name):
+                driver = MagicMock()
+                driver.async_agent_config_reload = AsyncMock(
+                    side_effect=RuntimeError("agent reload failed")
+                )
+                driver.async_restart_service = AsyncMock()
+                task = create_coop_apply_patchers_task(
+                    ["fsw.example"],
+                    config_name=config_name,
+                    fail_on_agent_reload_error=True,
+                )
+                assert task.params is not None
+                with (
+                    _taac_env(taac_oss=False, meta_internal=False),
+                    patch(
+                        f"{ALL_PATH}.async_get_device_driver",
+                        new_callable=AsyncMock,
+                        return_value=driver,
+                    ),
+                    self.assertRaises(ExceptionGroup) as failure,
+                ):
+                    await CoopApplyPatchersTask(logger=MagicMock()).run(
+                        json.loads(task.params.json_params or "{}")
+                    )
+                self.assertEqual(1, len(failure.exception.exceptions))
+                self.assertIsInstance(failure.exception.exceptions[0], RuntimeError)
+                driver.async_agent_config_reload.assert_awaited_once_with()
+                driver.async_restart_service.assert_not_called()
+
+    async def test_failure_waits_for_other_agent_reloads(self) -> None:
+        finished = asyncio.Event()
+
+        async def slow_reload() -> None:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            finished.set()
+
+        failing_driver = MagicMock()
+        failing_driver.async_agent_config_reload = AsyncMock(
+            side_effect=RuntimeError("agent reload failed")
+        )
+        other_driver = MagicMock()
+        other_driver.async_agent_config_reload = AsyncMock(side_effect=slow_reload)
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                side_effect=[failing_driver, other_driver],
+            ),
+            self.assertRaises(ExceptionGroup),
+        ):
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                {
+                    "hostnames": ["first.example", "second.example"],
+                    "config_name": "agent",
+                    "fail_on_agent_reload_error": True,
+                }
+            )
+        self.assertTrue(finished.is_set())
+        other_driver.async_agent_config_reload.assert_awaited_once_with()
+
+    async def test_strict_apply_preserves_reload_cancellation(self) -> None:
+        driver = MagicMock()
+        driver.async_agent_config_reload = AsyncMock(side_effect=asyncio.CancelledError)
+        driver.async_restart_service = AsyncMock()
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                {
+                    "hostnames": ["fsw.example"],
+                    "config_name": "bgpcpp",
+                    "fail_on_agent_reload_error": True,
+                }
+            )
+        driver.async_agent_config_reload.assert_awaited_once_with()
+        driver.async_restart_service.assert_not_called()
+
+    async def test_strict_apply_reports_both_reload_errors(self) -> None:
+        errors = [
+            RuntimeError("first reload failed"),
+            ValueError("second reload failed"),
+        ]
+        drivers = [MagicMock(), MagicMock()]
+        for driver, error in zip(drivers, errors):
+            driver.async_agent_config_reload = AsyncMock(side_effect=error)
+            driver.async_restart_service = AsyncMock()
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                side_effect=drivers,
+            ),
+            self.assertRaises(ExceptionGroup) as failure,
+        ):
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                {
+                    "hostnames": ["first.example", "second.example"],
+                    "config_name": "bgpcpp",
+                    "fail_on_agent_reload_error": True,
+                }
+            )
+        self.assertEqual(tuple(errors), failure.exception.exceptions)
+        for driver in drivers:
+            driver.async_agent_config_reload.assert_awaited_once_with()
+            driver.async_restart_service.assert_not_called()
+
+    async def test_legacy_default_still_restarts_bgp_on_reload_error(self) -> None:
+        driver = MagicMock()
+        driver.async_agent_config_reload = AsyncMock(
+            side_effect=RuntimeError("agent reload failed")
+        )
+        driver.async_restart_service = AsyncMock()
+        task = create_coop_apply_patchers_task(["fsw.example"])
+        assert task.params is not None
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+        ):
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                json.loads(task.params.json_params or "{}")
+            )
+        driver.async_agent_config_reload.assert_awaited_once_with()
+        driver.async_restart_service.assert_awaited_once()
+
     async def test_singular_agent_config_does_not_restart_bgpd(self) -> None:
         driver = MagicMock()
         driver.async_agent_config_reload = AsyncMock()
@@ -427,6 +572,101 @@ class CoopUnregisterPatchersTaskTest(later.unittest.TestCase):
         driver, registered = await self._run_teardown(taac_oss=True, owner=None)
         self._assert_every_config_cleaned(driver, registered)
         driver.async_restore_patched_configs.assert_awaited_once_with()
+
+
+class EnableIxiaPortsPatcherTaskTest(later.unittest.TestCase):
+    async def test_registration_enables_only_configured_ports(self) -> None:
+        driver = MagicMock()
+        driver.async_register_python_patcher = AsyncMock()
+        cases = [
+            (
+                ["eth1/1/1", "eth1/2/1", "eth1/1/1"],
+                {"eth1/1/1": "enable", "eth1/2/1": "enable"},
+            ),
+            (
+                iter(["eth1/3/1", "eth1/4/1", "eth1/5/1"]),
+                {"eth1/3/1": "enable", "eth1/4/1": "enable", "eth1/5/1": "enable"},
+            ),
+        ]
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+        ):
+            for interfaces, expected in cases:
+                with self.subTest(ports=expected):
+                    driver.async_register_python_patcher.reset_mock()
+                    task = create_enable_ixia_ports_patcher_task(
+                        "fsw.example", interfaces
+                    )
+                    assert task.params is not None
+                    await CoopRegisterPatcherTask(logger=MagicMock()).run(
+                        json.loads(task.params.json_params or "{}")
+                    )
+                    driver.async_register_python_patcher.assert_awaited_once_with(
+                        config_name="agent",
+                        patcher_name="a_enable_ixia_ports",
+                        py_func_name="change_port_admin_state",
+                        patcher_args=expected,
+                        patcher_desc="",
+                    )
+
+    def test_empty_or_invalid_scope_is_rejected(self) -> None:
+        for interfaces in ([], [""], [" "], [" eth1/1/1 "], "eth1/1/1"):
+            with self.subTest(interfaces=interfaces):
+                with self.assertRaisesRegex(ValueError, "IXIA interfaces"):
+                    create_enable_ixia_ports_patcher_task(
+                        "fsw.example", t.cast(list[str], interfaces)
+                    )
+
+    async def test_teardown_unregisters_before_agent_reload(self) -> None:
+        registered = [
+            CoopConfigPatcher(
+                name="a_enable_ixia_ports", owner=tasks_all.DNE_TEST_REGRESSION_NAME
+            ),
+            CoopConfigPatcher(name="foreign_patcher", owner="another-owner"),
+        ]
+
+        async def list_patchers(config_name: str) -> list[CoopConfigPatcher]:
+            return list(registered) if config_name == "agent" else []
+
+        async def unregister(name: str, config_name: str, **kwargs: t.Any) -> None:
+            registered[:] = [patcher for patcher in registered if patcher.name != name]
+
+        driver = MagicMock()
+        driver.async_coop_list_patchers = AsyncMock(side_effect=list_patchers)
+        driver.async_coop_unregister_patchers = AsyncMock(side_effect=unregister)
+        driver.async_agent_config_reload = AsyncMock()
+        driver.async_restart_service = AsyncMock()
+        cleanup = create_coop_unregister_patchers_task("fsw.example")
+        apply = create_coop_apply_patchers_task(
+            ["fsw.example"], config_name="agent", fail_on_agent_reload_error=True
+        )
+        assert cleanup.params is not None and apply.params is not None
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+        ):
+            await CoopUnregisterPatchersTask(logger=MagicMock()).run(
+                json.loads(cleanup.params.json_params or "{}")
+            )
+            driver.async_agent_config_reload.assert_not_awaited()
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                json.loads(apply.params.json_params or "{}")
+            )
+        self.assertEqual(["foreign_patcher"], [patcher.name for patcher in registered])
+        driver.async_coop_unregister_patchers.assert_awaited_once_with(
+            "a_enable_ixia_ports", "agent", auto_remediate_failure=True
+        )
+        driver.async_agent_config_reload.assert_awaited_once_with()
+        driver.async_restart_service.assert_not_awaited()
 
 
 class CoopPatcherTaskGateTest(later.unittest.TestCase):

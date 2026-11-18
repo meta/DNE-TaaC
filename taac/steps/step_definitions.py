@@ -5957,6 +5957,7 @@ def create_verify_port_operational_state_step(
     operational_state: bool,
     description: t.Optional[str] = None,
     device_regexes: t.Optional[t.List[str]] = None,
+    start_traffic: bool = True,
 ) -> Step:
     """
     Create a step to verify port operational state.
@@ -5966,20 +5967,19 @@ def create_verify_port_operational_state_step(
         operational_state: Expected operational state (True=up, False=down)
         description: Custom description for the step
         device_regexes: Optional device patterns that scope the verification
+        start_traffic: Whether the generic step pre-hook should start IXIA traffic.
 
     Returns:
         Step object for port state verification
     """
+    params_dict = {
+        "interfaces": interfaces,
+        "operational_state": operational_state,
+    }
+    _add_skip_start_traffic_param(params_dict, start_traffic)
     return Step(
         name=StepName.VERIFY_PORT_OPERATIONAL_STATE,
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "interfaces": interfaces,
-                    "operational_state": operational_state,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params_dict)),
         description=description,
         device_regexes=device_regexes,
     )

@@ -14,6 +14,7 @@ Import from this module instead of creating inline Task objects in test configs.
 import base64
 import json
 import typing as t
+from collections.abc import Iterable
 
 from taac.constants import (
     ARISTA_7808_CPU_COUNT,
@@ -566,6 +567,30 @@ def create_coop_register_patcher_task(
     )
 
 
+def create_enable_ixia_ports_patcher_task(
+    hostname: str,
+    interfaces: Iterable[str],
+) -> Task:
+    """Register an agent patcher for the test's configured IXIA interfaces."""
+    if isinstance(interfaces, str):
+        raise ValueError("IXIA interfaces must be a collection of port names")
+    interface_names = list(interfaces)
+    if not interface_names or any(
+        not isinstance(interface, str)
+        or not interface.strip()
+        or interface != interface.strip()
+        for interface in interface_names
+    ):
+        raise ValueError("IXIA interfaces must contain nonempty unpadded port names")
+    return create_coop_register_patcher_task(
+        hostname=hostname,
+        config_name="agent",
+        patcher_name="a_enable_ixia_ports",
+        patcher_args=dict.fromkeys(interface_names, "enable"),
+        py_func_name="change_port_admin_state",
+    )
+
+
 def create_coop_register_jq_patcher_task(
     hostname: str,
     patcher_name: str,
@@ -597,6 +622,7 @@ def create_coop_apply_patchers_task(
     config_name: str = "bgpcpp",
     do_warmboot: bool = False,
     do_coldboot: bool = False,
+    fail_on_agent_reload_error: bool = False,
 ) -> Task:
     """
     Create a task to apply registered patchers on device(s).
@@ -607,6 +633,9 @@ def create_coop_apply_patchers_task(
         do_warmboot: Whether to perform a warmboot after applying (default: False)
         do_coldboot: Whether to perform a coldboot after applying (default: False).
             Required for port-channel agent patchers (min-link, agg-port creation, etc.)
+        fail_on_agent_reload_error: Report reload failures after all reload attempts
+            finish. Defaults to the existing best-effort reload behavior. Boot
+            paths already propagate failures and do not use this flag.
 
     Returns:
         Task object to apply patchers
@@ -615,6 +644,8 @@ def create_coop_apply_patchers_task(
         "hostnames": hostnames,
         "config_name": config_name,
     }
+    if fail_on_agent_reload_error:
+        params["fail_on_agent_reload_error"] = True
     if do_coldboot:
         params["do_coldboot"] = True
     elif do_warmboot:

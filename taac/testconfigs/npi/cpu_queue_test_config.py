@@ -77,6 +77,7 @@ from taac.task_definitions import (
     create_coop_apply_patchers_task,
     create_coop_register_patcher_task,
     create_coop_unregister_patchers_task,
+    create_enable_ixia_ports_patcher_task,
     create_run_commands_on_shell_task,
     create_wait_for_agent_convergence_task,
 )
@@ -361,6 +362,7 @@ def create_npi_cpu_queue_test_config(
     # netwhoami lookup.
     if low_queue is None or mid_queue is None or high_queue is None:
         low_queue, mid_queue, high_queue = get_cpu_queue_constants(device_name)
+    ixia_interfaces = [ixia_downlink_interface, ixia_uplink_interface]
     # Create and return the complete test configuration
     return TestConfig(
         name=test_config_name,
@@ -373,10 +375,7 @@ def create_npi_cpu_queue_test_config(
         endpoints=[
             taac_types.Endpoint(
                 name=device_name,
-                ixia_ports=[
-                    ixia_downlink_interface,
-                    ixia_uplink_interface,
-                ],
+                ixia_ports=ixia_interfaces,
                 dut=True,
                 mac_address=local_mac_address,
                 direct_ixia_connections=direct_ixia_connections or [],
@@ -395,6 +394,7 @@ def create_npi_cpu_queue_test_config(
                 if restore_soft_drain
                 else []
             ),
+            create_enable_ixia_ports_patcher_task(device_name, ixia_interfaces),
             # Remove all the bgp peers present in the device first
             create_coop_register_patcher_task(
                 hostname=device_name,
@@ -481,6 +481,7 @@ def create_npi_cpu_queue_test_config(
             create_coop_apply_patchers_task(
                 hostnames=[device_name],
                 config_name="bgpcpp",
+                fail_on_agent_reload_error=True,
             ),
             create_configure_parallel_bgp_peers_task(
                 hostname=device_name,
@@ -565,11 +566,17 @@ def create_npi_cpu_queue_test_config(
             ),
             create_coop_apply_patchers_task(
                 hostnames=[device_name],
+                fail_on_agent_reload_error=True,
             ),
         ],
         # Tasks to clean up after testing is complete
         teardown_tasks=[
             create_coop_unregister_patchers_task(device_name),
+            create_coop_apply_patchers_task(
+                hostnames=[device_name],
+                config_name="agent",
+                fail_on_agent_reload_error=True,
+            ),
             *(
                 [
                     create_run_commands_on_shell_task(
@@ -2027,6 +2034,7 @@ def create_npi_cpu_queue_test_config(
                     mid_queue=mid_queue,
                     high_queue=high_queue,
                     ixia_downlink_interface=ixia_downlink_interface,
+                    ixia_interfaces=[ixia_downlink_interface, ixia_uplink_interface],
                     # Total IXIA-mimic BGP peers across all three directions;
                     # used to scale the A2-leakage noise tolerance per queue.
                     bgp_peer_count=downlink_peer_count

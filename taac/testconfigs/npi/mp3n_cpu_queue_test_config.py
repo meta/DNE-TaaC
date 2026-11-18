@@ -69,6 +69,7 @@ from taac.task_definitions import (
     create_coop_apply_patchers_task,
     create_coop_register_patcher_task,
     create_coop_unregister_patchers_task,
+    create_enable_ixia_ports_patcher_task,
 )
 from taac.testconfigs.npi.cpu_queue_test_config import (
     _select_playbooks,
@@ -1298,6 +1299,7 @@ def create_mp3n_npi_cpu_queue_test_config(
         ),
     ]
     ports = [ixia_downlink_port, ixia_uplink_port]
+    ixia_interfaces = [port.interface for port in ports]
     bgp_peer_count = downlink_peer_count + uplink_peer_count
     playbooks = _apply_sp4_queue_overrides(
         [
@@ -1325,7 +1327,7 @@ def create_mp3n_npi_cpu_queue_test_config(
         endpoints=[
             taac_types.Endpoint(
                 name=device_name,
-                ixia_ports=[port.interface for port in ports],
+                ixia_ports=ixia_interfaces,
                 dut=True,
                 mac_address=local_mac_address,
                 direct_ixia_connections=[
@@ -1340,6 +1342,7 @@ def create_mp3n_npi_cpu_queue_test_config(
         ],
         setup_tasks=[
             create_coop_unregister_patchers_task(device_name),
+            create_enable_ixia_ports_patcher_task(device_name, ixia_interfaces),
             create_coop_register_patcher_task(
                 hostname=device_name,
                 config_names=bgp_config_names,
@@ -1373,9 +1376,18 @@ def create_mp3n_npi_cpu_queue_test_config(
                 patcher_args={"peer_configs": json.dumps(peer_configs)},
                 py_func_name="add_bgp_peers",
             ),
-            create_coop_apply_patchers_task(hostnames=[device_name]),
+            create_coop_apply_patchers_task(
+                hostnames=[device_name], fail_on_agent_reload_error=True
+            ),
         ],
-        teardown_tasks=[create_coop_unregister_patchers_task(device_name)],
+        teardown_tasks=[
+            create_coop_unregister_patchers_task(device_name),
+            create_coop_apply_patchers_task(
+                hostnames=[device_name],
+                config_name="agent",
+                fail_on_agent_reload_error=True,
+            ),
+        ],
         basic_port_configs=[
             taac_types.BasicPortConfig(
                 endpoint=f"{device_name}:{ixia_downlink_port.interface}",

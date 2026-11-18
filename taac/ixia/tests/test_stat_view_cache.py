@@ -5,7 +5,7 @@
 import threading
 import typing as t
 import unittest
-from unittest.mock import call, MagicMock, patch
+from unittest.mock import call, MagicMock, PropertyMock, patch
 
 from taac.ixia.taac_ixia import (
     IxiaOperationTimeoutError,
@@ -305,6 +305,37 @@ class GetOrCreateStatViewTest(unittest.TestCase):
 
     def setUp(self):
         self.ixia = _create_taac_ixia()
+
+    def test_latest_stats_re_resolves_a_stale_traffic_item_view_once(self):
+        """A dead view id is re-resolved by caption once; other errors still raise."""
+        self.ixia.test_case_uuid = "test-case"
+        self.ixia.captured_stats = {"test-case": {}}
+        self.ixia.capturing = False
+        stale = MagicMock()
+        stale._ViewName = "Traffic Item Statistics"
+        type(stale).Rows = PropertyMock(
+            side_effect=Exception(" Args do not match signature")
+        )
+        fresh = MagicMock()
+        fresh._ViewName = "Traffic Item Statistics"
+        type(fresh).Rows = PropertyMock(return_value=[])
+        self.ixia.traffic_item_view_assistant = stale
+        self.ixia._stat_view_cache["Traffic Item Statistics"] = stale
+        self.ixia._get_traffic_item_view = MagicMock(return_value=fresh)
+
+        self.assertEqual(self.ixia.get_latest_stats(max_timeout_sec=1), [])
+        self.ixia._get_traffic_item_view.assert_called_once_with()
+        self.assertIs(self.ixia.traffic_item_view_assistant, fresh)
+        self.assertNotIn("Traffic Item Statistics", self.ixia._stat_view_cache)
+
+        other = MagicMock()
+        other._ViewName = "Traffic Item Statistics"
+        type(other).Rows = PropertyMock(side_effect=Exception("connection reset"))
+        self.ixia.traffic_item_view_assistant = other
+        self.ixia._get_traffic_item_view.reset_mock()
+        with self.assertRaises(Exception):
+            self.ixia.get_latest_stats(max_timeout_sec=1)
+        self.ixia._get_traffic_item_view.assert_not_called()
 
     def test_latest_stats_lock_timeout_preserves_best_effort_fallback(self):
         self.ixia.test_case_uuid = "test-case"

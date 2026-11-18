@@ -12,14 +12,22 @@ as they did before the OSS patcher existed.
 """
 
 import contextlib
+import importlib
 import logging
+import os
 import typing as t
 from unittest.mock import patch
 
 from later.unittest import TestCase
-from neteng.test_infra.dne.taac.driver import fboss_switch, oss_coop_patcher
 from taac.driver.fboss_switch import FbossSwitch
 from taac.utils import oss_taac_lib_utils
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+
+fboss_switch = importlib.import_module(f"{_PACKAGE}.driver.fboss_switch")
+oss_coop_patcher = importlib.import_module(f"{_PACKAGE}.driver.oss_coop_patcher")
 
 _INTERNAL = (False, False)
 _CONTAINER = (True, True)

@@ -15,7 +15,8 @@ from taac.health_checks.snapshot_health_checks.cpu_queue_health_check import (
 )
 from taac.health_check.health_check import types as hc_types
 
-_HC_MODULE = "neteng.test_infra.dne.taac.health_checks.snapshot_health_checks.cpu_queue_health_check"
+# ShipIt rewrites imports but not string literals; derive the patch target.
+_HC_MODULE = CpuQueueHealthCheck.__module__
 
 
 def _snapshot(out_packets: dict, discards: dict, timestamp: int) -> Snapshot:

@@ -2,6 +2,7 @@
 # pyre-unsafe
 import asyncio
 import json
+import os
 import time
 import typing as t
 import unittest
@@ -15,6 +16,10 @@ from taac.steps.step_definitions import (
     DrainUndrainStep,
 )
 from taac.test_as_a_config import types as taac_types
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
 
 
 class DrainUndrainStepTest(unittest.IsolatedAsyncioTestCase):
@@ -88,7 +93,7 @@ class DrainUndrainStepTest(unittest.IsolatedAsyncioTestCase):
             with (
                 self.subTest(drain=drain),
                 patch(
-                    "neteng.test_infra.dne.taac.steps.step_definitions."
+                    f"{_PACKAGE}.steps.step_definitions."
                     "oss_config_patcher_enabled",
                     return_value=True,
                 ),
@@ -133,7 +138,7 @@ class DrainUndrainStepTest(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "neteng.test_infra.dne.taac.steps.step_definitions.asyncio.sleep",
+                f"{_PACKAGE}.steps.step_definitions.asyncio.sleep",
                 new_callable=AsyncMock,
             ),
             self.assertRaisesRegex(RuntimeError, "eth1/3/1"),
@@ -153,7 +158,7 @@ class DrainUndrainStepTest(unittest.IsolatedAsyncioTestCase):
         ]
 
         with patch(
-            "neteng.test_infra.dne.taac.steps.step_definitions.asyncio.sleep",
+            f"{_PACKAGE}.steps.step_definitions.asyncio.sleep",
             new_callable=AsyncMock,
         ) as sleep:
             await self.step.run(
@@ -207,7 +212,7 @@ class DrainUndrainStepTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, read_state.await_count)
 
     @patch(
-        "neteng.test_infra.dne.taac.steps.step_definitions.async_nds_drain",
+        f"{_PACKAGE}.steps.step_definitions.async_nds_drain",
         new_callable=AsyncMock,
     )
     async def test_nds_resolves_interfaces_through_testbed_topology(

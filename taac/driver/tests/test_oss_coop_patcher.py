@@ -6,6 +6,7 @@
 fake device that keeps its files in memory."""
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -42,6 +43,12 @@ from taac.driver.driver_constants import FbossSystemctlServiceName
 from taac.driver.oss_patchers import PatcherError
 from pyre_extensions import none_throws
 from taac.test_as_a_config import types as taac_types
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+
+ocp = importlib.import_module(f"{_PACKAGE}.driver.oss_coop_patcher")
 
 HOST = "dut1"
 BGP_LIVE = ocp.CONFIG_SPECS["bgpcpp"].live_path

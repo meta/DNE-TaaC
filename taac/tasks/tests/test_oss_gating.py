@@ -2,6 +2,8 @@
 """Tasks that behave differently under TAAC_OSS=1."""
 
 import base64
+import importlib
+import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +12,11 @@ from taac.tasks.all import (
     AllocateCgroupSliceMemory,
     AssertThriftRateLimitEnabledTask,
 )
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+all_tasks = importlib.import_module(f"{_PACKAGE}.tasks.all")
 
 
 class OssGatingTest(unittest.IsolatedAsyncioTestCase):

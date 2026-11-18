@@ -4681,7 +4681,11 @@ class FbossSwitch(AbstractSwitch):
         while the device is drained, since the live config is then not what
         bgpd serves. One apply for the batch, so bgpd restarts once.
         """
-        from neteng.test_infra.dne.taac.driver import config_modifiers, oss_coop_patcher
+        import importlib
+
+        package = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+        config_modifiers = importlib.import_module(f"{package}.driver.config_modifiers")
+        oss_coop_patcher = importlib.import_module(f"{package}.driver.oss_coop_patcher")
 
         action = "drain" if drain else "undrain"
         if await config_modifiers.async_is_device_drained(self):

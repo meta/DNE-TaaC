@@ -12,6 +12,7 @@ flag and ignore that one entirely. See FBOSS_COLD_BOOT_ONCE_FILE in
 keeps the internal ``cold_boot_once_0`` flag.
 """
 
+import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
@@ -26,7 +27,11 @@ from taac.constants import (
 from taac.driver.driver_constants import FbossSystemctlServiceName
 from taac.driver.fboss_switch import FbossSwitch
 
-_FBOSS_SWITCH_MODULE = "neteng.test_infra.dne.taac.driver.fboss_switch"
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+
+_FBOSS_SWITCH_MODULE = f"{_PACKAGE}.driver.fboss_switch"
 
 
 class ColdBootFileTest(unittest.IsolatedAsyncioTestCase):

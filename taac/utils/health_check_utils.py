@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
+import asyncio
 import ipaddress
+import logging
 import math
 import os
 import random
@@ -379,6 +381,96 @@ def collector_window_start(
     jq_start = check_params.get("start_time") or 0
     anchor = max(float(jq_start), get_test_case_start_time())
     return anchor if anchor else window_end - lookback_sec
+
+
+# A window narrower than this many poll intervals is widened by
+# ``floor_collector_window``. Two, not one: a CPU sample is a delta against the
+# previous poll, so the first poll in any window yields no value.
+MIN_WINDOW_POLL_INTERVALS: float = 2.0
+
+
+def floor_collector_window(
+    window_start: float, window_end: float, poll_interval_sec: float
+) -> float:
+    """Widen a collector query window backwards to at least
+    ``MIN_WINDOW_POLL_INTERVALS`` poll intervals.
+
+    Measurement checks (CPU, memory) report MAX over the window, so a window
+    shorter than the collector's poll interval contains no sample and the check
+    has to SKIP. That is the common case for a precheck: the runner stamps the
+    test-case start immediately before prechecks run, so the default window is
+    near-zero-width and the check never evaluates.
+
+    Mirrors the ODS path's own floor (``_prepare_time_window`` widens a window
+    under 60s), scaled to the collector's poll interval instead.
+
+    Only for checks that need a sample to produce a value. Checks that assert
+    the *absence* of an event (unclean exits, inactive units) must keep the
+    caller's window: widening theirs would attribute the previous playbook's
+    event to this one.
+    """
+    min_window_sec = MIN_WINDOW_POLL_INTERVALS * poll_interval_sec
+    if window_end - window_start < min_window_sec:
+        return window_end - min_window_sec
+    return window_start
+
+
+# A just-started collector gets this many poll intervals to produce a measurable
+# sample before a measurement check gives up and SKIPs. CPU% is a delta against
+# the previous poll, so its first measurable value needs two polls.
+FIRST_SAMPLE_WAIT_POLL_INTERVALS: float = 3.0
+# How often to re-check while waiting; well under any collector's poll interval
+# so the wait ends with the sample, not an interval after it.
+FIRST_SAMPLE_WAIT_STEP_SEC: float = 0.5
+
+
+async def await_first_collector_sample(
+    collector: t.Any,
+    services: t.Sequence[str],
+    window_end: float,
+    logger: t.Optional[logging.Logger] = None,
+) -> float:
+    """Give a just-started collector time to produce its first measurable sample.
+
+    ``floor_collector_window`` only widens a window backwards, which covers a
+    precheck that fires a few poll intervals after the collector started. A
+    config whose setup tasks are all no-ops runs its prechecks right after
+    collector start, before the first poll (an SSH round trip) returns, and
+    no backward widening can find a row that does not exist yet. The CPU
+    collector needs one poll more than that: its first row carries ``None`` for
+    every service because CPU% is a delta against the previous poll.
+
+    Applies only to a collector whose polling thread is alive and that has
+    fewer than two rows, i.e. one that started moments ago. Waits up to
+    ``FIRST_SAMPLE_WAIT_POLL_INTERVALS`` poll intervals for a non-``None``
+    value for any of ``services``, polling every ``FIRST_SAMPLE_WAIT_STEP_SEC``,
+    and returns ``time.time()`` as the window end so the rows that landed are
+    inside the window. Anything else returns the caller's ``window_end``
+    untouched: a collector that was never started, or one with a history whose
+    rows fall outside the window (services masked or inactive), keeps its SKIP.
+    """
+    thread = getattr(collector, "_thread", None)
+    if thread is None or not thread.is_alive() or len(collector.rows) >= 2:
+        return window_end
+    wait_sec = FIRST_SAMPLE_WAIT_POLL_INTERVALS * collector.interval_sec
+
+    def measurable() -> bool:
+        now = time.time()
+        got = collector.max_per_service_in_window(now - wait_sec, now)
+        return any(service in got for service in services)
+
+    if not measurable():
+        if logger is not None:
+            logger.info(
+                f"[{collector.__class__.__name__}] no measurable sample yet; "
+                f"waiting up to {wait_sec:.0f}s for its first poll(s)"
+            )
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            await asyncio.sleep(FIRST_SAMPLE_WAIT_STEP_SEC)
+            if measurable():
+                break
+    return time.time()
 
 
 def generate_prefix_nh_list_map(

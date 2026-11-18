@@ -19,7 +19,9 @@ from taac.libs.collectors.cpu_utilization_collector import (
 )
 from taac.libs.collectors.registry import get_collector_for_host
 from taac.utils.health_check_utils import (
+    await_first_collector_sample,
     collector_window_start,
+    floor_collector_window,
     format_timestamp,
 )
 from taac.health_check.health_check import types as hc_types
@@ -37,6 +39,22 @@ if t.TYPE_CHECKING or not TAAC_OSS:
 
 CPU_UTILIZATION_KEY_DESC_FBOSS = "regex(cgroup.slice.workload.*({service}).*.cpu.stat.util_pct),!filter(.*(metalos).*)"
 CPU_UTILIZATION_KEY_DESC_EOS = "bgpd.process.cpu.percent"
+
+
+def format_cpu_max_summary(
+    service_data_list: t.Sequence[t.Mapping[str, t.Any]],
+    window_sec: float,
+) -> str:
+    """One-line MAX-over-window summary for the health check result message.
+
+    The tabulated version goes to ``logger.info``, which the runner suppresses
+    on console; only the result message reaches the run summary table.
+    """
+    if not service_data_list:
+        return ""
+    ordered = sorted(service_data_list, key=lambda d: d["cpu_pct"], reverse=True)
+    parts = [f"{d['service']} {d['cpu_pct']:.2f}%/{d['threshold']}%" for d in ordered]
+    return f"MAX over {window_sec:.0f}s: {', '.join(parts)}"
 
 
 class CpuUtilizationHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn]):
@@ -482,10 +500,16 @@ class CpuUtilizationHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthChe
             )
         now = time.time()
         window_end = check_params.get("window_end", now)
+        window_end = await await_first_collector_sample(
+            collector, services, window_end, self.logger
+        )
         lookback_sec = check_params.get("lookback_sec", 900)
         window_start = check_params.get(
             "window_start",
             collector_window_start(check_params, window_end, lookback_sec),
+        )
+        window_start = floor_collector_window(
+            window_start, window_end, collector.interval_sec
         )
 
         max_per_service = collector.max_per_service_in_window(window_start, window_end)
@@ -539,6 +563,7 @@ class CpuUtilizationHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthChe
             )
 
         window_sec = max(0.0, window_end - window_start)
+        max_summary = format_cpu_max_summary(service_data_list, window_sec)
         table_rows = [
             [d["service"], f"{d['cpu_pct']:.2f}", f"{d['threshold']}"]
             for d in service_data_list
@@ -571,9 +596,13 @@ class CpuUtilizationHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthChe
                 message=(
                     f"CPU utilization exceeded threshold on {obj.name}:\n"
                     + "\n".join(violations)
+                    + f"\n{max_summary}"
                 ),
             )
         return hc_types.HealthCheckResult(
             status=hc_types.HealthCheckStatus.PASS,
-            message="CPU utilization is within the defined threshold.",
+            message=(
+                "CPU utilization is within the defined threshold.\n"
+                f"{max_summary}"
+            ),
         )

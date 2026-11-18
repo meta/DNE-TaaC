@@ -20,7 +20,9 @@ from taac.libs.collectors.memory_utilization_collector import (
 from taac.libs.collectors.registry import get_collector_for_host
 from taac.utils.arista_utils import find_process_pid
 from taac.utils.health_check_utils import (
+    await_first_collector_sample,
     collector_window_start,
+    floor_collector_window,
     format_timestamp,
 )
 from taac.health_check.health_check import types as hc_types
@@ -58,6 +60,29 @@ DEFAULT_SERVICE_NAMES = [
     "fboss_hw_agent@0",
 ]
 MEMORY_UTILIZATION_KEY_DESC_EOS = "bgpd.process.memory.rss.bytes"
+
+
+def format_memory_max_summary(
+    service_data_list: t.Sequence[t.Mapping[str, t.Any]],
+    window_sec: float,
+) -> str:
+    """One-line MAX-over-window summary for the health check result message.
+
+    Rendered in MB rather than raw bytes to stay readable in the run summary
+    table. A threshold of 0 means "no global check" (see the caller), shown
+    here as "no limit" so a large peak under no threshold isn't misread as
+    passing a check that never ran.
+    """
+    if not service_data_list:
+        return ""
+    ordered = sorted(service_data_list, key=lambda d: d["memory_bytes"], reverse=True)
+    parts = []
+    for d in ordered:
+        used_mb = d["memory_bytes"] / (1024 * 1024)
+        threshold = d["threshold"]
+        limit = f"{threshold / (1024 * 1024):,.1f}MB" if threshold > 0 else "no limit"
+        parts.append(f"{d['service']} {used_mb:,.1f}MB/{limit}")
+    return f"MAX over {window_sec:.0f}s: {', '.join(parts)}"
 
 
 class MemoryUtilizationHealthCheck(
@@ -627,10 +652,16 @@ class MemoryUtilizationHealthCheck(
             )
         now = time.time()
         window_end = check_params.get("window_end", now)
+        window_end = await await_first_collector_sample(
+            collector, services, window_end, self.logger
+        )
         lookback_sec = check_params.get("lookback_sec", 900)
         window_start = check_params.get(
             "window_start",
             collector_window_start(check_params, window_end, lookback_sec),
+        )
+        window_start = floor_collector_window(
+            window_start, window_end, collector.interval_sec
         )
 
         max_per_service = collector.max_per_service_in_window(window_start, window_end)
@@ -685,6 +716,7 @@ class MemoryUtilizationHealthCheck(
             )
 
         window_sec = max(0.0, window_end - window_start)
+        max_summary = format_memory_max_summary(service_data_list, window_sec)
         table_rows = [
             [d["service"], f"{d['memory_bytes']:,}", f"{d['threshold']:,.0f}"]
             for d in service_data_list
@@ -717,9 +749,13 @@ class MemoryUtilizationHealthCheck(
                 message=(
                     f"Memory utilization exceeded threshold on {obj.name}:\n"
                     + "\n".join(violations)
+                    + f"\n{max_summary}"
                 ),
             )
         return hc_types.HealthCheckResult(
             status=hc_types.HealthCheckStatus.PASS,
-            message="Memory utilization is within the defined threshold.",
+            message=(
+                "Memory utilization is within the defined threshold.\n"
+                f"{max_summary}"
+            ),
         )

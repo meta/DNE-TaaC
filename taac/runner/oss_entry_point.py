@@ -287,6 +287,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("=" * 60)
     logger.info("OSS TAAC Test Runner")
     logger.info("=" * 60)
+    logger.info(f"Image commit: {os.environ.get('TAAC_GIT_SHA', 'unknown')}")
     logger.info(f"Test Configs: {args.test_configs}")
     logger.info(f"DUTs: {args.duts}")
     if args.log_file:

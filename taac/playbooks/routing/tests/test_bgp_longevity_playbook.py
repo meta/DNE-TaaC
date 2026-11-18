@@ -7,6 +7,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import later.unittest
+from taac.abstractions.churn.workloads import (
+    LongevityCommunityChurn,
+)
+from taac.playbooks.routing import (
+    bgp_ebb_playbooks as _bgp_ebb_playbooks,
+)
 from taac.playbooks.routing.bgp_ebb_playbooks import (
     get_bgp_ebb_longevity_playbook,
 )
@@ -15,6 +21,7 @@ from taac.stages.stage_definitions import (
 )
 from taac.steps.step_definitions import (
     create_bgp_longevity_community_churn_step,
+    create_longevity_community_churn_step,
 )
 from taac.test_as_a_config import types as taac_types
 
@@ -27,6 +34,21 @@ def _payload(step: taac_types.Step) -> dict:
 
 
 class BgpLongevityPlaybookTest(later.unittest.TestCase):
+    def test_typed_step_matches_legacy_payload(self) -> None:
+        legacy = create_bgp_longevity_community_churn_step(
+            duration_seconds=14_400,
+            cadence_seconds=60,
+        )
+        typed = create_longevity_community_churn_step(
+            LongevityCommunityChurn.create(
+                duration_seconds=14_400,
+                cadence_seconds=60,
+            )
+        )
+
+        self.assertEqual(_payload(legacy), _payload(typed))
+        self.assertEqual(legacy.description, typed.description)
+
     def test_step_factory_serializes_wall_clock_contract(self) -> None:
         step = create_bgp_longevity_community_churn_step(
             duration_seconds=14_400,
@@ -72,10 +94,9 @@ class BgpLongevityPlaybookTest(later.unittest.TestCase):
         self.assertIn("Quiesce 300s", description)
 
     def test_playbook_duration_is_the_churn_window(self) -> None:
-        target = (
-            "neteng.test_infra.dne.taac.playbooks.routing."
-            "bgp_ebb_playbooks.get_profile_checks"
-        )
+        # ShipIt rewrites import statements but not string literals, so the
+        # patch target is read off the imported module's __name__.
+        target = f"{_bgp_ebb_playbooks.__name__}.get_profile_checks"
         with patch(target) as get_checks:
             get_checks.return_value = SimpleNamespace(
                 prechecks=[], postchecks=[], snapshot_checks=[]

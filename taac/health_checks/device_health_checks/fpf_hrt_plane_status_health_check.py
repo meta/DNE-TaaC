@@ -14,7 +14,10 @@ from taac.libs.fpf.fpf_collector_registry import (
     everpaste_details_suffix,
     get_collector,
     get_disruption_time,
+    get_restart_completion_time,
+    get_restart_time,
     get_test_case_start_time,
+    restart_tolerant_collector_view,
 )
 from taac.health_check.health_check import types as hc_types
 
@@ -41,7 +44,9 @@ class FpfHrtPlaneStatusHealthCheck(
     collector registry. That ONE collector holds ALL monitored GPU hosts (each
     row carries its ``host``); this check iterates the hosts present in its rows
     and evaluates each host independently; every host must satisfy the contract.
-    Each poll captures the State of every plane (beth0..beth7). Two contracts
+    Each poll captures every configured device/local-plane tuple. New-SDK MWG2
+    uses devices 0..7 with local planes 0..3; legacy RTP may retain one device
+    with planes 0..7. Two contracts
     via ``mode``:
 
       mode="all_up" (default): every plane is UP across the whole window. Used
@@ -86,9 +91,20 @@ class FpfHrtPlaneStatusHealthCheck(
         # nulls tolerated). Ignored by the "drain" mode.
         stability_mode = check_params.get("stability_mode", "strict")
         expected_planes: t.Optional[t.List[int]] = check_params.get("expected_planes")
+        device_ids: t.Optional[t.List[int]] = check_params.get("device_ids")
         impacted_planes: t.List[int] = [
             int(p) for p in (check_params.get("impacted_planes") or [])
         ]
+        impacted_tuples_by_host_device: t.Optional[
+            t.Dict[str, t.Dict[str, t.List[int]]]
+        ] = check_params.get("impacted_tuples_by_host_device")
+        restart_tolerant_hosts = set(
+            check_params.get("restart_tolerant_hosts", []) or []
+        )
+        restart_ts = get_restart_time() if restart_tolerant_hosts else 0.0
+        restart_completion_ts = (
+            get_restart_completion_time() if restart_tolerant_hosts else 0.0
+        )
 
         if mode == "drain":
             _skip = disruption_inconclusive_skip()
@@ -106,7 +122,7 @@ class FpfHrtPlaneStatusHealthCheck(
         if mode == "drain":
             disruption_ts = get_disruption_time()
             if disruption_ts > 0:
-                default_start = disruption_ts
+                default_start = max(default_start, disruption_ts)
         window_start = check_params.get("window_start", default_start)
         # all_up settle: skip the first settle_sec (restore-phase recovery
         # transient) before asserting every plane is UP.
@@ -116,22 +132,55 @@ class FpfHrtPlaneStatusHealthCheck(
 
         # The single collector holds all hosts (each row carries its host); the
         # hosts to evaluate are those present in the in-window rows.
-        hosts = collector.hosts_in_window(window_start, window_end)
-        if not hosts:
-            hosts = list(getattr(collector, "hosts", []) or [])
+        hosts = collector.hosts_in_window(window_start, window_end) or list(
+            getattr(collector, "hosts", []) or []
+        )
 
         host_results: t.List[_HostPlaneResult] = []
         for host in hosts:
+            host_collector = collector
+            recovery_detail = ""
+            if host in restart_tolerant_hosts:
+                host_collector, recovery_detail = restart_tolerant_collector_view(
+                    collector,
+                    host=host,
+                    restart_ts=restart_ts,
+                    restart_completion_ts=restart_completion_ts,
+                    row_is_error=lambda row: (
+                        not bool(getattr(row, "valid", True))
+                        or str(getattr(row, "notes", "") or "").startswith("error:")
+                        or not bool(getattr(row, "plane_states", {}))
+                    ),
+                )
+            if host_collector is None:
+                hr = _HostPlaneResult(host)
+                hr.status = "FAIL"
+                hr.results = []
+                self.logger.error(
+                    f"[HRT plane-status][{host}] restart recovery: {recovery_detail}"
+                )
+                host_results.append(hr)
+                continue
             hr = self._evaluate_host(
                 host,
-                collector,
+                host_collector,
                 mode,
                 stability_mode,
                 expected_planes,
                 impacted_planes,
+                device_ids,
+                (
+                    impacted_tuples_by_host_device.get(host, {})
+                    if impacted_tuples_by_host_device is not None
+                    else None
+                ),
                 window_start,
                 window_end,
             )
+            if recovery_detail:
+                self.logger.info(
+                    f"[HRT plane-status][{host}] restart recovery: {recovery_detail}"
+                )
             host_results.append(hr)
 
         if not host_results or all(hr.status == "SKIP" for hr in host_results):
@@ -174,13 +223,15 @@ class FpfHrtPlaneStatusHealthCheck(
         stability_mode: str,
         expected_planes: t.Optional[t.List[int]],
         impacted_planes: t.List[int],
+        device_ids: t.Optional[t.List[int]],
+        impacted_tuples_by_device: t.Optional[t.Dict[str, t.List[int]]],
         window_start: float,
         window_end: float,
     ) -> _HostPlaneResult:
         hr = _HostPlaneResult(host)
         self.logger.info(
             f"  [HRT plane-status][{host}] mode={mode} "
-            f"dev{getattr(collector, 'device_id', '?')} "
+            f"devices={device_ids or getattr(collector, 'device_ids', '?')} "
             f"window: {window_start:.0f} to {window_end:.0f} "
             f"({window_end - window_start:.0f}s span)"
         )
@@ -192,6 +243,8 @@ class FpfHrtPlaneStatusHealthCheck(
                 impacted_planes=impacted_planes,
                 expected_planes=expected_planes,
                 host=host,
+                device_ids=device_ids,
+                impacted_tuples_by_device=impacted_tuples_by_device,
             )
         else:
             results = collector.evaluate_all_up_window(
@@ -201,6 +254,7 @@ class FpfHrtPlaneStatusHealthCheck(
                 last_sample_only=(stability_mode == "last_sample"),
                 skip_null_strict=(stability_mode == "skip_null_strict"),
                 host=host,
+                device_ids=device_ids,
             )
         hr.results = results
         hr.timeout_count = collector.timeout_count_in_window(
@@ -210,7 +264,8 @@ class FpfHrtPlaneStatusHealthCheck(
         for r in results:
             status = "PASS" if r.passed else "FAIL"
             self.logger.info(
-                f"  [HRT plane-status][{host}] Plane {r.plane}: [{status}] "
+                f"  [HRT plane-status][{host}] dev{r.device_id}/L{r.plane}: "
+                f"[{status}] "
                 f"expect={r.expected_state} {r.detail}"
             )
 
@@ -249,7 +304,8 @@ def _format_report(host_results: t.List[_HostPlaneResult], mode: str, agg: str) 
             )
             for r in failures:
                 lines.append(
-                    f"    Plane {r.plane}: [FAIL] expect={r.expected_state} "
+                    f"    dev{r.device_id}/L{r.plane}: [FAIL] "
+                    f"expect={r.expected_state} "
                     f"observed={r.observed_state} — {r.detail}"
                 )
     lines.append(f"AGGREGATE: {agg}")

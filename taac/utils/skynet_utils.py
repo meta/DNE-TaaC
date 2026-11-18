@@ -25,7 +25,7 @@ TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 # Only import Meta-internal modules when not in OSS mode
 if not TAAC_OSS:
     from neteng.netcastle.utils.skynet_utils import (
-        async_get_device_info_from_fbnet,
+        async_get_fbnet_device_vendor,
         get_skynet_thrift_client,
     )
     from nettools.skynet.Query import types as query_types
@@ -36,8 +36,8 @@ else:
         def __getattr__(self, attr: str) -> t.Any:  # pragma: no cover - guard
             raise RuntimeError("Skynet Query/Struct types are unavailable in OSS mode")
 
-    query_types = cast(t.Any, _UnavailableSkynetTypes())  # pyre-ignore[31]
-    skynet_types = cast(t.Any, _UnavailableSkynetTypes())  # pyre-ignore[31]
+    query_types = cast(t.Any, _UnavailableSkynetTypes())
+    skynet_types = cast(t.Any, _UnavailableSkynetTypes())
 
 
 SKYNET_TIER: str = "skynet_thrift"
@@ -195,11 +195,7 @@ async def async_get_vendor_info_from_fbnet(device_name: str) -> t.Optional[str]:
     """
     Given the device_name, queries FBNet to return the vendor name
     """
-    device_info = await async_get_device_info_from_fbnet(
-        device_name, "desired_platform.os_type_name"
-    )
-    if device_info and device_info.desired_platform:
-        return device_info.desired_platform.os_type_name
+    return await async_get_fbnet_device_vendor(device_name)
 
 
 @async_memoize_forever

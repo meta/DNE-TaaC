@@ -13,8 +13,28 @@ from taac.abstractions.compilation.model import (
     DesiredPresence,
     DutPlan,
     EndpointPlan,
+    EndpointSetupMode,
     PolicyDirection,
     ResourceId,
+    RoutingConfigPlan,
+)
+from taac.abstractions.component_semantics import (
+    ComponentDesiredState,
+    ComponentReadinessRequirement,
+    ComponentReconcileMode,
+    ComponentRole,
+)
+from taac.abstractions.config_artifact_semantics import (
+    ConfigArtifactProvider,
+)
+from taac.abstractions.physical_interface_semantics import (
+    PhysicalInterfaceProfile,
+    PhysicalLinkRate,
+)
+
+
+_EOS_IXIA_INTERFACE_PROFILE = PhysicalInterfaceProfile(
+    rate=PhysicalLinkRate(aggregate_gbps=100, lane_count=2)
 )
 
 
@@ -28,7 +48,9 @@ class EosBgpCppCapabilityPreflight:
 
     def validate(self, plan: DutPlan) -> None:
         endpoint = _required_dut_endpoint(plan)
-        _validate_routing_config(plan, endpoint)
+        _validate_physical_interfaces(plan, endpoint)
+        routing_config = _validate_routing_config(plan, endpoint)
+        _validate_components(plan, endpoint, routing_config)
         _validate_policy_bindings(plan, endpoint)
 
 
@@ -54,7 +76,14 @@ def _required_dut_endpoint(plan: DutPlan) -> EndpointPlan:
     return endpoint
 
 
-def _validate_routing_config(plan: DutPlan, endpoint: EndpointPlan) -> None:
+def _validate_routing_config(
+    plan: DutPlan,
+    endpoint: EndpointPlan,
+) -> RoutingConfigPlan:
+    if endpoint.setup_mode is EndpointSetupMode.PRELOADED:
+        raise UnsupportedEosBgpCppCapabilityError(
+            "EOS/BGP++ capability does not support preloaded setup"
+        )
     if len(plan.routing_configs) != 1:
         raise UnsupportedEosBgpCppCapabilityError(
             "EOS/BGP++ capability requires exactly one routing-config plan; "
@@ -70,6 +99,99 @@ def _validate_routing_config(plan: DutPlan, endpoint: EndpointPlan) -> None:
         raise UnsupportedEosBgpCppCapabilityError(
             f"routing config {routing_config.resource_id} has unsupported driver "
             f"{routing_config.routing_driver!r}"
+        )
+    source = routing_config.source
+    if endpoint.setup_mode is EndpointSetupMode.FULL and source is None:
+        raise UnsupportedEosBgpCppCapabilityError(
+            f"routing config {routing_config.resource_id} requires a config "
+            "artifact source for full setup"
+        )
+    if (
+        source is not None
+        and source.provider is not ConfigArtifactProvider.CONFIGERATOR
+    ):
+        raise UnsupportedEosBgpCppCapabilityError(
+            f"routing config {routing_config.resource_id} has unsupported source "
+            f"provider {source.provider.value!r}"
+        )
+    return routing_config
+
+
+def _validate_physical_interfaces(
+    plan: DutPlan,
+    endpoint: EndpointPlan,
+) -> None:
+    for interface in plan.interfaces:
+        if interface.endpoint_id != endpoint.resource_id:
+            raise UnsupportedEosBgpCppCapabilityError(
+                f"interface {interface.resource_id} targets {interface.endpoint_id}, "
+                f"expected {endpoint.resource_id}"
+            )
+        if interface.bound_interface is None or interface.physical_interface_id is None:
+            raise UnsupportedEosBgpCppCapabilityError(
+                f"interface {interface.resource_id} has no physical binding"
+            )
+    for physical_interface in plan.physical_interfaces:
+        if physical_interface.endpoint_id != endpoint.resource_id:
+            raise UnsupportedEosBgpCppCapabilityError(
+                f"physical interface {physical_interface.resource_id} targets "
+                f"{physical_interface.endpoint_id}, expected {endpoint.resource_id}"
+            )
+        if physical_interface.profile != _EOS_IXIA_INTERFACE_PROFILE:
+            raise UnsupportedEosBgpCppCapabilityError(
+                f"physical interface {physical_interface.resource_id} has "
+                f"unsupported profile {physical_interface.profile!r}"
+            )
+    expected_link_ids = {
+        link.resource_id
+        for link in plan.links
+        if endpoint.resource_id in {link.a_endpoint_id, link.z_endpoint_id}
+    }
+    physical_link_ids = {
+        link_id
+        for physical_interface in plan.physical_interfaces
+        for link_id in physical_interface.link_ids
+    }
+    if physical_link_ids != expected_link_ids:
+        raise UnsupportedEosBgpCppCapabilityError(
+            "EOS/BGP++ physical interfaces must own every DUT link exactly"
+        )
+
+
+def _validate_components(
+    plan: DutPlan,
+    endpoint: EndpointPlan,
+    routing_config: RoutingConfigPlan,
+) -> None:
+    if len(plan.components) != 1:
+        raise UnsupportedEosBgpCppCapabilityError(
+            "EOS/BGP++ capability requires exactly one routing-control-plane "
+            f"component; found {len(plan.components)}"
+        )
+    component = plan.components[0]
+    if component.endpoint_id != endpoint.resource_id:
+        raise UnsupportedEosBgpCppCapabilityError(
+            f"component {component.resource_id} targets {component.endpoint_id}, "
+            f"expected {endpoint.resource_id}"
+        )
+    expected = (
+        ComponentRole.ROUTING_CONTROL_PLANE,
+        ComponentDesiredState.RUNNING,
+        ComponentReconcileMode.RESTART_AFTER_CONFIGURATION,
+        ComponentReadinessRequirement.ACKNOWLEDGED,
+        (routing_config.resource_id,),
+    )
+    actual = (
+        component.role,
+        component.desired_state,
+        component.reconcile_mode,
+        component.readiness,
+        component.depends_on,
+    )
+    if actual != expected:
+        raise UnsupportedEosBgpCppCapabilityError(
+            f"component {component.resource_id} has unsupported routing-control-plane "
+            f"contract {actual!r}"
         )
 
 

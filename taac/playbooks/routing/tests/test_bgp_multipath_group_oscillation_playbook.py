@@ -4,6 +4,7 @@
 import json
 import unittest
 
+from taac.abstractions.churn.workloads import MultipathChurn
 from taac.constants import BgpPlusPlusProfile
 from taac.playbooks.routing.bgp_ebb_playbooks import (
     get_bgp_ebb_multipath_group_oscillation_playbook,
@@ -11,8 +12,9 @@ from taac.playbooks.routing.bgp_ebb_playbooks import (
 from taac.stages.stage_definitions import (
     create_multipath_group_oscillation_stage,
 )
-from taac.testconfigs.routing.util.bgp_ebb_constants import (
-    IXIA_BGP_MON_IC_PARENT_NETWORK,
+from taac.steps.step_definitions import (
+    create_bgp_multipath_oscillation_step,
+    create_multipath_churn_step,
 )
 from taac.test_as_a_config import types as taac_types
 
@@ -33,43 +35,57 @@ def _step_params(step: taac_types.Step) -> dict:
 
 
 class BgpMultipathGroupOscillationPlaybookTest(unittest.TestCase):
-    def test_stage_spans_configured_peer_range_and_uses_strict_targeting(self) -> None:
+    def test_typed_step_matches_legacy_payload(self) -> None:
+        legacy = create_bgp_multipath_oscillation_step(
+            hostname="dut.example.com",
+            ipv4_peer_regex=".*IPV4_EBGP$",
+            ipv6_peer_regex=".*IPV6_EBGP$",
+            ipv4_session_count=140,
+            ipv6_session_count=140,
+            test_duration_seconds=1680,
+            oscillation_interval_seconds=280,
+            min_peers_to_stop=1,
+            max_peers_to_stop=11,
+        )
+        typed = create_multipath_churn_step(
+            MultipathChurn.create(
+                hostname="dut.example.com",
+                ipv4_peer_regex=".*IPV4_EBGP$",
+                ipv6_peer_regex=".*IPV6_EBGP$",
+                ipv4_session_count=140,
+                ipv6_session_count=140,
+                test_duration_seconds=1680,
+                oscillation_interval_seconds=280,
+                min_peers_to_stop=1,
+                max_peers_to_stop=11,
+            )
+        )
+
+        self.assertEqual(_step_params(legacy), _step_params(typed))
+        self.assertEqual(legacy.description, typed.description)
+
+    def test_stage_uses_path_aware_targeted_probe_workflow(self) -> None:
         stage = create_multipath_group_oscillation_stage(
-            oscillation_interval_seconds=280
+            hostname="dut.example.com", oscillation_interval_seconds=280
         )
 
-        self.assertEqual(50, len(stage.steps))
-        stop_steps = [
-            step
-            for step in stage.steps
-            if step.description is not None and "Stop IPv4" in step.description
-        ]
-        self.assertEqual(
-            [1, 3, 5, 7, 9, 11],
-            [_ixia_args(step)["session_end_idx"] for step in stop_steps],
-        )
-        for step in stop_steps:
-            self.assertEqual(1, _ixia_args(step)["expected_peer_count"])
-            self.assertTrue(_ixia_args(step)["validate_session_range"])
-
-        wait_steps = [
-            step
-            for step in stage.steps
-            if step.name == taac_types.StepName.LONGEVITY_STEP
-        ]
-        self.assertEqual(
-            1800, sum(_step_params(step)["duration"] for step in wait_steps)
-        )
-        self.assertEqual(
-            [140, 140, 140, 140, 140, 140, 140, 140, 140, 140, 140, 140, 120],
-            [_step_params(step)["duration"] for step in wait_steps],
-        )
+        self.assertEqual(2, len(stage.steps))
+        workflow = _step_params(stage.steps[1])
+        self.assertEqual("bgp_multipath_oscillation", workflow["custom_step_name"])
+        self.assertEqual("dut.example.com", workflow["hostname"])
+        self.assertEqual(1800, workflow["test_duration_seconds"])
+        self.assertEqual(280, workflow["oscillation_interval_seconds"])
+        self.assertEqual(1, workflow["min_peers_to_stop"])
+        self.assertEqual(11, workflow["max_peers_to_stop"])
+        self.assertEqual(2, workflow["probe_prefixes_per_afi"])
+        self.assertEqual(2, workflow["stable_sample_count"])
+        self.assertEqual(30, workflow["bgp_read_timeout_seconds"])
 
     def test_stage_requires_dual_stack_baseline_wide_enough_for_max_delta(
         self,
     ) -> None:
         stage = create_multipath_group_oscillation_stage(
-            oscillation_interval_seconds=280
+            hostname="dut.example.com", oscillation_interval_seconds=280
         )
         baseline = stage.steps[0]
 
@@ -85,27 +101,43 @@ class BgpMultipathGroupOscillationPlaybookTest(unittest.TestCase):
     def test_stage_rejects_invalid_peer_and_cycle_geometry(self) -> None:
         with self.assertRaisesRegex(ValueError, "peer-stop range"):
             create_multipath_group_oscillation_stage(
-                min_peers_to_stop=12, max_peers_to_stop=11
+                hostname="dut.example.com", min_peers_to_stop=12, max_peers_to_stop=11
             )
         with self.assertRaisesRegex(ValueError, "configured session count"):
             create_multipath_group_oscillation_stage(
-                ipv4_session_count=10, max_peers_to_stop=11
+                hostname="dut.example.com", ipv4_session_count=10, max_peers_to_stop=11
             )
-        with self.assertRaisesRegex(ValueError, "exactly six complete cycles"):
-            create_multipath_group_oscillation_stage(test_duration_seconds=60)
-        with self.assertRaisesRegex(ValueError, "exactly six complete cycles"):
+        with self.assertRaisesRegex(ValueError, "configured cycles"):
             create_multipath_group_oscillation_stage(
+                hostname="dut.example.com", test_duration_seconds=60
+            )
+        with self.assertRaisesRegex(ValueError, "configured cycles"):
+            create_multipath_group_oscillation_stage(
+                hostname="dut.example.com",
                 test_duration_seconds=1400,
                 oscillation_interval_seconds=280,
             )
 
+    def test_stage_allows_one_full_budget_validation_cycle(self) -> None:
+        stage = create_multipath_group_oscillation_stage(
+            hostname="dut.example.com",
+            test_duration_seconds=280,
+            oscillation_interval_seconds=280,
+            cycle_count=1,
+        )
+
+        workflow = _step_params(stage.steps[1])
+        self.assertEqual(1, workflow["cycle_count"])
+
     def test_playbook_adds_strict_fallback_cleanup_for_both_afis(self) -> None:
+        bgp_mon_parent_network = "2401:db00:e50d:44:a"
         playbook = get_bgp_ebb_multipath_group_oscillation_playbook(
             device_name="dut.example.com",
             peergroup_ibgp_v6="IBGP_V6",
             peergroup_ibgp_v4="IBGP_V4",
             expected_established_sessions=42,
             profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            bgp_mon_parent_network=bgp_mon_parent_network,
         )
 
         cleanup_steps = playbook.cleanup_steps
@@ -117,7 +149,7 @@ class BgpMultipathGroupOscillationPlaybookTest(unittest.TestCase):
             [target["regex"] for target in restore_args["peer_ranges"]],
         )
         self.assertEqual(
-            [11, 11],
+            [140, 140],
             [target["session_end_idx"] for target in restore_args["peer_ranges"]],
         )
         self.assertEqual(140, _step_params(cleanup_steps[1])["duration"])
@@ -138,7 +170,7 @@ class BgpMultipathGroupOscillationPlaybookTest(unittest.TestCase):
         )
         self.assertEqual(42, session_params["expected_established_session_count"])
         self.assertEqual(
-            [f"{IXIA_BGP_MON_IC_PARENT_NETWORK}::/80"],
+            [f"{bgp_mon_parent_network}::/80"],
             session_params["parent_prefixes_to_ignore"],
         )
         self.assertEqual(0, width_params["peers_stopped_delta"])

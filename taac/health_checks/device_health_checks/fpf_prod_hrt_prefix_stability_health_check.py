@@ -1,9 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-# pyre-unsafe
-
 import logging
-import time
 import typing as t
 
 from taac.constants import TestDevice
@@ -15,7 +12,12 @@ from taac.libs.fpf.fpf_collector_registry import (
     everpaste_details_suffix,
     get_collector,
     get_disruption_time,
-    get_test_case_start_time,
+    get_recovery_completion_time,
+    get_recovery_start_time,
+    get_restart_completion_time,
+    get_restart_time,
+    resolve_observation_window,
+    restart_tolerant_collector_view,
 )
 from taac.libs.fpf.fpf_prod_hrt_prefix import normalize_prefix
 from taac.libs.fpf.fpf_stress_checks import (
@@ -87,15 +89,16 @@ def discover_prod_collectors(
     c = get_collector(name)
     if c is None:
         return []
+    prefixes_by_host = check_params.get("prefixes_by_host") or {}
+    if prefixes_by_host:
+        # An explicit host/prefix map is a required observation contract, not a
+        # best-effort filter over whichever hosts happened to emit rows. Return
+        # every requested host so a missing host is surfaced by the evaluator.
+        return [(str(host), c) for host in prefixes_by_host]
     hosts: t.List[str] = []
     hiw = getattr(c, "hosts_in_window", None)
     if callable(hiw):
-        window_end = check_params.get("window_end", time.time())
-        tc_start = get_test_case_start_time()
-        lookback_sec = check_params.get("lookback_sec", 900)
-        window_start = check_params.get(
-            "window_start", tc_start if tc_start else window_end - lookback_sec
-        )
+        window_start, window_end = resolve_observation_window(check_params)
         hosts = t.cast(t.List[str], hiw(window_start, window_end) or [])
     if not hosts:
         hosts = list(getattr(c, "hosts", []) or [])
@@ -151,6 +154,7 @@ class _HostResult:
         self.s2_ok = True  # data integrity
         self.compliance_issues: t.List[str] = []
         self.null_issues: t.List[str] = []
+        self.notes: t.List[str] = []
         # impacted prefix -> dict(ts_str, lost, gained, baseline, post_rb)
         self.impacts: t.List[t.Dict[str, t.Any]] = []
 
@@ -183,6 +187,84 @@ def _baseline_tuple(
 ) -> t.Tuple[t.Tuple[int, ...], ...]:
     """Comparable plane-set tuple for the golden baseline."""
     return tuple(tuple(baseline[fld]) for fld in _LIST_FIELDS)
+
+
+def _required_prefix_integrity_issues(
+    host: str,
+    collector: t.Any,
+    window_start: float,
+    window_end: float,
+    required_norms: t.Set[str],
+) -> t.List[str]:
+    """Return fail-closed gaps in the configured host x prefix contract."""
+    rows = [
+        row
+        for row in collector.get_rows_in_window(window_start, window_end)
+        if getattr(row, "host", None) == host
+    ]
+    if not rows:
+        return []
+    missing_counts = dict.fromkeys(required_norms, 0)
+    for row in rows:
+        present = {normalize_prefix(prefix) for prefix in getattr(row, "prefixes", {})}
+        for norm in required_norms - present:
+            missing_counts[norm] += 1
+    return [
+        f"missing required prefix {norm} in {count}/{len(rows)} sample(s)"
+        for norm, count in sorted(missing_counts.items())
+        if count
+    ]
+
+
+def _state_description(rb: t.Any) -> str:
+    return (
+        f"reachable={_fmt(sorted(rb.reachable_planes))},"
+        f"drained={_fmt(sorted(rb.drained_planes))},"
+        f"unreachable={_fmt(sorted(rb.unreachable_planes))},"
+        f"plane_up={_fmt(sorted(rb.plane_up))}"
+    )
+
+
+def _cross_host_state_issues(
+    collectors: t.List[t.Tuple[str, t.Any]],
+    prefixes_by_host: t.Dict[str, t.Set[str]],
+    window_start: float,
+    window_end: float,
+) -> t.Dict[str, t.List[str]]:
+    """Compare each required prefix's latest complete state across observers."""
+    latest_by_prefix: t.Dict[str, t.Dict[str, t.Any]] = {}
+    for host, collector in collectors:
+        required = prefixes_by_host.get(host, set())
+        if not required:
+            continue
+        rows = collector.get_rows_in_window(window_start, window_end)
+        timeline = _prefix_samples(rows, required, host=host)
+        for norm, info in timeline.items():
+            complete = [
+                rb
+                for _ts, _ts_str, rb in info["samples"]
+                if not _sample_null_fields(rb)
+            ]
+            if complete:
+                latest_by_prefix.setdefault(norm, {})[host] = complete[-1]
+
+    issues: t.Dict[str, t.List[str]] = {}
+    for norm, states_by_host in sorted(latest_by_prefix.items()):
+        if len(states_by_host) < 2:
+            continue
+        state_groups: t.Dict[t.Tuple[t.Tuple[int, ...], ...], t.List[str]] = {}
+        for host, rb in states_by_host.items():
+            state_groups.setdefault(_rb_tuple(rb), []).append(host)
+        if len(state_groups) == 1:
+            continue
+        detail = "; ".join(
+            f"{host}({_state_description(states_by_host[host])})"
+            for host in sorted(states_by_host)
+        )
+        message = f"cross-host mismatch for prefix {norm}: {detail}"
+        for host in states_by_host:
+            issues.setdefault(host, []).append(message)
+    return issues
 
 
 def _first_regressing_impact(
@@ -280,6 +362,184 @@ def _evaluate_host(
     return res
 
 
+def _restart_rows_for_host(
+    host: str,
+    collector: t.Any,
+    window_start: float,
+    window_end: float,
+) -> t.List[t.Tuple[float, t.Any]]:
+    rows = [
+        (ts, row)
+        for row in collector.get_rows_in_window(window_start, window_end)
+        if getattr(row, "host", None) == host
+        if (ts := _row_ts(row)) is not None
+    ]
+    return sorted(rows, key=lambda item: item[0])
+
+
+def _restart_monitored_prefixes(
+    rows: t.List[t.Tuple[float, t.Any]], target_norms: t.Optional[t.Set[str]]
+) -> t.Set[str]:
+    if target_norms:
+        return set(target_norms)
+    return {
+        normalize_prefix(pfx)
+        for _ts, row in rows
+        for pfx in getattr(row, "prefixes", {})
+    }
+
+
+def _restart_baselines(
+    rows: t.List[t.Tuple[float, t.Any]],
+    monitored: t.Set[str],
+    restart_ts: float,
+) -> t.Tuple[t.Dict[str, t.Dict[str, t.List[int]]], t.Dict[str, str]]:
+    baselines: t.Dict[str, t.Dict[str, t.List[int]]] = {}
+    displays: t.Dict[str, str] = {}
+    for ts, row in rows:
+        if ts > restart_ts:
+            break
+        for raw, rb in row.prefixes.items():
+            norm = normalize_prefix(raw)
+            if norm in monitored and not _sample_null_fields(rb):
+                baselines[norm] = _baseline_of(rb)
+                displays[norm] = raw
+    return baselines, displays
+
+
+def _complete_post_restart_rows(
+    rows: t.List[t.Tuple[float, t.Any]],
+    monitored: t.Set[str],
+    restart_ts: float,
+) -> t.Tuple[t.List[t.Tuple[float, t.Dict[str, t.Any]]], int, t.Optional[float]]:
+    valid: t.List[t.Tuple[float, t.Dict[str, t.Any]]] = []
+    ignored = 0
+    last_incomplete_ts: t.Optional[float] = None
+    for ts, row in rows:
+        if ts <= restart_ts:
+            continue
+        by_norm = {normalize_prefix(raw): rb for raw, rb in row.prefixes.items()}
+        if any(
+            norm not in by_norm or _sample_null_fields(by_norm[norm])
+            for norm in monitored
+        ):
+            ignored += 1
+            last_incomplete_ts = ts
+        else:
+            valid.append((ts, by_norm))
+    return valid, ignored, last_incomplete_ts
+
+
+def _evaluate_host_restart_recovery(
+    host: str,
+    collector: t.Any,
+    window_start: float,
+    window_end: float,
+    target_norms: t.Optional[t.Set[str]],
+    restart_ts: float,
+    max_recovery_sec: float,
+    restart_completion_ts: t.Optional[float] = None,
+) -> _HostResult:
+    """Validate full production-prefix recovery after an HRT restart.
+
+    Each prefix's baseline is its last complete sample at or before restart.
+    Empty, partial, or invalid rows after restart are treated as expected outage
+    observations. Recovery eligibility begins after the restart command
+    completes or the last observed outage row, whichever is later. Recovery
+    latency begins at the first complete eligible row and ends at the first row
+    where every monitored prefix matches its baseline. The final complete row
+    must also remain healthy.
+    """
+    res = _HostResult(host)
+    rows = _restart_rows_for_host(host, collector, window_start, window_end)
+    monitored = _restart_monitored_prefixes(rows, target_norms)
+    res.n_prefixes = len(monitored)
+    if not monitored:
+        res.status = "FAIL"
+        res.s1_ok = False
+        res.s2_ok = False
+        res.compliance_issues.append("no monitored prefix data")
+        return res
+
+    baselines, displays = _restart_baselines(rows, monitored, restart_ts)
+    missing_baselines = sorted(monitored - set(baselines))
+    if missing_baselines:
+        res.status = "FAIL"
+        res.s1_ok = False
+        res.s2_ok = False
+        res.compliance_issues.append(
+            "no complete pre-restart baseline for " + ", ".join(missing_baselines)
+        )
+        return res
+
+    valid_post, ignored_rows, last_incomplete_ts = _complete_post_restart_rows(
+        rows, monitored, restart_ts
+    )
+    if ignored_rows:
+        res.notes.append(
+            f"ignored {ignored_rows} empty/incomplete outage row(s) after restart"
+        )
+    eligibility_ts = max(
+        restart_ts,
+        restart_completion_ts or restart_ts,
+        last_incomplete_ts or restart_ts,
+    )
+    valid_post = [(ts, by_norm) for ts, by_norm in valid_post if ts > eligibility_ts]
+    res.notes.append(f"post-outage recovery eligibility starts at {eligibility_ts:.3f}")
+    res.n_samples = len(valid_post) * len(monitored)
+    if not valid_post:
+        res.status = "FAIL"
+        res.s1_ok = False
+        res.s2_ok = False
+        res.compliance_issues.append("no complete valid post-restart sample")
+        return res
+
+    first_valid_ts = valid_post[0][0]
+    full_recovery_ts: t.Optional[float] = None
+    for ts, by_norm in valid_post:
+        if all(
+            _sample_matches_baseline(by_norm[norm], baselines[norm])
+            for norm in monitored
+        ):
+            full_recovery_ts = ts
+            break
+
+    if full_recovery_ts is None:
+        res.s1_ok = False
+        res.compliance_issues.append(
+            "no complete post-restart sample recovered all monitored prefixes"
+        )
+    else:
+        recovery_sec = round(full_recovery_ts - first_valid_ts, 3)
+        if recovery_sec > max_recovery_sec:
+            res.s1_ok = False
+            res.compliance_issues.append(
+                f"full prefix recovery took {recovery_sec:.3f}s > "
+                f"{max_recovery_sec:.1f}s SLA"
+            )
+        else:
+            res.notes.append(
+                f"all {len(monitored)} prefix(es) recovered in "
+                f"{recovery_sec:.3f}s from first valid post-restart sample"
+            )
+
+    final_by_norm = valid_post[-1][1]
+    final_regressions = sorted(
+        displays.get(norm, norm)
+        for norm in monitored
+        if not _sample_matches_baseline(final_by_norm[norm], baselines[norm])
+    )
+    if final_regressions:
+        res.s1_ok = False
+        res.compliance_issues.append(
+            "final valid sample regressed for " + ", ".join(final_regressions)
+        )
+
+    res.s2_ok = True
+    res.status = "PASS" if res.s1_ok else "FAIL"
+    return res
+
+
 def _evaluate_prefix_series(
     res: _HostResult,
     display: str,
@@ -302,6 +562,9 @@ def _evaluate_prefix_series(
         # at the end of the window (the "recovered" state).
         tail = (
             samples[-recovery_last_n:] if len(samples) >= recovery_last_n else samples
+        )
+        res.n_samples += sum(
+            1 for _ts, _ts_str, rb in tail if not _sample_null_fields(rb)
         )
         expected_tuple = _baseline_tuple(baseline)
         all_compliant = all(
@@ -402,19 +665,21 @@ def _evaluate_host_transition(
     window_start: float,
     window_end: float,
     target_norms: t.Optional[t.Set[str]],
+    affected_norms: t.Optional[t.Set[str]],
     impacted_planes: t.Set[int],
     max_transition_sec: float,
     disruption_ts: t.Optional[float],
 ) -> _HostResult:
     """Link-event transition contract for one host.
 
-    For every monitored prefix, each impacted plane that was reachable at the
+    For every affected prefix, each impacted plane that was reachable at the
     window baseline MUST leave the reachable set (go drained/unreachable) and do
     so within ``max_transition_sec``. The transition latency is measured from
     ``disruption_ts`` when supplied, else from the plane's last still-reachable
     sample before the drop (disruption-relative latency). A plane that never
     drops, or drops too slowly, fails. By the final in-window sample the
-    impacted planes must not be reachable.
+    impacted planes must not be reachable. Configured prefixes outside
+    ``affected_norms`` must remain unchanged throughout the window.
     """
     res = _HostResult(host)
     rows = collector.get_rows_in_window(window_start, window_end)
@@ -435,6 +700,25 @@ def _evaluate_host_transition(
         info = timeline[norm]
         display = info["display"]
         samples = info["samples"]
+        res.n_samples += len(samples)
+        if affected_norms is not None and norm not in affected_norms:
+            baseline = _baseline_of(samples[0][2])
+            for _ts, ts_str, rb in samples:
+                bad_fields = _sample_null_fields(rb)
+                if bad_fields:
+                    res.null_issues.append(
+                        f"UNAFFECTED {display} null field(s) at {ts_str}: "
+                        + ",".join(bad_fields)
+                    )
+                    break
+                if not _sample_matches_baseline(rb, baseline):
+                    res.compliance_issues.append(
+                        f"UNAFFECTED {display} churned at {ts_str}: "
+                        f"{_state_description(samples[0][2])} -> "
+                        f"{_state_description(rb)}"
+                    )
+                    break
+            continue
         baseline_reachable = set(samples[0][2].reachable_planes)
         relevant = sorted(impacted_planes & baseline_reachable)
         if not relevant:
@@ -442,7 +726,6 @@ def _evaluate_host_transition(
             # VF2 prefix when a VF1 lane was disabled) — skip from transition.
             continue
         any_relevant = True
-        res.n_samples += len(samples)
         final_reachable = set(samples[-1][2].reachable_planes)
         for plane in relevant:
             last_reachable_ts: t.Optional[float] = None
@@ -509,26 +792,29 @@ def _evaluate_host_local_drain(
     collector: t.Any,
     window_start: float,
     window_end: float,
-    local_norms: t.Set[str],
+    affected_norms: t.Set[str],
     impacted_planes: t.Set[int],
     max_drain_sec: float,
-    disruption_ts: t.Optional[float],
+    action_ts: t.Optional[float],
+    recovery_completion_ts: t.Optional[float],
     to_drained: bool,
 ) -> _HostResult:
     """Local-vs-remote drain/undrain contract for one host.
 
-    Splits monitored prefixes into LOCAL (this host's own, ``local_norms``) and
-    REMOTE (everything else). Three signals on the LOCAL prefixes' impacted
-    plane(s); a no-churn assertion on the REMOTE prefixes:
+    Splits monitored prefixes into AFFECTED (the origin route expected to react
+    on this observer, ``affected_norms``) and UNAFFECTED (everything else).
+    Three signals apply to affected prefixes' impacted plane(s); unaffected
+    prefixes retain a no-churn assertion:
 
       ``to_drained=True`` (DRAIN): each impacted plane that was reachable at the
         baseline must move into ``drained_planes`` (Signal 1), must NOT land in
         ``unreachable_planes`` — drained, not unavailable (Signal 2), and must do
-        so within ``max_drain_sec`` of ``disruption_ts`` (Signal 3).
+        so within ``max_drain_sec`` of the recorded drain start (Signal 3).
       ``to_drained=False`` (UNDRAIN): each impacted plane must LEAVE
         ``drained_planes`` and return to ``reachable_planes`` within
-        ``max_drain_sec`` (Signals 1+3); it must not be left unreachable
-        (Signal 2).
+        ``max_drain_sec`` of the separately recorded recovery start
+        (Signals 1+3); it must not be left unreachable (Signal 2), and at
+        least one sample must follow recovery completion.
 
     REMOTE prefixes must show NO churn: their reachable plane set is unchanged
     across the whole window (a drain of THIS host's local advert must not move a
@@ -553,18 +839,18 @@ def _evaluate_host_local_drain(
     def _split(
         samples: t.List[t.Any],
     ) -> t.Tuple[t.Any, t.List[t.Any]]:
-        """(pre-disruption baseline sample, post-disruption samples).
+        """Return the pre-action baseline and post-action samples.
 
         Anchoring the baseline at the sample JUST BEFORE the recorded disruption
         time makes the check robust to a dirty starting state (e.g. a plane left
-        drained by a prior aborted run): we judge the transition the disruption
-        actually caused, measured from the disruption moment, not from whatever
-        the window happened to open on.
+        drained by a prior aborted run): we judge the transition the action
+        actually caused, measured from its recorded start, not from whatever the
+        window happened to open on.
         """
-        if disruption_ts is None:
+        if action_ts is None:
             return samples[0][2], samples
-        pre = [s for s in samples if s[0] <= disruption_ts]
-        post = [s for s in samples if s[0] > disruption_ts]
+        pre = [s for s in samples if s[0] <= action_ts]
+        post = [s for s in samples if s[0] > action_ts]
         base = pre[-1][2] if pre else samples[0][2]
         return base, (post if post else samples)
 
@@ -573,24 +859,35 @@ def _evaluate_host_local_drain(
         display = info["display"]
         samples = info["samples"]
         res.n_samples += len(samples)
-        is_local = norm in local_norms
+        is_affected = norm in affected_norms
         base_rb, post_samples = _split(samples)
 
-        if not is_local:
-            # REMOTE prefix: reachable set must not change through the disruption.
+        if (
+            not to_drained
+            and recovery_completion_ts is not None
+            and not any(ts >= recovery_completion_ts for ts, _ts_str, _rb in samples)
+        ):
+            res.compliance_issues.append(
+                f"{display} has no collector sample after recovery completed at "
+                f"{recovery_completion_ts:.3f}"
+            )
+            continue
+
+        if not is_affected:
+            # Unaffected prefix: reachable set must not change through disruption.
             baseline_reachable = set(base_rb.reachable_planes)
             for _ts, ts_str, rb in post_samples:
                 if set(rb.reachable_planes) != baseline_reachable:
                     res.compliance_issues.append(
-                        f"REMOTE {display} churned at {ts_str}: reachable "
+                        f"UNAFFECTED {display} churned at {ts_str}: reachable "
                         f"{_fmt(sorted(baseline_reachable))}->"
                         f"{_fmt(sorted(rb.reachable_planes))} "
-                        f"(expected no change on a local-host drain)"
+                        "(expected no change for this route)"
                     )
                     break
             continue
 
-        # LOCAL prefix: assert the drain/undrain transition on impacted planes.
+        # AFFECTED prefix: assert the drain/undrain transition on impacted planes.
         baseline_reachable = set(base_rb.reachable_planes)
         baseline_drained = set(base_rb.drained_planes)
         # On DRAIN the relevant planes are those reachable just before the drain;
@@ -625,7 +922,7 @@ def _evaluate_host_local_drain(
             # Signal 1: the impacted plane reached the expected state.
             if transition_ts is None:
                 res.compliance_issues.append(
-                    f"LOCAL {display} plane {plane} never became {want} "
+                    f"AFFECTED {display} plane {plane} never became {want} "
                     f"({'drain' if to_drained else 'undrain'} did not take)"
                 )
                 continue
@@ -637,15 +934,15 @@ def _evaluate_host_local_drain(
             # here for undrain.
             if not to_drained and plane in set(final_rb.unreachable_planes):
                 res.compliance_issues.append(
-                    f"LOCAL {display} plane {plane} left UNREACHABLE after undrain "
+                    f"AFFECTED {display} plane {plane} left UNREACHABLE after undrain "
                     f"(expected reachable)"
                 )
-            # Signal 3: within SLA, measured from the disruption moment.
-            ref = disruption_ts if disruption_ts is not None else post_samples[0][0]
+            # Signal 3: within SLA, measured from the drain/recovery action.
+            ref = action_ts if action_ts is not None else post_samples[0][0]
             latency = round(transition_ts - ref, 1)
             if latency > max_drain_sec:
                 res.compliance_issues.append(
-                    f"LOCAL {display} plane {plane} became {want} in {latency}s "
+                    f"AFFECTED {display} plane {plane} became {want} in {latency}s "
                     f"> {max_drain_sec:.0f}s SLA"
                 )
             else:
@@ -671,7 +968,7 @@ def _evaluate_host_local_drain(
             unexplained = new_unreach - set(final_rb.drained_planes)
             if unexplained:
                 res.compliance_issues.append(
-                    f"LOCAL {display} plane(s) {sorted(unexplained)} went "
+                    f"AFFECTED {display} plane(s) {sorted(unexplained)} went "
                     f"UNAVAILABLE (unreachable without being drained)"
                 )
 
@@ -711,6 +1008,10 @@ def _format_report(host_results: t.List[_HostResult], agg: str) -> str:
             )
         if r.null_issues and not r.impacts:
             lines.append(f"    NULL: {'; '.join(r.null_issues[:5])}")
+        if r.compliance_issues and not r.impacts:
+            lines.append(f"    ISSUE: {'; '.join(r.compliance_issues[:5])}")
+        for note in r.notes:
+            lines.append(f"    NOTE: {note}")
     lines.append(f"AGGREGATE: {agg}")
     return "\n".join(lines)
 
@@ -722,7 +1023,7 @@ class FpfProdHrtPrefixStabilityHealthCheck(
 
     Consumes the single live ``prod_hrt_prefix`` collector registered in the FPF
     collector registry. That ONE collector holds ALL monitored hosts (each row
-    carries its ``host``, and each host monitors its own prefixes); this check
+    carries its ``host``, and each host monitors its configured prefixes); this check
     iterates the hosts present in its rows and evaluates each host independently.
     For every monitored prefix on a host, over the test window:
 
@@ -735,6 +1036,13 @@ class FpfProdHrtPrefixStabilityHealthCheck(
         ``expected_*`` check_params (applied to all prefixes).
       Signal 2 — Data integrity: no null data points (poll timeout >2min,
         missing prefix, or a non-list plane field).
+
+    ``mode="restart_recovery"`` is the HRT-restart exception to that strict
+    stability rule. It reports but ignores empty/incomplete outage rows, uses
+    each prefix's last complete pre-restart sample as baseline, and bounds full
+    post-restart recovery from the first complete sample after restart completion
+    or the final outage row. This prevents a healthy pre-outage race sample from
+    anchoring recovery at zero seconds.
 
     The result message is a per-host report that names every IMPACTED prefix
     with the timestamp it regressed and the planes lost (before->after). When
@@ -763,12 +1071,7 @@ class FpfProdHrtPrefixStabilityHealthCheck(
                 message="No prod_hrt_prefix collector(s) in registry",
             )
 
-        window_end = check_params.get("window_end", time.time())
-        tc_start = get_test_case_start_time()
-        lookback_sec = check_params.get("lookback_sec", 900)
-        window_start = check_params.get(
-            "window_start", tc_start if tc_start else window_end - lookback_sec
-        )
+        window_start, window_end = resolve_observation_window(check_params)
 
         mode = check_params.get("mode", "stability")
         # Blip-handling contract for the stability assertion (mode="stability"):
@@ -796,6 +1099,13 @@ class FpfProdHrtPrefixStabilityHealthCheck(
         target_norms = (
             {normalize_prefix(p) for p in prefix_filter} if prefix_filter else None
         )
+        raw_prefixes_by_host: t.Dict[str, t.List[str]] = (
+            check_params.get("prefixes_by_host", {}) or {}
+        )
+        target_norms_by_host = {
+            str(host): {normalize_prefix(prefix) for prefix in prefixes}
+            for host, prefixes in raw_prefixes_by_host.items()
+        }
 
         fixed_expected = self._build_fixed_expected(check_params)
 
@@ -815,10 +1125,18 @@ class FpfProdHrtPrefixStabilityHealthCheck(
             check_params.get("impacted_planes_by_host", {}) or {}
         )
         max_transition_sec = float(check_params.get("max_transition_sec", 30.0))
-        # LOCAL prefix set (this host's own advertised prefixes). Everything else
-        # monitored is treated as REMOTE for the local_drain/local_undrain modes.
+        # Legacy global affected-prefix set. ``affected_prefixes_by_host`` is the
+        # precise form for a route observed from multiple hosts; it prevents an
+        # observer's copy from being mislabeled based only on a global set.
         local_norms: t.Set[str] = {
             normalize_prefix(p) for p in (check_params.get("local_prefixes") or [])
+        }
+        raw_affected_by_host: t.Dict[str, t.List[str]] = (
+            check_params.get("affected_prefixes_by_host", {}) or {}
+        )
+        affected_norms_by_host = {
+            str(host): {normalize_prefix(prefix) for prefix in prefixes}
+            for host, prefixes in raw_affected_by_host.items()
         }
         max_drain_sec = float(check_params.get("max_drain_sec", 30.0))
         # Reference for the transition SLA: explicit check_param wins; else the
@@ -831,21 +1149,148 @@ class FpfProdHrtPrefixStabilityHealthCheck(
             recorded = get_disruption_time()
             disruption_ts = recorded if recorded > 0 else None
 
+        recovery_ts: t.Optional[float] = None
+        recovery_completion_ts: t.Optional[float] = None
+        if mode == "local_undrain":
+            recovery_ts = check_params.get("recovery_ts")
+            if recovery_ts is None:
+                recorded_recovery = get_recovery_start_time()
+                recovery_ts = recorded_recovery if recorded_recovery > 0 else None
+            recovery_completion_ts = check_params.get("recovery_completion_ts")
+            if recovery_completion_ts is None:
+                recorded_completion = get_recovery_completion_time()
+                recovery_completion_ts = (
+                    recorded_completion if recorded_completion > 0 else None
+                )
+            if recovery_ts is None or recovery_completion_ts is None:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        "No complete recorded recovery boundary for local_undrain "
+                        f"(start={recovery_ts}, completion={recovery_completion_ts})"
+                    ),
+                )
+            # Cleanup of the disrupt playbook may perform the undrain before the
+            # restore playbook starts. Retain those cross-playbook samples.
+            if "window_start" not in check_params:
+                window_start = min(window_start, recovery_ts)
+
+        restart_ts: t.Optional[float] = None
+        restart_completion_ts: t.Optional[float] = None
+        max_recovery_sec = float(check_params.get("max_recovery_sec", 30.0))
+        if mode == "restart_recovery":
+            restart_ts = check_params.get("restart_ts")
+            if restart_ts is None:
+                recorded = get_restart_time()
+                restart_ts = recorded if recorded > 0 else None
+            if restart_ts is None:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message="No recorded HRT restart timestamp",
+                )
+            restart_completion_ts = check_params.get("restart_completion_ts")
+            if restart_completion_ts is None:
+                recorded_completion = get_restart_completion_time()
+                restart_completion_ts = (
+                    recorded_completion if recorded_completion > 0 else None
+                )
+
+        restart_tolerant_hosts = set(
+            check_params.get("restart_tolerant_hosts", []) or []
+        )
+        restart_ts_for_tolerance = get_restart_time() if restart_tolerant_hosts else 0.0
+        restart_completion_for_tolerance = (
+            get_restart_completion_time() if restart_tolerant_hosts else 0.0
+        )
+        evaluation_collectors: t.List[t.Tuple[str, t.Any]] = []
+        restart_failures: t.Dict[str, str] = {}
+        for host, collector in collectors:
+            if host not in restart_tolerant_hosts:
+                evaluation_collectors.append((host, collector))
+                continue
+            view, detail = restart_tolerant_collector_view(
+                collector,
+                host=host,
+                restart_ts=restart_ts_for_tolerance,
+                restart_completion_ts=restart_completion_for_tolerance,
+                row_is_error=lambda row: not bool(getattr(row, "prefixes", {})),
+            )
+            if view is None:
+                restart_failures[host] = detail
+                evaluation_collectors.append((host, collector))
+            else:
+                logger.info("[%s] restart recovery: %s", host, detail)
+                evaluation_collectors.append((host, view))
+
+        for host, collector in evaluation_collectors:
+            empty_rows = [
+                row
+                for row in collector.get_rows_in_window(window_start, window_end)
+                if getattr(row, "host", None) == host
+                and not bool(getattr(row, "prefixes", {}))
+            ]
+            if empty_rows:
+                restart_failures[host] = (
+                    f"{len(empty_rows)} unexpected empty/null collector row(s)"
+                )
+
         host_results = self._evaluate_hosts(
-            collectors,
+            evaluation_collectors,
             mode=mode,
             window_start=window_start,
             window_end=window_end,
             target_norms=target_norms,
+            target_norms_by_host=target_norms_by_host,
             fixed_expected=fixed_expected,
             stability_mode=stability_mode,
             recovery_last_n=recovery_last_n,
             local_norms=local_norms,
+            affected_norms_by_host=affected_norms_by_host,
             impacted_by_host=impacted_by_host,
             max_drain_sec=max_drain_sec,
             max_transition_sec=max_transition_sec,
             disruption_ts=disruption_ts,
+            recovery_ts=recovery_ts,
+            recovery_completion_ts=recovery_completion_ts,
+            restart_ts=restart_ts,
+            restart_completion_ts=restart_completion_ts,
+            max_recovery_sec=max_recovery_sec,
         )
+        results_by_host = {result.host: result for result in host_results}
+        if mode != "restart_recovery":
+            for host, collector in evaluation_collectors:
+                required = target_norms_by_host.get(host, set())
+                issues = _required_prefix_integrity_issues(
+                    host,
+                    collector,
+                    window_start,
+                    window_end,
+                    required,
+                )
+                if issues and host in results_by_host:
+                    result = results_by_host[host]
+                    result.status = "FAIL"
+                    result.s2_ok = False
+                    result.null_issues.extend(issues)
+        if mode in ("stability", "restart_recovery"):
+            cross_host_issues = _cross_host_state_issues(
+                evaluation_collectors,
+                target_norms_by_host,
+                window_start,
+                window_end,
+            )
+            for host, issues in cross_host_issues.items():
+                if host not in results_by_host:
+                    continue
+                result = results_by_host[host]
+                result.status = "FAIL"
+                result.s1_ok = False
+                result.compliance_issues.extend(issues)
+        for result in host_results:
+            if result.host in restart_failures:
+                result.status = "FAIL"
+                result.s2_ok = False
+                result.null_issues.append(restart_failures[result.host])
         return await self._aggregate_and_report(
             host_results, collectors, window_start, window_end
         )
@@ -892,31 +1337,55 @@ class FpfProdHrtPrefixStabilityHealthCheck(
         window_start: float,
         window_end: float,
         target_norms: t.Optional[t.Set[str]],
+        target_norms_by_host: t.Dict[str, t.Set[str]],
         fixed_expected: t.Optional[t.Dict[str, t.List[int]]],
         stability_mode: str,
         recovery_last_n: t.Optional[int],
         local_norms: t.Set[str],
+        affected_norms_by_host: t.Dict[str, t.Set[str]],
         impacted_by_host: t.Dict[str, t.List[int]],
         max_drain_sec: float,
         max_transition_sec: float,
         disruption_ts: t.Optional[float],
+        recovery_ts: t.Optional[float],
+        recovery_completion_ts: t.Optional[float],
+        restart_ts: t.Optional[float],
+        restart_completion_ts: t.Optional[float],
+        max_recovery_sec: float,
     ) -> t.List[_HostResult]:
         """Dispatch each (host, collector) to the evaluator for ``mode`` and log a
         one-line verdict per host."""
         dts = float(disruption_ts) if disruption_ts is not None else None
+        rts = float(recovery_ts) if recovery_ts is not None else None
         host_results: t.List[_HostResult] = []
         for host, collector in collectors:
             impacted = {int(p) for p in impacted_by_host.get(host, [])}
-            if mode in ("local_drain", "local_undrain"):
+            host_target_norms = target_norms_by_host.get(host, target_norms)
+            host_affected_norms = affected_norms_by_host.get(host, local_norms)
+            if mode == "restart_recovery":
+                if restart_ts is None:
+                    raise ValueError("restart_recovery requires restart_ts")
+                res = _evaluate_host_restart_recovery(
+                    host,
+                    collector,
+                    window_start,
+                    window_end,
+                    host_target_norms,
+                    restart_ts,
+                    max_recovery_sec,
+                    restart_completion_ts,
+                )
+            elif mode in ("local_drain", "local_undrain"):
                 res = _evaluate_host_local_drain(
                     host,
                     collector,
                     window_start,
                     window_end,
-                    local_norms,
+                    host_affected_norms,
                     impacted,
                     max_drain_sec,
-                    dts,
+                    dts if mode == "local_drain" else rts,
+                    recovery_completion_ts,
                     to_drained=(mode == "local_drain"),
                 )
             elif mode == "transition":
@@ -925,7 +1394,12 @@ class FpfProdHrtPrefixStabilityHealthCheck(
                     collector,
                     window_start,
                     window_end,
-                    target_norms,
+                    host_target_norms,
+                    (
+                        host_affected_norms
+                        if host in affected_norms_by_host or local_norms
+                        else None
+                    ),
                     impacted,
                     max_transition_sec,
                     dts,
@@ -936,11 +1410,25 @@ class FpfProdHrtPrefixStabilityHealthCheck(
                     collector,
                     window_start,
                     window_end,
-                    target_norms,
+                    host_target_norms,
                     fixed_expected,
                     stability_mode=stability_mode,
                     recovery_last_n=recovery_last_n,
                 )
+            if host in target_norms_by_host and res.status == "SKIP":
+                res.status = "FAIL"
+                res.s1_ok = False
+                if res.n_prefixes:
+                    res.compliance_issues.append(
+                        f"required host {host} produced {res.n_samples} "
+                        "configured-prefix sample(s), but no affected plane "
+                        f"scope overlapped {sorted(impacted)}"
+                    )
+                else:
+                    res.compliance_issues.append(
+                        f"required host {host} produced no in-window samples for "
+                        "its configured prefixes"
+                    )
             host_results.append(res)
             self.logger.info(
                 f"  [prod HRT prefix][{host}] mode={mode} VERDICT {res.status} — "

@@ -2,70 +2,21 @@
 
 # pyre-unsafe
 
-"""Structural + HC-expectation unit tests for the FPF FSDB disruption test configs.
+"""Structural unit tests for the FPF FSDB disruption test configs.
 
-These tests import each config module and assert both:
-  (a) the static TestConfig shape: two-playbook ordering, the HRT session-stat
-      check mode + expected_connected(_during), the host-spray ``all_samples``
-      flag on tc29, FSDB service / trigger used by each step;
-  (b) the per-config HEALTH-CHECK EXPECTATIONS extracted from the config's
-      playbooks: each longevity playbook (v2) carries the full stable-state
-      hardening check set, and the session-stat check (pulled BY check_id from
-      the config) PASSes/FAILs under mocked-collector data shaped to the
-      documented disruption (32 -> 28 on lane 0 + recovery, etc.).
-
-Mocked-collector simulations follow the pattern in
-``test_fpf_hrt_session_stat_health_check.py``: ``get_collector`` is patched to a
-synthetic collector whose ``evaluate_window`` / ``evaluate_recovery_hold`` /
-``timeout_count_in_window`` / ``format_window_table`` return canned values, so
-correctness is proven without devices.
+Covers the standalone tc29b config (one-way remote-prefix withdrawal while the
+local FSDB is in graceful restart). The tc28/tc29/tc30/tc31 standalone configs
+were removed: tc28 runs as the ``fpf_tc28_fsdb_kill`` playbooks of
+``fpf_shared_injection_suite``, tc29 is covered by the suite's tc07 (FSDB stop
+inside the GR window) and tc30/tc31 by the suite's tc08 (FSDB stop beyond the
+GR window, restart and settle in one playbook).
 """
 
 import json
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
 
-from taac.constants import TestDevice
-from taac.health_checks.device_health_checks.fpf_hrt_session_stat_health_check import (
-    FpfHrtSessionStatHealthCheck,
-)
-from taac.libs.fpf.fpf_stress_checks import (
-    FsdbSessionWindowResult,
-)
-from taac.testconfigs.fpf import (
-    fpf_tc28_fsdb_kill,
-    fpf_tc29_fsdb_gr_stop30_reenable,
-    fpf_tc30_fsdb_gr_stop180_no_reenable,
-    fpf_tc31_fsdb_enable_recover,
-)
-from taac.health_check.health_check import types as hc_types
+from taac.testconfigs.fpf import fpf_tc29b_fsdb_gr_remote_withdraw
 from taac.test_as_a_config import types as taac_types
-
-_HC_MODULE = (
-    "neteng.test_infra.dne.taac.health_checks.device_health_checks"
-    ".fpf_hrt_session_stat_health_check"
-)
-_GPU_HOST = "rtptest1555.mwg2"
-
-
-def _all_postchecks(playbook):
-    return list(playbook.postchecks or [])
-
-
-def _session_stat_checks(playbook):
-    return [
-        pc
-        for pc in _all_postchecks(playbook)
-        if pc.name == hc_types.CheckName.FPF_HRT_SESSION_STAT_CHECK
-    ]
-
-
-def _host_spray_checks(playbook):
-    return [
-        pc
-        for pc in _all_postchecks(playbook)
-        if pc.name == hc_types.CheckName.FPF_HOST_SPRAY_CHECK
-    ]
 
 
 def _check_params(check) -> dict:
@@ -79,472 +30,259 @@ def _all_steps(playbook):
     return steps
 
 
-def _step_names(playbook):
-    return [s.name for s in _all_steps(playbook)]
+def _step_params(step) -> dict:
+    if step.step_params is None:
+        return {}
+    return json.loads(step.step_params.json_params)
+
+
+def _task_params(task) -> dict:
+    if task.params is None:
+        return {}
+    return json.loads(task.params.json_params)
 
 
 def _checks_by_id(playbook) -> dict:
     return {c.check_id: c for c in (playbook.postchecks or []) if c.check_id}
 
 
-def _make_session_collector(
-    window_result: FsdbSessionWindowResult,
-    recovery=(True, 90.0, "recovered to 32 and held for 90.0s (>= floor)"),
-    timeout_count: int = 0,
-) -> MagicMock:
-    """Build a synthetic HRT FSDB-session collector for the session-stat HC."""
-    collector = MagicMock()
-    collector.host = _GPU_HOST
-    # Multi-host session-stat HC iterates collector.hosts_in_window(...); a bare
-    # MagicMock would return an empty iterable and make the check SKIP.
-    collector.hosts = [_GPU_HOST]
-    collector.hosts_in_window.return_value = [_GPU_HOST]
-    collector.evaluate_window.return_value = window_result
-    collector.evaluate_recovery_hold.return_value = recovery
-    collector.timeout_count_in_window.return_value = timeout_count
-    collector.format_window_table.return_value = "(table)"
-    return collector
+def _prechecks_by_id(playbook) -> dict:
+    return {c.check_id: c for c in (playbook.prechecks or []) if c.check_id}
 
 
-# Stable-state hardening v2 check IDs that EVERY tc28-31 longevity playbook
-# must carry (anchored at the longevity playbook start by the runner's
-# per-playbook re-stamp of test_case_start_time). The remote-failure stable
-# check(s) are asserted separately (single broad check vs. per-VF-group) — see
-# below.
-_V2_STABLE_REQUIRED_IDS = {
-    # FSDB ribMap + BGP RIB convergence (one per observed lane).
-    "fpf_fsdb_convergence_lane0",
-    "fpf_bgp_convergence_lane0",
-    # HRT bulk convergence on the injected lane(s).
-    "fpf_hrt_convergence_lane0",
-    "fpf_hrt_convergence_lane1",
-    # Prod-prefix stability and per-host FSDB-session postcheck.
-    "fpf_prod_hrt_prefix_stability",
-    "fpf_hrt_postcheck",
-}
-
-# Remote-failure stable check IDs. tc29/tc30/tc31 (single injection) carry one
-# broad "fpf_remote_failure_stable" check; tc28 (8-STSW split-per-VF injection,
-# rf_vf_groups) replaces it with one per VF group, each scoped to that group's
-# own lanes ("fpf_remote_failure_stable_<suffix>").
-_RF_STABLE_SINGLE_IDS = {"fpf_remote_failure_stable"}
-_RF_STABLE_VF_GROUP_IDS = {
-    "fpf_remote_failure_stable_vf1",
-    "fpf_remote_failure_stable_vf2",
-}
-
-
-def _required_v2_ids(vf_grouped: bool) -> set:
-    return _V2_STABLE_REQUIRED_IDS | (
-        _RF_STABLE_VF_GROUP_IDS if vf_grouped else _RF_STABLE_SINGLE_IDS
-    )
-
-
-class TestFpfTc28FsdbKill(unittest.TestCase):
+class TestFpfTc29bRemotePrefixWithdraw(unittest.TestCase):
     def setUp(self):
-        self.cfg = fpf_tc28_fsdb_kill.create_fpf_tc28_test_config()
+        self.module = fpf_tc29b_fsdb_gr_remote_withdraw
+        self.cfg = self.module.TEST_CONFIG
 
-    def test_name_and_tags(self):
-        self.assertEqual(self.cfg.name, "fpf_tc28_fsdb_kill")
-        self.assertIn("fpf", self.cfg.tags)
+    def test_two_phase_shape_without_ib_traffic(self):
+        self.assertEqual(self.cfg.name, "fpf_tc29b_fsdb_gr_remote_withdraw")
+        self.assertEqual(
+            [playbook.name for playbook in self.cfg.playbooks],
+            [
+                "fpf_tc29b_fsdb_gr_remote_withdraw_disrupt",
+                "fpf_tc29b_fsdb_gr_remote_withdraw_recovery",
+            ],
+        )
+        task_names = [task.task_name for task in self.cfg.setup_tasks]
+        self.assertNotIn("fpf_start_ib_traffic", task_names)
+        self.assertNotIn("fpf_stop_ib_traffic", task_names)
 
-    def test_two_playbooks_strict_order(self):
-        self.assertEqual(len(self.cfg.playbooks), 2)
-        self.assertEqual(self.cfg.playbooks[0].name, "fpf_tc28_fsdb_kill_disrupt")
-        self.assertEqual(self.cfg.playbooks[1].name, "fpf_tc28_fsdb_kill_longevity")
+    def test_exact_a_and_b_injection_and_named_collectors(self):
+        injections = [
+            task
+            for task in self.cfg.setup_tasks
+            if task.task_name == "fpf_inject_bgp_prefixes"
+        ]
+        groups = [
+            group for task in injections for group in _task_params(task)["groups"]
+        ]
+        remote_b = next(g for g in groups if g["prefix_base"] == "4000:dd::/64")
+        self.assertEqual(remote_b["devices"], [self.module.REMOTE_GTSW])
+        self.assertEqual(remote_b["count"], 1000)
+        self.assertEqual(remote_b["increment_step"], "0:0:1::")
+        self.assertEqual(remote_b["community_list"], "gtsw")
+        self.assertEqual(remote_b["batch_size"], 100)
 
-    def test_disrupt_playbook_has_repeated_crash_step(self):
-        names = _step_names(self.cfg.playbooks[0])
-        # repeated-crash, record-disruption, and longevity are all CUSTOM_STEP /
-        # LONGEVITY_STEP; assert the crash + injection steps are present.
-        self.assertIn(taac_types.StepName.LONGEVITY_STEP, names)
-        # at least one CUSTOM_STEP (the repeated fsdb crash + record-disruption).
-        self.assertIn(taac_types.StepName.CUSTOM_STEP, names)
+        collector_task = next(
+            task
+            for task in self.cfg.setup_tasks
+            if task.task_name == "fpf_start_collectors"
+        )
+        params = _task_params(collector_task)
+        self.assertEqual(params["poll_interval_sec"], 2.0)
+        groups = {g["name"]: g for g in params["additional_namespaces"]}
+        self.assertEqual(groups["remote_b"]["subnet_prefix"], "4000:dd::/32")
+        self.assertEqual(
+            groups["remote_b"]["bgp_gtsws"],
+            [self.module.REMOTE_GTSW, self.module.LOCAL_GTSW],
+        )
+        self.assertEqual(groups["remote_b"]["fsdb_gtsws"], [self.module.LOCAL_GTSW])
+        self.assertEqual(groups["remote_b"]["fib_gtsws"], [self.module.LOCAL_GTSW])
+        self.assertEqual(groups["local_a"]["fib_gtsws"], [self.module.LOCAL_GTSW])
 
-    def test_disrupt_session_stat_disruption_mode_28(self):
-        checks = _session_stat_checks(self.cfg.playbooks[0])
-        self.assertEqual(len(checks), 1)
-        params = _check_params(checks[0])
-        self.assertEqual(params["mode"], "disruption")
-        self.assertEqual(params["expected_connected"], 32)
-        self.assertEqual(params["expected_connected_during"], 28)
-        self.assertEqual(params["impacted_lanes"], [0])
-        self.assertEqual(params["recovery_min_sec"], 60)
+    def test_collectors_pin_the_characterized_twshared_hosts(self):
+        expected = ["twshared1352.03.mwg2", "twshared1388.03.mwg2"]
+        stale = {"rtptest1555.mwg2", "rtptest1599.mwg2"}
+        collector_task = next(
+            task
+            for task in self.cfg.setup_tasks
+            if task.task_name == "fpf_start_collectors"
+        )
+        params = _task_params(collector_task)
+        remote_b = next(
+            group
+            for group in params["additional_namespaces"]
+            if group["name"] == "remote_b"
+        )
 
-    def test_longevity_playbook_has_no_session_stat_disruption(self):
-        # The longevity playbook is the stable-state hardening contract; it should
-        # not carry a disruption-mode session-stat postcheck of its own.
-        for chk in _session_stat_checks(self.cfg.playbooks[1]):
-            self.assertNotEqual(_check_params(chk)["mode"], "disruption")
+        self.assertEqual(self.module.GPU_HOSTS, expected)
+        self.assertEqual(params["hosts"], expected)
+        self.assertEqual(params["fsdb_session_hosts"], expected)
+        self.assertEqual(remote_b["hosts"], expected)
+        self.assertTrue(stale.isdisjoint(params["hosts"]))
 
-    def test_longevity_playbook_has_v2_stable_check_set(self):
-        """Playbook 2 (longevity) is built via create_fpf_hardening_playbook_v2
-        and must carry the full stable-state check set (anchored at its own
-        start by the runner's per-playbook test_case_start_time re-stamp)."""
-        ids = set(_checks_by_id(self.cfg.playbooks[1]).keys())
-        # tc28 uses the 8-STSW split-per-VF injection (per-group RF checks).
-        required = _required_v2_ids(vf_grouped=True)
+        lifecycle = _check_params(
+            _checks_by_id(self.cfg.playbooks[0])["fpf_tc29b_remote_prefix_withdrawn"]
+        )
+        for key in (
+            "a_hrt_positive_expected",
+            "a_hrt_remote_failure_expected",
+            "b_hrt_positive_expected",
+            "b_hrt_remote_failure_expected",
+        ):
+            self.assertEqual(list(lifecycle[key]), expected)
+
+    def test_scale_injection_is_252_batched_and_serially_bounded(self):
+        injection_tasks = [
+            task
+            for task in self.cfg.setup_tasks
+            if task.task_name == "fpf_inject_bgp_prefixes"
+        ]
+        self.assertEqual(
+            len(injection_tasks),
+            9,
+            "eight A origins plus one B origin must be separate setup tasks",
+        )
+        all_groups = []
+        for task in injection_tasks:
+            params = _task_params(task)
+            self.assertEqual(len(params["groups"]), 1)
+            group = params["groups"][0]
+            self.assertEqual(len(group["devices"]), 1)
+            all_groups.append(group)
+
+        a_groups = [g for g in all_groups if g["prefix_base"].startswith("5000:")]
+        self.assertEqual(len(a_groups), 8)
+        for group in a_groups:
+            self.assertEqual(group["count"], 4032)
+            self.assertEqual(group["batch_size"], 252)
+            self.assertEqual(group["count"] // group["batch_size"], 16)
+
+        self.assertEqual(_task_params(injection_tasks[-1])["settle_sec"], 120)
         self.assertTrue(
-            required.issubset(ids),
-            f"missing stable check IDs: {required - ids}",
+            all(_task_params(task)["settle_sec"] == 0 for task in injection_tasks[:-1])
         )
 
-
-class TestFpfTc29FsdbGrStop30(unittest.TestCase):
-    def setUp(self):
-        self.cfg = fpf_tc29_fsdb_gr_stop30_reenable.create_fpf_tc29_test_config()
-
-    def test_name_and_order(self):
-        self.assertEqual(self.cfg.name, "fpf_tc29_fsdb_gr_stop30_reenable")
-        self.assertEqual(len(self.cfg.playbooks), 2)
-        self.assertEqual(self.cfg.playbooks[0].name, "fpf_tc29_fsdb_gr_stop30_disrupt")
-        self.assertEqual(
-            self.cfg.playbooks[1].name, "fpf_tc29_fsdb_gr_stop30_longevity"
+        present = _check_params(
+            _prechecks_by_id(self.cfg.playbooks[0])["fpf_tc29b_remote_prefix_present"]
         )
-
-    def test_disrupt_has_stop_and_start_steps(self):
-        # Two service-interruption steps (stop + start) -> SERVICE_INTERRUPTION_STEP.
-        names = _step_names(self.cfg.playbooks[0])
-        si_count = sum(
-            1 for n in names if n == taac_types.StepName.SERVICE_INTERRUPTION_STEP
+        self.assertIn(
+            ["fib_local_a", self.module.LOCAL_GTSW, 4032],
+            present["scalar_expectations"],
         )
-        self.assertEqual(si_count, 2)
+        for host_map in present["a_hrt_positive_expected"].values():
+            for counts in host_map.values():
+                self.assertEqual(counts, [4032, 4032, 4032, 4032])
 
-    def test_session_stat_disruption_recovery_60(self):
-        checks = _session_stat_checks(self.cfg.playbooks[0])
-        self.assertEqual(len(checks), 1)
-        params = _check_params(checks[0])
-        self.assertEqual(params["mode"], "disruption")
-        self.assertEqual(params["expected_connected_during"], 28)
-        self.assertEqual(params["impacted_lanes"], [0])
-        # Bumped 30 -> 60: a 120s post-re-enable settle inside the disrupt
-        # playbook gives the collector window time to observe the 28 -> 32
-        # recovery and a full 60s held floor.
-        self.assertEqual(params["recovery_min_sec"], 60)
+        withdrawal_tasks = [
+            task
+            for task in self.cfg.teardown_tasks
+            if task.task_name == "fpf_inject_bgp_prefixes"
+        ]
+        self.assertEqual(len(withdrawal_tasks), 9)
+        for task in withdrawal_tasks:
+            params = _task_params(task)
+            self.assertTrue(params["withdraw"])
+            self.assertEqual(len(params["groups"]), 1)
+            self.assertEqual(len(params["groups"][0]["devices"]), 1)
 
-    def test_disrupt_has_post_reenable_settle(self):
-        # FIX 6: a settle longevity step follows the re-enable so the session
-        # collector window spans the 28 -> 32 recovery.
-        names = _step_names(self.cfg.playbooks[0])
-        self.assertEqual(names[-1], taac_types.StepName.LONGEVITY_STEP)
-
-    def test_host_spray_all_samples_true(self):
-        # Host-spray postcheck is present (skip_ssh is off in the default unit-test
-        # environment) and uses all_samples=True.
-        sprays = _host_spray_checks(self.cfg.playbooks[0])
-        self.assertEqual(len(sprays), 1)
-        params = _check_params(sprays[0])
-        self.assertTrue(params.get("all_samples"))
-        self.assertEqual(
-            sorted(params["hosts"]),
-            sorted(fpf_tc29_fsdb_gr_stop30_reenable.SPRAY_HOSTS),
-        )
-
-    def test_longevity_playbook_has_v2_stable_check_set(self):
-        ids = set(_checks_by_id(self.cfg.playbooks[1]).keys())
-        # tc29/tc31 use the single broad remote-failure stable check.
-        required = _required_v2_ids(vf_grouped=False)
-        self.assertTrue(
-            required.issubset(ids),
-            f"missing stable check IDs: {required - ids}",
-        )
-
-
-class TestFpfTc30FsdbGrStop180(unittest.TestCase):
-    def setUp(self):
-        self.cfg = fpf_tc30_fsdb_gr_stop180_no_reenable.create_fpf_tc30_test_config()
-
-    def test_name_and_order(self):
-        self.assertEqual(self.cfg.name, "fpf_tc30_fsdb_gr_stop180_no_reenable")
-        self.assertEqual(len(self.cfg.playbooks), 2)
-        self.assertEqual(self.cfg.playbooks[0].name, "fpf_tc30_fsdb_gr_stop180_disrupt")
-        self.assertEqual(
-            self.cfg.playbooks[1].name, "fpf_tc30_fsdb_gr_stop180_stays_down"
-        )
-
-    def test_disrupt_has_exactly_one_stop_no_start(self):
-        names = _step_names(self.cfg.playbooks[0])
-        si_count = sum(
-            1 for n in names if n == taac_types.StepName.SERVICE_INTERRUPTION_STEP
-        )
-        # Exactly one service-interruption step (the stop); fsdb is NOT re-enabled.
-        self.assertEqual(si_count, 1)
-
-    def test_stays_down_playbook_has_no_postchecks(self):
-        # tc30's stays_down (Playbook[1]) is empty — the stays-down checks live
-        # on Playbook[0] (disrupt) scoped via window_from_disruption_time. The
-        # 5-min hold IS the observation window; no separate longevity playbook.
-        self.assertEqual(_all_postchecks(self.cfg.playbooks[1]), [])
-
-    def test_disrupt_carries_session_stat_stable_28_no_recovery(self):
-        # The session-stat stable check now lives on the disrupt playbook,
-        # scoped to the 5-min hold via window_from_disruption_time.
-        checks = _session_stat_checks(self.cfg.playbooks[0])
-        self.assertEqual(len(checks), 1)
-        params = _check_params(checks[0])
-        # "stays at 28, no recovery" -> stable mode, expected_connected=28.
-        self.assertEqual(params["mode"], "stable")
-        self.assertEqual(params["expected_connected"], 28)
-
-
-class TestFpfTc31FsdbEnableRecover(unittest.TestCase):
-    def setUp(self):
-        self.cfg = fpf_tc31_fsdb_enable_recover.create_fpf_tc31_test_config()
-
-    def test_two_playbooks_strict_order(self):
-        # FIX 5: restructured to disruption-only (enable+settle) + stable-state
-        # longevity, so the stable prechecks run AFTER the enable (not before).
-        self.assertEqual(self.cfg.name, "fpf_tc31_fsdb_enable_recover")
-        self.assertEqual(len(self.cfg.playbooks), 2)
-        self.assertEqual(
-            self.cfg.playbooks[0].name, "fpf_tc31_fsdb_enable_recover_disrupt"
-        )
-        self.assertEqual(
-            self.cfg.playbooks[1].name, "fpf_tc31_fsdb_enable_recover_longevity"
-        )
-
-    def test_disrupt_playbook_enable_step_no_checks(self):
-        # Playbook 1 is disruption-only: the enable step + settle, NO checks.
+    def test_disruption_sequence_and_absence_contract(self):
         disrupt = self.cfg.playbooks[0]
-        names = _step_names(disrupt)
-        self.assertIn(taac_types.StepName.SERVICE_INTERRUPTION_STEP, names)
-        self.assertEqual(names[-1], taac_types.StepName.LONGEVITY_STEP)
-        self.assertEqual(_all_postchecks(disrupt), [])
-        self.assertEqual(list(disrupt.prechecks or []), [])
-
-    def test_session_stat_stable_32_in_longevity(self):
-        # The session-stat stable check now lives in the longevity playbook (2).
-        checks = _session_stat_checks(self.cfg.playbooks[1])
-        self.assertEqual(len(checks), 1)
-        params = _check_params(checks[0])
-        self.assertEqual(params["mode"], "stable")
-        self.assertEqual(params["expected_connected"], 32)
-
-    def test_longevity_playbook_has_v2_stable_check_set(self):
-        ids = set(_checks_by_id(self.cfg.playbooks[1]).keys())
-        # tc29/tc31 use the single broad remote-failure stable check.
-        required = _required_v2_ids(vf_grouped=False)
-        self.assertTrue(
-            required.issubset(ids),
-            f"missing stable check IDs: {required - ids}",
+        custom = [
+            _step_params(step)
+            for step in _all_steps(disrupt)
+            if step.name == taac_types.StepName.CUSTOM_STEP
+        ]
+        sequence = next(
+            params
+            for params in custom
+            if params.get("custom_step_name") == "fpf_remote_prefix_gr_sequence"
         )
+        self.assertEqual(sequence["local_gtsw"], self.module.LOCAL_GTSW)
+        self.assertEqual(sequence["remote_gtsw"], self.module.REMOTE_GTSW)
+        self.assertEqual(sequence["between_stops_sec"], 30)
+        self.assertEqual(sequence["before_local_restart_sec"], 30)
+        self.assertEqual(sequence["max_fsdb_outage_sec"], 120)
 
-
-class _SessionStatHCExpectationsBase(unittest.IsolatedAsyncioTestCase):
-    """Shared scaffolding for driving the session-stat HC with mocked data.
-
-    The check_params are pulled BY check_id from the test config's own
-    playbook, so what's exercised is exactly what the config asserts at run
-    time.
-    """
-
-    async def asyncSetUp(self):
-        self.health_check = FpfHrtSessionStatHealthCheck(logger=MagicMock())
-        self.device = MagicMock(spec=TestDevice)
-        self.device.name = "gtsw001.l1002.c087.mwg2"
-        ep_patcher = patch(
-            f"{_HC_MODULE}.everpaste_details_suffix",
-            new=AsyncMock(return_value=""),
+        lifecycle = _check_params(
+            _checks_by_id(disrupt)["fpf_tc29b_remote_prefix_withdrawn"]
         )
-        self.addCleanup(ep_patcher.stop)
-        ep_patcher.start()
-        skip_patcher = patch(
-            f"{_HC_MODULE}.disruption_inconclusive_skip", return_value=None
+        self.assertEqual(lifecycle["mode"], "withdrawn")
+        self.assertEqual(lifecycle["deadline_sec"], 120)
+        self.assertEqual(
+            set(lifecycle["outage_tolerant_collectors"]),
+            {
+                f"fsdb_remote_b@{self.module.LOCAL_GTSW}",
+                f"hrt_remote_b@{self.module.GPU_HOSTS[0]}",
+                f"hrt@{self.module.GPU_HOSTS[0]}",
+            },
         )
-        self.addCleanup(skip_patcher.stop)
-        skip_patcher.start()
-        tcs_patcher = patch(
-            f"{_HC_MODULE}.get_test_case_start_time", return_value=1000.0
+        self.assertEqual(
+            lifecycle["scalar_expectations"],
+            [
+                ["bgp_remote_b", self.module.LOCAL_GTSW, 0],
+                ["fib_remote_b", self.module.LOCAL_GTSW, 0],
+                ["fsdb_remote_b", self.module.LOCAL_GTSW, 0],
+                ["fib_local_a", self.module.LOCAL_GTSW, 4032],
+            ],
         )
-        self.addCleanup(tcs_patcher.stop)
-        tcs_patcher.start()
+        remote_host = self.module.GPU_HOSTS[1]
+        local_host = self.module.GPU_HOSTS[0]
+        a_positive = lifecycle["a_hrt_positive_expected"]
+        self.assertEqual(a_positive[local_host]["0"], [4032, 4032, 4032, 4032])
+        self.assertEqual(a_positive[remote_host]["0"], [0, 4032, 4032, 4032])
+        self.assertEqual(a_positive[remote_host]["1"], [4032, 4032, 4032, 4032])
+        a_rf = lifecycle["a_hrt_remote_failure_expected"]
+        self.assertEqual(a_rf[remote_host]["0"], [4032, 0, 0, 0])
+        self.assertEqual(a_rf[remote_host]["1"], [0, 0, 0, 0])
 
-    async def _run_with(self, collector, params):
-        with patch(f"{_HC_MODULE}.get_collector", return_value=collector):
-            return await self.health_check._run(
-                self.device, hc_types.BaseHealthCheckIn(), params
-            )
-
-    def _params_from_config(self, playbook, check_id: str) -> dict:
-        chk = _checks_by_id(playbook)[check_id]
-        return json.loads(chk.check_params.json_params)
-
-
-class TestTc28Tc29SessionStatHCExpectations(_SessionStatHCExpectationsBase):
-    """tc28 + tc29 share the disruption-mode contract: census 32 -> 28 on lane 0
-    during the kill / GR-stop, recover to 32 and hold for the configured floor.
-    """
-
-    async def test_tc28_drop_then_recover_pass(self):
-        cfg = fpf_tc28_fsdb_kill.create_fpf_tc28_test_config()
-        params = self._params_from_config(
-            cfg.playbooks[0], "fpf_tc28_fsdb_kill_session_stat"
+    def test_recovery_starts_only_remote_bgp_and_b_remains_absent(self):
+        recovery = self.cfg.playbooks[1]
+        custom = [
+            _step_params(step)
+            for step in _all_steps(recovery)
+            if step.name == taac_types.StepName.CUSTOM_STEP
+        ]
+        start = next(
+            params
+            for params in custom
+            if params.get("custom_step_name") == "fpf_remote_prefix_start_origin_bgp"
         )
-        # 32 stable -> 28 dip on lane 0 -> 32 recovery (held).
-        res = FsdbSessionWindowResult(
-            host=_GPU_HOST,
-            samples=30 + 60 + 25,  # ~115 samples spanning stable+kill+recovery
-            error_samples=0,
-            min_connected=28,
-            max_connected=32,
-            last_connected=32,
-            reached_expected=True,
-            impacted_lane_churn={0: True},
-            detail="connected min=28 max=32 last=32",
-        )
-        result = await self._run_with(_make_session_collector(res), params)
-        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
-
-    async def test_tc28_never_recovers_fail(self):
-        cfg = fpf_tc28_fsdb_kill.create_fpf_tc28_test_config()
-        params = self._params_from_config(
-            cfg.playbooks[0], "fpf_tc28_fsdb_kill_session_stat"
-        )
-        # Dropped to 28, climbs to 30 but never reaches 32.
-        res = FsdbSessionWindowResult(
-            host=_GPU_HOST,
-            samples=100,
-            error_samples=0,
-            min_connected=28,
-            max_connected=30,
-            last_connected=30,
-            reached_expected=False,
-            impacted_lane_churn={0: True},
-            detail="connected min=28 max=30 last=30",
-        )
-        result = await self._run_with(
-            _make_session_collector(
-                res,
-                recovery=(
-                    False,
-                    0.0,
-                    "did not recover by window end (last=30, expected 32)",
-                ),
+        self.assertEqual(start["remote_gtsw"], self.module.REMOTE_GTSW)
+        self.assertFalse(
+            any(
+                step.name == taac_types.StepName.FPF_BGP_PREFIX_INJECTION_STEP
+                for step in _all_steps(recovery)
             ),
-            params,
+            "recovery must not recreate the runtime-only B namespace",
         )
-        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
-        self.assertIn("Signal2", result.message)
-
-    async def test_tc29_drop_then_recover_pass(self):
-        cfg = fpf_tc29_fsdb_gr_stop30_reenable.create_fpf_tc29_test_config()
-        params = self._params_from_config(
-            cfg.playbooks[0], "fpf_tc29_fsdb_gr_stop30_session_stat"
+        lifecycle = _check_params(
+            _checks_by_id(recovery)["fpf_tc29b_remote_prefix_stays_absent"]
         )
-        # tc29 now uses a 60s recovery floor (matches tc28) thanks to the
-        # post-re-enable settle inside the disrupt playbook.
-        self.assertEqual(params["recovery_min_sec"], 60)
-        res = FsdbSessionWindowResult(
-            host=_GPU_HOST,
-            samples=80,
-            error_samples=0,
-            min_connected=28,
-            max_connected=32,
-            last_connected=32,
-            reached_expected=True,
-            impacted_lane_churn={0: True},
-            detail="connected min=28 max=32 last=32",
+        self.assertEqual(lifecycle["mode"], "recovery")
+        self.assertEqual(lifecycle["deadline_sec"], 60)
+        self.assertEqual(
+            lifecycle["outage_tolerant_collectors"],
+            [f"bgp_remote_b@{self.module.REMOTE_GTSW}"],
         )
-        # Recovered + held 65s >= 60s floor.
-        result = await self._run_with(
-            _make_session_collector(
-                res,
-                recovery=(True, 65.0, "recovered to 32 and held 65.0s (>= 60s floor)"),
-            ),
-            params,
+        b_scalars = [
+            expected
+            for collector, _device, expected in lifecycle["scalar_expectations"]
+            if collector.endswith("remote_b")
+        ]
+        self.assertTrue(b_scalars)
+        self.assertTrue(all(expected == 0 for expected in b_scalars))
+        self.assertIn(
+            ["fib_local_a", self.module.LOCAL_GTSW, 4032],
+            lifecycle["scalar_expectations"],
         )
-        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
-
-
-class TestTc30SessionStatHCExpectations(_SessionStatHCExpectationsBase):
-    """tc30 ("stays at 28, no recovery"): stable-mode check at 28 — steady
-    holds PASS, any climb back toward 32 FAILs the impaired-steady contract."""
-
-    async def test_steady_28_pass(self):
-        cfg = fpf_tc30_fsdb_gr_stop180_no_reenable.create_fpf_tc30_test_config()
-        # Session-stat check now lives on the disrupt playbook (playbooks[0]),
-        # scoped to the 5-min hold via window_from_disruption_time.
-        params = self._params_from_config(
-            cfg.playbooks[0], "fpf_tc30_fsdb_gr_stop180_session_stat"
-        )
-        self.assertEqual(params["mode"], "stable")
-        self.assertEqual(params["expected_connected"], 28)
-        res = FsdbSessionWindowResult(
-            host=_GPU_HOST,
-            samples=40,
-            error_samples=0,
-            min_connected=28,
-            max_connected=28,
-            last_connected=28,
-            reached_expected=True,
-            detail="connected min=28 max=28 last=28",
-        )
-        result = await self._run_with(_make_session_collector(res), params)
-        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
-
-    async def test_climbs_back_to_32_fail(self):
-        cfg = fpf_tc30_fsdb_gr_stop180_no_reenable.create_fpf_tc30_test_config()
-        # Session-stat check now lives on the disrupt playbook (playbooks[0]),
-        # scoped to the 5-min hold via window_from_disruption_time.
-        params = self._params_from_config(
-            cfg.playbooks[0], "fpf_tc30_fsdb_gr_stop180_session_stat"
-        )
-        # The impaired-steady-state contract requires min==max==28; a climb to
-        # 32 (fsdb came back unexpectedly) breaks that.
-        res = FsdbSessionWindowResult(
-            host=_GPU_HOST,
-            samples=40,
-            error_samples=0,
-            min_connected=28,
-            max_connected=32,
-            last_connected=32,
-            reached_expected=True,
-            detail="connected min=28 max=32 last=32",
-        )
-        result = await self._run_with(_make_session_collector(res), params)
-        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
-
-
-class TestTc31SessionStatHCExpectations(_SessionStatHCExpectationsBase):
-    """tc31: stable-mode @ 32. Steady 32 PASSes; a dip below 32 FAILs."""
-
-    async def test_steady_32_pass(self):
-        cfg = fpf_tc31_fsdb_enable_recover.create_fpf_tc31_test_config()
-        params = self._params_from_config(
-            cfg.playbooks[1], "fpf_tc31_fsdb_enable_recover_session_stat"
-        )
-        self.assertEqual(params["mode"], "stable")
-        self.assertEqual(params["expected_connected"], 32)
-        res = FsdbSessionWindowResult(
-            host=_GPU_HOST,
-            samples=50,
-            error_samples=0,
-            min_connected=32,
-            max_connected=32,
-            last_connected=32,
-            reached_expected=True,
-            detail="connected min=32 max=32 last=32",
-        )
-        result = await self._run_with(_make_session_collector(res), params)
-        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
-
-    async def test_dip_to_28_fail(self):
-        cfg = fpf_tc31_fsdb_enable_recover.create_fpf_tc31_test_config()
-        params = self._params_from_config(
-            cfg.playbooks[1], "fpf_tc31_fsdb_enable_recover_session_stat"
-        )
-        res = FsdbSessionWindowResult(
-            host=_GPU_HOST,
-            samples=50,
-            error_samples=0,
-            min_connected=28,
-            max_connected=32,
-            last_connected=32,
-            reached_expected=True,
-            detail="connected min=28 max=32 last=32",
-        )
-        result = await self._run_with(_make_session_collector(res), params)
-        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        for host_map in lifecycle["b_hrt_positive_expected"].values():
+            for counts in host_map.values():
+                self.assertEqual(counts, [0, 0, 0, 0])
+        for host_map in lifecycle["b_hrt_remote_failure_expected"].values():
+            for counts in host_map.values():
+                self.assertEqual(counts, [0, 0, 0, 0])
 
 
 if __name__ == "__main__":

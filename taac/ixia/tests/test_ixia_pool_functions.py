@@ -1,10 +1,47 @@
 # pyre-unsafe
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+import contextlib
+import ipaddress
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
 from ixia.ixia import types as ixia_types
-from taac.ixia.ixia import Ixia
+from taac.ixia.ixia import (
+    _is_ipv4_prefix_pool,
+    _is_ipv6_bgp_peer,
+    BgpIpv6Peer,
+    Ipv4PrefixPools,
+    Ipv6PrefixPools,
+    Ixia,
+)
+
+
+class TestPublicRestpyTypeCompatibility(unittest.TestCase):
+    def test_runtime_compatibility_symbols_remain_importable(self) -> None:
+        public_v4 = type("Ipv4PrefixPools", (), {})()
+        public_v6 = type("Ipv6PrefixPools", (), {})()
+        public_peer = type("BgpIpv6Peer", (), {})()
+        self.assertIsInstance(public_v4, Ipv4PrefixPools)
+        self.assertIsInstance(public_v6, Ipv6PrefixPools)
+        self.assertIsInstance(public_peer, BgpIpv6Peer)
+
+    def test_hashed_public_prefix_pool_modules_are_identified_by_class(self) -> None:
+        public_v4 = type("Ipv4PrefixPools", (), {})()
+        public_v6 = type("Ipv6PrefixPools", (), {})()
+        self.assertTrue(_is_ipv4_prefix_pool(public_v4))
+        self.assertFalse(_is_ipv4_prefix_pool(public_v6))
+
+    def test_unknown_prefix_pool_takes_v6_branch(self) -> None:
+        # Not an IPv4 pool, so callers take the IPv6 branch — the contract
+        # test_bgp_session_indices pins with its _PrefixPool stand-in.
+        # (Raising here broke that contract: the old isinstance check
+        # returned False for anything that was not an IPv4 pool.)
+        self.assertFalse(_is_ipv4_prefix_pool(type("UnknownPrefixPool", (), {})()))
+
+    def test_hashed_public_ipv6_peer_module_is_identified_by_class(self) -> None:
+        public_peer = type("BgpIpv6Peer", (), {})()
+        self.assertTrue(_is_ipv6_bgp_peer(public_peer))
 
 
 class _MultiValue:
@@ -89,9 +126,52 @@ def _create_ixia_instance():
     ixia.logger = MagicMock()
     ixia.session = MagicMock()
     ixia.stop_protocols = MagicMock()
+    # Protocol-state settling is out of scope here (these tests cover regex
+    # filtering and position math) and needs a live topology to poll
+    # DeviceGroup.Status against. It has dedicated coverage in
+    # test_protocol_state_wait.py.
+    ixia.stop_protocols_and_wait = MagicMock()
     ixia.start_protocols = MagicMock()
     ixia.apply_changes = MagicMock()
+    ixia.mutation_transaction = MagicMock(return_value=contextlib.nullcontext())
     return ixia
+
+
+def _make_partitioned_prefix_target(
+    *,
+    peer_count: int,
+    prefixes_per_peer: int,
+    starts: list[str],
+    lasts: list[str],
+):
+    pool = MagicMock()
+    pool.Name = "PREFIX_POOL_IPV6_EBGP"
+    pool.Count = peer_count
+    pool.NumberOfAddresses = prefixes_per_peer
+    pool.NetworkAddress.Values = starts
+    pool.NetworkAddress.Pattern = "counter"
+    pool.NetworkAddress._properties = {
+        "pattern": "counter",
+        "counter": {
+            "start": starts[0],
+            "step": "::",
+            "count": peer_count,
+        },
+    }
+    pool.LastNetworkAddress = lasts
+    pool.PrefixLength.Values = [64]
+
+    network_group = MagicMock()
+    network_group.Name = "BGP_IPV6_EBGP_NETWORK_GROUP"
+    network_group.Multiplier = 1
+    network_group.Ipv6PrefixPools.find.return_value = [pool]
+    network_group.Ipv4PrefixPools.find.return_value = []
+
+    device_group = MagicMock()
+    device_group.Name = "DEVICE_GROUP_IPV6_EBGP"
+    device_group.Multiplier = peer_count
+    device_group.NetworkGroup.find.return_value = [network_group]
+    return device_group, network_group, pool
 
 
 class TestBuildAsPathPositionValues(unittest.TestCase):
@@ -99,7 +179,7 @@ class TestBuildAsPathPositionValues(unittest.TestCase):
 
     def test_basic_pool(self):
         """Two paths of length 3 produce 3 position lists of 2 values each."""
-        pool = ["65001 65002 65003", "65004 65005 65006"]
+        pool = [(65001, 65002, 65003), (65004, 65005, 65006)]
         result = Ixia._build_as_path_position_values(pool, max_as_path_length=3)
         self.assertEqual(len(result), 3)
         self.assertEqual(result[0], [65001, 65004])
@@ -108,7 +188,7 @@ class TestBuildAsPathPositionValues(unittest.TestCase):
 
     def test_uneven_path_lengths_pads_zero(self):
         """Shorter paths get 0 for positions beyond their length."""
-        pool = ["65001 65002 65003", "65004"]
+        pool = [(65001, 65002, 65003), (65004,)]
         result = Ixia._build_as_path_position_values(pool, max_as_path_length=3)
         self.assertEqual(result[0], [65001, 65004])
         self.assertEqual(result[1], [65002, 0])
@@ -116,7 +196,7 @@ class TestBuildAsPathPositionValues(unittest.TestCase):
 
     def test_single_path(self):
         """A single path produces lists with one value each."""
-        pool = ["100 200"]
+        pool = [(100, 200)]
         result = Ixia._build_as_path_position_values(pool, max_as_path_length=2)
         self.assertEqual(result[0], [100])
         self.assertEqual(result[1], [200])
@@ -195,6 +275,260 @@ class TestGeneratedRouteNextHop(unittest.TestCase):
         route_property.NextHopType.Single.assert_called_once_with("sameaslocalip")
 
 
+class TestOfflinePrefixResize(unittest.TestCase):
+    def test_caller_owned_stop_window_does_not_restart_protocols(self) -> None:
+        ixia = _create_ixia_instance()
+        ipv4_pool = MagicMock()
+        ipv6_pool = MagicMock()
+        network_group = MagicMock()
+        network_group.Name = "PREFIX_POOL_EBGP"
+        network_group.Multiplier = 1
+        network_group.Ipv4PrefixPools.find.return_value = [ipv4_pool]
+        network_group.Ipv6PrefixPools.find.return_value = [ipv6_pool]
+        device_group = _make_device_group("DEVICE_GROUP_EBGP", [network_group])
+        ixia.get_device_groups_by_port_and_interface = MagicMock(
+            return_value=[device_group]
+        )
+
+        ixia.update_prefix_counts_by_port(
+            hostname="bag010.ash6",
+            interface="Ethernet3/36/1",
+            prefix_count=1,
+            network_group_multiplier=50_000,
+            protocols_already_stopped=True,
+        )
+
+        self.assertEqual(network_group.Multiplier, 50_000)
+        self.assertEqual(ipv4_pool.NumberOfAddresses, 1)
+        self.assertEqual(ipv6_pool.NumberOfAddresses, 1)
+        ixia.stop_protocols_and_wait.assert_not_called()
+        ixia.start_protocols.assert_not_called()
+        ixia.apply_changes.assert_called_once()
+
+
+class TestPartitionedPrefixResize(unittest.TestCase):
+    def test_geometry_partitions_exactly_fifty_thousand_prefixes(self) -> None:
+        for peer_count, expected_per_peer in (
+            (1, 50_000),
+            (2, 25_000),
+            (4, 12_500),
+            (8, 6_250),
+            (16, 3_125),
+        ):
+            with self.subTest(peer_count=peer_count):
+                per_peer, _step, starts, lasts = Ixia._partitioned_prefix_geometry(
+                    starting_prefix="2001:db8:1000::",
+                    prefix_length=64,
+                    peer_count=peer_count,
+                    total_prefix_count=50_000,
+                )
+                self.assertEqual(expected_per_peer, per_peer)
+                self.assertEqual(peer_count, len(starts))
+                self.assertEqual(peer_count, len(lasts))
+                for index in range(peer_count):
+                    start = int(ipaddress.ip_address(starts[index]))
+                    last = int(ipaddress.ip_address(lasts[index]))
+                    self.assertEqual(expected_per_peer, (last - start) // 2**64 + 1)
+                    if index:
+                        self.assertLess(
+                            int(ipaddress.ip_address(lasts[index - 1])),
+                            start,
+                        )
+                self.assertEqual(
+                    50_000,
+                    sum(
+                        (
+                            int(ipaddress.ip_address(last))
+                            - int(ipaddress.ip_address(start))
+                        )
+                        // 2**64
+                        + 1
+                        for start, last in zip(starts, lasts)
+                    ),
+                )
+
+    def test_rejects_non_divisible_partition(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be divisible"):
+            Ixia._partitioned_prefix_geometry(
+                starting_prefix="2001:db8:1000::",
+                prefix_length=64,
+                peer_count=3,
+                total_prefix_count=50_000,
+            )
+
+    def test_requires_one_exact_prefix_pool_target(self) -> None:
+        ixia = _create_ixia_instance()
+        near_match = _make_partitioned_prefix_target(
+            peer_count=16,
+            prefixes_per_peer=3_125,
+            starts=["2001:db8:1000::"] * 16,
+            lasts=["2001:db8:1000:c34::"] * 16,
+        )
+        near_match[2].Name = "PREFIX_POOL_IPV6_EBGP_BACKUP"
+        ixia.get_device_groups_by_port_and_interface = MagicMock(
+            return_value=[near_match[0]]
+        )
+
+        with self.assertRaisesRegex(ValueError, "matched 0 pools"):
+            ixia.configure_partitioned_bgp_prefixes_by_port(
+                hostname="bag012.ash6",
+                interface="Ethernet3/36/1",
+                peer_count=4,
+                total_prefix_count=50_000,
+                prefix_pool_regex="PREFIX_POOL_IPV6_EBGP",
+                starting_prefix="2001:db8:1000::",
+                prefix_length=64,
+            )
+
+        ixia.stop_protocols_and_wait.assert_called_once_with()
+        ixia.apply_changes.assert_not_called()
+        ixia.start_protocols.assert_not_called()
+
+    def test_stops_applies_exact_geometry_then_starts(self) -> None:
+        ixia = _create_ixia_instance()
+        initial = _make_partitioned_prefix_target(
+            peer_count=16,
+            prefixes_per_peer=50_000,
+            starts=["2001:db8:1000::"] * 16,
+            lasts=["2001:db8:1000:c34f::"] * 16,
+        )
+        desired = _make_partitioned_prefix_target(
+            peer_count=4,
+            prefixes_per_peer=12_500,
+            starts=[
+                "2001:db8:1000:0:0:0:0:0",
+                "2001:db8:1000:30d4:0:0:0:0",
+                "2001:db8:1000:61a8:0:0:0:0",
+                "2001:db8:1000:927c:0:0:0:0",
+            ],
+            lasts=[
+                "2001:db8:1000:30d3:0:0:0:0",
+                "2001:db8:1000:61a7:0:0:0:0",
+                "2001:db8:1000:927b:0:0:0:0",
+                "2001:db8:1000:c34f:0:0:0:0",
+            ],
+        )
+        ixia.get_device_groups_by_port_and_interface = MagicMock(
+            side_effect=[[initial[0]], [desired[0]]]
+        )
+
+        result = ixia.configure_partitioned_bgp_prefixes_by_port(
+            hostname="bag012.ash6",
+            interface="Ethernet3/36/1",
+            peer_count=4,
+            total_prefix_count=50_000,
+            prefix_pool_regex="PREFIX_POOL_IPV6_EBGP",
+            starting_prefix="2001:db8:1000::",
+            prefix_length=64,
+        )
+
+        ixia.stop_protocols_and_wait.assert_called_once_with()
+        self.assertEqual(4, initial[0].Multiplier)
+        self.assertEqual(12_500, initial[2].NumberOfAddresses)
+        initial[2].NetworkAddress.Increment.assert_called_once_with(
+            start_value="2001:db8:1000::",
+            step_value="0:0:0:30d4::",
+        )
+        ixia.apply_changes.assert_called_once_with()
+        ixia.start_protocols.assert_called_once_with()
+        self.assertEqual(50_000, result["total_prefix_count"])
+        self.assertEqual(12_500, result["prefixes_per_peer"])
+        self.assertEqual("0:0:0:30d4::", result["prefix_step"])
+
+    def test_readback_mismatch_restores_original_geometry(self) -> None:
+        ixia = _create_ixia_instance()
+        initial = _make_partitioned_prefix_target(
+            peer_count=16,
+            prefixes_per_peer=50_000,
+            starts=["2001:db8:1000::"] * 16,
+            lasts=["2001:db8:1000:c34f::"] * 16,
+        )
+        mismatched = _make_partitioned_prefix_target(
+            peer_count=4,
+            prefixes_per_peer=12_500,
+            starts=["2001:db8:1000::"] * 4,
+            lasts=["2001:db8:1000:30d3::"] * 4,
+        )
+        rollback = _make_partitioned_prefix_target(
+            peer_count=4,
+            prefixes_per_peer=12_500,
+            starts=["2001:db8:1000::"] * 4,
+            lasts=["2001:db8:1000:30d3::"] * 4,
+        )
+        restored = _make_partitioned_prefix_target(
+            peer_count=16,
+            prefixes_per_peer=50_000,
+            starts=["2001:db8:1000::"] * 16,
+            lasts=["2001:db8:1000:c34f::"] * 16,
+        )
+        ixia.get_device_groups_by_port_and_interface = MagicMock(
+            side_effect=[
+                [initial[0]],
+                [mismatched[0]],
+                [rollback[0]],
+                [restored[0]],
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "readback mismatch"):
+            ixia.configure_partitioned_bgp_prefixes_by_port(
+                hostname="bag012.ash6",
+                interface="Ethernet3/36/1",
+                peer_count=4,
+                total_prefix_count=50_000,
+                prefix_pool_regex="PREFIX_POOL_IPV6_EBGP",
+                starting_prefix="2001:db8:1000::",
+                prefix_length=64,
+            )
+
+        self.assertEqual(16, rollback[0].Multiplier)
+        self.assertEqual(50_000, rollback[2].NumberOfAddresses)
+        rollback[2].NetworkAddress.Increment.assert_called_once_with(
+            "2001:db8:1000::",
+            "::",
+            16,
+        )
+        self.assertEqual(2, ixia.apply_changes.call_count)
+        ixia.start_protocols.assert_not_called()
+
+    def test_rollback_failure_preserves_primary_geometry_error(self) -> None:
+        ixia = _create_ixia_instance()
+        initial = _make_partitioned_prefix_target(
+            peer_count=16,
+            prefixes_per_peer=50_000,
+            starts=["2001:db8:1000::"] * 16,
+            lasts=["2001:db8:1000:c34f::"] * 16,
+        )
+        mismatched = _make_partitioned_prefix_target(
+            peer_count=4,
+            prefixes_per_peer=12_500,
+            starts=["2001:db8:1000::"] * 4,
+            lasts=["2001:db8:1000:30d3::"] * 4,
+        )
+        rollback_error = RuntimeError("rollback target disappeared")
+        ixia.get_device_groups_by_port_and_interface = MagicMock(
+            side_effect=[[initial[0]], [mismatched[0]], rollback_error]
+        )
+
+        with self.assertRaisesRegex(ValueError, "readback mismatch") as context:
+            ixia.configure_partitioned_bgp_prefixes_by_port(
+                hostname="bag012.ash6",
+                interface="Ethernet3/36/1",
+                peer_count=4,
+                total_prefix_count=50_000,
+                prefix_pool_regex="PREFIX_POOL_IPV6_EBGP",
+                starting_prefix="2001:db8:1000::",
+                prefix_length=64,
+            )
+
+        self.assertIs(context.exception.__cause__, rollback_error)
+        self.assertIn(
+            "partitioned BGP prefix rollback also failed",
+            " ".join(context.exception.__notes__),
+        )
+        ixia.start_protocols.assert_not_called()
+
+
 class TestExtendedCommunityPool(unittest.TestCase):
     def setUp(self):
         self.ixia = _create_ixia_instance()
@@ -208,15 +542,16 @@ class TestExtendedCommunityPool(unittest.TestCase):
         )
         self.assertEqual([True], route.EnableExtendedCommunity.Values)
         self.assertEqual(1, route.NoOfExternalCommunities)
-        self.assertEqual(
-            ["administratoras2octet", "administratoras2octet"],
-            position.Type.Values,
-        )
-        self.assertEqual(["routetarget", "routetarget"], position.SubType.Values)
-        self.assertEqual([65001, 65001], position.AsNumber2Bytes.Values)
+        # Both rows share a two-byte ASN and route-target subtype, so five of the
+        # six fields are constant and collapse to a single value. Only the
+        # assigned number differs per row, so only it ships a per-route list --
+        # see Ixia._write_multivalue.
+        self.assertEqual(["administratoras2octet"], position.Type.Values)
+        self.assertEqual(["routetarget"], position.SubType.Values)
+        self.assertEqual([65001], position.AsNumber2Bytes.Values)
         self.assertEqual([1, 70000], position.AssignedNumber4Bytes.Values)
-        self.assertEqual([0, 0], position.AsNumber4Bytes.Values)
-        self.assertEqual([0, 0], position.AssignedNumber2Bytes.Values)
+        self.assertEqual([0], position.AsNumber4Bytes.Values)
+        self.assertEqual([0], position.AssignedNumber2Bytes.Values)
 
     def test_four_byte_as_route_target_uses_two_byte_assigned_number(self):
         position = _ExtendedCommunity()
@@ -259,7 +594,8 @@ class TestExtendedCommunityPool(unittest.TestCase):
 
     def test_extended_community_api_errors_are_logged_and_reraised(self):
         position = _ExtendedCommunity()
-        position.Type.ValueList = MagicMock(side_effect=RuntimeError("write failed"))
+        # A single row makes Type constant, so the write goes through Single().
+        position.Type.Single = MagicMock(side_effect=RuntimeError("write failed"))
 
         with self.assertRaisesRegex(RuntimeError, "write failed"):
             self.ixia.configure_extended_community_pool_on_route_property(
@@ -309,6 +645,494 @@ class TestRoutePropertyPublicApis(unittest.TestCase):
             self.ixia.configure_as_path_pool_on_route_property(route, [])
 
         route.EnableAsPathSegments.Single.assert_not_called()
+
+    def test_as_path_segment_api_programs_sequence_and_set(self):
+        route = MagicMock()
+        segments = [MagicMock(), MagicMock()]
+        segment_slots = [
+            [MagicMock(), MagicMock()],
+            [MagicMock(), MagicMock()],
+        ]
+        route.BgpAsPathSegmentList.find.return_value = segments
+        for segment, slots in zip(segments, segment_slots):
+            segment.BgpAsNumberList.find.return_value = slots
+
+        self.ixia.configure_as_path_segment_pools_on_route_property(
+            route,
+            (
+                ("asseq", ["65001 65002", "65003 65004"]),
+                ("asset", ["65101 65102", "65103 65104"]),
+            ),
+        )
+
+        route.EnableAsPathSegments.Single.assert_called_once_with(True)
+        self.assertEqual(2, route.NoOfASPathSegmentsPerRouteRange)
+        segments[0].SegmentType.Single.assert_called_once_with("asseq")
+        segments[1].SegmentType.Single.assert_called_once_with("asset")
+        segment_slots[0][0].AsNumber.ValueList.assert_called_once_with([65001, 65003])
+        segment_slots[1][1].AsNumber.ValueList.assert_called_once_with([65102, 65104])
+
+    def test_as_path_segment_api_splits_each_path_once(self):
+        split_calls: list[str] = []
+
+        class CountingPath(str):
+            def split(self, sep=None, maxsplit=-1):
+                split_calls.append(str(self))
+                return super().split(sep, maxsplit)
+
+        route = MagicMock()
+        segments = [MagicMock(), MagicMock()]
+        for segment in segments:
+            segment.BgpAsNumberList.find.return_value = [MagicMock(), MagicMock()]
+        route.BgpAsPathSegmentList.find.return_value = segments
+        paths = (
+            ("asseq", [CountingPath("65001 65002"), CountingPath("65003 65004")]),
+            ("asset", [CountingPath("65101 65102"), CountingPath("65103 65104")]),
+        )
+
+        self.ixia.configure_as_path_segment_pools_on_route_property(route, paths)
+
+        self.assertEqual(
+            [str(path) for _segment_type, pool in paths for path in pool], split_calls
+        )
+
+    def test_as_path_segment_snapshot_reads_only_original_structure(self):
+        route = MagicMock()
+        route.EnableAsPathSegments = _MultiValue(["false", "false"])
+        original_segment = MagicMock()
+        original_segment.SegmentType = _MultiValue(["asseq", "asseq"])
+        original_slot = MagicMock()
+        original_slot.AsNumber = _MultiValue([65000, 65000])
+        original_slot.EnableASNumber = _MultiValue(["true", "true"])
+        expanded_slot = MagicMock()
+        expanded_segment = MagicMock()
+        prepared = (
+            (original_segment, (original_slot, expanded_slot), 1),
+            (expanded_segment, (expanded_slot, expanded_slot), 0),
+        )
+
+        snapshots = self.ixia._capture_as_path_segment_values(route, prepared, 1)
+
+        self.assertEqual(
+            [
+                "route.enable",
+                "segment[0].type",
+                "segment[0].slot[0].asn",
+                "segment[0].slot[0].enable",
+            ],
+            [label for label, _handle, _values in snapshots],
+        )
+        self.assertEqual(0, expanded_slot.AsNumber.Values.call_count)
+        self.assertEqual(0, expanded_segment.SegmentType.Values.call_count)
+
+    def test_as_path_segment_api_validates_all_pools_before_programming(self):
+        route = MagicMock()
+
+        with self.assertRaisesRegex(ValueError, "equal row counts"):
+            self.ixia.configure_as_path_segment_pools_on_route_property(
+                route,
+                (
+                    ("asseq", ["65001", "65002"]),
+                    ("asset", ["65101"]),
+                ),
+            )
+
+        route.EnableAsPathSegments.Single.assert_not_called()
+
+    def test_as_path_segment_api_rejects_variable_width_before_programming(self):
+        route = MagicMock()
+
+        with self.assertRaisesRegex(ValueError, "fixed positive width"):
+            self.ixia.configure_as_path_segment_pools_on_route_property(
+                route,
+                (
+                    ("asseq", ["65001 65002", "65003"]),
+                    ("asset", ["65101 65102", "65103 65104"]),
+                ),
+            )
+
+        route.EnableAsPathSegments.Single.assert_not_called()
+
+    def test_as_path_segment_api_rolls_back_structure_on_slot_validation_error(self):
+        route = MagicMock()
+        route.NoOfASPathSegmentsPerRouteRange = 1
+        segments = [MagicMock(), MagicMock()]
+        segments[0].NumberOfAsNumberInSegment = 1
+        segments[1].NumberOfAsNumberInSegment = 3
+        segments[0].BgpAsNumberList.find.return_value = [MagicMock(), MagicMock()]
+        segments[1].BgpAsNumberList.find.return_value = [MagicMock()]
+        route.BgpAsPathSegmentList.find.return_value = segments
+
+        with self.assertRaisesRegex(ValueError, "segment 1 has 1 slots"):
+            self.ixia.configure_as_path_segment_pools_on_route_property(
+                route,
+                (
+                    ("asseq", ["65001 65002", "65003 65004"]),
+                    ("asset", ["65101 65102", "65103 65104"]),
+                ),
+            )
+
+        self.assertEqual(1, route.NoOfASPathSegmentsPerRouteRange)
+        self.assertEqual(
+            [1, 3],
+            [segment.NumberOfAsNumberInSegment for segment in segments],
+        )
+        route.EnableAsPathSegments.Single.assert_not_called()
+        for segment in segments:
+            segment.SegmentType.Single.assert_not_called()
+
+    def test_as_path_segment_api_rolls_back_missing_segment_count(self):
+        route = MagicMock()
+        route.NoOfASPathSegmentsPerRouteRange = 1
+        route.BgpAsPathSegmentList.find.return_value = [MagicMock()]
+
+        with self.assertRaisesRegex(ValueError, "1 entries"):
+            self.ixia.configure_as_path_segment_pools_on_route_property(
+                route,
+                (
+                    ("asseq", ["65001", "65002"]),
+                    ("asset", ["65101", "65102"]),
+                ),
+            )
+
+        self.assertEqual(1, route.NoOfASPathSegmentsPerRouteRange)
+        route.EnableAsPathSegments.Single.assert_not_called()
+
+    def test_as_path_segment_api_rolls_back_restpy_slot_lookup_error(self):
+        route = MagicMock()
+        route.NoOfASPathSegmentsPerRouteRange = 1
+        segments = [MagicMock(), MagicMock()]
+        segments[0].NumberOfAsNumberInSegment = 1
+        segments[1].NumberOfAsNumberInSegment = 3
+        segments[0].BgpAsNumberList.find.return_value = [MagicMock(), MagicMock()]
+        segments[1].BgpAsNumberList.find.side_effect = RuntimeError("RestPy failure")
+        route.BgpAsPathSegmentList.find.return_value = segments
+
+        with self.assertRaisesRegex(RuntimeError, "RestPy failure"):
+            self.ixia.configure_as_path_segment_pools_on_route_property(
+                route,
+                (
+                    ("asseq", ["65001 65002", "65003 65004"]),
+                    ("asset", ["65101 65102", "65103 65104"]),
+                ),
+            )
+
+        self.assertEqual(1, route.NoOfASPathSegmentsPerRouteRange)
+        self.assertEqual(
+            [1, 3],
+            [segment.NumberOfAsNumberInSegment for segment in segments],
+        )
+        route.EnableAsPathSegments.Single.assert_not_called()
+
+    def test_as_path_segment_api_rolls_back_restpy_segment_lookup_error(self):
+        route = MagicMock()
+        route.NoOfASPathSegmentsPerRouteRange = 1
+        route.BgpAsPathSegmentList.find.side_effect = RuntimeError("RestPy failure")
+
+        with self.assertRaisesRegex(RuntimeError, "RestPy failure"):
+            self.ixia.configure_as_path_segment_pools_on_route_property(
+                route,
+                (
+                    ("asseq", ["65001", "65002"]),
+                    ("asset", ["65101", "65102"]),
+                ),
+            )
+
+        self.assertEqual(1, route.NoOfASPathSegmentsPerRouteRange)
+        route.EnableAsPathSegments.Single.assert_not_called()
+
+    def test_as_path_segment_prepare_rollback_is_best_effort(self):
+        class TrackingSegment:
+            def __init__(self, *, fail_restore=False, lookup_error=None):
+                self._width = 1
+                self._programmed = False
+                self.fail_restore = fail_restore
+                self.restore_attempted = False
+                self.BgpAsNumberList = MagicMock()
+                if lookup_error is None:
+                    self.BgpAsNumberList.find.return_value = [MagicMock(), MagicMock()]
+                else:
+                    self.BgpAsNumberList.find.side_effect = lookup_error
+
+            @property
+            def NumberOfAsNumberInSegment(self):
+                return self._width
+
+            @NumberOfAsNumberInSegment.setter
+            def NumberOfAsNumberInSegment(self, value):
+                if self._programmed and value == 1:
+                    self.restore_attempted = True
+                    if self.fail_restore:
+                        raise RuntimeError(f"first width restore failed {'x' * 2_000}")
+                self._width = value
+                self._programmed = value != 1
+
+        first = TrackingSegment(fail_restore=True)
+        second = TrackingSegment(
+            lookup_error=RuntimeError(f"slot lookup failed {'x' * 2_000}")
+        )
+        route = MagicMock()
+        route.NoOfASPathSegmentsPerRouteRange = 1
+        route.BgpAsPathSegmentList.find.return_value = [first, second]
+
+        with self.assertRaises(RuntimeError) as context:
+            self.ixia._prepare_as_path_segments(
+                route,
+                (("asseq", 2, []), ("asset", 2, [])),
+            )
+
+        message = str(context.exception)
+        self.assertRegex(
+            message,
+            "preparation failed .*slot lookup failed.*rollback also failed.*"
+            "segment\\[0\\].width",
+        )
+        self.assertNotIn("x" * 300, message)
+        self.assertLess(len(message), 600)
+        self.assertTrue(first.restore_attempted)
+        self.assertTrue(second.restore_attempted)
+        self.assertEqual(1, route.NoOfASPathSegmentsPerRouteRange)
+
+    def test_as_path_segment_api_rolls_back_partial_programming_error(self):
+        route = MagicMock()
+        route.NoOfASPathSegmentsPerRouteRange = 1
+        route.EnableAsPathSegments = _MultiValue(["false", "false"])
+        segments = [MagicMock(), MagicMock()]
+        segment_slots = []
+        for index, segment in enumerate(segments):
+            segment.NumberOfAsNumberInSegment = 1
+            segment.SegmentType = _MultiValue([f"original-{index}"] * 2)
+            slots = [MagicMock(), MagicMock()]
+            for position, slot in enumerate(slots):
+                slot.AsNumber = _MultiValue([65000 + position] * 2)
+                slot.EnableASNumber = _MultiValue(["false", "false"])
+            segment.BgpAsNumberList.find.return_value = slots
+            segment_slots.append(slots)
+        route.BgpAsPathSegmentList.find.return_value = segments
+
+        def fail_after_partial_write(slots, _position_values):
+            slots[0].AsNumber.ValueList([999, 999])
+            slots[0].EnableASNumber.Single(True)
+            raise RuntimeError("programming failure")
+
+        self.ixia._apply_as_positions_concurrently = MagicMock(
+            side_effect=fail_after_partial_write
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "programming failure"):
+            self.ixia.configure_as_path_segment_pools_on_route_property(
+                route,
+                (
+                    ("asseq", ["65001 65002", "65003 65004"]),
+                    ("asset", ["65101 65102", "65103 65104"]),
+                ),
+            )
+
+        self.assertEqual(1, route.NoOfASPathSegmentsPerRouteRange)
+        self.assertEqual([1, 1], [s.NumberOfAsNumberInSegment for s in segments])
+        self.assertEqual(["false", "false"], route.EnableAsPathSegments.Values)
+        self.assertEqual(["original-0"] * 2, segments[0].SegmentType.Values)
+        self.assertEqual([65000, 65000], segment_slots[0][0].AsNumber.Values)
+        self.assertEqual(["false", "false"], segment_slots[0][0].EnableASNumber.Values)
+
+    def test_as_path_segment_rollback_rejects_empty_snapshot(self):
+        handle = MagicMock()
+
+        with self.assertRaisesRegex(ValueError, "empty IXIA multivalue snapshot"):
+            self.ixia._restore_ixia_values(handle, ())
+
+        handle.Single.assert_not_called()
+        handle.ValueList.assert_not_called()
+
+    def test_as_path_segment_rollback_reports_bounded_handle_evidence(self):
+        failed_snapshots = []
+        for index in range(12):
+            handle = MagicMock()
+            handle.ValueList.side_effect = RuntimeError("x" * 2_000)
+            failed_snapshots.append((f"failed[{index}]", handle, ("false", "false")))
+        restored_snapshots = [
+            (
+                f"restored[{index}]",
+                _MultiValue(["current", "current"]),
+                ("original", "original"),
+            )
+            for index in range(7)
+        ]
+        self.ixia._restore_as_path_segment_structure = MagicMock()
+
+        with self.assertRaises(RuntimeError) as context:
+            self.ixia._rollback_as_path_segment_programming(
+                MagicMock(),
+                (),
+                1,
+                (*failed_snapshots, *restored_snapshots),
+            )
+
+        message = str(context.exception)
+        self.assertIn("failed_count=12", message)
+        self.assertIn("failed[11]", message)
+        self.assertNotIn("failed[0]", message)
+        self.assertIn("restored_count=7", message)
+        self.assertIn("restored[6]", message)
+        self.assertNotIn("restored[0]", message)
+        self.assertNotIn("x" * 300, message)
+        self.assertLess(len(message), 4_000)
+        self.ixia._restore_as_path_segment_structure.assert_called_once()
+
+    def test_as_path_segment_snapshot_rollback_is_best_effort(self):
+        class FailingRestoreSegment:
+            def __init__(self, original_width, slots):
+                self._width = original_width
+                self._original_width = original_width
+                self._was_programmed = False
+                self.BgpAsNumberList = MagicMock()
+                self.BgpAsNumberList.find.return_value = slots
+                self.SegmentType = _MultiValue(["original", "original"])
+
+            @property
+            def NumberOfAsNumberInSegment(self):
+                return self._width
+
+            @NumberOfAsNumberInSegment.setter
+            def NumberOfAsNumberInSegment(self, value):
+                if self._was_programmed and value == self._original_width:
+                    raise RuntimeError("width rollback failure")
+                self._width = value
+                self._was_programmed = value != self._original_width
+
+        class SnapshotFailure:
+            @property
+            def Values(self):
+                raise RuntimeError("snapshot failure")
+
+        slots = [MagicMock(), MagicMock()]
+        for slot in slots:
+            slot.AsNumber = _MultiValue([65000, 65000])
+            slot.EnableASNumber = _MultiValue(["false", "false"])
+        first = FailingRestoreSegment(1, slots)
+        second = MagicMock()
+        second.NumberOfAsNumberInSegment = 3
+        second.BgpAsNumberList.find.return_value = slots
+        second.SegmentType = _MultiValue(["original", "original"])
+        route = MagicMock()
+        route.NoOfASPathSegmentsPerRouteRange = 1
+        route.EnableAsPathSegments = SnapshotFailure()
+        route.BgpAsPathSegmentList.find.return_value = [first, second]
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "snapshot failed .*snapshot failure.*rollback also failed.*"
+            "width rollback failure",
+        ):
+            self.ixia.configure_as_path_segment_pools_on_route_property(
+                route,
+                (
+                    ("asseq", ["65001 65002", "65003 65004"]),
+                    ("asset", ["65101 65102", "65103 65104"]),
+                ),
+            )
+
+        self.assertEqual(2, first.NumberOfAsNumberInSegment)
+        self.assertEqual(3, second.NumberOfAsNumberInSegment)
+        self.assertEqual(1, route.NoOfASPathSegmentsPerRouteRange)
+
+    def test_as_path_segment_api_programs_two_255_slot_segments(self):
+        route = MagicMock()
+        segments = [MagicMock(), MagicMock()]
+        route.BgpAsPathSegmentList.find.return_value = segments
+        for segment in segments:
+            segment.BgpAsNumberList.find.return_value = [MagicMock()] * 255
+        self.ixia._apply_as_positions_concurrently = MagicMock()
+        sequence = " ".join(str(64512 + offset) for offset in range(255))
+        as_set = " ".join(str(65000 + offset) for offset in range(255))
+
+        self.ixia.configure_as_path_segment_pools_on_route_property(
+            route,
+            (
+                ("asseq", [sequence, sequence]),
+                ("asset", [as_set, as_set]),
+            ),
+        )
+
+        self.assertEqual(2, route.NoOfASPathSegmentsPerRouteRange)
+        self.assertEqual(
+            [255, 255],
+            [segment.NumberOfAsNumberInSegment for segment in segments],
+        )
+        self.assertEqual(2, self.ixia._apply_as_positions_concurrently.call_count)
+        for call in self.ixia._apply_as_positions_concurrently.call_args_list:
+            self.assertEqual(255, len(call.args[1]))
+            self.assertEqual(2, len(call.args[1][0]))
+
+    def test_large_as_matrix_is_applied_in_resource_manager_batches(self):
+        slots = [MagicMock() for _ in range(128)]
+        for position, slot in enumerate(slots):
+            slot.href = f"/api/v1/sessions/1/ixnetwork/as-number/{position}"
+        position_values = [[position] * 10_000 for position in range(128)]
+        self.ixia.ixnetwork = MagicMock()
+        self.ixia.ixnetwork.href = "/api/v1/sessions/1/ixnetwork"
+        self.ixia.ixnetwork._connection._execute.return_value = [
+            {"xpath": f"/as-number[{position + 1}]"} for position in range(128)
+        ]
+        self.ixia.ixnetwork.ResourceManager.ImportConfig.return_value = []
+
+        self.ixia._apply_as_positions_concurrently(slots, position_values)
+
+        self.assertEqual(8, self.ixia.ixnetwork.ResourceManager.ImportConfig.call_count)
+        first_payload = json.loads(
+            self.ixia.ixnetwork.ResourceManager.ImportConfig.call_args_list[0].args[0]
+        )
+        self.assertEqual(32, len(first_payload))
+        self.assertEqual(
+            "/multivalue[@source = '/as-number[1] asNumber']/valueList",
+            first_payload[0]["xpath"],
+        )
+        self.assertEqual(position_values[0], first_payload[0]["values"])
+        self.assertEqual(
+            "/multivalue[@source = '/as-number[1] enableASNumber']/singleValue",
+            first_payload[1]["xpath"],
+        )
+        self.assertTrue(first_payload[1]["value"])
+        for slot in slots:
+            slot.AsNumber.ValueList.assert_not_called()
+            slot.EnableASNumber.Single.assert_not_called()
+        self.ixia.logger.info.assert_any_call(
+            "Configuring %d AS positions in ResourceManager batches of %d "
+            "across %d route rows",
+            128,
+            16,
+            10_000,
+        )
+
+    def test_large_as_matrix_fails_closed_on_batch_import_error(self):
+        slots = [MagicMock() for _ in range(128)]
+        for position, slot in enumerate(slots):
+            slot.href = f"/api/v1/sessions/1/ixnetwork/as-number/{position}"
+        self.ixia.ixnetwork = MagicMock()
+        self.ixia.ixnetwork.href = "/api/v1/sessions/1/ixnetwork"
+        self.ixia.ixnetwork._connection._execute.return_value = [
+            {"xpath": f"/as-number[{position + 1}]"} for position in range(128)
+        ]
+        self.ixia.ixnetwork.ResourceManager.ImportConfig.return_value = [
+            "invalidCommit"
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "positions \\[0, 16\\)"):
+            self.ixia._apply_as_positions_concurrently(
+                slots, [[position] * 10_000 for position in range(128)]
+            )
+
+        self.ixia.ixnetwork.ResourceManager.ImportConfig.assert_called_once()
+
+    def test_as_matrix_rejects_ragged_route_rows(self):
+        slots = [MagicMock(), MagicMock()]
+
+        with self.assertRaisesRegex(ValueError, "equal route-row counts"):
+            self.ixia._apply_as_positions_concurrently(slots, [[1], [2, 3]])
+
+        for slot in slots:
+            slot.AsNumber.ValueList.assert_not_called()
+            slot.EnableASNumber.Single.assert_not_called()
 
     def test_community_api_programs_each_community_position(self):
         route = MagicMock()

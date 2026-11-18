@@ -35,6 +35,10 @@ from taac.testconfigs.routing.util.bgp_ebb_health_checks import (
     BGP_STANDARD_POSTCHECKS,
     BGP_STANDARD_SNAPSHOT_CHECKS,
 )
+from taac.utils.characterization import (
+    characterization_summary_jq_var,
+    KIND_CPU_PERCENTILE,
+)
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config.types import (
     Playbook,
@@ -44,7 +48,7 @@ from taac.test_as_a_config.types import (
 )
 
 
-_CRASH_GATE_SERVICES: t.List[str] = ["Bgp", "FibAgent", "FibAgentBgp"]
+_CRASH_GATE_SERVICES: t.List[str] = ["Bgpcpp", "FibAgent", "FibAgentBgp"]
 _CRASH_GATE_DAEMONS: t.List[str] = ["FibBgpGrpc"]
 
 # Spec 2.2.3 leak gate: max allowed memory growth over the churn run (200 MB).
@@ -52,8 +56,12 @@ _MEMORY_GROWTH_THRESHOLD_BYTES: int = 200 * (1024**2)
 
 
 # jq var the CPU percentile STOP step stashes its summary into, read back by
-# the CPU_PERCENTILE_CHECK postcheck. jq-safe: no dots or colons.
-_CPU_PERCENTILE_SUMMARY_JQ_VAR = "cpu_percentile_summary"
+# the CPU_PERCENTILE_CHECK postcheck. Span-qualified through the shared
+# helper so this bracket cannot collide with another one in the same run.
+_CPU_PERCENTILE_SPAN: str = "peer_down_isolation"
+_CPU_PERCENTILE_SUMMARY_JQ_VAR: str = characterization_summary_jq_var(
+    KIND_CPU_PERCENTILE, _CPU_PERCENTILE_SPAN
+)
 
 
 # Standard checks that cannot reach a verdict on this EOS DUT, so they only ever

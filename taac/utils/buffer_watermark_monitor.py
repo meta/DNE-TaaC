@@ -62,6 +62,7 @@ import matplotlib.pyplot as plt
 from fb303.clients import FacebookService
 from libfb.py.asyncio.thrift import ClientType, get_direct_client
 from matplotlib.animation import FuncAnimation  # noqa: F401
+from taac.utils.fboss_ports import fboss_thrift_port
 
 
 logger = logging.getLogger(__name__)
@@ -113,16 +114,16 @@ class BufferWatermarkData:
         self.global_headroom: t.List[int] = []
 
         # Per-port per-queue: {port -> {queue_label -> [values]}}
-        self.ucast_wm: t.Dict[str, t.Dict[str, t.List[int]]] = (  # pyre-ignore[8]
-            defaultdict(lambda: defaultdict(list))
+        self.ucast_wm: t.Dict[str, t.Dict[str, t.List[int]]] = defaultdict(
+            lambda: defaultdict(list)
         )
 
         # Per-port per-PG: {port -> {pg_label -> [values]}}
-        self.pg_headroom: t.Dict[str, t.Dict[str, t.List[int]]] = (  # pyre-ignore[8]
-            defaultdict(lambda: defaultdict(list))
+        self.pg_headroom: t.Dict[str, t.Dict[str, t.List[int]]] = defaultdict(
+            lambda: defaultdict(list)
         )
-        self.pg_shared: t.Dict[str, t.Dict[str, t.List[int]]] = (  # pyre-ignore[8]
-            defaultdict(lambda: defaultdict(list))
+        self.pg_shared: t.Dict[str, t.Dict[str, t.List[int]]] = defaultdict(
+            lambda: defaultdict(list)
         )
 
         # CPU queue watermarks: {queue_label -> [values]}
@@ -132,9 +133,9 @@ class BufferWatermarkData:
         self.fabric_wm: t.Dict[str, t.List[int]] = defaultdict(list)
 
         # Per-port per-queue congestion drops: {port -> {queue_label -> [values]}}
-        self.congestion_drops: t.Dict[  # pyre-ignore[8]
-            str, t.Dict[str, t.List[int]]
-        ] = defaultdict(lambda: defaultdict(list))
+        self.congestion_drops: t.Dict[str, t.Dict[str, t.List[int]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
         # Per-port total congestion drops: {port -> [values]}
         self.congestion_drops_port: t.Dict[str, t.List[int]] = defaultdict(list)
 
@@ -301,7 +302,9 @@ class BufferWatermarkData:
                 self._trim(vals)
 
 
-FBOSS_FB303_PORT: int = 5909
+# fb303 counters are served by the agent's own ThriftServer, so the migrated
+# port serves them too. 5931 (hwagent) is outside the blocked VNC range.
+FBOSS_FB303_PORT: int = fboss_thrift_port(5909)
 FBOSS_MNPU_FB303_PORT: int = 5931
 
 # Cache the working port after first successful connection

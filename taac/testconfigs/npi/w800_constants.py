@@ -21,14 +21,21 @@ Consumed by `wedge800_npi_test_config.py`.
 # ---------------------------------------------------------------------------
 # Device identity
 # ---------------------------------------------------------------------------
-# TODO(w800): real DUT hostname once the device is in the lab / netwhoami.
-W800_DEVICE_NAME = "wedge800001.TODO.example"
+# TODO(w800): real scale-topology hostnames once the devices are in the lab.
+W800_FSW_DEVICE_NAMES: list[str] = [
+    "wedge800fsw001.TODO.example",
+    "wedge800fsw002.TODO.example",
+]
+W800_RSW_DUT_DEVICE_NAME: str = "wedge800rsw001.TODO.example"
+W800_RSW_PEER_DEVICE_NAME: str = "wedge800rsw002.TODO.example"
+# TODO(w800): real standalone DUT hostname once the device is in the lab.
+W800_DEVICE_NAME: str = "wedge800001.TODO.example"
 # TODO(w800): local MAC for the DUT side of IXIA peering (placeholder = locally
 # administered address). Read from the real DUT when it arrives.
-W800_LOCAL_MAC_ADDRESS = "02:00:00:00:00:0c"
-# Basset device pool. NOTE: create_npi_cpu_queue_test_config currently hardcodes
-# basset_pool="dne.test" internally, so this is informational until that param
-# is honored. TODO(w800): confirm the w800 lab pool.
+W800_LOCAL_MAC_ADDRESS: str = "02:00:00:00:00:0c"
+# TODO(w800): local MAC for the peer RSW side of IXIA peering.
+W800_RSW_PEER_LOCAL_MAC_ADDRESS: str = "02:00:00:00:00:0d"
+# Basset device pool. TODO(w800): confirm the w800 lab pool.
 W800_BASSET_POOL = "dne.test"
 
 # ---------------------------------------------------------------------------
@@ -41,6 +48,19 @@ W800_BASSET_POOL = "dne.test"
 W800_IXIA_DOWNLINK_INTERFACE = "eth1/13/1"
 W800_IXIA_UPLINK_INTERFACE = "eth1/13/3"
 W800_IXIA_ROGUE_INTERFACE = "eth1/13/5"
+W800_RSW_DUT_IXIA_PORTS: list[str] = [
+    W800_IXIA_DOWNLINK_INTERFACE,
+    W800_IXIA_UPLINK_INTERFACE,
+    W800_IXIA_ROGUE_INTERFACE,
+]
+W800_RSW_PEER_IXIA_DOWNLINK_INTERFACE: str = "eth1/13/1"
+W800_RSW_PEER_IXIA_UPLINK_INTERFACE: str = "eth1/13/3"
+W800_RSW_PEER_IXIA_ROGUE_INTERFACE: str = "eth1/13/5"
+W800_RSW_PEER_IXIA_PORTS: list[str] = [
+    W800_RSW_PEER_IXIA_DOWNLINK_INTERFACE,
+    W800_RSW_PEER_IXIA_UPLINK_INTERFACE,
+    W800_RSW_PEER_IXIA_ROGUE_INTERFACE,
+]
 
 # ---------------------------------------------------------------------------
 # CPU queue indices (low / mid / high)
@@ -217,7 +237,47 @@ W800_SNAKE_SOURCE_IP = "5000:1::1/64"
 W800_SNAKE_DEST_IP = "5000:1::2/64"
 
 # ===========================================================================
-# Thrift hardening tests (THFT_001..005)
+# Snake tests (per speed grade)
+# ===========================================================================
+# Consumed by wedge800_npi_test_config.py's W800_SNAKE_*_TEST_CONFIG, built
+# with gen_snake_test_config() -- the same builder as the longevity config
+# above, but one TestConfig per speed grade (the shape the reference
+# MINIPACK3_STANDALONE_TEST_CONFIG_{400G,800G} configs use) so a failure
+# names the speed it happened at.
+#
+# Each loop entry is (source_interface, destination_interface, source_ip,
+# destination_ip); source and destination are two cages on the SAME DUT
+# joined by a fiber jumper, with point-to-point /64 addressing. Every loop
+# in a config must run at that config's speed grade.
+#
+# The 800G loop deliberately reuses the longevity jumper above: it is the
+# same physical cable, so it must not be described twice.
+# TODO(w800): real jumpered cages per speed grade once the DUT is cabled.
+W800_SNAKE_800G_LOOPS = [
+    (
+        W800_SNAKE_SOURCE_INTERFACE,
+        W800_SNAKE_DEST_INTERFACE,
+        W800_SNAKE_SOURCE_IP,
+        W800_SNAKE_DEST_IP,
+    ),
+]
+W800_SNAKE_400G_LOOPS = [
+    ("eth1/3/1", "eth1/4/1", "5000:2::1/64", "5000:2::2/64"),
+    ("eth1/3/5", "eth1/4/5", "4000:2::1/64", "4000:2::2/64"),
+]
+
+# 99% rather than 100%: the reference 800G snake caps line rate to stay under
+# the IXIA overspeed rounding that reports false loss (T227297634).
+W800_SNAKE_LINE_RATE = 99
+W800_SNAKE_ITERATION = 10
+# FRONTEND IMIX distribution -- the DEFAULT_FRAME_SIZE weights from
+# qos_scheduling_test_config.py. Deliberately NOT the DSF_FRAME_SIZES weights
+# the reference Minipack3 800G snake uses: those are the backend/DSF fabric
+# profile, and w800 is a frontend platform.
+W800_SNAKE_IMIX_WEIGHT = {100: 1, 1500: 4, 4500: 5, 7000: 1, 9000: 1}
+
+# ===========================================================================
+# Thrift hardening tests (THFT_001..006)
 # ===========================================================================
 # Consumed by wedge800_npi_test_config.py's W800_THRIFT_HARDENING_TEST_CONFIG.
 # ALL BGP scaffolding knobs are SHARED with the CPU-queue / BGP configs above
@@ -228,6 +288,15 @@ W800_SNAKE_DEST_IP = "5000:1::2/64"
 # invalidate the BGP_SESSION_ESTABLISH precheck.
 # TODO(w800): real NBR-adjacent uplink ports once the DUT is racked/cabled.
 W800_STSW_FLAP_PORTS = [
+    "eth1/5/1",
+    "eth1/6/1",
+]
+
+# Interface-flap qualification uses the same DUT-side uplinks plus their
+# index-aligned far ends on the peer RSW for the simultaneous DUT/NBR case.
+# TODO(w800): replace with the real peer-side ports once the topology is cabled.
+W800_INTERFACE_FLAP_NBR_DEVICE_NAME = W800_RSW_PEER_DEVICE_NAME
+W800_INTERFACE_FLAP_NBR_PORTS = [
     "eth1/5/1",
     "eth1/6/1",
 ]
@@ -253,3 +322,109 @@ W800_SPEED_FLIP_CHURN_CAGES = [
     ("eth1/21", "eth1/2"),
     ("eth1/22", "eth1/3"),
 ]
+
+# ===========================================================================
+# FE QoS scheduling and buffering
+# ===========================================================================
+# Consumed by wedge800_npi_test_config.py's W800_FE_QOS_TEST_CONFIG, built with
+# test_config_qos_scheduling(). Following the SSW-Elbert reference, the
+# congestion traffic REUSES the rogue IXIA port, its parent network and its
+# remote AS (W800_IXIA_ROGUE_INTERFACE /
+# W800_IXIA_ROGUE_IC_PARENT_NETWORK_V6 / W800_REMOTE_ROGUE_AS_4BYTE) rather
+# than needing a fourth IXIA port -- the rogue port is idle during QoS runs.
+# Only the congestion prefix block is QoS-specific, so it is the only thing
+# defined here.
+# TODO(w800): tune the congestion prefix block once real w800 egress buffer
+# sizing is known -- it sets how much traffic is driven into the congested
+# queue.
+W800_CONGESTION_PREFIX_COUNT_V6 = 100
+W800_CONGESTION_PREFIX_START_V6 = "2001:db8:0:1f00::"
+
+# ===========================================================================
+# Prefix profiling & overload tests
+# ===========================================================================
+# Consumed by w800_npi_test_config.py's W800_PREFIX_PROFILING_* configs, built
+# with create_device_test_configs() from the MP3N prefix-profiling module.
+#
+# Prefix profiling drives three route DISTRIBUTIONS into the DUT's FIB --
+# contiguous (sequential), hybrid (clustered) and non-contiguous (scattered) --
+# at four prefix lengths (/48, /64, /80, /128), then warmboots / restarts bgpd /
+# coldboots under that load and measures reconvergence.
+#
+# Each distribution needs its OWN IXIA port (they are separate BGP peers
+# advertising separate prefix pools), plus a downlink port that sources the
+# traffic, so this class needs FOUR IXIA ports -- one more than the
+# uplink/downlink/rogue trio the hardening classes use. Each spec is
+# (interface, network_v6, ixia_chassis_ip, ixia_port).
+# TODO(w800): real interfaces, chassis IP and IXIA port numbers once the DUT is
+# racked and cabled to the chassis.
+W800_PREFIX_PROFILING_IXIA_CHASSIS_IP: str = "2001:db8:0:ffff::1"
+W800_PREFIX_PROFILING_CONTIGUOUS_SPEC: tuple[str, str, str, str] = (
+    "eth1/9/1",
+    "2001:db8:0:2101",
+    W800_PREFIX_PROFILING_IXIA_CHASSIS_IP,
+    "1/1",
+)
+W800_PREFIX_PROFILING_HYBRID_SPEC: tuple[str, str, str, str] = (
+    "eth1/10/1",
+    "2001:db8:0:2102",
+    W800_PREFIX_PROFILING_IXIA_CHASSIS_IP,
+    "1/2",
+)
+W800_PREFIX_PROFILING_NON_CONTIGUOUS_SPEC: tuple[str, str, str, str] = (
+    "eth1/11/1",
+    "2001:db8:0:2103",
+    W800_PREFIX_PROFILING_IXIA_CHASSIS_IP,
+    "1/3",
+)
+W800_PREFIX_PROFILING_DOWNLINK_SPEC: tuple[str, str, str, str] = (
+    "eth1/12/1",
+    "2001:db8:0:2104",
+    W800_PREFIX_PROFILING_IXIA_CHASSIS_IP,
+    "1/4",
+)
+
+# BGP policy names the prefix-profiling peer attaches to. Separate from the
+# hardening route-maps: prefix profiling advertises its own prefix pools and
+# must not be filtered by the production ingress policy.
+# TODO(w800): real policy names on the DUT.
+W800_PREFIX_PROFILING_INGRESS_POLICY: str = "TODO_W800_PREFIX_PROFILING_IN"
+W800_PREFIX_PROFILING_EGRESS_POLICY: str = "TODO_W800_PREFIX_PROFILING_OUT"
+W800_PREFIX_PROFILING_PATCHER_SUFFIX: str = "w800_ixia_prefix_profiling"
+
+# Per-hardware route scale: prefix length -> (prefix_count, multiplier). This is
+# the ONLY hardware-specific part of a prefix profile -- the fixed-prefix /
+# random-mask / prefix-step patterns that define each distribution are shared
+# and inherited from the MP3N baseline.
+#
+# Seeded from the MP3N/RTSW baseline so the configs build and are runnable
+# shape-wise before the hardware exists.
+# TODO(w800): retune all three tables against real W800 FIB headroom -- these
+# numbers are what the test is actually measuring, so they matter more than any
+# other placeholder in this file.
+W800_PREFIX_PROFILING_CONTIGUOUS_SCALE: dict[int, tuple[int, int]] = {
+    48: (74000, 1),
+    64: (74000, 1),
+    80: (74000, 1),
+    128: (15000, 1),
+}
+W800_PREFIX_PROFILING_HYBRID_SCALE: dict[int, tuple[int, int]] = {
+    48: (1000, 74),
+    64: (1000, 74),
+    80: (1000, 74),
+    128: (202, 74),
+}
+W800_PREFIX_PROFILING_NON_CONTIGUOUS_SCALE: dict[int, tuple[int, int]] = {
+    48: (1, 40000),
+    64: (1, 40000),
+    80: (1, 40000),
+    128: (1, 1000),
+}
+
+# PREFIX_LIMIT_CHECK ceiling per distribution: total routes + 100 headroom.
+# Must be kept consistent with the scale tables above.
+W800_PREFIX_PROFILING_LIMITS: dict[str, int] = {
+    "contiguous": 74100,
+    "hybrid": 74100,
+    "non_contiguous": 40100,
+}

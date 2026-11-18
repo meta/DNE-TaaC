@@ -3,12 +3,14 @@
 import asyncio
 import base64
 import copy
+import importlib
 import ipaddress
 import itertools
 import json
 import os
 import random
 import re
+import shlex
 import tempfile
 import time
 import typing as t
@@ -24,17 +26,22 @@ if not TAAC_OSS:
     from neteng.netcastle.utils.paramiko_utils import ParamikoClient
 
 from neteng.fboss.ctrl.types import PortInfoThrift
-from taac.constants import ARISTA_DAEMON_EXEC_SCRIPTS
+from taac.constants import (
+    ARISTA_DAEMON_EXEC_SCRIPTS,
+    RENAMED_ARISTA_DAEMONS,
+)
 from taac.driver.driver_constants import (
     DNE_TEST_REGRESSION_NAME,
     FbossSystemctlServiceName,
 )
 from taac.file_templates import FILE_TEMPLATES
 from taac.tasks.base_task import BaseTask
+from taac.utils import arista_utils
+from taac.utils.bgpcpp_log_level_marker import record_configured
 from taac.utils.common import (
+    get_bgp_peer_configs,
     get_default_bgp_configs,
     get_default_configs,
-    is_host_drainable,
     run_in_thread,
 )
 from taac.utils.driver_factory import async_get_device_driver
@@ -46,6 +53,7 @@ from taac.utils.oss_taac_lib_utils import (
     async_retryable,
     get_ipv6_for_host,
     none_throws,
+    oss_config_patcher_enabled,
 )
 
 # `async_get_memory_current_pct` has an OSS-safe stub in system_stress_utils that
@@ -79,6 +87,11 @@ from taac.test_as_a_config import types as taac_types
 IPAddress = t.Union[IPv4Address, IPv6Address]
 IPNetwork = t.Union[IPv4Network, IPv6Network]
 
+_BGPCPP_UPDATE_GROUP_STATE_VALIDATION_ATTEMPTS = 3
+_BGPCPP_UPDATE_GROUP_STATE_VALIDATION_RETRY_DELAY_SECONDS = 10
+_ARISTA_DAEMON_START_VALIDATION_ATTEMPTS = 15
+_ARISTA_DAEMON_START_VALIDATION_RETRY_DELAY_SECONDS = 2
+
 
 class WaitForAgentConvergenceTask(BaseTask):
     NAME = "wait_for_agent_convergence"
@@ -96,6 +109,170 @@ class WaitForAgentConvergenceTask(BaseTask):
                 )
             )
         await asyncio.gather(*coroutines)
+
+
+class CoopSetAccessPolicyTask(BaseTask):
+    """Set multiple port policies in one COOP API call and verify readback."""
+
+    NAME = "coop_set_access_policy"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        if TAAC_OSS:
+            raise NotImplementedError(
+                "coop_set_access_policy is available only in Meta-internal TAAC"
+            )
+        from coop_thrift.coop.types import AccessPolicyState
+
+        coop_utils = importlib.import_module(
+            "neteng.test_infra.dne.taac.internal.coop_utils"
+        )
+
+        hostname = params["hostname"]
+        requested = params["policies"]
+        policies = {
+            port_name: AccessPolicyState[coop_utils.parse_access_mode(state_name).name]
+            for port_name, state_name in requested.items()
+        }
+        await coop_utils.async_set_and_verify_access_policy(hostname, policies)
+
+
+class ValidateAccessPolicyHardwareTask(BaseTask):
+    """Fail when Agent policy state and uncached SAI PORT state disagree."""
+
+    NAME = "validate_access_policy_hardware"
+
+    async def _read_fboss_json(
+        self,
+        driver: t.Any,
+        command: str,
+        parser: t.Callable[[str, str], t.Any],
+        hostname: str,
+    ) -> t.Any:
+        last_error = "command returned empty output"
+        for attempt in range(1, 4):
+            output = await driver.async_run_cmd_on_shell(command)
+            if output.strip():
+                try:
+                    return parser(output, hostname)
+                except ValueError as error:
+                    last_error = f"parser rejected output: {error}"
+            if attempt == 3:
+                break
+            self.logger.warning(
+                "%s did not return usable output on %s (attempt %s/3): %s",
+                command,
+                hostname,
+                attempt,
+                last_error,
+            )
+            await asyncio.sleep(1)
+        raise RuntimeError(
+            f"Unable to read {command!r} from {hostname} after 3 attempts: {last_error}"
+        )
+
+    async def _validate_coop_readback(
+        self,
+        coop_utils: t.Any,
+        access_policy_state: t.Any,
+        hostname: str,
+        expectations: t.Mapping[str, t.Any],
+    ) -> None:
+        coop_policies = await coop_utils.async_get_access_policy(hostname)
+        mismatches = []
+        for port_name, mode in expectations.items():
+            actual = coop_policies.get(port_name)
+            expected = access_policy_state[mode.name]
+            if actual != expected and not (
+                mode is coop_utils.AccessMode.UNCONSTRAINED and actual is None
+            ):
+                mismatches.append(
+                    f"{port_name}: COOP state is {actual}, expected {expected}"
+                )
+        if mismatches:
+            raise RuntimeError(
+                "Access-policy COOP/Agent drift: " + "; ".join(mismatches)
+            )
+
+    async def _validate_hardware_state(
+        self,
+        coop_utils: t.Any,
+        hostname: str,
+        expectations: t.Mapping[str, t.Any],
+        requested_mechanism: t.Optional[str],
+    ) -> None:
+        driver = await async_get_device_driver(hostname)
+        software_ports = await self._read_fboss_json(
+            driver,
+            "fboss2 --fmt json show port",
+            coop_utils.parse_access_policy_port_entries,
+            hostname,
+        )
+        missing = sorted(set(expectations) - software_ports.keys())
+        if missing:
+            raise RuntimeError(f"Ports absent from Agent output: {missing}")
+        hardware_ports = await self._read_fboss_json(
+            driver,
+            "fboss2 --fmt json show hw-object PORT uncached",
+            coop_utils.parse_access_policy_hw_port_objects,
+            hostname,
+        )
+        offset = coop_utils.infer_access_policy_system_port_offset(
+            software_ports.values(),
+            hardware_ports,
+            (software_ports[port_name].port_id for port_name in expectations),
+        )
+        inferred_mechanisms = (
+            {}
+            if requested_mechanism
+            else coop_utils.infer_access_policy_mechanism(
+                expectations, software_ports, hardware_ports, offset
+            )
+        )
+        failures = []
+        for port_name, mode in expectations.items():
+            mechanism = requested_mechanism or inferred_mechanisms[port_name]
+            software = software_ports[port_name]
+            hardware = hardware_ports[software.port_id + offset]
+            result = coop_utils.validate_access_policy_hardware_port(
+                software, hardware, mode, mechanism
+            )
+            self.logger.info(
+                "%s access-policy HW check: mode=%s mechanism=%s "
+                "IngressAcl=%s Metadata=%s result=%s",
+                port_name,
+                mode.value,
+                mechanism,
+                hardware.ingress_acl,
+                hardware.metadata,
+                "PASS" if result.passed else "FAIL",
+            )
+            if not result.passed:
+                failures.append(f"{port_name}: {result.reason}")
+        if failures:
+            raise RuntimeError("Access-policy SW/HW drift: " + "; ".join(failures))
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        if TAAC_OSS:
+            raise NotImplementedError(
+                "validate_access_policy_hardware is available only internally"
+            )
+        from coop_thrift.coop.types import AccessPolicyState
+
+        coop_utils = importlib.import_module(
+            "neteng.test_infra.dne.taac.internal.coop_utils"
+        )
+        hostname = params["hostname"]
+        expectations = {
+            port_name: coop_utils.parse_access_mode(mode)
+            for port_name, mode in params["expectations"].items()
+        }
+        requested_mechanism = params.get("mechanism")
+        await self._validate_coop_readback(
+            coop_utils, AccessPolicyState, hostname, expectations
+        )
+        await self._validate_hardware_state(
+            coop_utils, hostname, expectations, requested_mechanism
+        )
 
 
 class WaitForBgpConvergenceTask(BaseTask):
@@ -121,6 +298,58 @@ class ConfigureParallelBgpPeers(BaseTask):
     DEFAULT_CONFIGURE_VLANS_PATCHER_NAME = "configure_vlans"
     DEFAULT_ADD_BGP_PEERS_PATCHER_NAME = "add_bgp_peers"
 
+    @staticmethod
+    def _interface_sort_key(interface: str) -> t.Tuple[int, ...]:
+        values = tuple(int(value) for value in re.findall(r"\d+", interface))
+        if not values:
+            raise ValueError(f"Interface has no numeric components: {interface}")
+        return values
+
+    def _validate_shared_vlan_split(
+        self,
+        config_json: t.Dict[str, t.List[t.Dict[str, t.Any]]],
+        interface_to_port_info: t.Dict[str, PortInfoThrift],
+        shared_vlan_id: int,
+    ) -> None:
+        interfaces = sorted(config_json, key=self._interface_sort_key)
+        primary = interfaces[0]
+        currently_shared = [
+            interface
+            for interface in interfaces
+            if shared_vlan_id in interface_to_port_info[interface].vlans
+        ]
+        if not currently_shared:
+            raise ValueError(
+                f"None of the selected IXIA ports is in shared VLAN {shared_vlan_id}"
+            )
+        if len(currently_shared) == 1 and currently_shared[0] != primary:
+            raise ValueError(
+                f"Only {primary} may remain in shared VLAN {shared_vlan_id}; "
+                f"found {currently_shared[0]}"
+            )
+
+        target_shared = [
+            interface
+            for interface, configs in config_json.items()
+            if any(config.get("vlan_id") == shared_vlan_id for config in configs)
+        ]
+        if target_shared != [primary]:
+            raise ValueError(
+                f"Shared VLAN {shared_vlan_id} must target only the lowest "
+                f"IXIA interface {primary}; got {target_shared}"
+            )
+        for interface, configs in config_json.items():
+            for config in configs:
+                if "vlan_id" not in config:
+                    raise ValueError(
+                        f"Explicit vlan_id is required for shared-VLAN split on {interface}"
+                    )
+                if config.get("retain_existing_vlan_addresses", True):
+                    raise ValueError(
+                        "Shared-VLAN split must replace existing VLAN addresses on "
+                        f"{interface}"
+                    )
+
     async def run(self, params: t.Dict[str, t.Any]) -> None:
         """
         example params:
@@ -140,6 +369,10 @@ class ConfigureParallelBgpPeers(BaseTask):
                             "remote_as_4_byte_step": 1, # optional. defaults to 0
                             "peer_group_name": "PEERGROUP_FSW_RSW_V4",
                             "prefix_length": 127,
+                            # Optional. Defaults to the port's current VLAN.
+                            "vlan_id": 4016,
+                            # Optional. Defaults to preserving live VLAN IPs.
+                            "retain_existing_vlan_addresses": false,
                         },
                     ]
                 }
@@ -185,6 +418,13 @@ class ConfigureParallelBgpPeers(BaseTask):
         interface_to_port_info = {
             port_info.name: port_info for port_info in all_port_info.values()
         }
+        shared_vlan_id = params.get("shared_vlan_id")
+        if shared_vlan_id is not None:
+            self._validate_shared_vlan_split(
+                config_json,
+                interface_to_port_info,
+                shared_vlan_id,
+            )
         for interface, configs in config_json.items():
             for config in configs:
                 config_only_interface_ip = config.get("config_only_interface_ip", False)
@@ -199,6 +439,18 @@ class ConfigureParallelBgpPeers(BaseTask):
                 gateway_starting_ip = config["gateway_starting_ip"]
                 gateway_increment_ip = config["gateway_increment_ip"]
                 interface_port_info = interface_to_port_info[interface]
+                if "vlan_id" in config:
+                    vlan_id = config["vlan_id"]
+                elif interface_port_info.vlans:
+                    vlan_id = interface_port_info.vlans[0]
+                else:
+                    raise ValueError(
+                        f"vlan_id is required for {interface} because the live "
+                        "port has no VLAN membership"
+                    )
+                retain_existing_vlan_addresses = config.get(
+                    "retain_existing_vlan_addresses", True
+                )
                 increment_ip_int = int(ipaddress.ip_address(increment_ip))
                 starting_ip_int = int(ipaddress.ip_address(starting_ip))
                 gateway_ip_int = int(ipaddress.ip_address(gateway_starting_ip))
@@ -231,34 +483,43 @@ class ConfigureParallelBgpPeers(BaseTask):
                                 description,
                             )
                         )
+                existing_vlan_addresses = []
+                if retain_existing_vlan_addresses:
+                    # pyre-fixme[16]: `AbstractSwitch` has no attribute
+                    #  `async_get_vlan_addresses`.
+                    existing_vlan_addresses = await driver.async_get_vlan_addresses(
+                        vlan_id, global_only=True
+                    )
                 vlan_ip_addresses = list(
                     set(
-                        (
-                            # pyre-fixme[16]: `AbstractSwitch` has no attribute
-                            #  `async_get_vlan_addresses`.
-                            await driver.async_get_vlan_addresses(
-                                interface_port_info.vlans[0], global_only=True
-                            )
-                            + [
-                                f"{ip_address}/{prefix_length}"
-                                for ip_address in local_addresses
-                            ]
-                        )
+                        existing_vlan_addresses
+                        + [
+                            f"{ip_address}/{prefix_length}"
+                            for ip_address in local_addresses
+                        ]
                     )
                 )
-                configure_vlan_configs[f"vlan{interface_port_info.vlans[0]}"].append(
-                    await self.create_configure_vlan_config(
-                        vlan_ip_addresses,
-                        interface_port_info,
-                    )
+                vlan_config = await self.create_configure_vlan_config(
+                    vlan_ip_addresses,
+                    interface_port_info,
+                    vlan_id,
                 )
+                if oss_config_patcher_enabled() and not retain_existing_vlan_addresses:
+                    # COOP replaces a VLAN's addresses; the OSS patcher merges
+                    # them unless told otherwise.
+                    vlan_config["retain_existing_vlan_addresses"] = False
+                configure_vlan_configs[f"vlan{vlan_id}"].append(vlan_config)
         await self.register_patchers_to_configure_vlans(
             hostname, configure_vlan_configs, configure_vlans_patcher_name
         )
 
-        await self.register_patchers_to_add_bgp_peers(
-            hostname, add_bgp_peer_configs, add_bgp_peers_patcher_name
-        )
+        # An interface-only topology deliberately has no BGP peers.  Do not
+        # register an empty bgpcpp patcher: besides being unnecessary, it makes
+        # a pure L2/NDP/ARP test depend on bgpd configuration and restarts.
+        if add_bgp_peer_configs:
+            await self.register_patchers_to_add_bgp_peers(
+                hostname, add_bgp_peer_configs, add_bgp_peers_patcher_name
+            )
 
     async def register_patchers_to_add_bgp_peers(
         self,
@@ -273,10 +534,7 @@ class ConfigureParallelBgpPeers(BaseTask):
             "patcher_args": {"peer_configs": json.dumps(add_bgp_peer_configs)},
             "patcher_desc": "",
         }
-        if is_host_drainable(hostname):
-            configs = ["bgpcpp", "bgpcpp_softdrain"]
-        else:
-            configs = ["bgpcpp"]
+        configs = get_bgp_peer_configs(hostname)
         await asyncio.gather(
             *[
                 # pyre-fixme[16]: `AbstractSwitch` has no attribute
@@ -344,9 +602,10 @@ class ConfigureParallelBgpPeers(BaseTask):
         self,
         ip_addresses: t.List[str],
         port_info: PortInfoThrift,
+        vlan_id: t.Optional[int] = None,
     ) -> t.Dict[str, t.Any]:
         return {
-            "vlan_id": port_info.vlans[0],
+            "vlan_id": vlan_id if vlan_id is not None else port_info.vlans[0],
             "ports": [port_info.portId],
             "ip_addresses": ip_addresses,
             "mtu": 9000,
@@ -367,19 +626,66 @@ class ConfigureParallelBgpPeers(BaseTask):
         return ip_addresses
 
 
+class IxiaStopTrafficAndWaitTask(BaseTask):
+    """Stop IXIA traffic and keep it stopped for a recovery window."""
+
+    NAME = "ixia_stop_traffic_and_wait"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        wait_seconds = float(params.get("wait_seconds", 0))
+        if wait_seconds < 0:
+            raise ValueError("wait_seconds must be non-negative")
+        self.ixia.stop_traffic()
+        self.logger.info(
+            "IXIA traffic stopped; holding recovery window for %.1f seconds",
+            wait_seconds,
+        )
+        await asyncio.sleep(wait_seconds)
+
+
+class IxiaSyncRawSourceMacsTask(BaseTask):
+    """Point RAW traffic items' source MAC at their tx port's device-group MAC."""
+
+    NAME = "ixia_sync_raw_source_macs"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        traffic_item_regex = params.get("traffic_item_regex", ".*")
+        sync_destination_macs = params.get("sync_destination_macs", False)
+        synced = self.ixia.sync_raw_traffic_source_macs(
+            traffic_item_regex, sync_destination_macs
+        )
+        if not synced:
+            raise ValueError(
+                f"No RAW traffic item matching {traffic_item_regex!r} had its "
+                "source MAC synced"
+            )
+        self.logger.info(f"Synced RAW traffic source MACs: {synced}")
+
+
+def _skip_coop_patcher_task(task: BaseTask) -> bool:
+    """COOP patcher tasks run internally (COOP) or in pure OSS (the OSS patcher).
+    The TAAC_OSS_META_INTERNAL container has neither -- its devices are
+    COOP-managed -- so it skips them, as every OSS run did before the OSS patcher.
+    """
+    if TAAC_OSS and not oss_config_patcher_enabled():
+        task.logger.info(
+            f"Skipping {task.NAME}: coop patchers are not available under "
+            "TAAC_OSS_META_INTERNAL=1."
+        )
+        return True
+    return False
+
+
 class CoopUnregisterPatchersTask(BaseTask):
     NAME = "coop_unregister_patchers"
 
     async def run(self, params: t.Dict[str, t.Any]) -> None:
-        if TAAC_OSS:
-            self.logger.info(
-                "Skipping coop_unregister_patchers: coop patchers are not "
-                "available under TAAC_OSS=1."
-            )
+        if _skip_coop_patcher_task(self):
             return
         hostnames = params.get("hostnames") or [none_throws(params.get("hostname"))]
         regex = params.get("regex", r".*.")
-        owner = params.get("owner", DNE_TEST_REGRESSION_NAME)
+        # OSS patchers carry no owner; COOP stamps DNE_TEST_REGRESSION_NAME.
+        owner = params.get("owner", None if TAAC_OSS else DNE_TEST_REGRESSION_NAME)
         config_names = params.get("config_names")
         unregister_patchers_coroutines = []
         for hostname in hostnames:
@@ -416,14 +722,12 @@ class CoopUnregisterPatchersTask(BaseTask):
                 if re.search(regex, patcher.name) and patcher.owner == owner
             ]
             if not patchers_to_unregister:
-                break
+                continue
             self.logger.info(
                 f"Unregistering patchers {patchers_to_unregister} from {hostname}:{config_name}"
             )
             for patcher in patchers_to_unregister:
-                # pyre-fixme[28]: Unexpected keyword argument `auto_remediate_failure`.
                 await driver.async_coop_unregister_patchers(
-                    # pyrefly: ignore [unexpected-keyword]
                     patcher,
                     config_name,
                     # pyrefly: ignore [unexpected-keyword]
@@ -440,25 +744,57 @@ class CoopUnregisterPatchersTask(BaseTask):
                 err_msg = f"Failed to unregister patchers {patchers_to_unregister} from {hostname}:{config_name}"
                 self.logger.error(err_msg)
                 raise Exception(err_msg)
+        if oss_config_patcher_enabled():
+            await self._activate_oss_unregister(driver, hostname)
+
+    async def _activate_oss_unregister(self, driver: t.Any, hostname: str) -> None:
+        """OSS unregister only rewrites config files, so activate them here and
+        callers need no apply task. With every patcher gone the baselines go back
+        (including one a crashed run left behind); otherwise the rebuilt configs
+        are installed. Either way only the daemons whose config changed restart."""
+        for config_name in get_default_configs(hostname):
+            if await driver.async_coop_list_patchers(config_name):
+                #  `async_apply_patchers`.
+                await driver.async_apply_patchers()
+                return
+        await driver.async_restore_patched_configs()
 
 
 class CoopRegisterPatcherTask(BaseTask):
     NAME = "coop_register_patcher"
 
     async def run(self, params: t.Dict[str, t.Any]) -> None:
-        if TAAC_OSS:
-            self.logger.info(
-                "Skipping coop_register_patcher: coop patchers are not "
-                "available under TAAC_OSS=1."
-            )
+        if _skip_coop_patcher_task(self):
             return
         hostname = params["hostname"]
         config_names = params.get("config_names") or [params["config_name"]]
         patcher_name = params["patcher_name"]
+        patcher_desc = params.get("patcher_desc", "")
+        jq_program = params.get("jq_program")
+        driver = await async_get_device_driver(hostname)
+        if jq_program is not None:
+            if "py_func_name" in params or "patcher_args" in params:
+                raise ValueError("A COOP patcher must select only jq or Python")
+            if TAAC_OSS:
+                raise NotImplementedError(
+                    "generic jq COOP patchers are available only in Meta-internal TAAC"
+                )
+            coop_utils = importlib.import_module(
+                "neteng.test_infra.dne.taac.internal.coop_utils"
+            )
+            for config_name in config_names:
+                await coop_utils.async_register_jq_patcher(
+                    hostname=hostname,
+                    config_name=config_name,
+                    patcher_name=patcher_name,
+                    jq_program=jq_program,
+                    description=patcher_desc,
+                    persistent=True,
+                )
+            return
+
         py_func_name = params["py_func_name"]
         patcher_args = json.loads(params["patcher_args"])
-        patcher_desc = params.get("patcher_desc", "")
-        driver = await async_get_device_driver(hostname)
         for config_name in config_names:
             # pyre-fixme[16]: `AbstractSwitch` has no attribute
             #  `async_register_python_patcher`.
@@ -475,16 +811,36 @@ class CoopApplyPatchersTask(BaseTask):
     NAME = "coop_apply_patchers"
 
     async def run(self, params: t.Dict[str, t.Any]) -> None:
-        if TAAC_OSS:
-            self.logger.info(
-                "Skipping coop_apply_patchers: coop patchers are not "
-                "available under TAAC_OSS=1."
-            )
+        if _skip_coop_patcher_task(self):
             return
         hostnames = params["hostnames"]
-        config_names = params.get(
-            "config_names",
-        )
+        if oss_config_patcher_enabled():
+            # No COOP agent: the OSS driver installs every changed config and
+            # activates it itself, so config_names is ignored. Without a boot
+            # flag it reloads the agent and restarts bgpd only for what changed,
+            # as the branch below does.
+            method = (
+                taac_types.ApplyPatcherMethod.AGENT_WARMBOOT
+                if params.get("do_warmboot")
+                else None
+            )
+            for hostname in hostnames:
+                driver = await async_get_device_driver(hostname)
+                # pyre-fixme[16]: `AbstractSwitch` has no attribute
+                #  `async_apply_patchers`.
+                await driver.async_apply_patchers(
+                    method, coldboot=bool(params.get("do_coldboot"))
+                )
+            return
+        config_names = params.get("config_names")
+        config_name = params.get("config_name")
+        # ``create_coop_apply_patchers_task`` serializes ``config_name="bgpcpp"``
+        # by default, and its callers expect every default config to apply,
+        # including the agent reload that picks up agent patchers such as the
+        # VLAN interfaces from ``configure_parallel_bgp_peers``. Only a
+        # non-default value (e.g. an agent-only apply) narrows the set.
+        if config_names is None and config_name not in (None, "bgpcpp"):
+            config_names = [config_name]
 
         do_warmboot = params.get("do_warmboot", False)
         do_coldboot = params.get("do_coldboot", False)
@@ -495,7 +851,6 @@ class CoopApplyPatchersTask(BaseTask):
             wait_for_convergence_coroutines = []
             for hostname in hostnames:
                 driver = await async_get_device_driver(hostname)
-                # pyre-fixme[16]: `AbstractSwitch` has no attribute
                 #  `async_create_cold_boot_file`.
                 create_cold_boot_file_coroutines.append(
                     driver.async_create_cold_boot_file()
@@ -524,7 +879,7 @@ class CoopApplyPatchersTask(BaseTask):
             await asyncio.gather(*wait_for_convergence_coroutines)
         else:
             reload_agent_config_coroutines = []
-            restart_bgp_coroutines = []
+            bgp_drivers = []
             for hostname in hostnames:
                 config_names = config_names or get_default_configs(hostname)
                 driver = await async_get_device_driver(hostname)
@@ -535,19 +890,35 @@ class CoopApplyPatchersTask(BaseTask):
                         driver.async_agent_config_reload()
                     )
                 if "bgpcpp" in config_names:
-                    restart_bgp_coroutines.append(
-                        driver.async_restart_service(FbossSystemctlServiceName.BGP)
-                    )
-            await asyncio.gather(
+                    bgp_drivers.append(driver)
+            reload_results = await asyncio.gather(
                 *reload_agent_config_coroutines, return_exceptions=True
             )
-            await asyncio.gather(*restart_bgp_coroutines)
+            if params.get("fail_on_agent_reload_error", False):
+                for result in reload_results:
+                    if isinstance(result, asyncio.CancelledError):
+                        raise result
+                errors = [
+                    result for result in reload_results if isinstance(result, Exception)
+                ]
+                if errors:
+                    raise ExceptionGroup(
+                        "Failed to reload agent configurations", errors
+                    )
+            await asyncio.gather(
+                *[
+                    driver.async_restart_service(FbossSystemctlServiceName.BGP)
+                    for driver in bgp_drivers
+                ]
+            )
 
 
 class CoopApplyPatchersV2(BaseTask):
     NAME = "coop_apply_patchers_v2"
 
     async def run(self, params: t.Dict[str, t.Any]) -> None:
+        if _skip_coop_patcher_task(self):
+            return
         hostnames = params["hostnames"]
         apply_patcher_method = params["apply_patcher_method"]
         apply_patcher_method_enum = taac_types.ApplyPatcherMethod(apply_patcher_method)
@@ -915,8 +1286,8 @@ class ScpFile(BaseTask):
     async def run(self, params: t.Dict[str, t.Any]) -> None:
         if TAAC_OSS:
             raise NotImplementedError(
-                "ScpFile requires the Meta-internal ConfigeratorClient and "
-                "ParamikoClient and cannot run under TAAC_OSS=1."
+                "ScpFile requires Meta-internal config sources and cannot run "
+                "under TAAC_OSS=1."
             )
         self.logger.info(f"Running {self.NAME} task with params: {params}")
         hostname = params["hostname"]
@@ -943,16 +1314,18 @@ class ScpFile(BaseTask):
                 "One of 'configerator_path', 'file_template', or 'file_content' must be provided"
             )
 
-        with tempfile.NamedTemporaryFile(
-            dir=tempfile.gettempdir(), mode="w", delete=False, newline="\n"
-        ) as tmp_file:
-            tmp_file.write(file_content)
-            local_file_path = tmp_file.name
-        with ParamikoClient(hostname) as client:
-            client.scp(
-                local_path=local_file_path,
-                remote_path=remote_path,
-            )
+        driver = await async_get_device_driver(hostname)
+        write_file = getattr(driver, "async_write_file_on_device", None)
+        if write_file is not None:
+            await write_file(file_content, remote_path)
+        else:
+            # Preserve support for non-FBOSS drivers that used the original
+            # driver-independent SCP implementation.
+            with tempfile.NamedTemporaryFile(mode="w", newline="\n") as local_file:
+                local_file.write(file_content)
+                local_file.flush()
+                with ParamikoClient(hostname) as client:
+                    client.scp(local_path=local_file.name, remote_path=remote_path)
         self.logger.info(f"Successfully copied file to {hostname}:{remote_path}")
 
 
@@ -970,24 +1343,265 @@ def _truncate_cmd_for_log(cmd: str, max_chars: int = _MAX_LOGGED_CMD_CHARS) -> s
     return f"{cmd[:max_chars]}... [truncated {len(cmd)} chars]"
 
 
+class AssertAgentWarmBoot(BaseTask):
+    """Require reported SW and selected HW boot types to be WARM_BOOT."""
+
+    NAME = "assert_agent_warm_boot"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        hostname = params["hostname"]
+        indices = params.get("hw_switch_indices", [0])
+        if not indices or any(type(index) is not int or index < 0 for index in indices):
+            raise ValueError("hw_switch_indices must contain non-negative indices")
+        driver = await async_get_device_driver(hostname)
+        # Empty flags deliberately prohibit the driver's intentional cold-boot
+        # exemptions. Missing SW/HW Thrift responses propagate as failures.
+        await t.cast(t.Any, driver)._async_assert_warm_booted(indices, set())
+        self.logger.info(f"{hostname}: SW and HW agents {indices} report WARM_BOOT")
+
+
+class AssertProcessVmHwm(BaseTask):
+    """Read actual process VmHWM; missing processes or counters fail closed."""
+
+    NAME = "assert_process_vmhwm"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        hostname = params["hostname"]
+        threshold = int(params["threshold_bytes"])
+        services = params["services"]
+        if threshold <= 0 or not services:
+            raise ValueError("Positive threshold and nonempty services are required")
+        driver = await async_get_device_driver(hostname)
+        for service in services:
+            unit = await t.cast(t.Any, driver).async_get_systemctl_service_name(service)
+            raw_pid = await driver.async_run_cmd_on_shell(
+                f"systemctl show {shlex.quote(unit)} -p MainPID --value"
+            )
+            pid = int(raw_pid.strip())
+            if pid <= 0:
+                raise RuntimeError(f"{hostname}: {service} has no live MainPID")
+            status = await t.cast(t.Any, driver).async_read_file(f"/proc/{pid}/status")
+            match = re.search(r"^VmHWM:\s+(\d+)\s+kB$", status, re.MULTILINE)
+            if match is None:
+                raise RuntimeError(f"{hostname}: {service} did not report VmHWM")
+            peak_bytes = int(match.group(1)) * 1024
+            if peak_bytes >= threshold:
+                raise RuntimeError(
+                    f"{hostname}: {service} VmHWM {peak_bytes} >= {threshold}"
+                )
+            self.logger.info(
+                f"{hostname}: {service} VmHWM={peak_bytes} bytes < {threshold}"
+            )
+
+
+class VerifySelectedForwarding(BaseTask):
+    """Verify exact resolved FIB IP/RIF pairs and physical PORT bindings."""
+
+    NAME = "verify_selected_forwarding"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        hostname = params["hostname"]
+        expected_routes = params["routes"]
+        expected_ports = params["interface_ports"]
+        if not expected_routes or not expected_ports:
+            raise ValueError("Nonempty routes and interface_ports are required")
+        driver = await async_get_device_driver(hostname)
+        deadline = time.monotonic() + float(params.get("timeout_seconds", 60))
+        while True:
+            interfaces = await t.cast(t.Any, driver).async_get_all_interfaces()
+            errors = []
+            for rif, port in expected_ports.items():
+                interface = interfaces.get(int(rif))
+                if interface is None or getattr(interface, "portId", None) != int(port):
+                    errors.append(f"RIF {rif} does not bind physical port {port}")
+            wanted = {
+                str(ipaddress.ip_network(route["prefix"])): route
+                for route in expected_routes
+            }
+            if len(wanted) != len(expected_routes):
+                raise ValueError("Expected route prefixes must be unique")
+            observed = {}
+            for route in await t.cast(t.Any, driver).async_get_route_table_details():
+                prefix = str(
+                    ipaddress.ip_network(
+                        (
+                            ipaddress.ip_address(route.dest.ip.addr),
+                            route.dest.prefixLength,
+                        )
+                    )
+                )
+                if prefix not in wanted:
+                    continue
+                if prefix in observed:
+                    errors.append(f"Duplicate FIB entry {prefix}")
+                observed[prefix] = route
+            for prefix, expected in wanted.items():
+                route = observed.get(prefix)
+                if route is None:
+                    errors.append(f"Missing FIB entry {prefix}")
+                    continue
+                pairs = {
+                    (str(ipaddress.ip_address(hop.ip.addr)), int(hop.interfaceID))
+                    for hop in route.fwdInfo or []
+                }
+                expected_pairs = {
+                    (str(ipaddress.ip_address(hop["ip"])), int(hop["interface_id"]))
+                    for hop in expected["next_hops"]
+                }
+                if (
+                    not expected_pairs
+                    or str(route.action).upper() != "NEXTHOPS"
+                    or pairs != expected_pairs
+                ):
+                    errors.append(
+                        f"{prefix}: action={route.action}, resolved={sorted(pairs)}, expected={sorted(expected_pairs)}"
+                    )
+            if not errors:
+                self.logger.info(
+                    f"{hostname}: verified {len(wanted)} exact FIB entries and PORT bindings"
+                )
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"{hostname}: selected forwarding failed: " + "; ".join(errors[:8])
+                )
+            await asyncio.sleep(2)
+
+
+class VerifySelectedBgpRoutes(BaseTask):
+    """Require exact selected per-peer NLRI while allowing unrelated native routes."""
+
+    NAME = "verify_selected_bgp_routes"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        universe = {
+            str(ipaddress.ip_network(prefix)) for prefix in params["selected_prefixes"]
+        }
+        peers = {
+            peer: {str(ipaddress.ip_network(prefix)) for prefix in prefixes}
+            for peer, prefixes in params["peer_prefixes"].items()
+        }
+        allowed = {
+            peer: {str(ipaddress.ip_network(prefix)) for prefix in prefixes}
+            for peer, prefixes in params.get("allowed_extra_prefixes", {}).items()
+        }
+        expectations = params.get("path_expectations", {})
+        if (
+            not universe
+            or not peers
+            or any(not wanted or not wanted <= universe for wanted in peers.values())
+            or any(
+                peer not in peers or not extra <= universe
+                for peer, extra in allowed.items()
+            )
+        ):
+            raise ValueError(
+                "Nonempty per-peer expected prefixes must belong to the selected universe"
+            )
+        driver = await async_get_device_driver(params["hostname"])
+        deadline = time.monotonic() + float(params.get("timeout_seconds", 60))
+        while True:
+            errors = []
+            for peer, wanted in peers.items():
+                networks = await t.cast(
+                    t.Any, driver
+                ).async_get_postfilter_received_networks(peer)
+                paths = {
+                    str(
+                        ipaddress.ip_network(
+                            (ipaddress.ip_address(prefix.prefix_bin), prefix.num_bits),
+                            strict=False,
+                        )
+                    ): path
+                    for prefix, path in networks.items()
+                }
+                observed = set(paths) & universe
+                unexpected = observed - wanted - allowed.get(peer, set())
+                if not wanted <= observed or unexpected:
+                    errors.append(
+                        f"{peer}: missing={sorted(wanted - observed)[:4]}, unexpected_selected={sorted(unexpected)[:4]}"
+                    )
+                for prefix in wanted & observed:
+                    expected = expectations.get(peer, {}).get(prefix)
+                    if expected is None:
+                        continue
+                    path = paths[prefix]
+                    segments = list(path.as_path or [])
+                    sequence = [
+                        asn for segment in segments for asn in segment.asns_4_byte
+                    ]
+                    if "as_path" in expected and (
+                        any(
+                            str(segment.seg_type).split(".")[-1]
+                            not in ("AS_SEQUENCE", "2")
+                            for segment in segments
+                        )
+                        or sequence != expected["as_path"]
+                    ):
+                        errors.append(f"{peer} {prefix}: unexpected AS path {sequence}")
+                    communities = {
+                        f"{community.asn}:{community.value}"
+                        for community in path.communities or []
+                    }
+                    if not set(expected.get("communities", [])) <= communities:
+                        errors.append(f"{peer} {prefix}: required communities missing")
+                    if "next_hop" in expected and (
+                        path.next_hop is None
+                        or str(ipaddress.ip_address(path.next_hop.prefix_bin))
+                        != str(ipaddress.ip_address(expected["next_hop"]))
+                    ):
+                        errors.append(f"{peer} {prefix}: unexpected next hop")
+                if observed - wanted:
+                    self.logger.info(
+                        f"{peer}: allowed reflected selected routes={len(observed - wanted)}"
+                    )
+            if not errors:
+                self.logger.info(
+                    f"{params['hostname']}: exact selected post-policy prefixes verified for {len(peers)} peers"
+                )
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Selected post-policy RIB failed: " + "; ".join(errors[:8])
+                )
+            await asyncio.sleep(2)
+
+
 class RunCommandsOnShell(BaseTask):
     NAME = "run_commands_on_shell"
 
     async def run(self, params: t.Dict[str, t.Any]) -> None:
         hostname = params["hostname"]
         cmds = params.get("cmds", [])
+        validate_output = params.get("validate_output", False)
         driver = await async_get_device_driver(hostname)
         for cmd in cmds:
             self.logger.info(
                 f"{hostname} -- Running command: {_truncate_cmd_for_log(cmd)}"
             )
-            await driver.async_run_cmd_on_shell(cmd)
+            if validate_output:
+                await t.cast(
+                    t.Any, driver
+                ).async_execute_show_or_configure_cmd_on_shell(cmd)
+            else:
+                await driver.async_run_cmd_on_shell(cmd)
+        bgpcpp_logging_config = params.get("bgpcpp_logging_config")
+        if bgpcpp_logging_config is not None:
+            self.logger.info(record_configured(hostname, bgpcpp_logging_config))
 
 
 class AllocateCgroupSliceMemory(BaseTask):
     NAME = "allocate_cgroup_slice_memory"
 
     async def run(self, params: t.Dict[str, t.Any]) -> None:
+        if TAAC_OSS:
+            # /opt/memory_pressure and the ODS memory query are Meta-only.
+            self.logger.warning(
+                "Skipping allocate_cgroup_slice_memory under TAAC_OSS=1: "
+                "/opt/memory_pressure and the ODS memory query are not "
+                "available, so no cgroup memory stress is applied."
+            )
+            return
         hostname = params["hostname"]
         executable_path = params.get("executable_path", "/opt/memory_pressure")
         slice_name = params["slice_name"]
@@ -1241,7 +1855,7 @@ class AristaDaemonControlTask(BaseTask):
     - Disable any daemon (shutdown existing "daemon <name>")
     - Check current daemon status
 
-    Supports daemons like: Bgp, FibAgent, FibAgentBgp, etc.
+    Supports daemons like: Bgpcpp, FibAgent, FibAgentBgp, etc.
     """
 
     NAME = "arista_daemon_control"
@@ -1254,7 +1868,7 @@ class AristaDaemonControlTask(BaseTask):
             params: Dictionary containing:
                 - hostname: Device hostname (required)
                 - action: "enable" or "disable" (required)
-                - daemon_name: Name of the daemon (required) - e.g., "Bgp", "FibAgent", "FibAgentBgp"
+                - daemon_name: Name of the daemon (required) - e.g., "Bgpcpp", "FibAgent", "FibAgentBgp"
                 - exec_script: Path to execution script (optional, uses default if not provided)
         """
         hostname = params["hostname"]
@@ -1274,6 +1888,7 @@ class AristaDaemonControlTask(BaseTask):
         driver = await async_get_device_driver(hostname)
 
         if action == "enable":
+            await self._remove_renamed_daemons(driver, daemon_name)
             await self._enable_daemon(driver, daemon_name, exec_script)
         elif action == "disable":
             await self._disable_daemon(driver, daemon_name)
@@ -1319,6 +1934,9 @@ class AristaDaemonControlTask(BaseTask):
                 - daemon_exists: bool - whether daemon config exists
                 - is_running: bool - whether daemon process is active
                 - process_info: str - daemon process information
+                - daemon_config: tuple[str, ...] - stripped lines of this
+                  daemon's running-config block, header first; empty when
+                  the daemon is not configured
         """
         try:
             # Check if daemon config exists
@@ -1327,9 +1945,8 @@ class AristaDaemonControlTask(BaseTask):
                 config_cmd
             )
 
-            # Use word boundary to match exact daemon name, not substring
-            pattern = rf"^daemon\s+{re.escape(daemon_name)}\s*$"
-            daemon_exists = bool(re.search(pattern, config_output, re.MULTILINE))
+            daemon_config = self._extract_daemon_config(config_output, daemon_name)
+            daemon_exists = bool(daemon_config)
 
             # Check if daemon process is running
             process_cmd = f"show daemon {daemon_name}"
@@ -1339,13 +1956,7 @@ class AristaDaemonControlTask(BaseTask):
                         process_cmd
                     )
                 )
-                # If we can get daemon info, it's likely running
-                # Check for indicators that daemon is active
-                is_running = (
-                    "Running" in process_output
-                    or "Active" in process_output
-                    or "PID" in process_output
-                )
+                is_running = self._daemon_process_is_running(process_output)
                 process_info = process_output.strip()
             except Exception:
                 # If show daemon command fails, daemon is likely not running
@@ -1356,6 +1967,7 @@ class AristaDaemonControlTask(BaseTask):
                 "daemon_exists": daemon_exists,
                 "is_running": is_running,
                 "process_info": process_info,
+                "daemon_config": daemon_config,
             }
         except Exception as e:
             self.logger.warning(
@@ -1365,7 +1977,64 @@ class AristaDaemonControlTask(BaseTask):
                 "daemon_exists": False,
                 "is_running": False,
                 "process_info": f"Error: {str(e)}",
+                "daemon_config": (),
             }
+
+    @staticmethod
+    def _daemon_process_is_running(process_output: str) -> bool:
+        return bool(
+            re.search(
+                r"^(?:Process|Agent):\s+\S+\s+"
+                r"\(running(?:\s+with\s+PID\s+\d+)?\)"
+                r"(?:[ \t]+[^\r\n]*)?$",
+                process_output,
+                re.IGNORECASE | re.MULTILINE,
+            )
+        )
+
+    @staticmethod
+    def _extract_daemon_config(
+        config_output: str, daemon_name: str
+    ) -> t.Tuple[str, ...]:
+        """Isolate one block so another daemon cannot satisfy idempotence checks."""
+        daemon_header = f"daemon {daemon_name}"
+        lines = config_output.splitlines()
+        for index, line in enumerate(lines):
+            if line.strip() != daemon_header:
+                continue
+            daemon_config = [daemon_header]
+            for child_line in lines[index + 1 :]:
+                stripped = child_line.strip()
+                if not stripped:
+                    continue
+                if child_line == child_line.lstrip():
+                    break
+                daemon_config.append(stripped)
+            return tuple(daemon_config)
+        return ()
+
+    @staticmethod
+    def _daemon_configuration_matches(
+        daemon_config: t.Iterable[str], exec_script: t.Optional[str]
+    ) -> bool:
+        normalized = set(daemon_config)
+        if "no shutdown" not in normalized:
+            return False
+        return exec_script is None or f"exec {exec_script}" in normalized
+
+    async def _remove_renamed_daemons(self, driver, daemon_name: str) -> None:
+        """Remove stanzas left under a daemon's previous name.
+
+        Devices configured before a rename still carry the old stanza; leaving
+        it would run a second copy of the same binary next to the new daemon.
+        """
+        for old_name in RENAMED_ARISTA_DAEMONS.get(daemon_name, ()):
+            if not await self._check_daemon_exists(driver, old_name):
+                continue
+            self.logger.info(f"Removing daemon {old_name}: renamed to {daemon_name}")
+            await driver.async_execute_show_or_configure_cmd_on_shell(
+                f"no daemon {old_name}", configure=True
+            )
 
     async def _enable_daemon(
         self, driver, daemon_name: str, exec_script: t.Optional[str] = None
@@ -1373,15 +2042,32 @@ class AristaDaemonControlTask(BaseTask):
         """
         Enable daemon.
 
-        If daemon doesn't exist, creates it with exec script.
-        Then ensures it's not shutdown.
+        Skips all EOS configuration when the daemon is already running with
+        the expected exec script and no shutdown, because re-applying the
+        block to a healthy daemon risks an unnecessary restart. Otherwise
+        creates the daemon with its exec script if missing, then ensures it
+        is not shutdown.
 
         Args:
             driver: Device driver instance
             daemon_name: Name of the daemon
             exec_script: Path to execution script (optional)
         """
-        daemon_exists = await self._check_daemon_exists(driver, daemon_name)
+        pre_enable_status = await self._check_daemon_running_status(driver, daemon_name)
+        daemon_exists = bool(pre_enable_status.get("daemon_exists", False))
+
+        if (
+            daemon_exists
+            and pre_enable_status.get("is_running", False)
+            and self._daemon_configuration_matches(
+                pre_enable_status.get("daemon_config", ()), exec_script
+            )
+        ):
+            self.logger.info(
+                f"Daemon {daemon_name} is already running with the expected "
+                "configuration; skipping the enable command"
+            )
+            return
 
         if not daemon_exists:
             self.logger.info(f"daemon {daemon_name} does not exist, creating it")
@@ -1400,11 +2086,15 @@ class AristaDaemonControlTask(BaseTask):
 
         await driver.async_execute_show_or_configure_cmd_on_shell(cmd, configure=True)
 
-        # Verify daemon was enabled successfully
-        await asyncio.sleep(2)  # Brief pause to allow daemon to start
-        post_enable_status = await self._check_daemon_running_status(
-            driver, daemon_name
-        )
+        post_enable_status: t.Dict[str, t.Any] = {}
+        for attempt in range(1, _ARISTA_DAEMON_START_VALIDATION_ATTEMPTS + 1):
+            post_enable_status = await self._check_daemon_running_status(
+                driver, daemon_name
+            )
+            if post_enable_status.get("is_running", False):
+                break
+            if attempt < _ARISTA_DAEMON_START_VALIDATION_ATTEMPTS:
+                await asyncio.sleep(_ARISTA_DAEMON_START_VALIDATION_RETRY_DELAY_SECONDS)
         self.logger.info(
             f"Post-enable status for daemon {daemon_name}: "
             f"exists={post_enable_status.get('daemon_exists', False)}, "
@@ -1416,6 +2106,11 @@ class AristaDaemonControlTask(BaseTask):
                 f"daemon {daemon_name} configuration was not created properly"
             )
             raise Exception(f"daemon {daemon_name} was not enabled successfully")
+        if not post_enable_status.get("is_running", False):
+            process_info = post_enable_status.get("process_info", "unknown")
+            raise RuntimeError(
+                f"daemon {daemon_name} did not reach running state: {process_info}"
+            )
 
         self.logger.info(f"Daemon {daemon_name} enabled successfully")
 
@@ -1570,7 +2265,7 @@ class AristaCreateFileFromConfig(BaseTask):
     """
 
     NAME = "arista_create_file_from_config"
-    MAX_RETRIES = 3
+    MAX_RETRIES = arista_utils.ARISTA_FILE_TRANSFER_MAX_RETRIES
     # Each base64 chunk is pushed as a single `echo '<chunk>'` argument inside a
     # `bash sudo sh -c "echo '<chunk>' > <path>.b64"` command. The hard ceiling
     # is NOT the Linux per-argument cap (MAX_ARG_STRLEN = 131072) — it is the
@@ -1588,7 +2283,7 @@ class AristaCreateFileFromConfig(BaseTask):
     # below 30000 unless and until the transport is switched off in-shell echo
     # (e.g. scp/sftp — see internal/tasks/bgp_weight_policy_task.py for the
     # scp pattern).
-    DEFAULT_CHUNK_SIZE = 30000
+    DEFAULT_CHUNK_SIZE = arista_utils.ARISTA_FILE_TRANSFER_CHUNK_SIZE
 
     async def run(self, params: t.Dict[str, t.Any]) -> None:
         """
@@ -1767,6 +2462,107 @@ class ValidateBgpcppConfigOnDevice(BaseTask):
                 f"BGP++ config validator returned unexpected output on "
                 f"{hostname}: {output_str.strip()}"
             )
+
+
+class ValidateBgpcppUpdateGroupState(BaseTask):
+    """Validate the live BGP++ Update Group state through Thrift."""
+
+    NAME = "validate_bgpcpp_update_group_state"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        hostname = params["hostname"]
+        expect_enabled = params["expect_enabled"]
+        if not isinstance(expect_enabled, bool):
+            raise ValueError("expect_enabled must be a bool")
+
+        await self._validate_state(hostname, expect_enabled)
+
+    @async_retryable(
+        retries=_BGPCPP_UPDATE_GROUP_STATE_VALIDATION_ATTEMPTS,
+        sleep_time=_BGPCPP_UPDATE_GROUP_STATE_VALIDATION_RETRY_DELAY_SECONDS,
+        exceptions=(Exception,),
+    )
+    async def _validate_state(self, hostname: str, expect_enabled: bool) -> None:
+        driver = await async_get_device_driver(hostname)
+        try:
+            response = await t.cast(t.Any, driver).async_get_update_group_info()
+        except Exception:
+            self.logger.exception(
+                f"Unable to query BGP++ update_group state on {hostname}"
+            )
+            raise
+        actual_enabled = response.enable_update_group
+
+        self.logger.info(
+            f"Observed BGP++ update_group enabled={actual_enabled} on {hostname}; "
+            f"expected {expect_enabled}"
+        )
+        if actual_enabled != expect_enabled:
+            raise RuntimeError(
+                f"BGP++ update_group enabled={actual_enabled} on {hostname}; "
+                f"expected {expect_enabled}"
+            )
+
+
+class VerifyBgpcppStackTask(BaseTask):
+    """Fail setup unless BGP++ is the only BGP stack enabled on an Arista DUT.
+
+    A device declared ARISTA_FBOSS is checked through BGP++ thrift, so the
+    running config must agree: ``daemon Bgpcpp`` enabled, native ``router bgp``
+    shut down, and no pre-rename ``daemon Bgp`` left behind.
+    """
+
+    NAME = "verify_bgpcpp_stack"
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        hostname = params["hostname"]
+        # The concrete Arista driver, not AbstractSwitch, owns the EOS CLI.
+        driver: t.Any = await async_get_device_driver(hostname)
+        daemon_config = await driver.async_execute_show_or_configure_cmd_on_shell(
+            "show running-config section daemon"
+        )
+        router_config = await driver.async_execute_show_or_configure_cmd_on_shell(
+            "show running-config section router bgp"
+        )
+        problems = self.stack_problems(daemon_config, router_config)
+        if problems:
+            raise RuntimeError(
+                f"BGP++ stack is not the only BGP enabled on {hostname}: "
+                + "; ".join(problems)
+            )
+        self.logger.info(
+            f"BGP++ stack verified on {hostname}: daemon Bgpcpp enabled, "
+            "native router bgp shut down, no daemon Bgp"
+        )
+
+    @staticmethod
+    def stack_problems(daemon_config: str, router_config: str) -> t.List[str]:
+        problems = []
+        bgpcpp = AristaDaemonControlTask._extract_daemon_config(daemon_config, "Bgpcpp")
+        if not bgpcpp:
+            problems.append("daemon Bgpcpp is not configured")
+        elif "shutdown" in bgpcpp[1:]:
+            problems.append("daemon Bgpcpp is shut down")
+        if AristaDaemonControlTask._extract_daemon_config(daemon_config, "Bgp"):
+            problems.append("pre-rename daemon Bgp is still configured")
+        router_lines = router_config.splitlines()
+        for index, line in enumerate(router_lines):
+            if not line.startswith("router bgp"):
+                continue
+            children = []
+            for child in router_lines[index + 1 :]:
+                if child.strip() and child == child.lstrip():
+                    break
+                children.append(child)
+            indents = [len(c) - len(c.lstrip()) for c in children if c.strip()]
+            top = min(indents, default=0)
+            # Neighbor- and VRF-level shutdowns do not disable the BGP instance.
+            if not any(
+                c.strip() == "shutdown" and len(c) - len(c.lstrip()) == top
+                for c in children
+            ):
+                problems.append(f"native {line.strip()} is not shut down")
+        return problems
 
 
 class DeployEosImageTask(BaseTask):
@@ -2078,7 +2874,6 @@ class DeployEosImageTask(BaseTask):
         # operations get fresh driver connections after the device reload
         if hasattr(async_get_device_driver, "cache_clear"):
             self.logger.info("  Clearing driver cache after reload...")
-            # pyre-fixme[16]: Callable `async_get_device_driver` has no attribute
             #  `cache_clear`.
             async_get_device_driver.cache_clear()
 
@@ -2190,7 +2985,11 @@ class AssertThriftRateLimitEnabledTask(BaseTask):
 
     NAME = "assert_thrift_rate_limit_enabled"
     THRIFT_RATE_LIMIT_KEY = "thriftApiToRateLimitInQps"
-    AGENT_CONFIG_PATH = "/etc/coop/agent/current"
+
+    # OSS DUTs have no COOP; the agent loads /etc/coop/agent.conf directly.
+    @classmethod
+    def agent_config_path(cls) -> str:
+        return "/etc/coop/agent.conf" if TAAC_OSS else "/etc/coop/agent/current"
 
     # Multi-line python script run on the DUT. Sent base64-encoded so we
     # don't have to escape quotes/newlines in the shell command. Catches
@@ -2250,7 +3049,7 @@ except Exception as e:
         level failure (python3-not-found, base64-not-found) surfaces in
         the captured output instead of disappearing."""
         script = cls._PROBE_SCRIPT.format(
-            path=cls.AGENT_CONFIG_PATH, key=cls.THRIFT_RATE_LIMIT_KEY
+            path=cls.agent_config_path(), key=cls.THRIFT_RATE_LIMIT_KEY
         )
         b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
         return f"echo {b64} | base64 -d | python3 - 2>&1"
@@ -2288,7 +3087,7 @@ except Exception as e:
         if result == "MISSING":
             raise RuntimeError(
                 f"{hostname}: `{self.THRIFT_RATE_LIMIT_KEY}` not found at "
-                f"top level of {self.AGENT_CONFIG_PATH}. Thrift API rate "
+                f"top level of {self.agent_config_path()}. Thrift API rate "
                 f"limiting is NOT enabled — refusing to start a THFT "
                 f"(thrift-hardening) run because the storm will overload "
                 f"`fboss_sw_agent`. See D108220182 (enables defaults for "
@@ -2299,7 +3098,7 @@ except Exception as e:
         if result.startswith("WRONG_TYPE "):
             raise RuntimeError(
                 f"{hostname}: `{self.THRIFT_RATE_LIMIT_KEY}` is present in "
-                f"{self.AGENT_CONFIG_PATH} but is NOT a dict ({result}). "
+                f"{self.agent_config_path()} but is NOT a dict ({result}). "
                 f"Expected mapping of API-name → qps int. The COOP-side "
                 f"schema may have changed; inspect the config and the "
                 f"`agent_thrift_api_to_rate_limit.mcconf` materialization "
@@ -2308,13 +3107,13 @@ except Exception as e:
         if result == "EMPTY":
             raise RuntimeError(
                 f"{hostname}: `{self.THRIFT_RATE_LIMIT_KEY}` is present "
-                f"and is a dict but empty in {self.AGENT_CONFIG_PATH}. "
+                f"and is a dict but empty in {self.agent_config_path()}. "
                 f"Thrift API rate limiting is effectively disabled — "
                 f"refusing to start THFT run. See D108220182."
             )
         if result.startswith("NOT_DICT "):
             raise RuntimeError(
-                f"{hostname}: root of {self.AGENT_CONFIG_PATH} is not a "
+                f"{hostname}: root of {self.agent_config_path()} is not a "
                 f"dict ({result}). The COOP-materialized config schema "
                 f"may have changed; cannot probe for "
                 f"`{self.THRIFT_RATE_LIMIT_KEY}`."
@@ -2325,11 +3124,11 @@ except Exception as e:
                 f"exist on the DUT ({result}). COOP may not have applied "
                 f"the agent config yet — try `systemctl restart coop` and "
                 f"wait for the file to materialize at "
-                f"{self.AGENT_CONFIG_PATH}."
+                f"{self.agent_config_path()}."
             )
         if result.startswith("INVALID_JSON "):
             raise RuntimeError(
-                f"{hostname}: {self.AGENT_CONFIG_PATH} exists but is not "
+                f"{hostname}: {self.agent_config_path()} exists but is not "
                 f"valid JSON ({result}). The file may have been truncated "
                 f"by a partial COOP write — re-fetch via `coop` CLI."
             )
@@ -2352,7 +3151,6 @@ except Exception as e:
         hostname = params["hostname"]
         driver = await async_get_device_driver(hostname)
         probe_cmd = self._build_probe_cmd()
-        # pyre-ignore[16]: AbstractSwitch has no attribute `async_run_cmd_on_shell`
         raw = await driver.async_run_cmd_on_shell(probe_cmd)
         raw_str = raw or ""
         # Tolerate stderr noise (DeprecationWarning, locale banners) that

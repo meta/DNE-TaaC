@@ -1,13 +1,17 @@
 # pyre-unsafe
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-"""Unit tests for TaacIxia.get_or_create_stat_view caching helper."""
+"""Unit tests for TaacIxia statistics and test-case lifecycle behavior."""
 
 import threading
 import typing as t
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import call, MagicMock, patch
 
-from taac.ixia.taac_ixia import TaacIxia
+from taac.ixia.taac_ixia import (
+    IxiaOperationTimeoutError,
+    IxiaSetupError,
+    TaacIxia,
+)
 
 
 def _create_taac_ixia():
@@ -18,10 +22,282 @@ def _create_taac_ixia():
     ixia.session = MagicMock()
     ixia.ixnetwork = MagicMock()
     ixia.is_uhd_chassis = False
+    ixia._snapshot_lock = threading.RLock()
     ixia._stat_view_cache = {}
     ixia._stat_view_index_lock = threading.Lock()
     ixia._stat_view_construction_locks = {}
+    ixia._latest_packet_loss_sample_time = {}
+    ixia._latest_traffic_rate_sample_time = {}
     return ixia
+
+
+class BeginTestCaseTest(unittest.TestCase):
+    def setUp(self):
+        self.ixia = _create_taac_ixia()
+
+    def test_begin_test_case_does_not_start_disabled_sampler(self):
+        self.ixia.sample_time = 0
+        self.ixia.capturing = False
+        self.ixia.paused = True
+        self.ixia._current_playbook_name = None
+        self.ixia.rotate_api_trace_phase = MagicMock()
+        self.ixia.enable_traffic = MagicMock()
+        self.ixia.prepare_traffic = MagicMock()
+        self.ixia.start = MagicMock()
+
+        self.ixia.begin_test_case("first")
+        self.ixia.begin_test_case("second")
+
+        self.ixia.start.assert_not_called()
+
+    def test_begin_test_case_generates_before_apply(self):
+        self.ixia.sample_time = 0
+        self.ixia.capturing = False
+        self.ixia.paused = True
+        self.ixia._current_playbook_name = None
+        self.ixia.rotate_api_trace_phase = MagicMock()
+        calls = MagicMock()
+        self.ixia.enable_traffic = calls.enable_traffic
+        self.ixia.prepare_traffic = calls.prepare_traffic
+
+        self.ixia.begin_test_case("test", ["^traffic$"])
+
+        self.assertEqual(
+            calls.mock_calls,
+            [
+                call.enable_traffic(["^traffic$"], apply_changes=False),
+                call.prepare_traffic(),
+            ],
+        )
+
+    def test_begin_test_case_defers_routed_traffic_preparation(self):
+        self.ixia.sample_time = 0
+        self.ixia.capturing = False
+        self.ixia.paused = True
+        self.ixia._current_playbook_name = None
+        self.ixia._defer_traffic_preparation = True
+        self.ixia.rotate_api_trace_phase = MagicMock()
+        self.ixia.enable_traffic = MagicMock()
+        self.ixia.prepare_traffic = MagicMock()
+
+        self.ixia.begin_test_case("test", ["^traffic$"])
+
+        self.ixia.enable_traffic.assert_not_called()
+        self.ixia.prepare_traffic.assert_not_called()
+        self.assertTrue(self.ixia._traffic_preparation_pending)
+        self.assertFalse(self.ixia._deferred_traffic_generation_complete)
+        self.assertFalse(self.ixia._traffic_start_pending)
+        self.assertEqual(["^traffic$"], self.ixia._pending_traffic_regexes)
+
+    def test_first_start_prepares_deferred_routed_traffic(self):
+        self.ixia._traffic_preparation_pending = True
+        self.ixia._pending_traffic_regexes = ["^traffic$"]
+        self.ixia.is_traffic_running = MagicMock(side_effect=[False, True])
+        self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
+        self.ixia.enable_traffic = MagicMock()
+        self.ixia.wait_for_view_assistants_ready = MagicMock()
+
+        with patch(
+            "neteng.test_infra.dne.taac.ixia.taac_ixia.Ixia.start_traffic"
+        ) as base_start:
+            self.ixia.start_traffic(regenerate_traffic_items=True)
+
+        self.ixia.enable_traffic.assert_called_once_with(
+            ["^traffic$"], apply_changes=False
+        )
+        self.assertEqual(2, self.ixia.regenerate_traffic_items.call_count)
+        self.ixia.finalize_deferred_traffic_item_replacements.assert_called_once_with()
+        base_start.assert_called_once_with(regenerate_traffic_items=False)
+        self.ixia.wait_for_view_assistants_ready.assert_called_once_with()
+        self.assertFalse(self.ixia._traffic_preparation_pending)
+        self.assertFalse(self.ixia._traffic_start_pending)
+        self.assertFalse(self.ixia._traffic_view_readiness_pending)
+        self.assertIsNone(self.ixia._pending_traffic_regexes)
+
+    def test_first_start_stops_retained_traffic_before_regeneration(self):
+        self.ixia._traffic_preparation_pending = True
+        self.ixia._traffic_view_readiness_pending = True
+        self.ixia._pending_traffic_regexes = ["^traffic$"]
+        self.ixia.is_traffic_running = MagicMock(side_effect=[True, True])
+        self.ixia.stop_traffic = MagicMock()
+        self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
+        self.ixia.enable_traffic = MagicMock()
+        self.ixia.wait_for_view_assistants_ready = MagicMock()
+
+        with patch(
+            "neteng.test_infra.dne.taac.ixia.taac_ixia.Ixia.start_traffic"
+        ) as base_start:
+            self.ixia.start_traffic()
+
+        self.ixia.stop_traffic.assert_called_once_with()
+        self.ixia.enable_traffic.assert_called_once_with(
+            ["^traffic$"], apply_changes=False
+        )
+        self.assertEqual(2, self.ixia.regenerate_traffic_items.call_count)
+        self.ixia.finalize_deferred_traffic_item_replacements.assert_called_once_with()
+        base_start.assert_called_once_with(regenerate_traffic_items=False)
+        self.assertFalse(self.ixia._traffic_preparation_pending)
+        self.assertFalse(self.ixia._traffic_start_pending)
+        self.assertFalse(self.ixia._traffic_view_readiness_pending)
+        self.assertIsNone(self.ixia._pending_traffic_regexes)
+
+    def test_failed_first_start_retries_without_repeating_preparation(self):
+        self.ixia._traffic_preparation_pending = True
+        self.ixia._pending_traffic_regexes = ["^traffic$"]
+        self.ixia.is_traffic_running = MagicMock(
+            side_effect=[False, False, False, True]
+        )
+        self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
+        self.ixia.enable_traffic = MagicMock()
+        self.ixia.wait_for_view_assistants_ready = MagicMock()
+
+        with patch(
+            "neteng.test_infra.dne.taac.ixia.taac_ixia.Ixia.start_traffic",
+            side_effect=[RuntimeError("apply failed"), None],
+        ) as base_start:
+            with self.assertRaisesRegex(RuntimeError, "apply failed"):
+                self.ixia.start_traffic()
+            self.assertTrue(self.ixia._traffic_preparation_pending)
+            self.assertTrue(self.ixia._deferred_traffic_generation_complete)
+            self.assertTrue(self.ixia._traffic_start_pending)
+            self.assertFalse(self.ixia._traffic_view_readiness_pending)
+            self.assertEqual(["^traffic$"], self.ixia._pending_traffic_regexes)
+
+            self.ixia.start_traffic(regenerate_traffic_items=True)
+
+        self.assertEqual(
+            [
+                call(regenerate_traffic_items=False),
+                call(regenerate_traffic_items=False),
+            ],
+            base_start.call_args_list,
+        )
+        self.assertEqual(2, self.ixia.regenerate_traffic_items.call_count)
+        self.ixia.finalize_deferred_traffic_item_replacements.assert_called_once_with()
+        self.ixia.enable_traffic.assert_called_once_with(
+            ["^traffic$"], apply_changes=False
+        )
+        self.ixia.wait_for_view_assistants_ready.assert_called_once_with()
+        self.assertFalse(self.ixia._traffic_preparation_pending)
+        self.assertFalse(self.ixia._deferred_traffic_generation_complete)
+        self.assertFalse(self.ixia._traffic_start_pending)
+        self.assertFalse(self.ixia._traffic_view_readiness_pending)
+        self.assertIsNone(self.ixia._pending_traffic_regexes)
+
+    def test_failed_finalize_retries_without_regenerating_swapped_items(self):
+        self.ixia._traffic_preparation_pending = True
+        self.ixia._deferred_traffic_generation_complete = False
+        self.ixia._pending_traffic_regexes = ["^traffic$"]
+        self.ixia.is_traffic_running = MagicMock(side_effect=[False, False, True])
+        self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia.finalize_deferred_traffic_item_replacements = MagicMock(
+            side_effect=[RuntimeError("swap failed"), None]
+        )
+        self.ixia.enable_traffic = MagicMock()
+        self.ixia.wait_for_view_assistants_ready = MagicMock()
+
+        with patch(
+            "neteng.test_infra.dne.taac.ixia.taac_ixia.Ixia.start_traffic"
+        ) as base_start:
+            with self.assertRaisesRegex(RuntimeError, "swap failed"):
+                self.ixia.start_traffic()
+            self.assertTrue(self.ixia._traffic_preparation_pending)
+            self.assertTrue(self.ixia._deferred_traffic_generation_complete)
+            self.assertFalse(self.ixia._traffic_start_pending)
+
+            self.ixia.start_traffic()
+
+        self.assertEqual(2, self.ixia.regenerate_traffic_items.call_count)
+        self.assertEqual(
+            2,
+            self.ixia.finalize_deferred_traffic_item_replacements.call_count,
+        )
+        base_start.assert_called_once_with(regenerate_traffic_items=False)
+        self.assertFalse(self.ixia._traffic_preparation_pending)
+        self.assertFalse(self.ixia._deferred_traffic_generation_complete)
+        self.assertFalse(self.ixia._traffic_start_pending)
+
+    def test_failed_post_start_stats_wait_does_not_rearm_preparation(self):
+        self.ixia._traffic_preparation_pending = True
+        self.ixia._pending_traffic_regexes = ["^traffic$"]
+        self.ixia.is_traffic_running = MagicMock(side_effect=[False, True, True])
+        self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
+        self.ixia.enable_traffic = MagicMock()
+        self.ixia.wait_for_view_assistants_ready = MagicMock(
+            side_effect=[RuntimeError("statistics unavailable"), None]
+        )
+
+        with patch(
+            "neteng.test_infra.dne.taac.ixia.taac_ixia.Ixia.start_traffic"
+        ) as base_start:
+            with self.assertRaisesRegex(RuntimeError, "statistics unavailable"):
+                self.ixia.start_traffic()
+            self.ixia.start_traffic()
+
+        self.assertEqual(
+            [call(regenerate_traffic_items=False)],
+            base_start.call_args_list,
+        )
+        self.ixia.enable_traffic.assert_called_once_with(
+            ["^traffic$"], apply_changes=False
+        )
+        self.assertEqual(2, self.ixia.wait_for_view_assistants_ready.call_count)
+        self.assertFalse(self.ixia._traffic_preparation_pending)
+        self.assertFalse(self.ixia._traffic_start_pending)
+        self.assertFalse(self.ixia._traffic_view_readiness_pending)
+        self.assertIsNone(self.ixia._pending_traffic_regexes)
+
+    def test_deferred_start_without_running_traffic_raises_and_keeps_start_pending(
+        self,
+    ):
+        self.ixia._traffic_preparation_pending = True
+        self.ixia._pending_traffic_regexes = ["^missing$"]
+        self.ixia.is_traffic_running = MagicMock(side_effect=[False, False])
+        self.ixia.regenerate_traffic_items = MagicMock()
+        self.ixia.finalize_deferred_traffic_item_replacements = MagicMock()
+        self.ixia.enable_traffic = MagicMock()
+        self.ixia.wait_for_view_assistants_ready = MagicMock()
+
+        with patch(
+            "neteng.test_infra.dne.taac.ixia.taac_ixia.Ixia.start_traffic"
+        ) as base_start:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "IXIA traffic did not start after deferred preparation",
+            ):
+                self.ixia.start_traffic()
+
+        base_start.assert_called_once_with(regenerate_traffic_items=False)
+        self.ixia.wait_for_view_assistants_ready.assert_not_called()
+        self.assertTrue(self.ixia._traffic_preparation_pending)
+        self.assertTrue(self.ixia._traffic_start_pending)
+        self.assertFalse(self.ixia._traffic_view_readiness_pending)
+        self.assertEqual(["^missing$"], self.ixia._pending_traffic_regexes)
+
+
+class TrafficRunningStateTest(unittest.TestCase):
+    def setUp(self):
+        self.ixia = _create_taac_ixia()
+
+    def test_started_waiting_for_stats_counts_as_running(self):
+        self.ixia.ixnetwork.Traffic.IsTrafficRunning = False
+        golden = MagicMock(Enabled=True, State="startedWaitingForStats")
+        rogue = MagicMock(Enabled=True, State="startedWaitingForStats")
+        self.ixia.get_traffic_items = MagicMock(return_value=[golden, rogue])
+
+        self.assertTrue(self.ixia.is_traffic_running())
+
+    def test_mixed_started_waiting_and_stopped_is_not_running(self):
+        self.ixia.ixnetwork.Traffic.IsTrafficRunning = False
+        golden = MagicMock(Enabled=True, State="startedWaitingForStats")
+        rogue = MagicMock(Enabled=True, State="stopped")
+        self.ixia.get_traffic_items = MagicMock(return_value=[golden, rogue])
+
+        self.assertFalse(self.ixia.is_traffic_running())
 
 
 class GetOrCreateStatViewTest(unittest.TestCase):
@@ -29,6 +305,98 @@ class GetOrCreateStatViewTest(unittest.TestCase):
 
     def setUp(self):
         self.ixia = _create_taac_ixia()
+
+    def test_latest_stats_lock_timeout_preserves_best_effort_fallback(self):
+        self.ixia.test_case_uuid = "test-case"
+        self.ixia.captured_stats = {"test-case": {}}
+        self.ixia.capturing = False
+        view = MagicMock()
+        view._ViewName = "Traffic Item Statistics"
+        row = MagicMock()
+        row.Columns = ["Loss %", "Frames Delta"]
+        row.__getitem__.side_effect = {
+            "Traffic Item": "traffic",
+            "Loss %": "1.5",
+            "Frames Delta": "3",
+        }.__getitem__
+        view.Rows = [row]
+        self.ixia.traffic_item_view_assistant = view
+        self.ixia.stat_view_snapshot = MagicMock(
+            side_effect=IxiaOperationTimeoutError("snapshot busy")
+        )
+
+        result = self.ixia.get_latest_stats()
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "identifier": "traffic",
+                    "packet_loss_percentage": 1.5,
+                    "frame_delta": 3.0,
+                    "view": "Traffic Item Statistics",
+                }
+            ],
+        )
+        timeout_seconds = self.ixia.stat_view_snapshot.call_args.kwargs[
+            "timeout_seconds"
+        ]
+        self.assertGreater(timeout_seconds, 0)
+        self.assertLessEqual(timeout_seconds, 180)
+        self.ixia.logger.warning.assert_called_once()
+
+    def test_sampler_timeout_falls_back_to_direct_packet_loss_read(self):
+        self.ixia.test_case_uuid = "test-case"
+        self.ixia.captured_stats = {"test-case": {}}
+        self.ixia.capturing = True
+        self.ixia.traffic_item_view_assistant = MagicMock()
+        expected = [{"identifier": "traffic", "packet_loss_duration": 0.0}]
+
+        with patch.object(
+            self.ixia,
+            "_get_packet_loss_statistics_unlocked",
+            return_value=expected,
+        ) as mock_get_loss:
+            result = self.ixia.get_latest_stats(max_timeout_sec=0)
+
+        self.assertEqual(expected, result)
+        mock_get_loss.assert_called_once_with(self.ixia.traffic_item_view_assistant)
+        self.ixia.logger.warning.assert_called_once()
+
+    def test_live_only_mode_does_not_start_thread_between_test_cases(self):
+        self.ixia.sample_time = 0
+        self.ixia.capturing = False
+        self.ixia.paused = False
+        self.ixia._current_playbook_name = None
+        self.ixia.rotate_api_trace_phase = MagicMock()
+        self.ixia.enable_traffic = MagicMock()
+        self.ixia.prepare_traffic = MagicMock()
+        self.ixia.start = MagicMock()
+
+        self.ixia.begin_test_case("first-test")
+        self.ixia.begin_test_case("second-test")
+
+        self.ixia.start.assert_not_called()
+        self.assertEqual("second-test", self.ixia.test_case_uuid)
+
+    def test_packet_loss_freshness_is_scoped_to_test_case(self):
+        self.ixia.test_case_uuid = "current-test"
+        self.ixia.capturing = True
+        stale = [{"identifier": "stale", "packet_loss_duration": 1.0}]
+        expected = [{"identifier": "fresh", "packet_loss_duration": 0.0}]
+        self.ixia.captured_stats = {"current-test": {"latest": stale}}
+        self.ixia._latest_packet_loss_sample_time = {"other-test": 100.0}
+        self.ixia.traffic_item_view_assistant = MagicMock()
+
+        with patch.object(
+            self.ixia,
+            "_get_packet_loss_statistics_unlocked",
+            return_value=expected,
+        ) as mock_get_loss:
+            result = self.ixia.get_latest_stats(max_timeout_sec=0, since_time=50.0)
+
+        self.assertEqual(expected, result)
+        mock_get_loss.assert_called_once_with(self.ixia.traffic_item_view_assistant)
 
     def test_first_call_constructs_assistant(self):
         """First call instantiates StatViewAssistant and caches it."""
@@ -56,6 +424,87 @@ class GetOrCreateStatViewTest(unittest.TestCase):
             self.assertIs(second, third)
             # Constructor called exactly once across three calls.
             self.assertEqual(mock_cls.call_count, 1)
+
+    def test_traffic_item_view_reuses_cached_instance_between_test_cases(self):
+        traffic_item = MagicMock()
+        traffic_item.Enabled = True
+        traffic_item.Tracking.find.return_value.TrackBy.__contains__.return_value = True
+        self.ixia.get_traffic_items = MagicMock(return_value=[traffic_item])
+
+        with patch(
+            "neteng.test_infra.dne.taac.ixia.taac_ixia.IxnStatViewAssistant"
+        ) as mock_cls:
+            mock_cls.return_value = MagicMock(name="traffic_item_view")
+            first = self.ixia._get_traffic_item_view()
+            second = self.ixia._get_traffic_item_view()
+
+        self.assertIs(first, second)
+        mock_cls.assert_called_once_with(
+            self.ixia.ixnetwork,
+            "Traffic Item Statistics",
+            Timeout=60,
+        )
+
+    def test_non_ptp_config_skips_ptp_statistics_view(self):
+        self.ixia.ixia_config = MagicMock(ptp_configs=[])
+        self.ixia._get_traffic_item_view = MagicMock()
+        self.ixia._get_ptp_drill_down_view = MagicMock()
+
+        self.ixia.wait_for_view_assistants_ready()
+
+        self.ixia._get_traffic_item_view.assert_called_once_with()
+        self.ixia._get_ptp_drill_down_view.assert_not_called()
+        self.assertIsNone(self.ixia.ptp_drill_down_view_assistant)
+
+    def test_attached_session_without_ixia_config_skips_ptp_statistics_view(self):
+        self.ixia.ixia_config = None
+        self.ixia._get_traffic_item_view = MagicMock()
+        self.ixia._get_ptp_drill_down_view = MagicMock()
+
+        self.ixia.wait_for_view_assistants_ready()
+
+        self.ixia._get_traffic_item_view.assert_called_once_with()
+        self.ixia._get_ptp_drill_down_view.assert_not_called()
+
+    def test_snapshot_busy_falls_back_to_live_statistics_pages(self):
+        class BusyTrafficView:
+            _ViewName = "Traffic Item Statistics"
+
+            @property
+            def Rows(self):
+                raise RuntimeError(
+                    "Snapshot DefaultSnapshotSettings already in progress"
+                )
+
+        view = BusyTrafficView()
+        view._View = MagicMock()
+        view._View.Caption = view._ViewName
+        view._View.Data.IsReady = True
+        view._View.Data.ColumnCaptions = [
+            "Traffic Item",
+            "Packet Loss Duration (ms)",
+            "Loss %",
+            "Frames Delta",
+        ]
+        view._View.Data.TotalPages = 1
+        view._View.Data.PageValues = [
+            [["TRAFFIC_A", "0", "0", "0"]],
+        ]
+
+        result = self.ixia._get_packet_loss_statistics_unlocked(view)
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "identifier": "TRAFFIC_A",
+                    "view": "Traffic Item Statistics",
+                    "packet_loss_duration": 0.0,
+                    "packet_loss_percentage": 0.0,
+                    "frame_delta": 0.0,
+                }
+            ],
+        )
 
     def test_different_view_names_cached_separately(self):
         """Different view_names produce different cached instances."""
@@ -163,13 +612,8 @@ class GetOrCreateStatViewTest(unittest.TestCase):
         self.assertEqual(construct_count["n"], 1)
         self.assertEqual(len(self.ixia._stat_view_cache), 1)
 
-    def test_concurrent_first_call_distinct_views_run_in_parallel(self):
-        """Construction of two DIFFERENT views happens in parallel, not serial.
-
-        Validates the per-view-name lock fix: a slow construction of view A
-        must NOT block construction of view B. Without per-view locks, both
-        constructions would serialize on the single shared lock.
-        """
+    def test_concurrent_first_call_distinct_views_share_session_lock(self):
+        """Construction of different views serializes on the IXIA session."""
         import time
 
         SLEEP = 0.2
@@ -204,16 +648,14 @@ class GetOrCreateStatViewTest(unittest.TestCase):
                 thread.join()
         # Both constructions occurred.
         self.assertEqual(len(timings), 2)
-        # Overlap check: the second-to-start began BEFORE the first-to-finish ended.
-        # If they ran serially, second.start would be after first.end.
         port_start, port_end = timings["Port Statistics"]
         proto_start, proto_end = timings["Protocols Summary"]
         first_end = min(port_end, proto_end)
         last_start = max(port_start, proto_start)
-        self.assertLess(
+        self.assertGreaterEqual(
             last_start,
             first_end,
-            "Distinct-view constructions must overlap (per-view lock); "
+            "Distinct-view construction must serialize on the session lock; "
             f"port=({port_start:.3f},{port_end:.3f}) "
             f"proto=({proto_start:.3f},{proto_end:.3f})",
         )
@@ -234,3 +676,142 @@ class GetOrCreateStatViewTest(unittest.TestCase):
             mock_cls.assert_called_once_with(
                 self.ixia.ixnetwork, "Port Statistics", Timeout=30
             )
+
+
+class GetLatestTrafficStatsTest(unittest.TestCase):
+    def test_disabled_sampler_uses_direct_snapshot(self):
+        ixia = _create_taac_ixia()
+        ixia.capturing = False
+        ixia.test_case_uuid = "test-case"
+        ixia.captured_stats_traffic = {"test-case": {}}
+        ixia.traffic_item_view_assistant = MagicMock()
+        ixia._snapshot_lock = threading.Lock()
+        expected = [{"identifier": "traffic", "tx_rate": 180}]
+
+        with patch.object(
+            ixia, "_get_traffic_rate_statistics_unlocked", return_value=expected
+        ) as mock_get_rate:
+            result = ixia.get_latest_stats_traffic()
+
+        self.assertEqual(expected, result)
+        mock_get_rate.assert_called_once_with(ixia.traffic_item_view_assistant)
+
+    def test_sampler_timeout_falls_back_to_direct_traffic_rate_read(self):
+        ixia = _create_taac_ixia()
+        ixia.capturing = True
+        ixia.test_case_uuid = "test-case"
+        ixia.captured_stats_traffic = {"test-case": {}}
+        ixia.traffic_item_view_assistant = MagicMock()
+        expected = [{"identifier": "traffic", "Tx Rate": 180.0}]
+
+        with patch.object(
+            ixia, "_get_traffic_rate_statistics_unlocked", return_value=expected
+        ) as mock_get_rate:
+            result = ixia.get_latest_stats_traffic(max_timeout_sec=0)
+
+        self.assertEqual(expected, result)
+        mock_get_rate.assert_called_once_with(ixia.traffic_item_view_assistant)
+        ixia.logger.warning.assert_called_once()
+
+    def test_sampler_lock_timeout_does_not_return_stale_traffic_rate_sample(self):
+        ixia = _create_taac_ixia()
+        ixia.capturing = True
+        ixia.test_case_uuid = "test-case"
+        ixia.captured_stats_traffic = {
+            "test-case": {"latest": [{"identifier": "stale", "Tx Rate": 0.0}]}
+        }
+        ixia.traffic_item_view_assistant = MagicMock()
+        ixia.stat_view_snapshot = MagicMock(
+            side_effect=IxiaOperationTimeoutError("snapshot busy")
+        )
+
+        with (
+            patch.object(
+                ixia, "_get_traffic_rate_statistics_unlocked"
+            ) as mock_get_rate,
+            self.assertRaises(IxiaOperationTimeoutError),
+        ):
+            ixia.get_latest_stats_traffic(max_timeout_sec=0)
+
+        mock_get_rate.assert_not_called()
+
+    def test_traffic_rate_freshness_is_scoped_to_test_case(self):
+        ixia = _create_taac_ixia()
+        ixia.capturing = True
+        ixia.test_case_uuid = "current-test"
+        stale = [{"identifier": "stale", "Tx Rate": 0.0}]
+        expected = [{"identifier": "fresh", "Tx Rate": 180.0}]
+        ixia.captured_stats_traffic = {"current-test": {"latest": stale}}
+        ixia._latest_traffic_rate_sample_time = {"other-test": 100.0}
+        ixia.traffic_item_view_assistant = MagicMock()
+
+        with patch.object(
+            ixia, "_get_traffic_rate_statistics_unlocked", return_value=expected
+        ) as mock_get_rate:
+            result = ixia.get_latest_stats_traffic(max_timeout_sec=0, since_time=50.0)
+
+        self.assertEqual(expected, result)
+        mock_get_rate.assert_called_once_with(ixia.traffic_item_view_assistant)
+
+    def test_direct_traffic_read_requires_initialized_view(self):
+        ixia = _create_taac_ixia()
+        ixia.capturing = False
+        ixia.test_case_uuid = "test-case"
+        ixia.captured_stats_traffic = {"test-case": {}}
+        ixia.traffic_item_view_assistant = None
+
+        with self.assertRaisesRegex(
+            IxiaSetupError,
+            "traffic-item statistics view is not initialized",
+        ):
+            ixia.get_latest_stats_traffic()
+
+    def test_direct_traffic_read_uses_unlocked_fallback_on_lock_timeout(self):
+        ixia = _create_taac_ixia()
+        ixia.capturing = False
+        ixia.test_case_uuid = "test-case"
+        ixia.captured_stats_traffic = {"test-case": {}}
+        ixia.traffic_item_view_assistant = MagicMock()
+        ixia.stat_view_snapshot = MagicMock(
+            side_effect=IxiaOperationTimeoutError("snapshot busy")
+        )
+        expected = [{"identifier": "traffic", "Tx Rate": 180.0}]
+
+        with patch.object(
+            ixia, "_get_traffic_rate_statistics_unlocked", return_value=expected
+        ) as mock_get_rate:
+            result = ixia.get_latest_stats_traffic(max_timeout_sec=7)
+
+        self.assertEqual(expected, result)
+        timeout_seconds = ixia.stat_view_snapshot.call_args.kwargs["timeout_seconds"]
+        self.assertGreater(timeout_seconds, 0)
+        self.assertLessEqual(timeout_seconds, 7)
+        mock_get_rate.assert_called_once_with(ixia.traffic_item_view_assistant)
+        ixia.logger.warning.assert_called_once()
+
+
+class LogBenchmarkRateReportTest(unittest.TestCase):
+    def setUp(self):
+        self.ixia = _create_taac_ixia()
+        self.ixia.capturing = False
+        self.ixia.traffic_item_view_assistant = MagicMock()
+        self.ixia.get_traffic_rate_statistics = MagicMock(
+            return_value=[{"identifier": "snake", "Tx Rate": 2000.0, "Rx Rate": 1000.0}]
+        )
+
+    def _report(self, frame_size_bytes: int) -> str:
+        self.ixia.log_benchmark_rate_report("snake", frame_size_bytes=frame_size_bytes)
+        self.ixia.logger.warning.assert_called_once()
+        return self.ixia.logger.warning.call_args.args[0]
+
+    def test_zero_frame_size_reports_instead_of_raising(self):
+        """Report-only: a misconfigured frame size must not raise ZeroDivisionError."""
+        report = self._report(frame_size_bytes=0)
+        self.assertIn("forwarded 50.0% of offered", report)
+        self.assertIn("~0 Mpps", report)
+
+    def test_pps_is_derived_from_the_frame_size(self):
+        # 1000 Mbps over 2 directions at 1000B frames = 0.0625 Mpps per direction.
+        report = self._report(frame_size_bytes=1000)
+        self.assertIn("forwarded 0.5 Gbps L2", report)
+        self.assertIn("at 1000B frames", report)

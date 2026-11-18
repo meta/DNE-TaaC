@@ -14,6 +14,7 @@ from taac.health_checks.constants import (
 from taac.utils.health_check_utils import (
     async_find_critical_core_dumps,
     format_timestamp,
+    is_fboss_core_dump_from_process,
 )
 from taac.health_check.health_check import types as hc_types
 
@@ -80,6 +81,9 @@ class DeviceCoreDumpsHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCh
             if (
                 start_time < timestamp <= end_time
                 and core_dump not in core_dumps_to_ignore
+                and not is_fboss_core_dump_from_process(
+                    core_dump, check_params.get("core_dump_processes_to_ignore", [])
+                )
             ):
                 new_core_dumps.append(core_dump)
         if new_core_dumps:

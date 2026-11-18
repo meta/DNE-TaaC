@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # pyre-unsafe
+import os
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,7 +22,11 @@ class ConcreteStep(Step):
         pass
 
 
-MODULE = "neteng.test_infra.dne.taac.steps.step"
+MODULE = (
+    "taac.steps.step"
+    if os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+    else "neteng.test_infra.dne.taac.steps.step"
+)
 
 
 class StepEverpasteFallbackTest(unittest.IsolatedAsyncioTestCase):
@@ -40,6 +45,7 @@ class StepEverpasteFallbackTest(unittest.IsolatedAsyncioTestCase):
         self.step_mock = MagicMock(spec=taac_types.Step)
 
         self.logger_mock = MagicMock()
+        self.shared_data = {}
 
         self.step = ConcreteStep(
             name="test_step",
@@ -53,6 +59,10 @@ class StepEverpasteFallbackTest(unittest.IsolatedAsyncioTestCase):
             step=self.step_mock,
             logger=self.logger_mock,
         )
+        self.step.shared_data = self.shared_data
+
+    def test_runner_shared_task_store_is_retained_by_step(self):
+        self.assertIs(self.step.shared_data, self.shared_data)
 
     @patch(f"{MODULE}.log_step_info")
     @patch(f"{MODULE}.async_everpaste_if_needed", new_callable=AsyncMock)
@@ -96,6 +106,21 @@ class StepEverpasteFallbackTest(unittest.IsolatedAsyncioTestCase):
         await self.step._run(taac_types.BaseInput(), {"key": "value"})
 
         self.step.setUp.assert_awaited_once()
+        self.step.run.assert_awaited_once()
+
+    @patch(f"{MODULE}.log_step_info")
+    @patch(f"{MODULE}.async_everpaste_if_needed", new_callable=AsyncMock)
+    async def test_run_can_leave_ixia_traffic_stopped(
+        self, mock_everpaste, mock_log_step
+    ):
+        mock_everpaste.return_value = "input logged"
+        self.step.ixia = MagicMock()
+        self.step.setUp = AsyncMock()
+        self.step.run = AsyncMock()
+
+        await self.step._run(taac_types.BaseInput(), {"skip_start_traffic": True})
+
+        self.step.ixia.start_traffic.assert_not_called()
         self.step.run.assert_awaited_once()
 
     @patch(f"{MODULE}.async_write_test_result", new_callable=AsyncMock)

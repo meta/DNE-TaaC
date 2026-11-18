@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
 import json
-import os
+import logging
 import typing as t
 
 from taac.constants import OS_TO_DEVICE_OS_TYPE_MAP
@@ -10,16 +10,39 @@ from taac.utils.oss_taac_lib_utils import (
     async_memoize_timed,
     ConsoleFileLogger,
     get_root_logger,
+    TAAC_OSS,
+    TAAC_OSS_META_INTERNAL,
 )
 from taac.test_as_a_config import types as taac_types
 
 LOGGER: ConsoleFileLogger = get_root_logger()
-TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
-# Meta-internal drivers — only importable outside OSS mode. In OSS, the
-# map is pre-populated with FbossSwitch (the OSS-shipped driver) for
-# DeviceOsType.FBOSS; users can register additional driver classes for
-# other OS types via register_driver_class().
+# Escape hatch for validating the OSS stack from INSIDE Meta.
+#
+# `TAAC_OSS=1` selects the OSS device driver, which authenticates with a plain
+# SSH key/password and speaks plaintext thrift. Meta lab devices use CoreSSH;
+# most also require secure thrift. This compatibility mode is limited to an
+# explicitly authorized snake DUT with a verified clear-thrift endpoint.
+#
+# With TAAC_OSS_META_INTERNAL=1 every OSS code path stays active — CSV topology,
+# oss_entry_point, the `taac.*` import layout, IXIA setup, and the exported
+# driver. Meta-only SSH and IXIA credential access are delegated to the narrow
+# host-side bridge.
+#
+# This mode validates the OSS runner and surrounding stack, not the exported
+# device transport. Validate that transport against non-Meta hardware.
+#
+# TAAC_OSS and TAAC_OSS_META_INTERNAL are parsed once, in oss_taac_lib_utils,
+# so the driver's agent restart gate (oss_agent_restart_paths_enabled) reads
+# the same values; the driver cannot import them from here without a cycle.
+if TAAC_OSS and TAAC_OSS_META_INTERNAL:
+    LOGGER.warning(
+        "TAAC_OSS_META_INTERNAL=1: running the OSS stack with the exported "
+        "device driver. Shell commands use the authenticated host bridge."
+    )
+
+# Keep this literal condition: the OSS compliance checker recognizes this as
+# the guard for the internal imports below.
 if not TAAC_OSS:
     from taac.internal.driver.arista_fboss_switch import (
         AristaFbossSwitch,
@@ -51,6 +74,11 @@ else:
 HOST_TO_DEVICE_OS_TYPE_MAP = {}
 HOST_TO_DRIVER_ARGS_MAP = {}
 
+DriverBootstrapPayload = t.Tuple[
+    t.Dict[str, taac_types.DeviceOsType],
+    t.Dict[str, t.Any],
+]
+
 
 def add_host_to_device_os_type_data(
     hostname: str, device_os_type: taac_types.DeviceOsType
@@ -62,6 +90,32 @@ def add_host_to_driver_args_data(
     hostname: str, driver_args: t.Dict[str, t.Any]
 ) -> None:
     HOST_TO_DRIVER_ARGS_MAP[hostname] = driver_args
+
+
+def capture_driver_bootstrap_data() -> DriverBootstrapPayload:
+    return (
+        dict(HOST_TO_DEVICE_OS_TYPE_MAP),
+        dict(HOST_TO_DRIVER_ARGS_MAP),
+    )
+
+
+def install_driver_bootstrap_data(
+    payload: DriverBootstrapPayload,
+    logger: logging.Logger,
+) -> None:
+    host_os_type_map, host_driver_args = payload
+    HOST_TO_DEVICE_OS_TYPE_MAP.update(host_os_type_map)
+    HOST_TO_DRIVER_ARGS_MAP.update(host_driver_args)
+    for hostname, device_os_type in host_os_type_map.items():
+        driver_class = DEVICE_OS_DRIVER_CLASS_MAP.get(device_os_type)
+        driver_class_name = driver_class.__name__ if driver_class is not None else None
+        logger.info(
+            "Installed periodic-worker driver bootstrap: "
+            f"hostname={hostname} classification_source=test_config.host_os_type_map "
+            f"device_os_type={device_os_type.name} "
+            f"selected_driver_class={driver_class_name} "
+            f"driver_args_present={hostname in host_driver_args}"
+        )
 
 
 def register_driver_class(

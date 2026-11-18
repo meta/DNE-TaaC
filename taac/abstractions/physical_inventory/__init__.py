@@ -2,6 +2,10 @@
 # pyre-strict
 """DICE physical inventory model and concrete testbed inventories."""
 
+from taac.abstractions.physical_interface_semantics import (
+    PhysicalInterfaceProfile,
+    PhysicalLinkRate,
+)
 from taac.abstractions.physical_inventory.physical_inventory import (
     PhysicalInventory,
     VALID_USAGES,
@@ -23,24 +27,21 @@ from taac.abstractions.physical_inventory.routing_dcn_testbed import (
 )
 from taac.abstractions.physical_inventory.routing_ebb_testbed import (
     BAG002_SNC1,
-    BAG010_ASH6,
-    BAG011_ASH6,
-    BAG012_ASH6,
-    BAG013_ASH6,
     EB01_LAB_ASH6,
     EB02_LAB_ASH6,
     EB03_LAB_ASH6,
     EB04_LAB_ASH6,
     EB_TEST_DEVICE,
     JSW002_M001_SNC1,
+    NRQEB006_ASH6,
+    NRQEB007_ASH6,
+    NRQEB008_ASH6,
+    NRQEB009_ASH6,
+    NRQEB010_ASH6,
 )
 
 __all__ = (
     "BAG002_SNC1",
-    "BAG010_ASH6",
-    "BAG011_ASH6",
-    "BAG012_ASH6",
-    "BAG013_ASH6",
     "CTE_UCMP_QZD_PHYSICAL_INVENTORY",
     "CTE_UCMP_STAND_ALONE_PHYSICAL_INVENTORY",
     "EB_TEST_DEVICE",
@@ -55,7 +56,14 @@ __all__ = (
     "FSW_QZB",
     "FSW001_QZB",
     "JSW002_M001_SNC1",
+    "NRQEB006_ASH6",
+    "NRQEB007_ASH6",
+    "NRQEB008_ASH6",
+    "NRQEB009_ASH6",
+    "NRQEB010_ASH6",
     "PhysicalInventory",
+    "PhysicalInterfaceProfile",
+    "PhysicalLinkRate",
     "QZD_FSW002",
     "QZD_LAB",
     "SSW_ELBERT_QZD1",

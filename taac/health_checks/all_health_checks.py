@@ -38,6 +38,9 @@ from taac.health_checks.device_health_checks.bgp_peer_route_set_equality_health_
 from taac.health_checks.device_health_checks.bgp_received_route_community_health_check import (
     BgpReceivedRouteCommunityHealthCheck,
 )
+from taac.health_checks.device_health_checks.bgp_rib_fib_consistency_health_check import (
+    BgpRibFibConsistencyHealthCheck,
+)
 from taac.health_checks.device_health_checks.bgp_route_count_verification_health_check import (
     BgpRouteCountVerificationHealthCheck,
 )
@@ -80,6 +83,9 @@ from taac.health_checks.device_health_checks.file_exists_health_check import (
 from taac.health_checks.device_health_checks.hardware_capacity_health_check import (
     HardwareCapacityHealthCheck,
 )
+from taac.health_checks.device_health_checks.in_congestion_discard_health_check import (
+    InCongestionDiscardHealthCheck,
+)
 from taac.health_checks.device_health_checks.l2_entry_threshold_health_check import (
     L2EntryThresholdHealthCheck,
 )
@@ -103,6 +109,9 @@ from taac.health_checks.device_health_checks.openr_fib_validate_health_check imp
 )
 from taac.health_checks.device_health_checks.openr_initialized_health_check import (
     OpenrInitializedHealthCheck,
+)
+from taac.health_checks.device_health_checks.openr_kvstore_keys_health_check import (
+    OpenrKvstoreKeysHealthCheck,
 )
 from taac.health_checks.device_health_checks.openr_overload_state_health_check import (
     OpenrOverloadStateHealthCheck,
@@ -130,6 +139,9 @@ from taac.health_checks.device_health_checks.port_speed_health_check import (
 )
 from taac.health_checks.device_health_checks.port_state_health_check import (
     PortStateHealthCheck,
+)
+from taac.health_checks.device_health_checks.prefix_limit_health_check import (
+    PrefixLimitHealthCheck,
 )
 from taac.health_checks.device_health_checks.route_convergence_time_health_check import (
     RouteConvergenceTimeHealthCheck,
@@ -230,6 +242,8 @@ OSS_HEALTH_CHECKS: t.List[HealthCheck] = [
     # DsfPfcHealthCheck,  # neteng.test_infra.dne.taac dep, excluded in OSS
     CoreDumpsHealthCheck,
     PortStateHealthCheck,
+    PrefixLimitHealthCheck,
+    BgpRibFibConsistencyHealthCheck,
     LldpHealthCheck,
     IxiaTrafficRateHealthCheck,
     PfcWdHealthCheck,
@@ -282,10 +296,12 @@ OSS_HEALTH_CHECKS: t.List[HealthCheck] = [
     OpenrFibValidateHealthCheck,
     OpenrOverloadStateHealthCheck,
     OpenrKvstoreConsistencyHealthCheck,
+    OpenrKvstoreKeysHealthCheck,
     AristaFbossNextHopValidityHealthCheck,
     PortChannelExpectedStateHealthCheck,
     # TmReconciliationFiringHealthCheck,  # ODS-dependent (taac.internal), excluded in OSS
     TmKernelStateSnapshotHealthCheck,
+    InCongestionDiscardHealthCheck,
 ]
 
 if not TAAC_OSS:

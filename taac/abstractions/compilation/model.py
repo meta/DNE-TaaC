@@ -3,10 +3,29 @@
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from enum import Enum
 
-from taac.abstractions.ixia_semantics import IxiaBgpCapability
+from taac.abstractions.component_semantics import (
+    ComponentDesiredState,
+    ComponentReadinessRequirement,
+    ComponentReconcileMode,
+    ComponentRole,
+)
+from taac.abstractions.config_artifact_semantics import (
+    ConfigArtifactRef,
+)
+from taac.abstractions.ixia_semantics import (
+    IxiaBgpCapability,
+    IxiaEndpointPortLabelStyle,
+    validate_ixia_bgp_tcp_window_size_bytes,
+    validate_ixia_peer_prefix_exclusion_ranges,
+)
+from taac.abstractions.physical_interface_semantics import (
+    PhysicalInterfaceGroupKind,
+    PhysicalInterfaceProfile,
+)
 from taac.abstractions.routing_semantics import (
     NetworkRole,
     PeerRelationship,
@@ -16,6 +35,7 @@ from taac.abstractions.routing_semantics import (
 class ResourceKind(str, Enum):
     ENDPOINT = "endpoint"
     LINK = "link"
+    PHYSICAL_INTERFACE = "physical_interface"
     INTERFACE = "interface"
     BGP_ADJACENCY = "bgp_adjacency"
     POLICY = "policy"
@@ -26,6 +46,7 @@ class ResourceKind(str, Enum):
     IXIA_DEVICE_GROUP = "ixia_device_group"
     IXIA_BGP_SESSION = "ixia_bgp_session"
     IXIA_ADVERTISEMENT = "ixia_advertisement"
+    IXIA_TRAFFIC_FLOW = "ixia_traffic_flow"
     OPENR = "openr"
 
 
@@ -54,6 +75,11 @@ class PolicyDirection(str, Enum):
 class IxiaPeerPrefixDistribution(str, Enum):
     SHARED = "shared"
     DISJOINT = "disjoint"
+
+
+class IxiaRouteScaleMode(str, Enum):
+    WINDOWED = "windowed"
+    FLAT = "flat"
 
 
 class IxiaNextHopMode(str, Enum):
@@ -184,6 +210,7 @@ class IxiaPrefixWindowPlan:
     prefixes_per_peer: int
     peer_distribution: IxiaPeerPrefixDistribution
     network_group_index: int
+    route_scale_mode: IxiaRouteScaleMode = IxiaRouteScaleMode.WINDOWED
 
     def __post_init__(self) -> None:
         if not self.source_start or not self.starting_prefix:
@@ -197,6 +224,8 @@ class IxiaPrefixWindowPlan:
         _require_non_negative(self.network_group_index, "network_group_index")
         if not isinstance(self.peer_distribution, IxiaPeerPrefixDistribution):
             raise TypeError("peer distribution must be an IxiaPeerPrefixDistribution")
+        if not isinstance(self.route_scale_mode, IxiaRouteScaleMode):
+            raise TypeError("route-scale mode must be an IxiaRouteScaleMode")
         if (
             self.membership_start_index + self.membership_prefix_count
             > self.source_count
@@ -294,6 +323,43 @@ class DutLinkPlan:
 
 
 @dataclass(frozen=True)
+class PhysicalInterfacePlan:
+    resource_id: ResourceId
+    endpoint_id: ResourceId
+    group_kind: PhysicalInterfaceGroupKind
+    logical_key: str
+    link_ids: tuple[ResourceId, ...]
+    bound_interface: str
+    profile: PhysicalInterfaceProfile
+
+    def __post_init__(self) -> None:
+        _require_kind(self.resource_id, ResourceKind.PHYSICAL_INTERFACE)
+        _require_kind(self.endpoint_id, ResourceKind.ENDPOINT)
+        if not isinstance(self.group_kind, PhysicalInterfaceGroupKind):
+            raise TypeError("physical interface group kind must be typed")
+        if not isinstance(self.logical_key, str) or not self.logical_key:
+            raise ValueError("physical interface logical key must be nonempty")
+        expected_path = (
+            *self.endpoint_id.path,
+            self.group_kind.value,
+            self.logical_key,
+        )
+        if self.resource_id.path != expected_path:
+            raise ValueError(
+                "physical interface resource ID must derive from endpoint and group"
+            )
+        if not isinstance(self.link_ids, tuple) or not self.link_ids:
+            raise ValueError("physical interface link IDs must be a nonempty tuple")
+        _require_kinds(self.link_ids, ResourceKind.LINK)
+        if len(frozenset(self.link_ids)) != len(self.link_ids):
+            raise ValueError("physical interface link IDs must be unique")
+        if not isinstance(self.bound_interface, str) or not self.bound_interface:
+            raise ValueError("physical interface binding must be nonempty")
+        if not isinstance(self.profile, PhysicalInterfaceProfile):
+            raise TypeError("physical interface profile must be typed")
+
+
+@dataclass(frozen=True)
 class InterfacePlan:
     resource_id: ResourceId
     endpoint_id: ResourceId
@@ -302,11 +368,29 @@ class InterfacePlan:
     afi: AddressFamily
     addresses: tuple[str, ...] = ()
     bound_interface: str | None = None
+    physical_interface_id: ResourceId | None = None
 
     def __post_init__(self) -> None:
         _require_kind(self.resource_id, ResourceKind.INTERFACE)
         _require_kind(self.endpoint_id, ResourceKind.ENDPOINT)
         _require_kinds(self.link_ids, ResourceKind.LINK)
+        if not isinstance(self.addresses, tuple) or any(
+            not isinstance(address, str) for address in self.addresses
+        ):
+            raise TypeError("interface addresses must be strings in a tuple")
+        if len(frozenset(self.addresses)) != len(self.addresses):
+            raise ValueError("interface addresses must be unique")
+        for address in self.addresses:
+            parsed = ipaddress.ip_interface(address)
+            if str(parsed) != address:
+                raise ValueError(
+                    f"interface address {address!r} must be a canonical CIDR"
+                )
+        if self.physical_interface_id is not None:
+            _require_kind(
+                self.physical_interface_id,
+                ResourceKind.PHYSICAL_INTERFACE,
+            )
 
 
 @dataclass(frozen=True)
@@ -356,25 +440,79 @@ class RoutingConfigPlan:
     resource_id: ResourceId
     endpoint_id: ResourceId
     routing_driver: str
+    source: ConfigArtifactRef | None = None
     required_features: tuple[str, ...] = ()
+    variant: None = None
 
     def __post_init__(self) -> None:
         _require_kind(self.resource_id, ResourceKind.ROUTING_CONFIG)
         _require_kind(self.endpoint_id, ResourceKind.ENDPOINT)
+        if not isinstance(self.routing_driver, str):
+            raise TypeError("routing config driver must be a string")
+        if not self.routing_driver:
+            raise ValueError("routing config driver must be nonempty")
+        if self.source is not None and not isinstance(self.source, ConfigArtifactRef):
+            raise TypeError("routing config source must be typed")
+        if not isinstance(self.required_features, tuple) or any(
+            not isinstance(feature, str) for feature in self.required_features
+        ):
+            raise TypeError(
+                "routing config required features must be strings in a tuple"
+            )
+        if any(not feature for feature in self.required_features):
+            raise ValueError("routing config required features must be nonempty")
+        if len(frozenset(self.required_features)) != len(self.required_features):
+            raise ValueError("routing config required features must be unique")
+        if self.variant is not None:
+            raise ValueError("routing config variants are not implemented")
 
 
 @dataclass(frozen=True)
 class ComponentPlan:
+    """Common prerequisites, not a backend daemon or OpenR lifecycle DAG."""
+
     resource_id: ResourceId
     endpoint_id: ResourceId
-    role: str
-    enabled: bool = True
+    role: ComponentRole
+    desired_state: ComponentDesiredState
+    reconcile_mode: ComponentReconcileMode
+    readiness: ComponentReadinessRequirement
     depends_on: tuple[ResourceId, ...] = ()
 
     def __post_init__(self) -> None:
         _require_kind(self.resource_id, ResourceKind.COMPONENT)
         _require_kind(self.endpoint_id, ResourceKind.ENDPOINT)
-        _require_kinds(self.depends_on, ResourceKind.COMPONENT)
+        if not isinstance(self.role, ComponentRole):
+            raise TypeError("component role must be typed")
+        if self.resource_id.path != (*self.endpoint_id.path, self.role.value):
+            raise ValueError("component resource ID must derive from endpoint and role")
+        if not isinstance(self.desired_state, ComponentDesiredState):
+            raise TypeError("component desired state must be typed")
+        if not isinstance(self.reconcile_mode, ComponentReconcileMode):
+            raise TypeError("component reconcile mode must be typed")
+        if not isinstance(self.readiness, ComponentReadinessRequirement):
+            raise TypeError("component readiness requirement must be typed")
+        if self.desired_state is ComponentDesiredState.STOPPED and (
+            self.reconcile_mode is not ComponentReconcileMode.NONE
+            or self.readiness is not ComponentReadinessRequirement.NONE
+        ):
+            raise ValueError(
+                "stopped component cannot request reconciliation or readiness"
+            )
+        if not isinstance(self.depends_on, tuple):
+            raise TypeError("component dependencies must be a tuple")
+        if len(frozenset(self.depends_on)) != len(self.depends_on):
+            raise ValueError("component dependencies must be unique")
+        for dependency in self.depends_on:
+            if dependency.kind not in {
+                ResourceKind.COMPONENT,
+                ResourceKind.ROUTING_CONFIG,
+            }:
+                raise ValueError(
+                    "component dependencies must target components or routing configs"
+                )
+            if dependency == self.resource_id:
+                raise ValueError("component cannot depend on itself")
 
 
 @dataclass(frozen=True)
@@ -389,6 +527,7 @@ class IxiaPortPlan:
     dut_interface: str
     ixia_port: str
     physical_inventory_index: int
+    endpoint_label_style: IxiaEndpointPortLabelStyle
     reuse_group: str | None = None
 
     def __post_init__(self) -> None:
@@ -398,6 +537,8 @@ class IxiaPortPlan:
         _require_kind(self.traffic_endpoint_id, ResourceKind.ENDPOINT)
         if not self.dut_physical_identifier or not self.chassis_identifier:
             raise ValueError("IXIA port endpoint identifiers must be nonempty")
+        if not isinstance(self.endpoint_label_style, IxiaEndpointPortLabelStyle):
+            raise TypeError("IXIA endpoint label style must be typed")
         _require_non_negative(
             self.physical_inventory_index,
             "physical_inventory_index",
@@ -441,6 +582,7 @@ class IxiaBgpSessionPlan:
     hold_timer_s: int
     keepalive_timer_s: int
     enable_graceful_restart: bool
+    tcp_window_size_bytes: int | None = None
 
     def __post_init__(self) -> None:
         _require_kind(self.resource_id, ResourceKind.IXIA_BGP_SESSION)
@@ -474,6 +616,40 @@ class IxiaBgpSessionPlan:
         _require_positive(self.keepalive_timer_s, "keepalive_timer_s")
         if not isinstance(self.enable_graceful_restart, bool):
             raise TypeError("IXIA graceful-restart intent must be a bool")
+        if self.tcp_window_size_bytes is not None:
+            validate_ixia_bgp_tcp_window_size_bytes(self.tcp_window_size_bytes)
+
+
+@dataclass(frozen=True)
+class IxiaPeerPrefixExclusionBlock:
+    prefix_start_index: int
+    prefix_count: int
+    peer_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.prefix_start_index, bool) or not isinstance(
+            self.prefix_start_index, int
+        ):
+            raise TypeError("IXIA exclusion prefix_start_index must be an integer")
+        if isinstance(self.prefix_count, bool) or not isinstance(
+            self.prefix_count, int
+        ):
+            raise TypeError("IXIA exclusion prefix_count must be an integer")
+        _require_non_negative(self.prefix_start_index, "prefix_start_index")
+        _require_positive(self.prefix_count, "prefix_count")
+        if not self.peer_indices:
+            raise ValueError("IXIA peer-prefix exclusion block requires peers")
+        if any(
+            isinstance(peer_index, bool) or not isinstance(peer_index, int)
+            for peer_index in self.peer_indices
+        ):
+            raise TypeError("IXIA exclusion peer indices must be integers")
+        if tuple(sorted(set(self.peer_indices))) != self.peer_indices:
+            raise ValueError(
+                "IXIA peer-prefix exclusion peers must be sorted and unique"
+            )
+        for peer_index in self.peer_indices:
+            _require_non_negative(peer_index, "peer_index")
 
 
 @dataclass(frozen=True)
@@ -489,6 +665,8 @@ class IxiaAdvertisementPlan:
     attributes: tuple[tuple[str, IxiaAttributeValue], ...] = ()
     route_attributes: IxiaRouteAttributePoolPlan | None = None
     policy_communities: tuple[str, ...] = ()
+    requires_route_mutation: bool = False
+    peer_prefix_exclusion_blocks: tuple[IxiaPeerPrefixExclusionBlock, ...] = ()
 
     def __post_init__(self) -> None:
         _require_kind(self.resource_id, ResourceKind.IXIA_ADVERTISEMENT)
@@ -498,6 +676,25 @@ class IxiaAdvertisementPlan:
             raise ValueError("IXIA advertisement attribute names must be nonempty")
         if any(not community for community in self.policy_communities):
             raise ValueError("IXIA policy communities must be nonempty")
+        if not isinstance(self.requires_route_mutation, bool):
+            raise TypeError("IXIA route-mutation intent must be a bool")
+        blocks = self.peer_prefix_exclusion_blocks
+        if not isinstance(blocks, tuple) or any(
+            not isinstance(block, IxiaPeerPrefixExclusionBlock) for block in blocks
+        ):
+            raise TypeError("IXIA peer-prefix exclusion blocks must be typed")
+        if blocks and (
+            self.prefix_window.peer_distribution
+            is not IxiaPeerPrefixDistribution.SHARED
+            or self.prefix_window.route_scale_mode is not IxiaRouteScaleMode.FLAT
+        ):
+            raise ValueError(
+                "IXIA peer-prefix exclusion requires flat shared route geometry"
+            )
+        validate_ixia_peer_prefix_exclusion_ranges(
+            tuple((block.prefix_start_index, block.prefix_count) for block in blocks),
+            prefixes_per_peer=self.prefix_window.prefixes_per_peer,
+        )
 
     @property
     def prefixes_per_peer(self) -> int:
@@ -506,6 +703,59 @@ class IxiaAdvertisementPlan:
     @property
     def prefix_length(self) -> int:
         return self.prefix_window.prefix_length
+
+
+@dataclass(frozen=True)
+class IxiaTrafficFlowPlan:
+    resource_id: ResourceId
+    logical_name: str
+    source_device_group_id: ResourceId
+    destination_advertisement_id: ResourceId
+    afi: AddressFamily
+    traffic_profile: str | None = None
+    rate_percent: float | None = None
+    rate_bps: int | None = None
+    frame_size_bytes: int | None = None
+    bidirectional: bool = False
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        _require_kind(self.resource_id, ResourceKind.IXIA_TRAFFIC_FLOW)
+        _require_kind(
+            self.source_device_group_id,
+            ResourceKind.IXIA_DEVICE_GROUP,
+        )
+        _require_kind(
+            self.destination_advertisement_id,
+            ResourceKind.IXIA_ADVERTISEMENT,
+        )
+        if not self.logical_name:
+            raise ValueError("IXIA traffic-flow logical name must be nonempty")
+        if not isinstance(self.afi, AddressFamily):
+            raise TypeError("IXIA traffic-flow address family must be typed")
+        if self.traffic_profile is not None and not self.traffic_profile:
+            raise ValueError("IXIA traffic-flow profile must be nonempty")
+        if self.rate_percent is not None and (
+            isinstance(self.rate_percent, bool)
+            or not isinstance(self.rate_percent, (int, float))
+        ):
+            raise TypeError("IXIA traffic-flow rate percent must be numeric")
+        if self.rate_bps is not None and (
+            isinstance(self.rate_bps, bool) or not isinstance(self.rate_bps, int)
+        ):
+            raise TypeError("IXIA traffic-flow bit rate must be an integer")
+        if self.frame_size_bytes is not None and (
+            isinstance(self.frame_size_bytes, bool)
+            or not isinstance(self.frame_size_bytes, int)
+        ):
+            raise TypeError("IXIA traffic-flow frame size must be an integer")
+        if self.rate_percent is not None and self.rate_bps is not None:
+            raise ValueError("IXIA traffic flow cannot set both rate units")
+        if not isinstance(self.bidirectional, bool) or not isinstance(
+            self.enabled,
+            bool,
+        ):
+            raise TypeError("IXIA traffic-flow flags must be bools")
 
 
 @dataclass(frozen=True)
@@ -525,6 +775,7 @@ class OpenRPlan:
 ResourcePlan = (
     EndpointPlan
     | DutLinkPlan
+    | PhysicalInterfacePlan
     | InterfacePlan
     | BgpAdjacencyPlan
     | PolicyPlan
@@ -535,6 +786,7 @@ ResourcePlan = (
     | IxiaDeviceGroupPlan
     | IxiaBgpSessionPlan
     | IxiaAdvertisementPlan
+    | IxiaTrafficFlowPlan
     | OpenRPlan
 )
 
@@ -543,6 +795,7 @@ ResourcePlan = (
 class DutPlan:
     endpoints: tuple[EndpointPlan, ...] = ()
     links: tuple[DutLinkPlan, ...] = ()
+    physical_interfaces: tuple[PhysicalInterfacePlan, ...] = ()
     interfaces: tuple[InterfacePlan, ...] = ()
     adjacencies: tuple[BgpAdjacencyPlan, ...] = ()
     policies: tuple[PolicyPlan, ...] = ()
@@ -551,10 +804,16 @@ class DutPlan:
     components: tuple[ComponentPlan, ...] = ()
     openr: tuple[OpenRPlan, ...] = ()
 
+    def __post_init__(self) -> None:
+        _validate_unique_resource_ids(self.iter_resources())
+        _validate_physical_interface_references(self)
+        _validate_component_references(self)
+
     def iter_resources(self) -> tuple[ResourcePlan, ...]:
         return (
             *self.endpoints,
             *self.links,
+            *self.physical_interfaces,
             *self.interfaces,
             *self.adjacencies,
             *self.policies,
@@ -571,6 +830,7 @@ class IxiaPlan:
     device_groups: tuple[IxiaDeviceGroupPlan, ...] = ()
     bgp_sessions: tuple[IxiaBgpSessionPlan, ...] = ()
     advertisements: tuple[IxiaAdvertisementPlan, ...] = ()
+    traffic_flows: tuple[IxiaTrafficFlowPlan, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_unique_resource_ids(self.iter_resources())
@@ -582,6 +842,7 @@ class IxiaPlan:
             *self.device_groups,
             *self.bgp_sessions,
             *self.advertisements,
+            *self.traffic_flows,
         )
 
     def iter_resource_ids(self) -> tuple[ResourceId, ...]:
@@ -642,12 +903,247 @@ def _validate_unique_resource_ids(resources: tuple[ResourcePlan, ...]) -> None:
         raise ValueError(f"duplicate compilation resource IDs: {rendered}")
 
 
+def _validate_component_references(plan: DutPlan) -> None:
+    dependencies = {
+        resource.resource_id: resource
+        for resource in (*plan.routing_configs, *plan.components)
+    }
+    for component in plan.components:
+        for dependency_id in component.depends_on:
+            dependency = dependencies.get(dependency_id)
+            if dependency is None:
+                raise ValueError(
+                    f"component {component.resource_id} references unknown "
+                    f"dependency {dependency_id}"
+                )
+            if dependency.endpoint_id != component.endpoint_id:
+                raise ValueError(
+                    f"component {component.resource_id} dependency {dependency_id} "
+                    "targets a different endpoint"
+                )
+
+
+def _validate_physical_interface_references(plan: DutPlan) -> None:
+    endpoints = {endpoint.resource_id: endpoint for endpoint in plan.endpoints}
+    links = {link.resource_id: link for link in plan.links}
+    physical_interfaces = {
+        interface.resource_id: interface for interface in plan.physical_interfaces
+    }
+    _validate_physical_interface_owners(
+        plan.physical_interfaces,
+        endpoints,
+        links,
+    )
+    members = _physical_interface_members(
+        plan.interfaces,
+        physical_interfaces,
+        endpoints,
+        links,
+    )
+    _validate_physical_interface_membership(physical_interfaces, members)
+
+
+def _validate_physical_interface_owners(
+    physical_interfaces: tuple[PhysicalInterfacePlan, ...],
+    endpoints: dict[ResourceId, EndpointPlan],
+    links: dict[ResourceId, DutLinkPlan],
+) -> None:
+    connection_owners: dict[tuple[ResourceId, str], ResourceId] = {}
+    link_owners: dict[tuple[ResourceId, ResourceId], ResourceId] = {}
+    for physical_interface in physical_interfaces:
+        if physical_interface.endpoint_id not in endpoints:
+            raise ValueError(
+                f"physical interface {physical_interface.resource_id} references "
+                f"unknown endpoint {physical_interface.endpoint_id}"
+            )
+        _claim_physical_links(physical_interface, links, link_owners)
+        connection = (
+            physical_interface.endpoint_id,
+            physical_interface.bound_interface,
+        )
+        prior_owner = connection_owners.get(connection)
+        if prior_owner is not None:
+            raise ValueError(
+                f"physical connection {connection!r} has multiple owners: "
+                f"{prior_owner}, {physical_interface.resource_id}"
+            )
+        connection_owners[connection] = physical_interface.resource_id
+
+
+def _claim_physical_links(
+    physical_interface: PhysicalInterfacePlan,
+    links: dict[ResourceId, DutLinkPlan],
+    owners: dict[tuple[ResourceId, ResourceId], ResourceId],
+) -> None:
+    for link_id in physical_interface.link_ids:
+        link = links.get(link_id)
+        if link is None:
+            raise ValueError(
+                f"physical interface {physical_interface.resource_id} references "
+                f"unknown link {link_id}"
+            )
+        if physical_interface.endpoint_id not in {
+            link.a_endpoint_id,
+            link.z_endpoint_id,
+        }:
+            raise ValueError(
+                f"physical interface {physical_interface.resource_id} link "
+                f"{link_id} targets a different endpoint"
+            )
+        owner_key = (physical_interface.endpoint_id, link_id)
+        prior_owner = owners.get(owner_key)
+        if prior_owner is not None:
+            raise ValueError(
+                f"link {link_id} has multiple physical owners at "
+                f"{physical_interface.endpoint_id}: {prior_owner}, "
+                f"{physical_interface.resource_id}"
+            )
+        owners[owner_key] = physical_interface.resource_id
+
+
+def _physical_interface_members(
+    interfaces: tuple[InterfacePlan, ...],
+    physical_interfaces: dict[ResourceId, PhysicalInterfacePlan],
+    endpoints: dict[ResourceId, EndpointPlan],
+    links: dict[ResourceId, DutLinkPlan],
+) -> dict[ResourceId, list[InterfacePlan]]:
+    members: dict[ResourceId, list[InterfacePlan]] = {
+        resource_id: [] for resource_id in physical_interfaces
+    }
+    for interface in interfaces:
+        _validate_logical_interface_links(interface, endpoints, links)
+        physical_id = interface.physical_interface_id
+        if interface.bound_interface is None:
+            if physical_id is not None:
+                raise ValueError(
+                    f"unbound interface {interface.resource_id} references "
+                    f"physical interface {physical_id}"
+                )
+            continue
+        if physical_id is None:
+            raise ValueError(
+                f"bound interface {interface.resource_id} has no physical interface"
+            )
+        physical_interface = physical_interfaces.get(physical_id)
+        if physical_interface is None:
+            raise ValueError(
+                f"interface {interface.resource_id} references unknown physical "
+                f"interface {physical_id}"
+            )
+        _validate_logical_physical_interface(
+            interface,
+            physical_interface,
+        )
+        members[physical_id].append(interface)
+    return members
+
+
+def _validate_logical_interface_links(
+    interface: InterfacePlan,
+    endpoints: dict[ResourceId, EndpointPlan],
+    links: dict[ResourceId, DutLinkPlan],
+) -> None:
+    if interface.endpoint_id not in endpoints:
+        raise ValueError(
+            f"interface {interface.resource_id} references unknown endpoint "
+            f"{interface.endpoint_id}"
+        )
+    for link_id in interface.link_ids:
+        link = links.get(link_id)
+        if link is None:
+            raise ValueError(
+                f"interface {interface.resource_id} references unknown link {link_id}"
+            )
+        if interface.endpoint_id not in {link.a_endpoint_id, link.z_endpoint_id}:
+            raise ValueError(
+                f"interface {interface.resource_id} link {link_id} targets a "
+                "different endpoint"
+            )
+        if interface.logical_port_role != link.logical_port_role:
+            raise ValueError(
+                f"interface {interface.resource_id} logical role does not match "
+                f"link {link_id}"
+            )
+        if interface.afi is not link.afi:
+            raise ValueError(
+                f"interface {interface.resource_id} AFI does not match link {link_id}"
+            )
+    expected_version = 4 if interface.afi is AddressFamily.IPV4 else 6
+    for address in interface.addresses:
+        if ipaddress.ip_interface(address).version != expected_version:
+            raise ValueError(
+                f"interface address {address!r} does not match {interface.afi.value}"
+            )
+
+
+def _validate_logical_physical_interface(
+    interface: InterfacePlan,
+    physical_interface: PhysicalInterfacePlan,
+) -> None:
+    if interface.endpoint_id != physical_interface.endpoint_id:
+        raise ValueError(
+            f"interface {interface.resource_id} and physical interface "
+            f"{physical_interface.resource_id} target different endpoints"
+        )
+    if interface.bound_interface != physical_interface.bound_interface:
+        raise ValueError(
+            f"interface {interface.resource_id} binding does not match physical "
+            f"interface {physical_interface.resource_id}"
+        )
+    if not set(interface.link_ids).issubset(physical_interface.link_ids):
+        raise ValueError(
+            f"interface {interface.resource_id} links are not owned by physical "
+            f"interface {physical_interface.resource_id}"
+        )
+    if (
+        physical_interface.group_kind is PhysicalInterfaceGroupKind.LOGICAL_ROLE
+        and interface.logical_port_role != physical_interface.logical_key
+    ):
+        raise ValueError(
+            f"interface {interface.resource_id} logical role does not match "
+            f"physical interface {physical_interface.resource_id}"
+        )
+
+
+def _validate_physical_interface_membership(
+    physical_interfaces: dict[ResourceId, PhysicalInterfacePlan],
+    members: dict[ResourceId, list[InterfacePlan]],
+) -> None:
+    for physical_id, grouped_interfaces in members.items():
+        if not grouped_interfaces:
+            raise ValueError(f"physical interface {physical_id} has no members")
+        member_link_ids = {
+            link_id
+            for interface in grouped_interfaces
+            for link_id in interface.link_ids
+        }
+        member_link_count = sum(
+            len(interface.link_ids) for interface in grouped_interfaces
+        )
+        if len(member_link_ids) != member_link_count:
+            raise ValueError(
+                f"physical interface {physical_id} link membership is duplicated"
+            )
+        if member_link_ids != set(physical_interfaces[physical_id].link_ids):
+            raise ValueError(
+                f"physical interface {physical_id} link membership is incomplete"
+            )
+
+
 def _validate_ixia_internal_references(plan: IxiaPlan) -> None:
     ports = {port.resource_id: port for port in plan.ports}
     device_groups = {group.resource_id: group for group in plan.device_groups}
     _validate_ixia_device_group_internal_references(plan, ports)
     _validate_ixia_session_internal_references(plan, device_groups)
     _validate_ixia_advertisement_internal_references(plan, device_groups)
+    _validate_ixia_traffic_flow_internal_references(
+        plan,
+        device_groups,
+        {
+            advertisement.resource_id: advertisement
+            for advertisement in plan.advertisements
+        },
+    )
 
 
 def _validate_ixia_device_group_internal_references(
@@ -726,6 +1222,59 @@ def _validate_ixia_advertisement_internal_references(
                 f"IXIA advertisement {advertisement.resource_id} allocation requires "
                 f"{expected_route_count} prefixes but its membership contains "
                 f"{advertisement.prefix_window.membership_prefix_count}"
+            )
+        for block in advertisement.peer_prefix_exclusion_blocks:
+            if block.peer_indices[-1] >= device_group.peer_count:
+                raise ValueError(
+                    f"IXIA advertisement {advertisement.resource_id} has a "
+                    "peer-prefix exclusion index outside device group "
+                    f"{device_group.resource_id}"
+                )
+            if len(block.peer_indices) >= device_group.peer_count:
+                raise ValueError(
+                    f"IXIA advertisement {advertisement.resource_id} peer-prefix "
+                    "exclusion must leave at least one active peer"
+                )
+
+
+def _validate_ixia_traffic_flow_internal_references(
+    plan: IxiaPlan,
+    device_groups: dict[ResourceId, IxiaDeviceGroupPlan],
+    advertisements: dict[ResourceId, IxiaAdvertisementPlan],
+) -> None:
+    for flow in plan.traffic_flows:
+        source_group = device_groups.get(flow.source_device_group_id)
+        if source_group is None:
+            raise ValueError(
+                f"IXIA traffic flow {flow.resource_id} references unknown source "
+                f"device group {flow.source_device_group_id}"
+            )
+        destination = advertisements.get(flow.destination_advertisement_id)
+        if destination is None:
+            raise ValueError(
+                f"IXIA traffic flow {flow.resource_id} references unknown "
+                f"destination advertisement {flow.destination_advertisement_id}"
+            )
+        destination_group = device_groups.get(destination.device_group_id)
+        if destination_group is None:
+            raise ValueError(
+                f"IXIA traffic flow {flow.resource_id} destination advertisement "
+                f"{destination.resource_id} references unknown device group "
+                f"{destination.device_group_id}"
+            )
+        if destination.afi is not flow.afi:
+            raise ValueError(
+                f"IXIA traffic flow {flow.resource_id} address family does not "
+                "match its destination"
+            )
+        if source_group.afi is not flow.afi or destination_group.afi is not flow.afi:
+            raise ValueError(
+                f"IXIA traffic flow {flow.resource_id} endpoint group address family "
+                "does not match its traffic"
+            )
+        if destination.route_count <= 0:
+            raise ValueError(
+                f"IXIA traffic flow {flow.resource_id} destination advertises no routes"
             )
 
 

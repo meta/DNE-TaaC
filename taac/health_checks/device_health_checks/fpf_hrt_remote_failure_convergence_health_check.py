@@ -12,17 +12,42 @@ from taac.health_checks.abstract_health_check import (
 )
 from taac.libs.fpf.fpf_collector_registry import (
     baseline_impaired_lane_union,
+    DEFAULT_SIGNAL3_STABILITY_DURATION_SEC,
     disruption_inconclusive_skip,
     everpaste_details_suffix,
     get_allow_baseline_failures,
     get_collector,
     get_disruption_time,
+    get_mutation_time,
+    get_restart_completion_time,
+    get_restart_time,
     get_test_case_start_time,
+    validate_restart_tolerant_tuple,
 )
-from taac.libs.fpf.fpf_stress_checks import _parse_ts
+from taac.libs.fpf.fpf_stress_checks import (
+    _parse_ts,
+    DEFAULT_SCALE_RECOVERY_POLL_DURATION_BUDGET_SEC,
+    derive_scale_recovery_poll_grace_sec,
+    evaluate_scale_recovery_samples,
+    normalize_scale_recovery_poll_duration,
+)
 from taac.health_check.health_check import types as hc_types
 
 JSONL_PATH = "/tmp/fpf_stress_hrt_remote_failure.jsonl"
+
+
+def _resolve_jsonl_observation_end(
+    rows: t.Sequence[t.Mapping[str, t.Any]], configured_window_end: t.Any
+) -> t.Optional[float]:
+    """Resolve an offline window end without eagerly parsing the fallback."""
+    if configured_window_end is not None:
+        return float(configured_window_end)
+    for row in reversed(rows):
+        try:
+            return _parse_ts(row["timestamp"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
 
 
 class FpfHrtRemoteFailureConvergenceHealthCheck(
@@ -50,11 +75,17 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
         check_params: t.Dict[str, t.Any],
     ) -> hc_types.HealthCheckResult:
         lanes: t.List[int] = check_params.get("lanes", [0, 1, 2, 3])
+        device_ids: t.List[int] = check_params.get("device_ids", [0])
         expected_per_lane: t.Dict[int, int] = {
             int(k): v for k, v in check_params.get("expected_per_lane", {}).items()
         }
         direction: str = check_params.get("direction", "drain")
         max_convergence_sec: int = check_params.get("max_convergence_sec", 120)
+        recovery_stability_sec = float(
+            check_params.get(
+                "recovery_stability_sec", DEFAULT_SIGNAL3_STABILITY_DURATION_SEC
+            )
+        )
         use_live = check_params.get("use_live_collectors", False)
         if direction == "drain":
             _skip = disruption_inconclusive_skip()
@@ -62,9 +93,9 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
                 return hc_types.HealthCheckResult(
                     status=hc_types.HealthCheckStatus.SKIP, message=_skip
                 )
-        # Baseline exclusion: for the "stable" (unimpacted-lane) assertion, drop
-        # lanes already impaired at precheck when the config opted in — a
-        # remote-failure on a known-degraded lab lane is PRE-EXISTING.
+        # Baseline exclusion is lane-only legacy state, so apply it only to the
+        # compatible dev0 topology. Multi-device checks retain every tuple rather
+        # than allowing one device's degraded lane to mask another device.
         if (
             direction
             in (
@@ -74,31 +105,48 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
                 "stable_last_n",
             )
             and get_allow_baseline_failures()
+            and device_ids == [0]
         ):
             baseline = baseline_impaired_lane_union()
-            kept = [lane for lane in lanes if lane not in baseline]
+            excluded = {
+                lane for lane in baseline if expected_per_lane.get(lane, 0) == 0
+            }
+            kept = [lane for lane in lanes if lane not in excluded]
             if baseline:
                 self.logger.info(
                     f"  [HRT remote_failure] excluding baseline-impaired lanes "
-                    f"{sorted(baseline & set(lanes))} from stable assertion"
+                    f"{sorted(excluded & set(lanes))} from stable assertion"
                 )
             lanes = kept
 
         if use_live:
             return await self._evaluate_from_live_collector(
-                lanes, expected_per_lane, direction, max_convergence_sec, check_params
+                lanes,
+                device_ids,
+                expected_per_lane,
+                direction,
+                max_convergence_sec,
+                recovery_stability_sec,
+                check_params,
             )
 
         return self._evaluate_from_jsonl(
-            lanes, expected_per_lane, direction, max_convergence_sec, check_params
+            lanes,
+            expected_per_lane,
+            direction,
+            max_convergence_sec,
+            recovery_stability_sec,
+            check_params,
         )
 
     async def _evaluate_from_live_collector(
         self,
         lanes: t.List[int],
+        device_ids: t.List[int],
         expected_per_lane: t.Dict[int, int],
         direction: str,
         max_convergence_sec: int,
+        recovery_stability_sec: float,
         check_params: t.Dict[str, t.Any],
     ) -> hc_types.HealthCheckResult:
         collector_name: str = check_params.get("collector_name", "hrt_remote_failure")
@@ -107,6 +155,17 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.SKIP,
                 message=f"No live HRT remote-failure collector '{collector_name}' in registry",
+            )
+        poll_grace_sec = check_params.get("poll_grace_sec")
+        poll_duration_budget_sec = float(
+            check_params.get(
+                "poll_duration_budget_sec",
+                DEFAULT_SCALE_RECOVERY_POLL_DURATION_BUDGET_SEC,
+            )
+        )
+        if direction == "scale_recovery" and poll_grace_sec is None:
+            poll_grace_sec = derive_scale_recovery_poll_grace_sec(
+                poll_interval_sec=getattr(collector, "interval_sec", None)
             )
 
         # Lane -> host-NIC mapping note (e.g. "→ beth0@rtptest1544") for messages.
@@ -131,7 +190,15 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
         # injection artifact as a drain-time regression. Falls back to tc_start
         # when no disruption time was recorded (disruption_time defaults to 0.0).
         default_start = tc_start if tc_start else window_end - lookback_sec
-        if direction in (
+        if check_params.get("use_mutation_time"):
+            mutation_time = get_mutation_time()
+            if mutation_time <= 0:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message="No FPF scale mutation timestamp was recorded",
+                )
+            default_start = max(default_start, mutation_time)
+        elif direction in (
             "stable",
             "stable_last_sample",
             "stable_skip_null_strict",
@@ -139,7 +206,7 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
         ):
             disruption_ts = get_disruption_time()
             if disruption_ts > 0:
-                default_start = disruption_ts
+                default_start = max(default_start, disruption_ts)
         window_start = check_params.get("window_start", default_start)
 
         self.logger.info(
@@ -148,36 +215,149 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
             f"({window_end - window_start:.0f}s span)"
         )
 
-        per_lane_results = collector.evaluate_per_lane_window(
-            window_start=window_start,
-            window_end=window_end,
-            lanes=lanes,
-            expected_per_lane=expected_per_lane,
-            direction=direction,
-            max_convergence_sec=max_convergence_sec,
-            only_hosts=only_hosts,
+        tuple_lanes: t.Dict[str, t.Dict[str, t.List[int]]] = check_params.get(
+            "tuple_lanes_by_host_device", {}
         )
+        excluded_tuple_lanes: t.Dict[str, t.Dict[str, t.List[int]]] = check_params.get(
+            "excluded_tuple_lanes_by_host_device", {}
+        )
+        restart_tolerant_hosts = set(
+            check_params.get("restart_tolerant_hosts", []) or []
+        )
+        if restart_tolerant_hosts:
+            per_lane_results = []
+            selected_hosts = only_hosts or collector.hosts
+            for host in selected_hosts:
+                host_direction = (
+                    "stable_skip_null_strict"
+                    if host in restart_tolerant_hosts
+                    else direction
+                )
+                for device_id in device_ids:
+                    per_lane_results.extend(
+                        collector.evaluate_per_lane_window(
+                            window_start=window_start,
+                            window_end=window_end,
+                            lanes=lanes,
+                            device_ids=[device_id],
+                            expected_per_lane=expected_per_lane,
+                            direction=host_direction,
+                            max_convergence_sec=max_convergence_sec,
+                            recovery_stability_sec=recovery_stability_sec,
+                            poll_grace_sec=poll_grace_sec,
+                            poll_duration_budget_sec=poll_duration_budget_sec,
+                            only_hosts=[host],
+                        )
+                    )
+        elif tuple_lanes:
+            per_lane_results = []
+            for host, devices in tuple_lanes.items():
+                for device_id, selected_lanes in devices.items():
+                    per_lane_results.extend(
+                        collector.evaluate_per_lane_window(
+                            window_start=window_start,
+                            window_end=window_end,
+                            lanes=selected_lanes,
+                            device_ids=[int(device_id)],
+                            expected_per_lane=expected_per_lane,
+                            direction=direction,
+                            max_convergence_sec=max_convergence_sec,
+                            recovery_stability_sec=recovery_stability_sec,
+                            poll_grace_sec=poll_grace_sec,
+                            poll_duration_budget_sec=poll_duration_budget_sec,
+                            only_hosts=[host],
+                        )
+                    )
+        elif excluded_tuple_lanes:
+            per_lane_results = []
+            selected_hosts = only_hosts or collector.hosts
+            for host in selected_hosts:
+                for device_id in device_ids:
+                    excluded = set(
+                        excluded_tuple_lanes.get(host, {}).get(str(device_id), [])
+                    )
+                    selected_lanes = [lane for lane in lanes if lane not in excluded]
+                    per_lane_results.extend(
+                        collector.evaluate_per_lane_window(
+                            window_start=window_start,
+                            window_end=window_end,
+                            lanes=selected_lanes,
+                            device_ids=[device_id],
+                            expected_per_lane=expected_per_lane,
+                            direction=direction,
+                            max_convergence_sec=max_convergence_sec,
+                            recovery_stability_sec=recovery_stability_sec,
+                            poll_grace_sec=poll_grace_sec,
+                            poll_duration_budget_sec=poll_duration_budget_sec,
+                            only_hosts=[host],
+                        )
+                    )
+        else:
+            per_lane_results = collector.evaluate_per_lane_window(
+                window_start=window_start,
+                window_end=window_end,
+                lanes=lanes,
+                device_ids=device_ids,
+                expected_per_lane=expected_per_lane,
+                direction=direction,
+                max_convergence_sec=max_convergence_sec,
+                recovery_stability_sec=recovery_stability_sec,
+                poll_grace_sec=poll_grace_sec,
+                poll_duration_budget_sec=poll_duration_budget_sec,
+                only_hosts=only_hosts,
+            )
 
-        failures = [r for r in per_lane_results if not r.passed]
+        if restart_tolerant_hosts:
+            restart_ts = get_restart_time()
+            restart_completion_ts = get_restart_completion_time()
+            rows = collector.get_rows_in_window(window_start, window_end)
+            for result in per_lane_results:
+                if result.host not in restart_tolerant_hosts:
+                    continue
+                if restart_ts <= 0:
+                    recovered = False
+                    recovery_detail = "no recorded HRT restart timestamp"
+                else:
+                    recovered, recovery_detail = validate_restart_tolerant_tuple(
+                        rows=rows,
+                        host=t.cast(str, result.host),
+                        device_id=t.cast(int, result.device_id),
+                        lane=result.lane,
+                        expected=expected_per_lane.get(result.lane, 0),
+                        restart_ts=restart_ts,
+                        restart_completion_ts=(
+                            restart_completion_ts if restart_completion_ts > 0 else None
+                        ),
+                    )
+                result.detail += f" | restart recovery: {recovery_detail}"
+                if not recovered:
+                    result.passed = False
+
+        failures = [r for r in per_lane_results if not r.passed and not r.inconclusive]
+        inconclusive = [r for r in per_lane_results if r.inconclusive]
         for r in per_lane_results:
-            status = "PASS" if r.passed else "FAIL"
+            status = (
+                "PASS" if r.passed else "INCONCLUSIVE" if r.inconclusive else "FAIL"
+            )
             self.logger.info(
-                f"  [HRT remote_failure live] Lane {r.lane}: [{status}] {r.detail}"
+                f"  [HRT remote_failure live] {r.device}: [{status}] {r.detail}"
             )
 
         details = await everpaste_details_suffix(
             f"HRT remote-failure ({direction}) — per-lane detail",
             [
-                f"Lane {r.lane}{_lbl(r.lane)}: [{'PASS' if r.passed else 'FAIL'}] "
+                f"{r.device}{_lbl(r.lane)}: "
+                f"[{'PASS' if r.passed else 'SKIP' if r.inconclusive else 'FAIL'}] "
                 f"{r.detail}"
                 for r in per_lane_results
             ],
             collectors=[collector],
             window_start=window_start,
             window_end=window_end,
-            result_status=("FAIL" if failures else "PASS"),
+            result_status=("FAIL" if failures else "SKIP" if inconclusive else "PASS"),
             result_reason="; ".join(
-                f"Lane {r.lane}{_lbl(r.lane)}: {r.detail}" for r in failures
+                f"{r.device}{_lbl(r.lane)}: {r.detail}"
+                for r in [*failures, *inconclusive]
             )[:300],
         )
 
@@ -193,13 +373,21 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
 
         if failures:
             fail_summary = "; ".join(
-                f"Lane {r.lane}{_lbl(r.lane)}: {r.detail}" for r in failures
+                f"{r.device}{_lbl(r.lane)}: {r.detail}" for r in failures
             )
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.FAIL,
                 message=fail_summary + details,
             )
-        pass_summary = "; ".join(f"Lane {r.lane}: {r.detail}" for r in per_lane_results)
+        if inconclusive:
+            summary = "; ".join(
+                f"{r.device}{_lbl(r.lane)}: {r.detail}" for r in inconclusive
+            )
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.SKIP,
+                message=summary + details,
+            )
+        pass_summary = "; ".join(f"{r.device}: {r.detail}" for r in per_lane_results)
         return hc_types.HealthCheckResult(
             status=hc_types.HealthCheckStatus.PASS,
             message=f"All lanes OK ({direction}) — {pass_summary}{details}",
@@ -211,6 +399,7 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
         expected_per_lane: t.Dict[int, int],
         direction: str,
         max_convergence_sec: int,
+        recovery_stability_sec: float,
         check_params: t.Dict[str, t.Any],
     ) -> hc_types.HealthCheckResult:
         jsonl_path = check_params.get("jsonl_path", JSONL_PATH)
@@ -231,8 +420,37 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
                 message="JSONL file is empty",
             )
 
-        first_ts = _parse_ts(rows[0]["timestamp"]).timestamp()
+        try:
+            first_ts = _parse_ts(rows[0]["timestamp"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.SKIP,
+                message=(
+                    "INCONCLUSIVE — JSONL trigger anchor has a missing or "
+                    "unparseable timestamp"
+                ),
+            )
         trigger_ts = first_ts + trigger_delay_sec
+        observation_end_ts = _resolve_jsonl_observation_end(
+            rows, check_params.get("window_end")
+        )
+        if observation_end_ts is None:
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.SKIP,
+                message="INCONCLUSIVE — JSONL has no parseable observation timestamp",
+            )
+        poll_grace_sec = check_params.get("poll_grace_sec")
+        poll_interval_sec = check_params.get("poll_interval_sec")
+        if poll_grace_sec is None and poll_interval_sec is not None:
+            poll_grace_sec = derive_scale_recovery_poll_grace_sec(
+                poll_interval_sec=float(poll_interval_sec)
+            )
+        poll_duration_budget_sec = float(
+            check_params.get(
+                "poll_duration_budget_sec",
+                DEFAULT_SCALE_RECOVERY_POLL_DURATION_BUDGET_SEC,
+            )
+        )
 
         results = [
             self._evaluate_lane_from_rows(
@@ -242,13 +460,18 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
                 trigger_ts,
                 direction,
                 max_convergence_sec,
+                recovery_stability_sec,
+                observation_end_ts,
+                float(poll_grace_sec) if poll_grace_sec is not None else None,
+                poll_duration_budget_sec,
             )
             for lane_id in sorted(lanes)
         ]
 
-        failures = [r for r in results if not r[1]]
-        for lane_id, passed, _actual, _conv, detail in results:
-            status = "PASS" if passed else "FAIL"
+        failures = [r for r in results if not r[1] and not r[5]]
+        inconclusive = [r for r in results if r[5]]
+        for lane_id, passed, _actual, _conv, detail, is_inconclusive in results:
+            status = "PASS" if passed else "SKIP" if is_inconclusive else "FAIL"
             self.logger.info(
                 f"  [HRT remote_failure] Lane {lane_id}: [{status}] {detail}"
             )
@@ -258,6 +481,12 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.FAIL,
                 message=fail_summary,
+            )
+        if inconclusive:
+            summary = "; ".join(f"Lane {r[0]}: {r[4]}" for r in inconclusive)
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.SKIP,
+                message=summary,
             )
         pass_summary = "; ".join(f"Lane {r[0]}: {r[4]}" for r in results)
         return hc_types.HealthCheckResult(
@@ -273,32 +502,118 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
         trigger_ts: float,
         direction: str,
         max_convergence_sec: int,
-    ) -> t.Tuple[int, bool, int, t.Optional[float], str]:
+        recovery_stability_sec: float,
+        observation_end_ts: float,
+        poll_grace_sec: t.Optional[float],
+        poll_duration_budget_sec: float,
+    ) -> t.Tuple[int, bool, int, t.Optional[float], str, bool]:
         if direction in (
             "stable",
             "stable_last_sample",
             "stable_skip_null_strict",
             "stable_last_n",
         ):
-            return self._evaluate_stable_from_rows(lane_id, rows, direction)
+            result = self._evaluate_stable_from_rows(lane_id, expected, rows, direction)
+            return (*result, False)
+        if direction == "scale_recovery":
+            return self._evaluate_scale_recovery_from_rows(
+                lane_id,
+                expected,
+                rows,
+                trigger_ts,
+                max_convergence_sec,
+                recovery_stability_sec,
+                observation_end_ts,
+                poll_grace_sec,
+                poll_duration_budget_sec,
+            )
         if direction == "drain":
-            return self._evaluate_drain_from_rows(
+            result = self._evaluate_drain_from_rows(
                 lane_id, expected, rows, max_convergence_sec
             )
-        return self._evaluate_recovery_from_rows(
+            return (*result, False)
+        result = self._evaluate_recovery_from_rows(
             lane_id, expected, rows, max_convergence_sec
+        )
+        return (*result, False)
+
+    def _evaluate_scale_recovery_from_rows(
+        self,
+        lane_id: int,
+        expected: int,
+        rows: t.List[t.Dict[str, t.Any]],
+        trigger_ts: float,
+        max_convergence_sec: int,
+        recovery_stability_sec: float,
+        observation_end_ts: float,
+        poll_grace_sec: t.Optional[float],
+        poll_duration_budget_sec: float,
+    ) -> t.Tuple[int, bool, int, t.Optional[float], str, bool]:
+        samples: t.List[t.Tuple[float, int]] = []
+        sample_durations_sec: t.Dict[float, float] = {}
+        error_count = 0
+        unscoped_timestamp_count = 0
+        invalid_duration_count = 0
+        for row in rows:
+            try:
+                row_ts = _parse_ts(row["timestamp"]).timestamp()
+            except (KeyError, TypeError, ValueError):
+                unscoped_timestamp_count += 1
+                continue
+            if row_ts < trigger_ts:
+                continue
+            lane_counts = row.get("lane_counts", [])
+            if not row.get("valid", True) or str(row.get("notes", "")).startswith(
+                "error:"
+            ):
+                error_count += 1
+                continue
+            if lane_id >= len(lane_counts):
+                error_count += 1
+                continue
+            samples.append((row_ts, int(lane_counts[lane_id])))
+            duration = normalize_scale_recovery_poll_duration(
+                row.get("duration_sec", 0.0)
+            )
+            if duration is None:
+                invalid_duration_count += 1
+            else:
+                sample_durations_sec[row_ts] = duration
+
+        evaluation = evaluate_scale_recovery_samples(
+            samples,
+            error_count=error_count,
+            expected=expected,
+            trigger_ts=trigger_ts,
+            observation_end_ts=observation_end_ts,
+            max_convergence_sec=max_convergence_sec,
+            recovery_stability_sec=recovery_stability_sec,
+            poll_grace_sec=poll_grace_sec,
+            poll_duration_budget_sec=poll_duration_budget_sec,
+            sample_durations_sec=sample_durations_sec,
+            unscoped_timestamp_count=unscoped_timestamp_count,
+            invalid_duration_count=invalid_duration_count,
+        )
+        return (
+            lane_id,
+            evaluation.passed,
+            evaluation.actual,
+            evaluation.recovery_sec,
+            evaluation.detail,
+            evaluation.inconclusive,
         )
 
     def _evaluate_stable_from_rows(
         self,
         lane_id: int,
+        expected: int,
         rows: t.List[t.Dict[str, t.Any]],
         direction: str = "stable",
     ) -> t.Tuple[int, bool, int, t.Optional[float], str]:
-        # A remote-failure count of 0 = healthy/golden; nonzero = failure. The
-        # ``direction`` selects the per-sample blip contract via the shared
-        # evaluate_blip_series helper (golden value 0). A row that lacks this
-        # lane's count is a null/missing sample (a collection blip).
+        # The direction selects the per-sample blip contract around the expected
+        # count. The default is zero, while a VF group whose own planes are not
+        # exposed can intentionally assert its cross-plane remote-failure count.
+        # A row that lacks this lane's count is a null/missing sample.
         from taac.libs.fpf.fpf_stress_checks import (
             BLIP_MODE_LAST_N,
             BLIP_MODE_LAST_SAMPLE,
@@ -329,13 +644,13 @@ class FpfHrtRemoteFailureConvergenceHealthCheck(
                 max_seen = count
             series.append(count)
 
-        passed, detail = evaluate_blip_series(series, 0, mode)
+        passed, detail = evaluate_blip_series(series, expected, mode)
         return (
             lane_id,
             passed,
             max_seen,
             None,
-            f"[{direction}] {detail} (max={max_seen})",
+            f"[{direction}] {detail} (expected={expected}, max={max_seen})",
         )
 
     def _evaluate_drain_from_rows(

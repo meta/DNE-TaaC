@@ -24,6 +24,9 @@ if t.TYPE_CHECKING or not TAAC_OSS:
         ReplaceBgpPeersTask,
         RestoreBgpPeersTask,
     )
+    from taac.internal.tasks.bgp_route_registry_cleanup_task import (
+        BgpRouteRegistryCleanupTask,
+    )
     from taac.internal.tasks.bgp_set_peer_groups_policy_task import (
         BgpSetPeerGroupsPolicyTask,
     )
@@ -48,11 +51,32 @@ if t.TYPE_CHECKING or not TAAC_OSS:
     from taac.internal.tasks.device_provisioning_task import (
         DeviceProvisioningTask,
     )
+    from taac.internal.tasks.eos_compiler_lifecycle_task import (
+        EosCompilerLifecycleTask,
+    )
+    from taac.internal.tasks.eos_os_upgrade_task import (
+        EosOsUpgradeTask,
+    )
     from taac.internal.tasks.ixia_preflight_task import (
         IxiaPreflightTask,
     )
+    from taac.internal.tasks.openr_fib_programming_task import (
+        OpenRFibProgrammingTask,
+    )
     from taac.internal.tasks.openr_route_action_task import (
         OpenRRouteActionTask,
+    )
+    from taac.internal.tasks.openr_scale_cold_boot_fixture_task import (
+        OpenRScaleColdBootFixtureTask,
+    )
+    from taac.internal.tasks.openr_scale_cold_boot_monitor import (
+        OpenRScaleColdBootMonitor,
+    )
+    from taac.internal.tasks.openr_scale_isolation_task import (
+        OpenRScaleIsolationTask,
+    )
+    from taac.internal.tasks.openr_scale_link_fixture_task import (
+        OpenRScaleLinkFixtureTask,
     )
     from taac.tasks.bgp_policy_generator_task import (
         GenerateCommunityBgpPolicyAndInjectTask,
@@ -71,6 +95,7 @@ if t.TYPE_CHECKING or not TAAC_OSS:
         ConfigureEosParallelBgpPeers,
         CreateEosBgpPeerGroup,
         RestoreRunningConfigTask,
+        WaitForEosInterfacesTask,
     )
     from taac.tasks.fpf_collector_tasks import (
         FpfStartCollectorsTask,
@@ -84,6 +109,9 @@ if t.TYPE_CHECKING or not TAAC_OSS:
     from taac.tasks.fpf_inject_bgp_prefixes_task import (
         FpfInjectBgpPrefixesTask,
     )
+    from taac.tasks.fpf_interface_admin_task import (
+        FpfEnsureInterfacesEnabledTask,
+    )
     from taac.tasks.fpf_restart_service_task import (
         FpfRestartServiceTask,
     )
@@ -94,21 +122,31 @@ from taac.tasks.all import (
     AllocateCgroupSliceMemory,
     AristaCreateFileFromConfig,
     AristaDaemonControlTask,
+    AssertAgentWarmBoot,
+    AssertProcessVmHwm,
     AssertThriftRateLimitEnabledTask,
     ConfigureParallelBgpPeers,
     CoopApplyPatchersTask,
     CoopApplyPatchersV2,
     CoopRegisterPatcherTask,
+    CoopSetAccessPolicyTask,
     CoopUnregisterPatchersTask,
     CreateVipInjectors,
     DeployEosImageTask,
     InjectBgpPolicyStatements,
     InvokeConcurrentThriftRequestsTask,
     IsolatePorts,
+    IxiaStopTrafficAndWaitTask,
+    IxiaSyncRawSourceMacsTask,
     RunCommandsOnShell,
     ScpFile,
     SetPortChannelMinLinkPatcherTask,
+    ValidateAccessPolicyHardwareTask,
     ValidateBgpcppConfigOnDevice,
+    ValidateBgpcppUpdateGroupState,
+    VerifyBgpcppStackTask,
+    VerifySelectedBgpRoutes,
+    VerifySelectedForwarding,
     WaitForAgentConvergenceTask,
     WaitForBgpConvergenceTask,
 )
@@ -143,13 +181,27 @@ from taac.tasks.periodic_tasks import (
     ProcessMonitorTask,
     ThriftStressPeriodicTask,
 )
+
+# RBB SRv6 qualification tasks (see taac/testconfigs/routing/qual_rbb.py).
+from taac.tasks.rbb_dut_bootstrap_task import RbbDutBootstrapTask
+from taac.tasks.rbb_edge_ebgp_task import RbbEdgeEbgpTask
+from taac.tasks.rbb_srv6_counter_delta_task import (
+    RbbSrv6CounterDeltaTask,
+)
+from taac.tasks.rbb_srv6_direct_route_task import (
+    RbbSrv6DirectRouteTask,
+)
+from taac.tasks.rbb_srv6_verify_task import RbbSrv6VerifyTask
+from taac.tasks.setup_base_configs_task import (
+    SetupBaseConfigsTask,
+)
 from taac.tasks.verify_best_path_changes_task import (
     VerifyBestPathChangesTask,
 )
 
-
 TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     AristaDaemonControlTask,
+    VerifyBgpcppStackTask,
     AssertThriftRateLimitEnabledTask,
     BgpTcpdumpTask,
     CoopUnregisterPatchersTask,
@@ -160,11 +212,18 @@ TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     WaitForBgpConvergenceTask,
     ConfigureParallelBgpPeers,
     CoopRegisterPatcherTask,
+    CoopSetAccessPolicyTask,
     CoopApplyPatchersTask,
     InvokeConcurrentThriftRequestsTask,
+    IxiaStopTrafficAndWaitTask,
+    IxiaSyncRawSourceMacsTask,
     AddStressStaticRoutes,
     CreateVipInjectors,
     ScpFile,
+    AssertAgentWarmBoot,
+    AssertProcessVmHwm,
+    VerifySelectedForwarding,
+    VerifySelectedBgpRoutes,
     RunCommandsOnShell,
     AllocateCgroupSliceMemory,
     InjectBgpPolicyStatements,
@@ -191,18 +250,34 @@ TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     ThriftStressPeriodicTask,
     AristaCreateFileFromConfig,
     ValidateBgpcppConfigOnDevice,
+    ValidateBgpcppUpdateGroupState,
+    ValidateAccessPolicyHardwareTask,
     ConfigureBgpcppStartupTask,
     VerifyBestPathChangesTask,
     SetPortChannelMinLinkPatcherTask,
+    SetupBaseConfigsTask,
+    RbbDutBootstrapTask,
+    RbbEdgeEbgpTask,
+    RbbSrv6CounterDeltaTask,
+    RbbSrv6DirectRouteTask,
+    RbbSrv6VerifyTask,
 ]
 
 # Add internal tasks only when not in OSS mode
 if not TAAC_OSS:
     TASK_REGISTRY.extend(
         [
+            OpenRFibProgrammingTask,
             OpenRRouteActionTask,
+            OpenRScaleColdBootFixtureTask,
+            OpenRScaleColdBootMonitor,
+            OpenRScaleIsolationTask,
+            OpenRScaleLinkFixtureTask,
             DeviceProvisioningTask,
+            EosCompilerLifecycleTask,
+            EosOsUpgradeTask,
             BgpQueueBackpressurePoll,
+            BgpRouteRegistryCleanupTask,
             BgpSetRouteFilterTask,
             BgpClearRouteFilterTask,
             BgpSetPeerGroupsPolicyTask,
@@ -230,12 +305,14 @@ if not TAAC_OSS:
             ConfigureEosParallelBgpPeers,
             CreateEosBgpPeerGroup,
             RestoreRunningConfigTask,
+            WaitForEosInterfacesTask,
             GenerateCommunityBgpPolicyTask,
             GenerateMultipleCommunityBgpPoliciesTask,
             GenerateCommunityBgpPolicyAndInjectTask,
             IxiaPreflightTask,
             FpfStartIbTrafficTask,
             FpfStopIbTrafficTask,
+            FpfEnsureInterfacesEnabledTask,
         ]
     )
 

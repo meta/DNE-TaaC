@@ -7,6 +7,12 @@ import ipaddress
 import typing as t
 from dataclasses import dataclass, fields, replace
 
+from taac.abstractions.config_artifact_semantics import (
+    ConfigArtifactRef,
+)
+from taac.abstractions.physical_interface_semantics import (
+    PhysicalInterfaceProfile,
+)
 from taac.abstractions.routing_semantics import (
     NetworkRole,
     PeerRelationship,
@@ -16,6 +22,7 @@ from taac.abstractions.topology.model import (
     BgpPeerGroup,
     BoundDeviceGroup,
     BoundIxiaDeviceGroupChild,
+    BoundRoutingConfig,
     BoundTopology,
     DeviceGroupPartition,
     DeviceGroupSpec,
@@ -24,6 +31,7 @@ from taac.abstractions.topology.model import (
     LogicalTopology,
     OpenRMode,
     PrefixAdvertisement,
+    resolve_endpoint_routing_drivers,
     ResolvedDeviceGroupProvenance,
     ResolvedIxiaPortAssignment,
     ResolvedPeer,
@@ -52,6 +60,10 @@ from taac.abstractions.validation import (
 _TRAFFIC_ENDPOINT_KINDS = frozenset({"ixia", "traffic", "trafficgen"})
 _TRAFFIC_ENDPOINT_ROLES = frozenset({"ixia", "traffic", "trafficgen"})
 _IXIA_4BYTE_ASN_MAX = IXIA_MAX_4BYTE_ASN
+# TAAC's own guard on DUT-side addresses per EOS interface and AFI, introduced
+# with D112268835. It is not a documented Arista EOS limit: EOS documents no
+# per-interface secondary-address maximum, and none has been measured near 500.
+# It is kept as a conservative bound until a lab run or Arista says otherwise.
 _EOS_SECONDARY_IP_LIMIT_PER_INTERFACE_AFI = 500
 _LEGACY_PEER_RELATIONSHIPS = {
     "uplink": PeerRelationship.EXTERNAL,
@@ -351,17 +363,125 @@ def _slice_ixia_child_advertisements(
     return tuple(
         replace(
             advertisement,
-            spec=(
-                advertisement.spec
-                if child.legacy_ixia_prefix_pool_name is None
-                else replace(
-                    advertisement.spec,
-                    legacy_ixia_name=child.legacy_ixia_prefix_pool_name,
-                )
-            ),
+            spec=_slice_ixia_child_advertisement_spec(advertisement.spec, child),
             paths_by_peer=advertisement.paths_by_peer[start:end],
         )
         for advertisement in advertisements
+    )
+
+
+def _slice_ixia_child_advertisement_spec(
+    advertisement: PrefixAdvertisement,
+    child: IxiaDeviceGroupChild,
+) -> PrefixAdvertisement:
+    allocation = advertisement.allocation
+    prefix_offset = (
+        child.start_index * allocation.prefixes_per_peer
+        if allocation.peer_distribution is PeerPrefixDistribution.DISJOINT
+        else 0
+    )
+    membership = advertisement.membership
+    if allocation.peer_distribution is PeerPrefixDistribution.DISJOINT:
+        membership = replace(
+            membership,
+            start_index=membership.start_index + prefix_offset,
+            prefix_count=child.peer_count * allocation.prefixes_per_peer,
+        )
+    return replace(
+        advertisement,
+        membership=membership,
+        next_hop=_slice_ixia_child_next_hop(advertisement, child, prefix_offset),
+        route_attributes=_rotate_ixia_child_route_attributes(
+            advertisement.route_attributes,
+            prefix_offset,
+        ),
+        legacy_ixia_name=(
+            child.legacy_ixia_prefix_pool_name
+            if child.legacy_ixia_prefix_pool_name is not None
+            else advertisement.legacy_ixia_name
+        ),
+    )
+
+
+def _slice_ixia_child_next_hop(
+    advertisement: PrefixAdvertisement,
+    child: IxiaDeviceGroupChild,
+    prefix_offset: int,
+) -> t.Any:
+    intent = advertisement.next_hop
+    if intent.mode is NextHopMode.SELF:
+        return intent
+    offset, count = _ixia_child_next_hop_window(
+        intent.distribution,
+        advertisement.allocation.peer_distribution,
+        child,
+        advertisement.allocation.prefixes_per_peer,
+        prefix_offset,
+    )
+    if intent.mode is NextHopMode.EXPLICIT:
+        source = intent.explicit_source
+        if source is None:
+            raise ValueError("explicit IXIA child next hop has no source")
+        return replace(
+            intent,
+            explicit_source=replace(
+                source,
+                addresses=source.addresses[offset : offset + count],
+            ),
+        )
+    source = intent.formulaic_source
+    if source is None:
+        raise ValueError("formulaic IXIA child next hop has no source")
+    starts = FormulaicAddressSequence(source.start, source.step, offset + 1)
+    return replace(
+        intent,
+        formulaic_source=replace(source, start=starts[offset]),
+    )
+
+
+def _ixia_child_next_hop_window(
+    distribution: NextHopDistribution | None,
+    peer_distribution: PeerPrefixDistribution,
+    child: IxiaDeviceGroupChild,
+    prefixes_per_peer: int,
+    prefix_offset: int,
+) -> tuple[int, int]:
+    if distribution is NextHopDistribution.SHARED:
+        return 0, 1
+    if distribution is NextHopDistribution.PER_PEER:
+        return child.start_index, child.peer_count
+    if distribution is NextHopDistribution.PER_PREFIX:
+        return (
+            (prefix_offset, child.peer_count * prefixes_per_peer)
+            if peer_distribution is PeerPrefixDistribution.DISJOINT
+            else (0, prefixes_per_peer)
+        )
+    if distribution is NextHopDistribution.PER_PEER_PREFIX:
+        return (
+            child.start_index * prefixes_per_peer,
+            child.peer_count * prefixes_per_peer,
+        )
+    raise ValueError(f"unsupported IXIA child next-hop distribution {distribution!r}")
+
+
+def _rotate_ixia_child_route_attributes(
+    route_attributes: t.Any,
+    prefix_offset: int,
+) -> t.Any:
+    if route_attributes is None or prefix_offset == 0:
+        return route_attributes
+
+    def rotate(values: tuple[t.Any, ...]) -> tuple[t.Any, ...]:
+        if not values:
+            return values
+        offset = prefix_offset % len(values)
+        return values[offset:] + values[:offset]
+
+    return replace(
+        route_attributes,
+        community_rows=rotate(route_attributes.community_rows),
+        extended_community_rows=rotate(route_attributes.extended_community_rows),
+        as_paths=rotate(route_attributes.as_paths),
     )
 
 
@@ -480,6 +600,12 @@ def _build_bound_topology(
         resolved_device_groups=mappings.resolved_device_groups,
         endpoint_os=context.endpoint_os,
         endpoint_network_roles=mappings.endpoint_network_roles,
+        routing_configs=_bound_routing_configs(
+            logical_topology,
+            context.physical_inventory,
+            bound_dgs,
+            mappings.routing_drivers,
+        ),
         routing_drivers=mappings.routing_drivers,
         ixia_ports=mappings.ixia_ports,
         interfaces=mappings.interfaces,
@@ -491,6 +617,48 @@ def _build_bound_topology(
         resolved_prefix_sets=dict(resolved_prefix_sets),
         resolved_route_senders=tuple(resolved_route_senders),
     )
+
+
+def _bound_routing_configs(
+    logical_topology: LogicalTopology,
+    physical_inventory: t.Any,
+    bound_dgs: t.Sequence[BoundDeviceGroup],
+    routing_drivers: t.Mapping[str, str],
+) -> dict[str, BoundRoutingConfig]:
+    artifact_by_driver = getattr(
+        physical_inventory,
+        "routing_config_artifacts",
+        {},
+    )
+    if not isinstance(artifact_by_driver, dict):
+        raise TypeError("routing_config_artifacts must be a dict")
+    configs = {}
+    for endpoint in logical_topology.endpoints:
+        if not _endpoint_is_dut(endpoint):
+            continue
+        drivers = resolve_endpoint_routing_drivers(
+            endpoint.name,
+            bound_dgs,
+            routing_drivers,
+        )
+        if len(drivers) > 1:
+            raise ValueError(
+                f"DUT endpoint {endpoint.name!r} resolves to multiple routing drivers: "
+                f"{drivers!r}"
+            )
+        if not drivers:
+            continue
+        driver = drivers[0]
+        source = artifact_by_driver.get(driver)
+        if source is not None and not isinstance(source, ConfigArtifactRef):
+            raise TypeError(
+                f"routing config artifact for {driver!r} must be a ConfigArtifactRef"
+            )
+        configs[endpoint.name] = BoundRoutingConfig(
+            routing_driver=driver,
+            source=source,
+        )
+    return configs
 
 
 def _resolve_route_senders(
@@ -1330,6 +1498,23 @@ def _validate_bound_ixia_snapshot(
                 message="resolved inventory index or connection was replaced",
             )
         )
+    expected_profile = _physical_interface_profile(
+        bound.physical_inventory,
+        assignment.dut_interface,
+        f"physical_inventory.ixia_ports[{assignment.physical_inventory_index}]",
+        issues,
+    )
+    if (
+        expected_profile is not None
+        and expected_profile != assignment.physical_interface_profile
+    ):
+        issues.append(
+            ValidationIssue(
+                path=f"{path}.physical_interface_profile",
+                code="resolved_port_assignment_mismatch",
+                message="resolved physical interface profile was replaced",
+            )
+        )
 
 
 def _validate_bound_prefix_intent(  # noqa: C901
@@ -1607,19 +1792,24 @@ def _resolve_device_group_ports(
             context.issues,
         )
         if port_index is not None:
-            dut_interface, ixia_port = _resolve_ixia_port(
+            dut_interface, ixia_port, interface_profile = _resolve_ixia_port(
                 context.physical_inventory,
                 port_index,
                 f"{path}.port_assignment.logical_role",
                 context.issues,
             )
-            if dut_interface is not None and ixia_port is not None:
+            if (
+                dut_interface is not None
+                and ixia_port is not None
+                and interface_profile is not None
+            ):
                 resolved_assignment = ResolvedIxiaPortAssignment(
                     logical_role=authored_assignment.logical_role,
                     dut_interface=dut_interface,
                     ixia_port=ixia_port,
                     physical_inventory_index=port_index,
                     reuse_group=authored_assignment.reuse_group,
+                    physical_interface_profile=interface_profile,
                     endpoint_label_style=authored_assignment.endpoint_label_style,
                 )
     return _ResolvedDeviceGroupPorts(
@@ -2010,10 +2200,10 @@ def _resolve_ixia_port(
     port_index: int,
     path: str,
     issues: list[ValidationIssue],
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, PhysicalInterfaceProfile | None]:
     ixia_ports = getattr(physical_inventory, "ixia_ports", None) or []
     if not ixia_ports:
-        return None, None
+        return None, None, None
     if port_index < 0 or port_index >= len(ixia_ports):
         issues.append(
             ValidationIssue(
@@ -2025,7 +2215,7 @@ def _resolve_ixia_port(
                 ),
             )
         )
-        return None, None
+        return None, None, None
     ixia_port_entry = ixia_ports[port_index]
     if not isinstance(ixia_port_entry, (tuple, list)) or len(ixia_port_entry) != 2:
         issues.append(
@@ -2035,7 +2225,7 @@ def _resolve_ixia_port(
                 message=("IXIA port entries must be (dut_interface, ixia_port) pairs"),
             )
         )
-        return None, None
+        return None, None, None
     dut_interface, ixia_port = ixia_port_entry
     if not isinstance(dut_interface, str) or not isinstance(ixia_port, str):
         issues.append(
@@ -2045,8 +2235,44 @@ def _resolve_ixia_port(
                 message="IXIA port entries must contain string interface names",
             )
         )
-        return None, None
-    return dut_interface, ixia_port
+        return None, None, None
+    profile = _physical_interface_profile(
+        physical_inventory,
+        dut_interface,
+        f"physical_inventory.ixia_ports[{port_index}]",
+        issues,
+    )
+    return dut_interface, ixia_port, profile
+
+
+def _physical_interface_profile(
+    physical_inventory: t.Any,
+    dut_interface: str,
+    path: str,
+    issues: list[ValidationIssue],
+) -> PhysicalInterfaceProfile | None:
+    profiles = getattr(physical_inventory, "physical_interface_profiles", None)
+    if isinstance(profiles, dict):
+        profile = profiles.get(dut_interface)
+    else:
+        profile = getattr(
+            physical_inventory,
+            "default_physical_interface_profile",
+            None,
+        )
+    if isinstance(profile, PhysicalInterfaceProfile):
+        return profile
+    issues.append(
+        ValidationIssue(
+            path=f"{path}.physical_interface_profile",
+            code="missing_physical_interface_profile",
+            message=(
+                f"DUT interface {dut_interface!r} requires a typed physical "
+                "interface profile"
+            ),
+        )
+    )
+    return None
 
 
 def _resolve_parent_network(
@@ -2753,12 +2979,12 @@ def _validate_eos_secondary_ip_limits(
                 message=(
                     f"EOS interface {interface} has {count} {afi} DUT-side "
                     f"peer IPs across device groups "
-                    f"{', '.join(sources[(interface, afi)])}; limit is "
+                    f"{', '.join(sources[(interface, afi)])}; TAAC's guard is "
                     f"{_EOS_SECONDARY_IP_LIMIT_PER_INTERFACE_AFI}"
                 ),
                 hint=(
                     "Split peers across additional interfaces or reduce peer_count "
-                    "so one EOS interface/AFI stays within the platform limit."
+                    "so one EOS interface/AFI stays within TAAC's guard."
                 ),
             )
         )

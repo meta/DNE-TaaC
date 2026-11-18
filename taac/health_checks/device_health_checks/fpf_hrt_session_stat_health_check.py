@@ -19,7 +19,9 @@ Two contracts via ``mode``:
     Signal 2 — AFTER the disruption stops the count recovers to
       ``expected_connected`` (32) and holds there for >= ``recovery_min_sec``.
     FAILs if either signal is violated, SKIPs when there are no in-window
-    samples, else PASSes. SKIPs (inconclusive) when the disruption was verified
+    samples and no exact host scope was requested, else PASSes. An explicitly
+    requested host with no samples FAILs closed. SKIPs (inconclusive) when the
+    disruption was verified
     ineffective.
 
   mode="stable": the CONNECTED count stays at ``expected_connected`` across the
@@ -76,6 +78,7 @@ class FpfHrtSessionStatHealthCheck(
         expected_connected_during (int): count expected during the disruption
             (e.g. 28). disruption mode only. Default 28.
         impacted_lanes (List[int]): lanes the disruption should churn (e.g. [0]).
+        only_hosts (List[str]): optional exact host scope for the disruption.
         recovery_min_sec (float): seconds the recovered census must hold.
             disruption mode only. Default 60.
         window_start / window_end (float): explicit window overrides.
@@ -116,6 +119,9 @@ class FpfHrtSessionStatHealthCheck(
         impacted_lanes: t.List[int] = [
             int(p) for p in (check_params.get("impacted_lanes") or [])
         ]
+        impacted_tuples_by_host_device: t.Dict[str, t.Dict[str, t.List[int]]] = (
+            check_params.get("impacted_tuples_by_host_device", {}) or {}
+        )
         recovery_min_sec = float(
             check_params.get("recovery_min_sec", DEFAULT_RECOVERY_MIN_SEC)
         )
@@ -154,9 +160,14 @@ class FpfHrtSessionStatHealthCheck(
             default_start = tc_start if tc_start else window_end - lookback_sec
             window_start = float(check_params.get("window_start", default_start))
 
-        # The single collector holds all hosts (each row carries its host); the
-        # hosts to evaluate are those present in the in-window rows.
-        hosts = collector.hosts_in_window(window_start, window_end)
+        # The single collector may hold both the affected host and unaffected
+        # controls. A disruption check can explicitly select only the host whose
+        # session census is expected to drop; stable checks default to all hosts.
+        configured_hosts = [
+            str(host) for host in (check_params.get("only_hosts") or [])
+        ]
+        exact_host_scope = bool(configured_hosts)
+        hosts = configured_hosts or collector.hosts_in_window(window_start, window_end)
         if not hosts:
             hosts = list(getattr(collector, "hosts", []) or [])
         self.logger.info(
@@ -191,7 +202,14 @@ class FpfHrtSessionStatHealthCheck(
                     expected_connected,
                     expected_during,
                     impacted_lanes,
+                    impacted_tuples_by_host_device.get(host, {}),
                     recovery_min_sec,
+                )
+            if exact_host_scope and hr.status == "SKIP":
+                hr.status = "FAIL"
+                hr.reason = (
+                    "Requested scoped host has no in-window HRT session samples — "
+                    f"{hr.reason}"
                 )
             host_results.append(hr)
 
@@ -290,6 +308,7 @@ class FpfHrtSessionStatHealthCheck(
         expected_connected: int,
         expected_during: int,
         impacted_lanes: t.List[int],
+        impacted_tuples_by_device: t.Dict[str, t.List[int]],
         recovery_min_sec: float,
     ) -> _HostSessionResult:
         hr = _HostSessionResult(host)
@@ -298,6 +317,7 @@ class FpfHrtSessionStatHealthCheck(
             window_end=window_end,
             expected_connected=expected_connected,
             impacted_lanes=impacted_lanes,
+            impacted_tuples_by_device=impacted_tuples_by_device,
             host=host,
         )
         if res.samples == 0:
@@ -312,15 +332,29 @@ class FpfHrtSessionStatHealthCheck(
         # Signal 1: census dropped to expected_during during the disruption, and
         # every requested impacted lane churned (connected dropped below total).
         drop_ok = res.min_connected is not None and res.min_connected <= expected_during
-        churn_ok = all(
-            res.impacted_lane_churn.get(lane, False) for lane in impacted_lanes
-        )
+        tuple_keys = [
+            f"dev{int(device_id)}/L{int(local_plane)}"
+            for device_id, local_planes in impacted_tuples_by_device.items()
+            for local_plane in local_planes
+        ]
+        if tuple_keys:
+            churn_ok = all(
+                res.impacted_tuple_churn.get(key, False) for key in tuple_keys
+            )
+            churn_label = "impacted-tuple churn"
+            churn_detail = _tuple_churn_str(res, tuple_keys)
+        else:
+            churn_ok = all(
+                res.impacted_lane_churn.get(lane, False) for lane in impacted_lanes
+            )
+            churn_label = "impacted-lane churn"
+            churn_detail = _churn_str(res, impacted_lanes)
         signal1_ok = drop_ok and churn_ok
         signal1_msg = (
             f"Signal1[drop]: min_connected={res.min_connected} "
             f"(<= {expected_during} expected during) "
-            f"{'OK' if drop_ok else 'FAIL'}; impacted-lane churn "
-            f"{'OK' if churn_ok else 'FAIL'} ({_churn_str(res, impacted_lanes)})"
+            f"{'OK' if drop_ok else 'FAIL'}; {churn_label} "
+            f"{'OK' if churn_ok else 'FAIL'} ({churn_detail})"
         )
 
         # Signal 2: census recovered to expected and held >= recovery_min_sec.
@@ -377,4 +411,13 @@ def _churn_str(res: t.Any, impacted_lanes: t.List[int]) -> str:
     return ", ".join(
         f"L{lane}={'yes' if res.impacted_lane_churn.get(lane, False) else 'no'}"
         for lane in impacted_lanes
+    )
+
+
+def _tuple_churn_str(res: t.Any, tuple_keys: t.List[str]) -> str:
+    if not tuple_keys:
+        return "no impacted tuples"
+    return ", ".join(
+        f"{key}={'yes' if res.impacted_tuple_churn.get(key, False) else 'no'}"
+        for key in sorted(tuple_keys)
     )

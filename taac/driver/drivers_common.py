@@ -18,6 +18,7 @@ from taac.driver.driver_constants import (
     DNE_LAB_SMC_TIER,
     DNE_REGRESSION_BASSET_POOL_NAME,
     DNE_STANDALONE_SMC_TIER,
+    FBOSS_DSF_LAB_SMC_TIER,
     FBOSS_LAB_SMC_TIER,
     IpAddress,
     NET_AI_DSF,
@@ -316,6 +317,7 @@ def is_dne_test_device(func: Callable) -> Callable:
             "c087.mwg2",  # MWG2 nano-FPF lab cluster (preprod) — gtsw leaf/remote pods
             ".l202.mwg2",  # MWG2 nano-FPF spine layer (preprod) — stsw001.s00[1-8].l202.mwg2
             "c085.ash6",  # ASH6 IcePack NPI lab cluster (preprod) — gtsw001/stsw001 in c085
+            ".qza1",  # QZA1 lab devices (SNC)
             ".qzk1",  # BBE-IP RBB lab devices in QZK1 (SNC)
             ".qzd1",  # BBE-IP RBB lab devices in QZD1 (SNC)
         )
@@ -338,6 +340,7 @@ def is_dne_test_device(func: Callable) -> Callable:
             NET_AI_LAB_SMC_TIER,
             NET_AI_LAB_REGRESSION_SMC_TIER,
             FBOSS_LAB_SMC_TIER,
+            FBOSS_DSF_LAB_SMC_TIER,
         ]
         dne_test_devices: List[str] = []
         for smc_tier in smc_tiers:

@@ -52,6 +52,15 @@ def create_argument_parser() -> argparse.ArgumentParser:
             "so the OSS topology loader picks up your environment's links."
         ),
     )
+    parser.add_argument(
+        "--secrets-file",
+        help=(
+            "Path to an OSS TAAC JSON credentials file. The supported schema "
+            "contains shared or hostname-specific DUT credentials and common "
+            "IXIA username/password fields. The file must not be accessible "
+            "by group or other users (chmod 600)."
+        ),
+    )
 
     # Device selection
     parser.add_argument(
@@ -108,9 +117,29 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Skip setup tasks",
     )
     parser.add_argument(
+        "--skip-oss-setup-tasks",
+        action="store_true",
+        help=(
+            "Skip the OSS setup-task stage, including its implicit defaults. "
+            "--skip-setup-tasks already covers these; use this to skip only "
+            "the OSS ones and still run the config's own setup tasks."
+        ),
+    )
+    parser.add_argument(
         "--skip-teardown-tasks",
         action="store_true",
         help="Skip teardown tasks",
+    )
+    parser.add_argument(
+        "--skip-health-checks",
+        help=(
+            "Comma-separated CheckName values to skip at every validation "
+            "stage, e.g. --skip-health-checks DRAIN_STATE_CHECK. Use for "
+            "checks a test config requests but that cannot run in this "
+            "environment (DRAIN_STATE_CHECK needs the Meta-only LocalDrainer), "
+            "instead of editing the config's check list. Sets "
+            "TAAC_SKIP_HEALTH_CHECKS."
+        ),
     )
     parser.add_argument(
         "--skip-post-setup-wait",

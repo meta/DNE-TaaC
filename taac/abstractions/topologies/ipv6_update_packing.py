@@ -1,7 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-strict
 
+from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
+    EBB_BGPCPP_LOGGING_CONFIG,
+)
 from taac.abstractions.compatibility.legacy_ebb_binding import (
+    IXIA03_EBGP_IC_PARENT_NETWORK_V6,
+    IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
     IXIA_EBGP_IC_PARENT_NETWORK_V6,
     IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
 )
@@ -28,6 +33,7 @@ from taac.abstractions.topology import (
     PrefixSet,
     RouteSender,
     RoutingDeviceConfig,
+    TaskCompatibilityProfile,
 )
 
 
@@ -35,6 +41,10 @@ IPV6_UPDATE_PACKING_PORT_MAP = {"ebgp": 0, "ibgp": 1}
 IPV6_UPDATE_PACKING_PARENT_NETWORKS = {
     "ebgp_v6": IXIA_EBGP_IC_PARENT_NETWORK_V6,
     "ibgp_v6": IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+}
+IPV6_UPDATE_PACKING_PARENT_NETWORKS_IXIA03 = {
+    "ebgp_v6": IXIA03_EBGP_IC_PARENT_NETWORK_V6,
+    "ibgp_v6": IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
 }
 IPV6_UPDATE_PACKING_AS_NUMBERS = {
     "ebgp": EBGP_REMOTE_AS,
@@ -95,7 +105,8 @@ IPV6_UPDATE_PACKING_ADVERTISEMENT = PrefixAdvertisement(
 
 IPV6_UPDATE_PACKING = LogicalTopology(
     name="ipv6_update_packing",
-    legacy_profile="ipv6_update_packing",
+    legacy_profile=None,
+    task_compatibility_profile=TaskCompatibilityProfile.IPV6_UPDATE_PACKING,
     endpoints=(
         EndpointSpec(name="dut0", role="dut", kind="dut", setup_mode="full"),
         EndpointSpec(name="ixia", role="trafficgen", kind="ixia", setup_mode="full"),
@@ -143,6 +154,7 @@ IPV6_UPDATE_PACKING = LogicalTopology(
     ),
     device_config=RoutingDeviceConfig(
         update_group_enable=False,
+        bgpcpp_logging_config_override=EBB_BGPCPP_LOGGING_CONFIG,
         openr_mode=OpenRMode.NONE,
     ),
     peer_groups=(
@@ -166,6 +178,7 @@ __all__ = (
     "IPV6_UPDATE_PACKING_EBGP_PEER_GROUP",
     "IPV6_UPDATE_PACKING_IBGP_PEER_GROUP",
     "IPV6_UPDATE_PACKING_PARENT_NETWORKS",
+    "IPV6_UPDATE_PACKING_PARENT_NETWORKS_IXIA03",
     "IPV6_UPDATE_PACKING_PEER_GROUPS",
     "IPV6_UPDATE_PACKING_PORT_MAP",
     "IPV6_UPDATE_PACKING_PREFIX_SET",

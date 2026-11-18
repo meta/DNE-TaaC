@@ -9,8 +9,20 @@ Allows callers to use the package-level path:
     )
 
 instead of the deeper module path.
+
+A NEW per-platform TestConfig does NOT belong here. Append it to that
+platform's ``<PLATFORM>_TEST_CONFIGS`` list (``W800_TEST_CONFIGS`` in
+wedge800_npi_test_config.py, ``AC100T_TEST_CONFIGS`` in
+ac100t_npi_test_config.py) and it reaches ``INTERNAL_TEST_CONFIGS``
+automatically -- neither this file nor testconfigs/internal/ needs an edit.
+The individual names below predate those lists and are kept only so existing
+callers of the package path keep working.
 """
 
+from taac.testconfigs.npi.ac100t_npi_test_config import (
+    AC100T_CPU_QUEUE_TEST_CONFIG,
+    AC100T_TEST_CONFIGS,
+)
 from taac.testconfigs.npi.cpu_queue_test_config import (
     create_dctypef_npi_cpu_queue_test_config,
     create_npi_cpu_queue_test_config,
@@ -24,6 +36,12 @@ from taac.testconfigs.npi.dlb_hardening_test_config import (
     NPI_DVT_ICEPACK_GTSW__DLB_HARDENING,
     NPI_DVT_ICEPACK_GTSW__DLB_LONGEVITY,
 )
+from taac.testconfigs.npi.fsw003_p003_qzd1_hardening_test_config import (
+    FSW003_P003_QZD1_INTERFACE_FLAP_TEST_CONFIG,
+    FSW003_P003_QZD1_L2_HARDENING_TEST_CONFIG,
+    FSW003_P003_QZD1_NEIGHBOR_INTERFACE_FLAP_TEST_CONFIG,
+    FSW003_P003_QZD1_TEST_CONFIGS,
+)
 from taac.testconfigs.npi.icepack_ecmp_resource_testing_config import (
     NPI_DVT_ICEPACK_GTSW__ECMP_RESOURCE_TESTING,
     test_config_for_icepack_ecmp_resource_testing,
@@ -31,24 +49,59 @@ from taac.testconfigs.npi.icepack_ecmp_resource_testing_config import (
 from taac.testconfigs.npi.icepack_gtsw_warmboot_troubleshooting_config import (
     NPI_ICEPACK_GTSW007_WARMBOOT_TROUBLESHOOTING_TEST_CONFIG,
 )
+from taac.testconfigs.npi.minipack_fsw004_p003_qzd1_cpu_queue_test_config import (
+    MINIPACK_FSW004_P003_QZD1_CPU_QUEUE_TEST_CONFIG,
+)
+from taac.testconfigs.npi.minipack_fsw004_p004_qzd1_cpu_queue_test_config import (
+    MINIPACK_FSW004_P004_QZD1_CPU_QUEUE_TEST_CONFIG,
+)
+from taac.testconfigs.npi.mp3ba_fa002_du001_qza1_cpu_queue_test_config import (
+    MP3BA_FA002_DU001_QZA1_CPU_QUEUE_TEST_CONFIG,
+)
 from taac.testconfigs.npi.multinode_pfc_test_config import (
     NPI_DVT_ICEPACK_GTSW__MULTI_NODE_PFC_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC002_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC004_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC005_007_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC009_010_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC012_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC013_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC015_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC016_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC017_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC018_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC019_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC8_TEST_CONFIG,
+    NPI_DVT_ICEPACK_GTSW__PFC_RERUN_TEST_CONFIG,
+)
+from taac.testconfigs.npi.qza_rtsw_dlb_case18_test_config import (
+    QZA_RTSW001_CHENAB_DLB_CASE18_QUICK_TEST_CONFIG,
 )
 from taac.testconfigs.npi.thrift_hardening_test_config import (
     create_npi_thrift_hardening_test_config,
-    ICEPACK_GTSW_STSW_FLAP_PORTS,
     NPI_DVT_ICEPACK_GTSW__THRIFT_HARDENING_TEST_CONFIG,
+)
+from taac.testconfigs.npi.wedge400c_rsw001_p001_qzd1_test_config import (
+    RSW001_P001_F01_QZD1_SYSTEM_REBOOT_TEST_CONFIG,
+    RSW001_P001_F01_QZD1_TEST_CONFIGS,
+    RSW001_P001_F01_QZD1_THRIFT_HARDENING_TEST_CONFIG,
 )
 from taac.testconfigs.npi.wedge800_npi_test_config import (
     W800_BGP_HARDENING_TEST_CONFIG,
     W800_CPU_QUEUE_TEST_CONFIG,
     W800_LONGEVITY_TEST_CONFIG,
     W800_SPEED_FLIP_SUBSUME_CHURN_TEST_CONFIG,
+    W800_TEST_CONFIGS,
     W800_THRIFT_HARDENING_TEST_CONFIG,
 )
 
 __all__ = [
-    "ICEPACK_GTSW_STSW_FLAP_PORTS",
+    "AC100T_CPU_QUEUE_TEST_CONFIG",
+    "AC100T_TEST_CONFIGS",
+    "FSW003_P003_QZD1_INTERFACE_FLAP_TEST_CONFIG",
+    "FSW003_P003_QZD1_L2_HARDENING_TEST_CONFIG",
+    "FSW003_P003_QZD1_NEIGHBOR_INTERFACE_FLAP_TEST_CONFIG",
+    "FSW003_P003_QZD1_TEST_CONFIGS",
     "NPI_51T_DVT_KO3_SSW_CPU_QUEUE_TEST_CONFIG",
     "NPI_51T_DVT_MP3_XSW_CPU_QUEUE_TEST_CONFIG",
     "NPI_DVT_ICEPACK_GTSW__CPU_QUEUE_TEST_CONFIG",
@@ -56,12 +109,33 @@ __all__ = [
     "NPI_DVT_ICEPACK_GTSW__DLB_LONGEVITY",
     "NPI_DVT_ICEPACK_GTSW__ECMP_RESOURCE_TESTING",
     "NPI_DVT_ICEPACK_GTSW__MULTI_NODE_PFC_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC002_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC004_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC005_007_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC009_010_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC012_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC013_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC015_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC016_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC017_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC018_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC019_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC_RERUN_TEST_CONFIG",
+    "NPI_DVT_ICEPACK_GTSW__PFC8_TEST_CONFIG",
     "NPI_DVT_ICEPACK_GTSW__THRIFT_HARDENING_TEST_CONFIG",
     "NPI_ICEPACK_GTSW007_WARMBOOT_TROUBLESHOOTING_TEST_CONFIG",
+    "QZA_RTSW001_CHENAB_DLB_CASE18_QUICK_TEST_CONFIG",
+    "RSW001_P001_F01_QZD1_SYSTEM_REBOOT_TEST_CONFIG",
+    "RSW001_P001_F01_QZD1_TEST_CONFIGS",
+    "RSW001_P001_F01_QZD1_THRIFT_HARDENING_TEST_CONFIG",
     "W800_BGP_HARDENING_TEST_CONFIG",
     "W800_CPU_QUEUE_TEST_CONFIG",
+    "MINIPACK_FSW004_P003_QZD1_CPU_QUEUE_TEST_CONFIG",
+    "MINIPACK_FSW004_P004_QZD1_CPU_QUEUE_TEST_CONFIG",
+    "MP3BA_FA002_DU001_QZA1_CPU_QUEUE_TEST_CONFIG",
     "W800_LONGEVITY_TEST_CONFIG",
     "W800_SPEED_FLIP_SUBSUME_CHURN_TEST_CONFIG",
+    "W800_TEST_CONFIGS",
     "W800_THRIFT_HARDENING_TEST_CONFIG",
     "build_dlb_hardening_testconfig",
     "create_dctypef_npi_cpu_queue_test_config",

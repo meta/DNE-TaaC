@@ -8,10 +8,11 @@ from dataclasses import replace
 
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
-    EBB_FULL_SCALE_PORT_MAP,
-    ebb_full_scale_topology,
+    EBB_FY26_SCALE,
     EBB_PARENT_NETWORKS,
     EBB_PEER_GROUPS,
+    EBB_PORT_MAP,
+    ebb_topology,
 )
 from taac.abstractions.topology import (
     DeviceGroupPartition,
@@ -27,18 +28,21 @@ from taac.abstractions.topology import (
     PrefixMembership,
     RouteAttributeDistribution,
     RouteAttributePool,
+    RouteScaleMode,
     RouteSender,
     StandardCommunity,
+    TaskCompatibilityProfile,
 )
 
 _PREFIXES_PER_PEER = 750
-_UG_BACKPRESSURE_BASE = ebb_full_scale_topology(
+_UG_BACKPRESSURE_BASE = ebb_topology(
+    scale=EBB_FY26_SCALE,
     openr_mode=OpenRMode.NONE,
     include_bgpmon=False,
     include_legacy_community_rows=False,
 )
 
-UG_BACKPRESSURE_PORT_MAP = dict(EBB_FULL_SCALE_PORT_MAP)
+UG_BACKPRESSURE_PORT_MAP = dict(EBB_PORT_MAP)
 UG_BACKPRESSURE_PARENT_NETWORKS = {
     key: value for key, value in EBB_PARENT_NETWORKS.items() if key != "bgpmon_v6"
 }
@@ -161,6 +165,10 @@ def _partitioned_leaf(
     partitioned_advertisement = replace(
         advertisement,
         name=f"{name}_routes",
+        allocation=replace(
+            advertisement.allocation,
+            route_scale_mode=RouteScaleMode.WINDOWED,
+        ),
         membership=membership,
         next_hop=_slice_next_hop(
             advertisement.next_hop,
@@ -169,6 +177,8 @@ def _partitioned_leaf(
         ),
         route_attributes=route_attributes,
         legacy_ixia_name=_legacy_prefix_name(legacy_device_group_name),
+        peer_prefix_activation=None,
+        requires_route_mutation=True,
     )
     return replace(
         base,
@@ -303,6 +313,8 @@ _IBGP_LEAVES = tuple(
 UG_BACKPRESSURE = replace(
     _UG_BACKPRESSURE_BASE,
     name="ug_backpressure",
+    legacy_profile=None,
+    task_compatibility_profile=TaskCompatibilityProfile.UG_BACKPRESSURE,
     device_groups=(*_UPLINK_LEAVES, *_IBGP_LEAVES),
     device_config=replace(
         _UG_BACKPRESSURE_BASE.device_config,

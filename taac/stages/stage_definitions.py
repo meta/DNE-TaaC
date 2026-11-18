@@ -30,11 +30,26 @@ When migrating an inline `Stage(...)` site:
 """
 
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
+from taac.abstractions.churn.attribute import AttributeChurn
+from taac.abstractions.churn.session import SessionChurn
+from taac.abstractions.churn.workloads import (
+    IgpUnresolvableChurn,
+    LongevityCommunityChurn,
+    MultipathChurn,
+)
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+from taac.abstractions.churn.route import (  # oss-rewrite (force ShipIt re-export to taac.* root)
+    RouteChurn,
+    RouteStorm,
+)
 from taac.constants import (
     DEFAULT_LOCAL_LINK,
     DEFAULT_OTHER_LINK,
@@ -49,8 +64,11 @@ from taac.steps.step_definitions import (
     create_advertise_withdraw_prefixes_step,
     create_bgp_attribute_churn_step,
     create_bgp_lifecycle_convergence_step,
-    create_bgp_longevity_community_churn_step,
+    create_bgp_nhg_random_storm_step,
     create_bgp_prefixes_med_value_step,
+    create_bgp_restoration_baseline_step,
+    create_bgp_restoration_probe_step,
+    create_bgp_restoration_verification_step,
     create_bgp_route_storm_step,
     create_change_as_path_length_step,
     create_clear_traffic_stats_step,
@@ -65,13 +83,17 @@ from taac.steps.step_definitions import (
     create_cpu_percentile_stop_step,
     create_daemon_control_step,
     create_drain_convergence_verification_step,
+    create_igp_unresolvable_churn_step,
     create_interface_flap_step,
     create_interface_permanent_flap_step,
     create_ixia_device_group_toggle_step,
+    create_ixia_gateway_resolution_step,
     create_ixia_packet_capture_step,
+    create_longevity_community_churn_step,
     create_longevity_step,
     create_mark_bgp_update_trigger_step,
     create_modify_bgp_prefixes_origin_value_step,
+    create_multipath_churn_step,
     create_multipath_nexthop_count_health_check_step,
     create_openr_route_action_step,
     create_randomize_prefix_local_preference_step,
@@ -81,11 +103,13 @@ from taac.steps.step_definitions import (
     create_register_speed_flip_patcher_step_v2,
     create_restore_bgp_peer_ranges_step,
     create_revert_route_storm_attributes_step,
+    create_route_churn_step,
     create_route_convergence_health_check_step,
     create_rss_start_step,
     create_rss_stop_step,
     create_service_convergence_step,
     create_service_interruption_step,
+    create_session_churn_step,
     create_set_bgp_prefixes_local_preference_step,
     create_set_peer_groups_policy_step,
     create_set_route_filter_step,
@@ -100,7 +124,6 @@ from taac.steps.step_definitions import (
     create_update_prefix_count_step,
     create_validated_bgp_route_oscillation_step,
     create_validated_bgp_session_oscillation_step,
-    create_validated_igp_unresolvable_pnh_step,
     create_validation_step,
     create_verify_bgp_update_send_quiet_step,
     create_verify_bgp_withdraw_send_quiet_step,
@@ -109,6 +132,15 @@ from taac.steps.step_definitions import (
     create_verify_port_speed_step_v2,
     create_verify_received_routes_step,
     create_wait_for_bgp_update_sent_step,
+    DEFAULT_LINK_UP_WAIT_S,
+)
+from taac.utils.characterization import (
+    characterization_session_key,
+    characterization_summary_jq_var,
+    CharacterizationConfig,
+    KIND_CPU_PERCENTILE,
+    KIND_RSS_DELTA,
+    PHASE_CONVERGENCE,
 )
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
@@ -126,7 +158,7 @@ from taac.test_as_a_config.types import (
 
 def create_bgp_restart_test_stage(
     device_name: str,
-    daemon_name: str = "Bgp",
+    daemon_name: str = "Bgpcpp",
     sleep_after_disable_seconds: int = 5,
     convergence_wait_seconds: int = 540,
     device_group_regex: str = ".*",
@@ -157,7 +189,7 @@ def create_bgp_restart_test_stage(
 
     Args:
         device_name: Name of the device
-        daemon_name: Name of the daemon to restart (default: "Bgp")
+        daemon_name: Name of the daemon to restart (default: "Bgpcpp")
         sleep_after_disable_seconds: Sleep duration after disabling daemon
         convergence_wait_seconds: Wait time for BGP convergence (default: 540s)
         device_group_regex: Regex pattern for device groups to enable
@@ -322,7 +354,7 @@ def create_bgp_restart_test_stage(
 
 def create_cold_start_test_stage(
     device_name: str,
-    daemon_name: str = "Bgp",
+    daemon_name: str = "Bgpcpp",
     sleep_after_disable_seconds: int = 30,
     convergence_wait_seconds: int = 500,
     device_group_regex: str = ".*",
@@ -343,6 +375,8 @@ def create_cold_start_test_stage(
     cpu_characterization_interval_seconds: float = 2.0,
     enable_rss_delta_characterization: bool = False,
     rss_characterization_interval_seconds: float = 3.0,
+    characterization_playbook_name: str | None = None,
+    gateway_resolution_device_group_names: Sequence[str] = (),
 ) -> Stage:
     """
     Create a BGP cold start test stage.
@@ -357,11 +391,12 @@ def create_cold_start_test_stage(
     3. Enable BGP daemon (initializes without sessions)
     4. Wait for BGP initial convergence to complete (no sessions active)
     5. Toggle all device groups to active (cold start - all sessions establish simultaneously)
+    5b. Require every named IXIA gateway MAC (optional)
     6. Monitor thread CPU during convergence (optional)
 
     Args:
         device_name: Name of the device
-        daemon_name: Name of the daemon to cold start (default: "Bgp")
+        daemon_name: Name of the daemon to cold start (default: "Bgpcpp")
         sleep_after_disable_seconds: Sleep duration after disabling daemon
         convergence_wait_seconds: Wait time for BGP initialization without sessions
         device_group_regex: Regex pattern for device groups to enable for cold start
@@ -401,9 +436,22 @@ def create_cold_start_test_stage(
         rss_characterization_interval_seconds: Background VmRSS sampling interval
             (seconds) for the RSS START step (default: 3.0). Only used when
             enable_rss_delta_characterization is True.
+        characterization_playbook_name: Name of the calling playbook, embedded in
+            the characterization session key and in every TAAC_CHAR log line.
+            Required when either characterization flag is True, and deliberately
+            has no default: this stage has more than one caller, and a wrong name
+            files the run's measurements under another playbook. Ignored when
+            both flags are False.
+        gateway_resolution_device_group_names: IXIA device groups whose gateway
+            MACs must resolve right after the Step 5 toggle, before Step 6
+            observes convergence. Empty (default) adds no gate.
 
     Returns:
         Stage object for BGP cold start test.
+
+    Raises:
+        ValueError: Either characterization flag is True and
+            characterization_playbook_name is unset.
 
     Note:
         When thread CPU monitoring is enabled, it runs for the entire convergence period
@@ -492,6 +540,18 @@ def create_cold_start_test_stage(
         require_match=True,
         verify_readback=True,
     )
+    # Step 5b: IXIA does not retry a gateway left unresolved when a re-enabled
+    # session starts, so require every gateway MAC before observing convergence.
+    gateway_steps = (
+        [
+            create_ixia_gateway_resolution_step(
+                gateway_resolution_device_group_names,
+                description="Re-resolve IXIA gateway MACs after re-enabling device groups",
+            )
+        ]
+        if gateway_resolution_device_group_names
+        else []
+    )
     # Step 6: Monitor thread CPU OR wait for convergence.
     # If monitoring is enabled, it runs for the convergence duration and
     # captures CPU activity after the cold start trigger.
@@ -570,10 +630,30 @@ def create_cold_start_test_stage(
     # during the toggle); STOP goes after Step 6, which blocks until convergence
     # completes -- so the window is exactly the convergence phase. Fully
     # sequential; the thread monitor stays a separate step.
+    # Bound once, non-optional, so the session-key calls below take a str. Unused
+    # when neither bracket is enabled, which is why the parameter stays optional.
+    characterization_playbook: str = ""
+    if enable_cpu_percentile_characterization or enable_rss_delta_characterization:
+        if not characterization_playbook_name:
+            # The name is embedded in the session key and every TAAC_CHAR log
+            # line, so a wrong one silently files this run's numbers under
+            # another playbook. Refuse rather than guess: there is no default
+            # that is correct for more than one caller.
+            raise ValueError(
+                "characterization_playbook_name is required when cold-start "
+                "CPU-percentile or RSS-delta characterization is enabled"
+            )
+        characterization_playbook = characterization_playbook_name
+
     cpu_start_steps = []
     cpu_stop_steps = []
     if enable_cpu_percentile_characterization:
-        session_key = f"cold_start_convergence:{device_name}"
+        session_key = characterization_session_key(
+            KIND_CPU_PERCENTILE,
+            characterization_playbook,
+            PHASE_CONVERGENCE,
+            device_name,
+        )
         cpu_start_steps = [
             create_cpu_percentile_start_step(
                 device_name=device_name,
@@ -586,7 +666,9 @@ def create_cold_start_test_stage(
         cpu_stop_steps = [
             create_cpu_percentile_stop_step(
                 session_key=session_key,
-                summary_jq_var="cpu_percentile_summary",
+                summary_jq_var=characterization_summary_jq_var(
+                    KIND_CPU_PERCENTILE, PHASE_CONVERGENCE
+                ),
             )
         ]
 
@@ -596,7 +678,12 @@ def create_cold_start_test_stage(
     rss_start_steps = []
     rss_stop_steps = []
     if enable_rss_delta_characterization:
-        rss_session_key = f"cold_start_rss:{device_name}"
+        rss_session_key = characterization_session_key(
+            KIND_RSS_DELTA,
+            characterization_playbook,
+            PHASE_CONVERGENCE,
+            device_name,
+        )
         rss_start_steps = [
             create_rss_start_step(
                 device_name=device_name,
@@ -607,7 +694,9 @@ def create_cold_start_test_stage(
         rss_stop_steps = [
             create_rss_stop_step(
                 session_key=rss_session_key,
-                summary_jq_var="rss_delta_summary",
+                summary_jq_var=characterization_summary_jq_var(
+                    KIND_RSS_DELTA, PHASE_CONVERGENCE
+                ),
             )
         ]
 
@@ -617,6 +706,7 @@ def create_cold_start_test_stage(
             *rss_start_steps,
             *cpu_start_steps,
             toggle_step,
+            *gateway_steps,
             *tail_steps,
             *cpu_stop_steps,
             *rss_stop_steps,
@@ -978,6 +1068,25 @@ def create_validated_ebgp_session_oscillation_stage(
                 downtime_seconds=downtime_seconds,
                 parent_prefixes_to_ignore=parent_prefixes_to_ignore,
                 description="Run validated dual-stack eBGP session oscillations",
+                ixia_restore_timeout_floor_seconds=180,
+            )
+        ]
+    )
+
+
+def create_session_churn_stage(
+    *,
+    hostname: str,
+    session_churn: SessionChurn,
+    description: str = "Run validated BGP session oscillations",
+) -> Stage:
+    """Create one Stage from a reusable typed session-churn specification."""
+    return Stage(
+        steps=[
+            create_session_churn_step(
+                hostname=hostname,
+                session_churn=session_churn,
+                description=description,
             )
         ]
     )
@@ -1597,6 +1706,7 @@ def create_validated_plane_bgp_session_oscillation_stage(
                 downtime_seconds=downtime_seconds,
                 parent_prefixes_to_ignore=parent_prefixes_to_ignore,
                 description="Run validated per-plane iBGP session oscillations",
+                ixia_restore_timeout_floor_seconds=600,
             )
         ]
     )
@@ -1737,28 +1847,50 @@ def create_validated_bgp_igp_instability_unresolvable_pnhs_stage(
     restore_start_ipv6s: list[str],
     local_link: dict[str, Any],
     other_link: dict[str, Any],
+    expected_in_scope_sessions: int,
     count: int = 63,
     step: int = 2,
     delete_count: int = 20,
     update_timeout_seconds: int = 60,
     stability_duration_seconds: int = 1800,
+    parent_prefixes_to_ignore: Sequence[str] = (),
+    convergence_stability_polls: int = 3,
+    convergence_stability_max_seconds: int = 300,
 ) -> Stage:
-    """Create the failure-safe validated CICD-EBB-08 stage."""
+    """Create the failure-safe validated CICD-EBB-08 stage.
+
+    The convergence window closes on quiescence rather than on
+    ``update_timeout_seconds`` alone. On bag013 with update groups off, BGP++
+    is still draining its per-peer UPDATE queue at T0+60s -- measured runs put
+    the drain between 60s and 120s -- so a fixed 60s window records the
+    baseline mid-flight and the soak then fails on ~30k UPDATEs that were
+    ordinary convergence traffic. Waiting for the counter to stop moving fixes
+    that without hard-coding a larger timeout that would break again at a
+    different scale.
+    """
     return Stage(
         steps=[
-            create_validated_igp_unresolvable_pnh_step(
-                device_name=device_name,
-                start_ipv4s=start_ipv4s,
-                start_ipv6s=start_ipv6s,
-                restore_start_ipv4s=restore_start_ipv4s,
-                restore_start_ipv6s=restore_start_ipv6s,
-                local_link=local_link,
-                other_link=other_link,
-                count=count,
-                step=step,
-                delete_count=delete_count,
-                update_timeout_seconds=update_timeout_seconds,
-                stability_duration_seconds=stability_duration_seconds,
+            create_igp_unresolvable_churn_step(
+                IgpUnresolvableChurn.create(
+                    hostname=device_name,
+                    start_ipv4s=start_ipv4s,
+                    start_ipv6s=start_ipv6s,
+                    restore_start_ipv4s=restore_start_ipv4s,
+                    restore_start_ipv6s=restore_start_ipv6s,
+                    local_link=local_link,
+                    other_link=other_link,
+                    count=count,
+                    step=step,
+                    delete_count=delete_count,
+                    update_timeout_seconds=update_timeout_seconds,
+                    stability_duration_seconds=stability_duration_seconds,
+                    expected_in_scope_sessions=expected_in_scope_sessions,
+                    parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+                    convergence_stability_polls=convergence_stability_polls,
+                    convergence_stability_max_seconds=(
+                        convergence_stability_max_seconds
+                    ),
+                )
             )
         ]
     )
@@ -1904,6 +2036,66 @@ def _create_route_oscillation_cycle_steps_spread(
     return steps
 
 
+def create_bgp_nhg_random_storm_stage(
+    *,
+    hostname: str,
+    ixia_items_by_afi: Mapping[str, Mapping[str, Any]],
+    prefix_pool_scope_regex: str | None = None,
+    seed: int = 160016,
+    inactive_paths_per_afi: int | None = None,
+    target_membership_width: int | None = None,
+    minimum_distinct_memberships_per_afi: int = 750,
+    minimum_observed_bgp_multiway_memberships: int = 1001,
+    minimum_paused_fibagent_samples: int = 1,
+    minimum_confirmed_pause_fap_samples: int = 3,
+    fibagent_nhg_watermark_high: int = 1000,
+    fibagent_nhg_watermark_low: int = 1000,
+    enable_control_plane_validation: bool = True,
+    control_plane_sample_interval_seconds: int = 5,
+    control_plane_read_timeout_seconds: int = 60,
+    minimum_changed_paths_per_epoch: int = 5_000,
+    epoch_count: int = 48,
+    epoch_interval_seconds: int = 25,
+    restoration_stage_prefix_count: int | None = None,
+    fibagent_restart_after_epoch: int | None = None,
+) -> Stage:
+    """Create C16 as one failure-safe, topology-bound random-storm step."""
+    return Stage(
+        steps=[
+            create_bgp_nhg_random_storm_step(
+                hostname=hostname,
+                ixia_items_by_afi=ixia_items_by_afi,
+                prefix_pool_scope_regex=prefix_pool_scope_regex,
+                seed=seed,
+                inactive_paths_per_afi=inactive_paths_per_afi,
+                target_membership_width=target_membership_width,
+                minimum_distinct_memberships_per_afi=(
+                    minimum_distinct_memberships_per_afi
+                ),
+                minimum_observed_bgp_multiway_memberships=(
+                    minimum_observed_bgp_multiway_memberships
+                ),
+                minimum_paused_fibagent_samples=minimum_paused_fibagent_samples,
+                minimum_confirmed_pause_fap_samples=(
+                    minimum_confirmed_pause_fap_samples
+                ),
+                fibagent_nhg_watermark_high=fibagent_nhg_watermark_high,
+                fibagent_nhg_watermark_low=fibagent_nhg_watermark_low,
+                enable_control_plane_validation=enable_control_plane_validation,
+                control_plane_sample_interval_seconds=(
+                    control_plane_sample_interval_seconds
+                ),
+                control_plane_read_timeout_seconds=(control_plane_read_timeout_seconds),
+                minimum_changed_paths_per_epoch=minimum_changed_paths_per_epoch,
+                epoch_count=epoch_count,
+                epoch_interval_seconds=epoch_interval_seconds,
+                restoration_stage_prefix_count=restoration_stage_prefix_count,
+                fibagent_restart_after_epoch=fibagent_restart_after_epoch,
+            )
+        ]
+    )
+
+
 def create_route_oscillations_stage(
     device_name: str,
     prefix_pool_regex: str,
@@ -1975,9 +2167,18 @@ def create_validated_bgp_route_oscillations_stage(
     readvertise_time: int = 60,
     test_duration_seconds: int = 3600,
     parent_prefixes_to_ignore: Sequence[str] = (),
+    transition_soft_threshold_seconds: Optional[float] = None,
+    advertise_transition_soft_threshold_seconds: Optional[float] = None,
+    fail_on_session_flap: Optional[bool] = None,
     description: str = "Run validated dual-stack BGP route oscillations",
 ) -> Stage:
-    """Create BGP route oscillations with a verdict for every trigger."""
+    """Create BGP route oscillations with a verdict for every trigger.
+
+    See ``create_validated_bgp_route_oscillation_step`` for the transition SLA
+    contract. The shared threshold gates both directions unless the optional
+    advertise threshold overrides only readvertisement; late convergence remains
+    blocking in either direction.
+    """
     return Stage(
         steps=[
             create_validated_bgp_route_oscillation_step(
@@ -1991,6 +2192,29 @@ def create_validated_bgp_route_oscillations_stage(
                 readvertise_time=readvertise_time,
                 test_duration_seconds=test_duration_seconds,
                 parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+                transition_soft_threshold_seconds=transition_soft_threshold_seconds,
+                advertise_transition_soft_threshold_seconds=(
+                    advertise_transition_soft_threshold_seconds
+                ),
+                fail_on_session_flap=fail_on_session_flap,
+                description=description,
+            )
+        ]
+    )
+
+
+def create_route_churn_stage(
+    *,
+    hostname: str,
+    route_churn: RouteChurn,
+    description: str = "Run validated dual-stack BGP route oscillations",
+) -> Stage:
+    """Create one Stage from a reusable typed route-churn specification."""
+    return Stage(
+        steps=[
+            create_route_churn_step(
+                hostname=hostname,
+                route_churn=route_churn,
                 description=description,
             )
         ]
@@ -2245,104 +2469,49 @@ def _create_change_as_path_length_step(
 def create_bgp_ebb_attribute_churn_stage(
     *,
     hostname: str,
-    prefix_pool_names: dict[str, dict[str, str]],
-    peer_count_per_plane: int,
-    selected_block_count_per_afi: int,
-    samples_per_block: int,
-    routes_per_block: int,
-    duration_seconds: int,
-    max_iterations: int,
-    cadence_seconds: int,
+    attribute_churn: AttributeChurn,
     poll_interval_seconds: int,
     transition_timeout_seconds: int,
     reference_setup_timeout_seconds: int,
-    restore_timeout_seconds: int,
     quiet_window_seconds: int,
     max_lookup_concurrency: int,
     openr_mode: str,
-    attribute_matrix: dict[str, dict[str, Any]],
+    ibgp_route_next_hop_starts: Mapping[str, Mapping[str, str]],
     convergence_hard_timeout_seconds: int = 300,
+    transient_observation_logging: str = "off",
 ) -> Stage:
     """Create CICD-EBB-10 as one failure-safe, audited custom workflow."""
     return Stage(
+        description="BGP attribute churn (CICD-EBB-10)",
         steps=[
             create_bgp_attribute_churn_step(
                 hostname=hostname,
-                prefix_pool_names=prefix_pool_names,
-                peer_count_per_plane=peer_count_per_plane,
-                selected_block_count_per_afi=selected_block_count_per_afi,
-                samples_per_block=samples_per_block,
-                routes_per_block=routes_per_block,
-                duration_seconds=duration_seconds,
-                max_iterations=max_iterations,
-                cadence_seconds=cadence_seconds,
+                attribute_churn=attribute_churn,
                 poll_interval_seconds=poll_interval_seconds,
                 transition_timeout_seconds=transition_timeout_seconds,
                 convergence_hard_timeout_seconds=convergence_hard_timeout_seconds,
                 reference_setup_timeout_seconds=reference_setup_timeout_seconds,
-                restore_timeout_seconds=restore_timeout_seconds,
                 quiet_window_seconds=quiet_window_seconds,
                 max_lookup_concurrency=max_lookup_concurrency,
                 openr_mode=openr_mode,
-                attribute_matrix=attribute_matrix,
+                ibgp_route_next_hop_starts=ibgp_route_next_hop_starts,
+                transient_observation_logging=transient_observation_logging,
             )
-        ]
+        ],
     )
 
 
 def create_bgp_ebb_route_storm_stage(
     *,
     hostname: str,
-    ixia_interface_mimic_ibgp: str,
-    expected_established_sessions: int,
-    observer_peer_parent_prefix: str,
-    prefix_pool_names: dict[str, str],
-    peer_count_per_plane: int,
-    selected_peer_rows: list[int],
-    routes_per_peer: int,
-    samples_per_block: int,
-    cycles: int,
-    advertise_seconds: int,
-    withdraw_seconds: int,
-    poll_interval_seconds: int,
-    transition_timeout_seconds: int,
-    session_establish_timeout_seconds: int,
-    restore_timeout_seconds: int,
-    quiet_window_seconds: int,
-    max_lookup_concurrency: int,
-    as_path_pool_size: int,
-    as_path_length: int,
-    communities_per_route: int,
-    extended_communities_per_route: int,
-    convergence_hard_timeout_seconds: int = 300,
+    route_storm: RouteStorm,
 ) -> Stage:
     """Create CICD-EBB-11 as one failure-safe, audited custom workflow."""
     return Stage(
         steps=[
             create_bgp_route_storm_step(
                 hostname=hostname,
-                ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-                expected_established_sessions=expected_established_sessions,
-                observer_peer_parent_prefix=observer_peer_parent_prefix,
-                prefix_pool_names=prefix_pool_names,
-                peer_count_per_plane=peer_count_per_plane,
-                selected_peer_rows=selected_peer_rows,
-                routes_per_peer=routes_per_peer,
-                samples_per_block=samples_per_block,
-                cycles=cycles,
-                advertise_seconds=advertise_seconds,
-                withdraw_seconds=withdraw_seconds,
-                poll_interval_seconds=poll_interval_seconds,
-                transition_timeout_seconds=transition_timeout_seconds,
-                convergence_hard_timeout_seconds=convergence_hard_timeout_seconds,
-                session_establish_timeout_seconds=session_establish_timeout_seconds,
-                restore_timeout_seconds=restore_timeout_seconds,
-                quiet_window_seconds=quiet_window_seconds,
-                max_lookup_concurrency=max_lookup_concurrency,
-                as_path_pool_size=as_path_pool_size,
-                as_path_length=as_path_length,
-                communities_per_route=communities_per_route,
-                extended_communities_per_route=extended_communities_per_route,
+                route_storm=route_storm,
             )
         ]
     )
@@ -2429,6 +2598,30 @@ def create_attribute_churn_stage(
     return Stage(steps=steps)
 
 
+def _fauu_ibgp_capture_interfaces(
+    singular: str | None, plural: Sequence[str] | None
+) -> tuple[str, ...]:
+    """Resolve legacy or plural capture inputs without silently dropping a link."""
+    if singular is not None and plural is not None:
+        raise ValueError("provide singular or plural iBGP capture interfaces, not both")
+    if plural is None:
+        interfaces = () if singular is None else (singular,)
+    else:
+        if isinstance(plural, str) or not plural:
+            raise ValueError(
+                "plural iBGP capture interfaces must be a nonempty sequence"
+            )
+        interfaces = tuple(plural)
+    if any(
+        not isinstance(interface, str) or not interface.strip()
+        for interface in interfaces
+    ):
+        raise ValueError("iBGP capture interfaces must be nonempty strings")
+    if len({interface.strip() for interface in interfaces}) != len(interfaces):
+        raise ValueError("duplicate iBGP capture interfaces")
+    return interfaces
+
+
 def create_fauu_drain_undrain_stage(  # noqa: C901
     device_name: str,
     prefix_pool_regex: str,
@@ -2443,11 +2636,19 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     convergence_signal: str = "per_peer_rib_version",
     peer_convergence_scope: dict | None = None,
     expected_min_peers: int | None = None,
+    verify_restoration: bool = True,
+    require_stable_restoration_baseline: bool = False,
+    expected_established_sessions: int | None = None,
+    expected_peer_addresses: Sequence[str] | None = None,
+    restoration_settle_timeout_seconds: int = 300,
+    drained_prefix_descriptors: Sequence[dict] | None = None,
+    tcp_dump_capture_interfaces_ibgp: Sequence[str] | None = None,
 ) -> Stage:
     """
     Create a test stage to verify BGP FAUU drain/undrain behavior on specific peers.
 
     This stage tests BGP's handling of attribute changes at the peer level by:
+    0. Snapshotting the pre-drain peer views, policy names and route count
     1. Starting IXIA packet capture for drain phase on all configured interfaces
     2. Draining: Set local preference to 120 for specified peers
     3. Draining: Set origin to incomplete for specified peers
@@ -2461,10 +2662,12 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     11. Save IXIA packet capture for undrain phase
     12. Verify undrain convergence inline (max 5 minutes)
     13. Generate consolidated convergence report from the core PCAP files
+    14. Verify the final peer views, policy names and route count match the
+        step-0 baseline exactly
 
-    Captures on two core interfaces:
-    - bgp_fauu_drain_ebgp.pcap / bgp_fauu_undrain_ebgp.pcap (eBGP SOURCE - where attributes originate)
-    - bgp_fauu_drain_ibgp.pcap / bgp_fauu_undrain_ibgp.pcap (iBGP RECEIVER - attribute propagation)
+    Captures on the eBGP source and every configured iBGP receiver. A single
+    receiver retains bgp_fauu_*drain_ibgp.pcap; multiple receivers use ordered
+    _1, _2, ... suffixes for capture identities, files, phases, and report keys.
 
     Args:
         device_name: Name of the device under test
@@ -2473,8 +2676,28 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         prefix_end_index: Ending index within the network group multiplier. If None, use all.
         tcp_dump_capture_interface_ebgp: Optional interface for IXIA packet capture on eBGP (SOURCE) (default: None)
         tcp_dump_capture_interface_bgpmon: Legacy auxiliary interface input; accepted but intentionally excluded from the stage
-        tcp_dump_capture_interface_ibgp: Optional interface for IXIA packet capture on iBGP (RECEIVER) (default: None)
+        tcp_dump_capture_interface_ibgp: Legacy single iBGP receiver interface; None omits capture.
+        tcp_dump_capture_interfaces_ibgp: Nonempty sequence of distinct iBGP receiver interfaces, mutually exclusive with the singular input.
         soak_time_seconds: Soak duration after drain and undrain (default: 1800 / 30 minutes)
+        convergence_mode: "counter", "pcap", or "hybrid" (default); see below.
+        counter_convergence_soak_seconds: Settle soak used in counter/hybrid mode
+        convergence_signal: "per_peer_rib_version" (default) or "global_table_version"
+        peer_convergence_scope: Peers the RIB-version poll watches; defaults to
+            the eBGP remote AS this stage drains
+        expected_min_peers: Anti-vacuousness floor for the convergence poll
+        verify_restoration: Snapshot every peer view, both policy names and the
+            RIB route count before the drain and require an exact match after
+            the undrain (default: True). Closes the case where sessions are up
+            and the RIB, FIB Agent and hardware FIB agree with each other while
+            the restored view itself is wrong.
+        require_stable_restoration_baseline: Require the full raw peer view to
+            remain unchanged before recording the restoration baseline.
+        expected_established_sessions: Exact peer count required by the stable
+            baseline path.
+        expected_peer_addresses: Exact topology-derived peer identities required
+            by the stable baseline path.
+        restoration_settle_timeout_seconds: How long the restoration check keeps
+            re-reading before failing (default: 300)
 
     Returns:
         Stage object for BGP FAUU drain/undrain test
@@ -2499,10 +2722,48 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     #               the capture runs, then tshark verifies path attributes.
     # do_pcap drives capture + tshark verify + report (pcap and hybrid);
     # do_counter_poll drives the RIB-version poll (counter and hybrid).
+    #
+    # Division of labour: the counter poll owns convergence timing, the captures
+    # own attribute correctness. A capture cannot time convergence at all, since
+    # it sits on the wire and never observes RIB recomputation or FIB
+    # programming. Here it is worse still: one capture spans both stimuli of a
+    # phase (local-pref, then origin), so max(UPDATE ts) - min(UPDATE ts) also
+    # covers the idle gap while IXNetwork stages the second attribute. Measured
+    # on bag011, that span came out at the apply-to-apply gap plus ~4s of real
+    # UPDATE flow (drain 175.1s gap / 179.5s span, undrain 364.3s gap / 368.5s
+    # span) while the DUT itself quiesced in 46.2s and 41.1s. What the capture
+    # can prove is that the attribute the stage set reached the peer, which is
+    # what expected_origin / expected_local_pref check below.
     if convergence_mode not in ("counter", "pcap", "hybrid"):
         raise ValueError(f"invalid convergence_mode: {convergence_mode!r}")
     do_pcap = convergence_mode in ("pcap", "hybrid")
     do_counter_poll = convergence_mode in ("counter", "hybrid")
+    ibgp_interfaces = _fauu_ibgp_capture_interfaces(
+        tcp_dump_capture_interface_ibgp, tcp_dump_capture_interfaces_ibgp
+    )
+    ibgp_captures = (
+        tuple(
+            (interface, "" if len(ibgp_interfaces) == 1 else f"_{index}")
+            for index, interface in enumerate(ibgp_interfaces, start=1)
+        )
+        if do_pcap
+        else ()
+    )
+    # Every pcap step below sets an attribute expectation, and an expectation
+    # without a prefix window is rejected at verification time as a
+    # misconfiguration. Fail at construction instead: a caller that enables
+    # captures without passing descriptors would otherwise only find out after
+    # the whole drain has already run on hardware.
+    if (
+        do_pcap
+        and (tcp_dump_capture_interface_ebgp or ibgp_interfaces)
+        and not drained_prefix_descriptors
+    ):
+        raise ValueError(
+            "fauu drain/undrain captures assert ORIGIN and LOCAL_PREF on the "
+            "drained prefixes, so drained_prefix_descriptors is required when "
+            f"convergence_mode={convergence_mode!r} enables a capture interface"
+        )
     # Same value for both the drain and the undrain soak: a short settle in
     # counter/hybrid mode (the RIB-version poll gates the wait instead), the
     # full fixed soak otherwise.
@@ -2534,6 +2795,31 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
 
         expected_min_peers = EBGP_PEER_COUNT_V4
 
+    # Restoration baseline. Scoped to every peer, not just the drained eBGP set:
+    # the requirement is that all observed peer views come back, and a FAUU
+    # drain that leaks into the iBGP side is exactly what a scoped baseline
+    # would miss. The convergence floor is a conservative reuse here (the full
+    # peer set is far larger), so a baseline that small already means the read
+    # was wrong.
+    if verify_restoration:
+        steps.append(
+            create_bgp_restoration_baseline_step(
+                snapshot_key="fauu_drain_undrain",
+                expected_min_peers=expected_min_peers,
+                require_stable_baseline=require_stable_restoration_baseline,
+                expected_peer_count=(
+                    expected_established_sessions
+                    if require_stable_restoration_baseline
+                    else None
+                ),
+                expected_peer_addresses=(
+                    expected_peer_addresses
+                    if require_stable_restoration_baseline
+                    else None
+                ),
+            ),
+        )
+
     # IXIA capture (bgp_fauu_*drain_*.pcap) feeds only this stage's tshark
     # verification, so it runs only when do_pcap is set.
     if do_pcap:
@@ -2550,14 +2836,14 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
             )
 
     # Step 3: Start IXIA packet capture on iBGP interface for drain (if provided)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="start",
-                capture_id="fauu_drain_ibgp",
-                description="Start IXIA packet capture for drain phase (iBGP RECEIVER)",
+                capture_id=f"fauu_drain_ibgp{suffix}",
+                description=f"Start IXIA packet capture for drain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -2596,7 +2882,12 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         steps.append(
             create_drain_convergence_verification_step(
                 pcap_filename=None,
-                max_convergence_time_seconds=300,  # 5 minutes for FAUU
+                # Sized against measured behaviour, not a round number: bag011
+                # at full scale reconverged in 15.4s (drain) and 10.3s
+                # (undrain) of real work, plus the 30s quiescence window this
+                # gate always pays. 200s leaves roughly 4x headroom over the
+                # observed worst phase while still catching a real slowdown.
+                max_convergence_time_seconds=200,
                 phase="drain",
                 convergence_signal=convergence_signal,
                 peer_scope=peer_convergence_scope,
@@ -2626,14 +2917,14 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 10: Stop IXIA packet capture for drain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="stop",
-                capture_id="fauu_drain_ibgp",
-                description="Stop IXIA packet capture for drain phase (iBGP RECEIVER)",
+                capture_id=f"fauu_drain_ibgp{suffix}",
+                description=f"Stop IXIA packet capture for drain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -2651,15 +2942,15 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 13: Save IXIA packet capture for drain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="save",
-                pcap_filename="bgp_fauu_drain_ibgp.pcap",
-                capture_id="fauu_drain_ibgp",
-                description="Save IXIA packet capture for drain phase (iBGP RECEIVER)",
+                pcap_filename=f"bgp_fauu_drain_ibgp{suffix}.pcap",
+                capture_id=f"fauu_drain_ibgp{suffix}",
+                description=f"Save IXIA packet capture for drain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -2672,18 +2963,34 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
                 expected_as_path_asn=None,
                 phase="drain (eBGP SOURCE)",
                 use_pcap_analysis=True,
+                expected_origin="incomplete",
+                expected_local_pref=120,
+                expected_attribute_prefixes=drained_prefix_descriptors,
             ),
         )
 
     # Step 16: Verify drain convergence (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    #
+    # The two legs expect different LOCAL_PREF values, and that asymmetry is the
+    # protocol, not a discrepancy. ORIGIN is a transitive attribute, so the
+    # value IXIA sets crosses the DUT unchanged and both legs expect it. LOCAL_PREF
+    # does not cross: RFC 4271 5.1.5 says a speaker MUST ignore LOCAL_PREF received
+    # from an external peer, and originates its own value toward internal peers.
+    # So the eBGP leg expects the 120 that IXIA emitted (proof the stimulus was
+    # applied) and the iBGP leg expects the DUT's own default 100 (proof the DUT
+    # ignored the eBGP-supplied 120 rather than leaking it into the iBGP mesh).
+    # Expecting 120 here failed a run against a correctly behaving DUT.
+    for _, suffix in ibgp_captures:
         steps.append(
             create_drain_convergence_verification_step(
-                pcap_filename="bgp_fauu_drain_ibgp.pcap",
+                pcap_filename=f"bgp_fauu_drain_ibgp{suffix}.pcap",
                 max_convergence_time_seconds=300,  # 5 minutes for FAUU
                 expected_as_path_asn=None,
-                phase="drain (iBGP RECEIVER)",
+                phase=f"drain (iBGP RECEIVER{suffix})",
                 use_pcap_analysis=True,
+                expected_origin="incomplete",
+                expected_local_pref=100,
+                expected_attribute_prefixes=drained_prefix_descriptors,
             ),
         )
 
@@ -2691,8 +2998,8 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     pcap_files_drain: dict[str, str] = {}
     if tcp_dump_capture_interface_ebgp:
         pcap_files_drain["ebgp_source"] = "bgp_fauu_drain_ebgp.pcap"
-    if tcp_dump_capture_interface_ibgp:
-        pcap_files_drain["ibgp_receiver"] = "bgp_fauu_drain_ibgp.pcap"
+    for _, suffix in ibgp_captures:
+        pcap_files_drain[f"ibgp_receiver{suffix}"] = f"bgp_fauu_drain_ibgp{suffix}.pcap"
 
     if do_pcap:
         steps.append(
@@ -2701,6 +3008,15 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
                 pcap_files=pcap_files_drain,
                 description="Generate consolidated drain convergence report",
             ),
+        )
+
+    # Step 16B: report-only sample of the same comparison the undrain gate makes.
+    # Placed at the end of the drain phase, mirroring the gate's position at the
+    # end of the undrain phase, so the two readings differ only in when they were
+    # taken and a drifted final state can be attributed to one half of the stage.
+    if verify_restoration:
+        steps.append(
+            create_bgp_restoration_probe_step(snapshot_key="fauu_drain_undrain"),
         )
 
     # Step 17: Start new IXIA packet capture for undrain phase (eBGP)
@@ -2716,14 +3032,14 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 19: Start new IXIA packet capture for undrain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="start",
-                capture_id="fauu_undrain_ibgp",
-                description="Start IXIA packet capture for undrain phase (iBGP RECEIVER)",
+                capture_id=f"fauu_undrain_ibgp{suffix}",
+                description=f"Start IXIA packet capture for undrain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -2764,7 +3080,8 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         steps.append(
             create_drain_convergence_verification_step(
                 pcap_filename=None,
-                max_convergence_time_seconds=300,  # 5 minutes for FAUU
+                # Same sizing as the drain gate above.
+                max_convergence_time_seconds=200,
                 phase="undrain",
                 convergence_signal=convergence_signal,
                 peer_scope=peer_convergence_scope,
@@ -2794,14 +3111,14 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 26: Stop IXIA packet capture for undrain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="stop",
-                capture_id="fauu_undrain_ibgp",
-                description="Stop IXIA packet capture for undrain phase (iBGP RECEIVER)",
+                capture_id=f"fauu_undrain_ibgp{suffix}",
+                description=f"Stop IXIA packet capture for undrain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -2819,15 +3136,15 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
         )
 
     # Step 29: Save IXIA packet capture for undrain phase (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    for interface, suffix in ibgp_captures:
         steps.append(
             create_ixia_packet_capture_step(
                 device_name=device_name,
-                interface=tcp_dump_capture_interface_ibgp,
+                interface=interface,
                 mode="save",
-                pcap_filename="bgp_fauu_undrain_ibgp.pcap",
-                capture_id="fauu_undrain_ibgp",
-                description="Save IXIA packet capture for undrain phase (iBGP RECEIVER)",
+                pcap_filename=f"bgp_fauu_undrain_ibgp{suffix}.pcap",
+                capture_id=f"fauu_undrain_ibgp{suffix}",
+                description=f"Save IXIA packet capture for undrain phase (iBGP RECEIVER{suffix})",
             ),
         )
 
@@ -2840,18 +3157,30 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
                 expected_as_path_asn=None,
                 phase="undrain (eBGP SOURCE)",
                 use_pcap_analysis=True,
+                expected_origin="igp",
+                expected_local_pref=100,
+                expected_attribute_prefixes=drained_prefix_descriptors,
             ),
         )
 
     # Step 32: Verify undrain convergence (iBGP)
-    if do_pcap and tcp_dump_capture_interface_ibgp:
+    #
+    # Both undrain legs expect 100, but for different reasons: the eBGP leg
+    # because the stage restored the tester to 100, the iBGP leg because the DUT
+    # always originates its own LOCAL_PREF (see the drain iBGP note above). The
+    # iBGP LOCAL_PREF is therefore identical in both phases and only ORIGIN
+    # discriminates drain from undrain on this leg.
+    for _, suffix in ibgp_captures:
         steps.append(
             create_drain_convergence_verification_step(
-                pcap_filename="bgp_fauu_undrain_ibgp.pcap",
+                pcap_filename=f"bgp_fauu_undrain_ibgp{suffix}.pcap",
                 max_convergence_time_seconds=300,  # 5 minutes for FAUU
                 expected_as_path_asn=None,
-                phase="undrain (iBGP RECEIVER)",
+                phase=f"undrain (iBGP RECEIVER{suffix})",
                 use_pcap_analysis=True,
+                expected_origin="igp",
+                expected_local_pref=100,
+                expected_attribute_prefixes=drained_prefix_descriptors,
             ),
         )
 
@@ -2859,8 +3188,10 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
     pcap_files_undrain: dict[str, str] = {}
     if tcp_dump_capture_interface_ebgp:
         pcap_files_undrain["ebgp_source"] = "bgp_fauu_undrain_ebgp.pcap"
-    if tcp_dump_capture_interface_ibgp:
-        pcap_files_undrain["ibgp_receiver"] = "bgp_fauu_undrain_ibgp.pcap"
+    for _, suffix in ibgp_captures:
+        pcap_files_undrain[f"ibgp_receiver{suffix}"] = (
+            f"bgp_fauu_undrain_ibgp{suffix}.pcap"
+        )
 
     if do_pcap:
         steps.append(
@@ -2868,6 +3199,16 @@ def create_fauu_drain_undrain_stage(  # noqa: C901
                 phase="undrain",
                 pcap_files=pcap_files_undrain,
                 description="Generate consolidated undrain convergence report",
+            ),
+        )
+
+    # Step 33: the undrain must land back on the exact pre-drain state, not just
+    # a self-consistent one. Runs last so convergence has already been asserted.
+    if verify_restoration:
+        steps.append(
+            create_bgp_restoration_verification_step(
+                snapshot_key="fauu_drain_undrain",
+                settle_timeout_seconds=restoration_settle_timeout_seconds,
             ),
         )
 
@@ -2888,6 +3229,8 @@ def create_plane_drain_undrain_stage(  # noqa: C901
     convergence_signal: str = "per_peer_rib_version",
     peer_convergence_scope: dict | None = None,
     expected_min_peers: int | None = None,
+    verify_restoration: bool = True,
+    restoration_settle_timeout_seconds: int = 300,
 ) -> list[Stage]:
     """
     Create a test stage to verify BGP plane drain/undrain behavior.
@@ -2903,6 +3246,7 @@ def create_plane_drain_undrain_stage(  # noqa: C901
        - Measures end-to-end convergence including path selection
 
     The test sequence:
+    0. Snapshot the pre-drain peer views, policy names and route count
     1. Start IXIA packet capture on all configured interfaces for drain phase
     2. Drain: Change origin attribute to incomplete for specified prefixes
     3. Drain: Prepend AS_PATH with ASN 65099
@@ -2915,6 +3259,8 @@ def create_plane_drain_undrain_stage(  # noqa: C901
     10. Soak for specified duration after undrain
     11. Save IXIA packet captures for undrain phase (all interfaces)
     12. Verify undrain convergence inline (max 10 minutes)
+    13. Verify the final plane policy, peer views and route count match the
+        step-0 baseline exactly
 
     Args:
         device_name: Name of the device under test
@@ -2925,6 +3271,20 @@ def create_plane_drain_undrain_stage(  # noqa: C901
         tcp_dump_capture_interface_ebgp: Optional interface for IXIA packet capture on eBGP (FA-UU) to verify best-path changes (default: None)
         tcp_dump_capture_interface_ibgp: Optional interface for IXIA packet capture on iBGP Plane (SOURCE) to measure drain start/end reference point (default: None)
         soak_time_seconds: Soak duration after drain and undrain operations (default: 1800 / 30 minutes)
+        convergence_mode: "counter", "pcap", or "hybrid" (default); see below.
+        counter_convergence_soak_seconds: Settle soak used in counter/hybrid mode
+        convergence_signal: "per_peer_rib_version" (default) or "global_table_version"
+        peer_convergence_scope: Peers the RIB-version poll watches; defaults to
+            the EB-FA/EB-EB egress policies this stage swaps
+        expected_min_peers: Anti-vacuousness floor for the convergence poll
+        verify_restoration: Snapshot every peer view, both policy names and the
+            RIB route count before the drain and require an exact match after
+            the undrain (default: True). This is what proves the four peer
+            groups came off their -DRAIN egress policies: a stage that leaves
+            EB-FA-OUT-DRAIN applied keeps every session up and keeps the RIB,
+            FIB Agent and hardware FIB mutually consistent.
+        restoration_settle_timeout_seconds: How long the restoration check keeps
+            re-reading before failing (default: 300)
 
     Returns:
         List of 6 Stage objects for BGP plane drain/undrain test:
@@ -2990,6 +3350,18 @@ def create_plane_drain_undrain_stage(  # noqa: C901
         expected_min_peers = EBGP_PEER_COUNT_V4
 
     steps_pre_drain = []
+
+    # Step 1: Restoration baseline, taken before any policy is swapped. Scoped
+    # to every peer because the drain applies to four peer groups spanning both
+    # the eBGP (EB-FA) and iBGP (EB-EB) sides, and the requirement covers all
+    # observed views, not only the ones the poll watches.
+    if verify_restoration:
+        steps_pre_drain.append(
+            create_bgp_restoration_baseline_step(
+                snapshot_key="plane_drain_undrain",
+                expected_min_peers=expected_min_peers,
+            ),
+        )
 
     # Step 1B: Start IXIA packet capture on eBGP interface for drain (if provided)
     if do_pcap and tcp_dump_capture_interface_ebgp:
@@ -3175,6 +3547,16 @@ def create_plane_drain_undrain_stage(  # noqa: C901
                 pcap_files=pcap_files_drain,
                 description="Generate consolidated drain convergence report with latency analysis",
             ),
+        )
+
+    # Step 5E: report-only sample of the same comparison the undrain gate makes.
+    # Placed at the end of the drain phase, mirroring the gate's position at the
+    # end of the undrain phase, so the two readings differ only in when they were
+    # taken. Both the -DRAIN policy apply and its revert otherwise sit inside the
+    # baseline-to-gate window, which leaves a drifted final state unattributable.
+    if verify_restoration:
+        steps_after_drain.append(
+            create_bgp_restoration_probe_step(snapshot_key="plane_drain_undrain"),
         )
 
     # Create Stage 3: Post-drain verification (sequential)
@@ -3375,6 +3757,17 @@ def create_plane_drain_undrain_stage(  # noqa: C901
             ),
         )
 
+    # Step 11: the undrain must land back on the exact pre-drain policy and peer
+    # views, not just a self-consistent state. Runs last so convergence has
+    # already been asserted.
+    if verify_restoration:
+        steps_post_undrain.append(
+            create_bgp_restoration_verification_step(
+                snapshot_key="plane_drain_undrain",
+                settle_timeout_seconds=restoration_settle_timeout_seconds,
+            ),
+        )
+
     # Create Stage 6: Post-undrain verification (sequential)
     stage_6_post_undrain = Stage(
         steps=steps_post_undrain,
@@ -3393,14 +3786,16 @@ def create_plane_drain_undrain_stage(  # noqa: C901
 
 
 def create_multipath_group_oscillation_stage(
+    hostname: str,
     ipv4_peer_regex: str = ".*IPV4_EBGP$",
     ipv6_peer_regex: str = ".*IPV6_EBGP$",
     ipv4_session_count: int = 100,
-    ipv6_session_count: int = 100,  # noqa: F841 - IPv6 multipath validation TBD
+    ipv6_session_count: int = 100,
     test_duration_seconds: int = 1800,
     oscillation_interval_seconds: int = 280,
     min_peers_to_stop: int = 1,
     max_peers_to_stop: int = 11,
+    cycle_count: int | None = None,
     prefix_subnets: list[str] | None = None,
     expected_min_baseline_width: int | None = None,
     expected_max_baseline_width: int | None = None,
@@ -3424,23 +3819,20 @@ def create_multipath_group_oscillation_stage(
         - IAR is enabled
 
     Test Steps:
-        1. Discover baseline: Measure the live eBGP multipath group width and
-           remember the prefix set at that width. Optional sanity bounds catch
-           an implausibly-small or implausibly-large measurement.
-        2. For each configured cycle, fluctuate BGP multipath groups for eBGP routes:
-           a. Stop N (where N varies from 1 to max_peers_to_stop) of the eBGP sessions
-              to reduce the multipath group
-           b. Verify multipath group for discovered prefixes is reduced by exactly N
-              (derived from the discovered baseline width — testbed-portable)
-           c. Restart the stopped sessions to restore the multipath group
-           d. Verify multipath group for discovered prefixes is back to the baseline width
+        1. Discover the complete dual-stack multipath baseline for cleanup.
+        2. Map installed BGP++ next hops to exact IXIA session indices.
+        3. Select two prefixes per address family from the largest path cohort.
+        4. Stop 1, 3, 5, 7, 9, and 11 mapped sessions.
+        5. Verify exact next-hop reduction with bounded sequential route probes.
+        6. Start the mapped sessions and verify exact next-hop restoration.
+        7. Keep each configured half-cycle dwell after early convergence.
 
     Args:
+        hostname: Device hostname used for BGP++ Thrift route probes.
         ipv4_peer_regex: Regex pattern to match IPv4 eBGP peers (default: ".*IPV4_EBGP$")
         ipv6_peer_regex: Regex pattern to match IPv6 eBGP peers (default: ".*IPV6_EBGP$")
-        ipv4_session_count: Total number of IPv4 eBGP sessions on the IXIA side —
-            used only for peer-stop indexing. The DUT-side multipath width is
-            measured at runtime, NOT assumed to equal this value.
+        ipv4_session_count: Total number of IPv4 eBGP sessions on the IXIA side.
+            Runtime discovery maps installed DUT paths to these sessions.
         ipv6_session_count: Total number of IPv6 eBGP sessions on the IXIA side.
         test_duration_seconds: Configured convergence-dwell budget in seconds
             (default: 1800 / 30 minutes). Trigger and validation execution time
@@ -3449,6 +3841,8 @@ def create_multipath_group_oscillation_stage(
         oscillation_interval_seconds: Interval between oscillations (default: 280 seconds)
         min_peers_to_stop: Minimum number of peers to stop per cycle (default: 1)
         max_peers_to_stop: Maximum number of peers to stop per cycle (default: 11)
+        cycle_count: Optional cycle count for a bounded validation run. The
+            cataloged playbook uses six cycles when this value is not set.
         prefix_subnets: Optional list of prefix subnets to check for multipath groups.
                         If None, baseline discovery will find prefixes automatically.
                         Example: ["10.200.0.0/16", "2001:db8:200::/48"]
@@ -3468,165 +3862,60 @@ def create_multipath_group_oscillation_stage(
         raise ValueError("peer-stop range exceeds the configured session count")
     if oscillation_interval_seconds <= 0:
         raise ValueError("oscillation_interval_seconds must be positive")
+    configured_cycles = cycle_count if cycle_count is not None else 6
+    if configured_cycles <= 0:
+        raise ValueError("cycle_count must be positive")
     num_cycles = test_duration_seconds // oscillation_interval_seconds
-    if num_cycles != 6:
-        raise ValueError("multipath oscillation requires exactly six complete cycles")
-    terminal_soak_seconds = test_duration_seconds - (
-        num_cycles * oscillation_interval_seconds
-    )
+    if num_cycles != configured_cycles:
+        raise ValueError(
+            "multipath oscillation duration must contain the configured cycles"
+        )
     required_baseline_width = max_peers_to_stop + 1
     if expected_min_baseline_width is not None:
         required_baseline_width = max(
             required_baseline_width, expected_min_baseline_width
         )
 
-    steps = []
-
-    # Step 0: Baseline discovery — measure the live multipath group width and
-    # remember the prefix set at that width. The validation steps below read
-    # the measurement back via use_discovered_width=True instead of hard-coding
-    # an expected value from ipv4_session_count (which counts IXIA peers, not
-    # DUT-installed multipath next-hops).
-    steps.append(
-        create_multipath_nexthop_count_health_check_step(
-            prefix_subnets=prefix_subnets,
-            discover_baseline=True,
-            expected_min_baseline_width=required_baseline_width,
-            expected_max_baseline_width=expected_max_baseline_width,
-            min_multipath_width=min_multipath_width,
-            required_address_families=["ipv4", "ipv6"],
-            description="Baseline: Discover live multipath group width from eBGP RIB",
-        )
-    )
-
-    if (min_peers_to_stop, max_peers_to_stop) == (1, 11):
-        peer_stop_schedule = [1, 3, 5, 7, 9, 11]
-    else:
-        peer_stop_span = max_peers_to_stop - min_peers_to_stop
-        peer_stop_schedule = [
-            min_peers_to_stop + round(cycle * peer_stop_span / (num_cycles - 1))
-            for cycle in range(num_cycles)
+    return Stage(
+        steps=[
+            create_multipath_nexthop_count_health_check_step(
+                prefix_subnets=prefix_subnets,
+                discover_baseline=True,
+                expected_min_baseline_width=required_baseline_width,
+                expected_max_baseline_width=expected_max_baseline_width,
+                min_multipath_width=min_multipath_width,
+                required_address_families=["ipv4", "ipv6"],
+                description=(
+                    "Baseline: Discover live multipath group width from eBGP RIB"
+                ),
+            ),
+            create_multipath_churn_step(
+                MultipathChurn.create(
+                    hostname=hostname,
+                    ipv4_peer_regex=ipv4_peer_regex,
+                    ipv6_peer_regex=ipv6_peer_regex,
+                    ipv4_session_count=ipv4_session_count,
+                    ipv6_session_count=ipv6_session_count,
+                    test_duration_seconds=test_duration_seconds,
+                    oscillation_interval_seconds=oscillation_interval_seconds,
+                    min_peers_to_stop=min_peers_to_stop,
+                    max_peers_to_stop=max_peers_to_stop,
+                    cycle_count=cycle_count,
+                    expected_min_baseline_width=expected_min_baseline_width,
+                    expected_max_baseline_width=expected_max_baseline_width,
+                    min_multipath_width=min_multipath_width,
+                    prefix_subnets=prefix_subnets or (),
+                )
+            ),
         ]
-
-    for cycle, n_peers_to_stop in enumerate(peer_stop_schedule):
-        cycle_num = cycle + 1
-
-        # Step 1: Stop N IPv4 eBGP sessions (reduce multipath group)
-        steps.append(
-            create_start_stop_bgp_peers_step(
-                peer_regex=ipv4_peer_regex,
-                start=False,
-                start_idx=1,
-                end_idx=n_peers_to_stop,
-                expected_peer_count=1,
-                validate_session_range=True,
-                description=f"Cycle {cycle_num}/{num_cycles}: Stop IPv4 eBGP sessions 1-{n_peers_to_stop} (reduce multipath group)",
-            )
-        )
-
-        # Step 2: Stop N IPv6 eBGP sessions (reduce multipath group)
-        steps.append(
-            create_start_stop_bgp_peers_step(
-                peer_regex=ipv6_peer_regex,
-                start=False,
-                start_idx=1,
-                end_idx=n_peers_to_stop,
-                expected_peer_count=1,
-                validate_session_range=True,
-                description=f"Cycle {cycle_num}/{num_cycles}: Stop IPv6 eBGP sessions 1-{n_peers_to_stop} (reduce multipath group)",
-            )
-        )
-
-        # Step 3: Wait for half the oscillation interval for routes to converge
-        convergence_wait = oscillation_interval_seconds // 2
-        steps.append(
-            create_longevity_step(
-                duration=convergence_wait,
-                description=f"Cycle {cycle_num}/{num_cycles}: Wait {convergence_wait}s for multipath group reduction to converge",
-            )
-        )
-
-        # Step 3a: Health check — width-relative reduce assertion.
-        # The expected count is discovered_width - n_peers_to_stop, computed
-        # inside the HC from the stored measurement (not from ipv4_session_count).
-        steps.append(
-            create_multipath_nexthop_count_health_check_step(
-                use_discovered_prefixes=True,
-                use_discovered_width=True,
-                peers_stopped_delta=n_peers_to_stop,
-                description=(
-                    f"Cycle {cycle_num}/{num_cycles}: Verify multipath group "
-                    f"reduced by {n_peers_to_stop} (width-relative)"
-                ),
-            )
-        )
-
-        # Step 4: Restart N IPv4 eBGP sessions (restore multipath group)
-        steps.append(
-            create_start_stop_bgp_peers_step(
-                peer_regex=ipv4_peer_regex,
-                start=True,
-                start_idx=1,
-                end_idx=n_peers_to_stop,
-                expected_peer_count=1,
-                validate_session_range=True,
-                description=f"Cycle {cycle_num}/{num_cycles}: Start IPv4 eBGP sessions 1-{n_peers_to_stop} (restore multipath group)",
-            )
-        )
-
-        # Step 5: Restart N IPv6 eBGP sessions (restore multipath group)
-        steps.append(
-            create_start_stop_bgp_peers_step(
-                peer_regex=ipv6_peer_regex,
-                start=True,
-                start_idx=1,
-                end_idx=n_peers_to_stop,
-                expected_peer_count=1,
-                validate_session_range=True,
-                description=f"Cycle {cycle_num}/{num_cycles}: Start IPv6 eBGP sessions 1-{n_peers_to_stop} (restore multipath group)",
-            )
-        )
-
-        # Step 6: Wait for remaining interval for routes to re-converge
-        remaining_wait = oscillation_interval_seconds - convergence_wait
-        steps.append(
-            create_longevity_step(
-                duration=remaining_wait,
-                description=f"Cycle {cycle_num}/{num_cycles}: Wait {remaining_wait}s for multipath group restoration to converge",
-            )
-        )
-
-        # Step 6a: Health check — restore assertion (peers_stopped_delta=0).
-        steps.append(
-            create_multipath_nexthop_count_health_check_step(
-                use_discovered_prefixes=True,
-                use_discovered_width=True,
-                peers_stopped_delta=0,
-                description=(
-                    f"Cycle {cycle_num}/{num_cycles}: Verify multipath group "
-                    "restored to baseline width"
-                ),
-            )
-        )
-
-    if terminal_soak_seconds:
-        steps.append(
-            create_longevity_step(
-                duration=terminal_soak_seconds,
-                description=(
-                    f"Terminal {terminal_soak_seconds}s soak to complete the "
-                    "configured oscillation workload duration"
-                ),
-            )
-        )
-
-    return Stage(steps=steps)
+    )
 
 
 def create_multipath_group_oscillation_cleanup_steps(
     ipv4_peer_regex: str,
     ipv6_peer_regex: str,
-    max_peers_to_restore: int,
+    ipv4_session_count_to_restore: int,
+    ipv6_session_count_to_restore: int,
     expected_established_sessions: int,
     convergence_wait_seconds: int,
     parent_prefixes_to_ignore: list[str] | None = None,
@@ -3656,14 +3945,14 @@ def create_multipath_group_oscillation_cleanup_steps(
                     "label": "IPv4",
                     "regex": ipv4_peer_regex,
                     "session_start_idx": 1,
-                    "session_end_idx": max_peers_to_restore,
+                    "session_end_idx": ipv4_session_count_to_restore,
                     "expected_peer_count": 1,
                 },
                 {
                     "label": "IPv6",
                     "regex": ipv6_peer_regex,
                     "session_start_idx": 1,
-                    "session_end_idx": max_peers_to_restore,
+                    "session_end_idx": ipv6_session_count_to_restore,
                     "expected_peer_count": 1,
                 },
             ),
@@ -3686,20 +3975,79 @@ def create_multipath_group_oscillation_cleanup_steps(
     ]
 
 
+def _validate_route_registry_runtime_update_inputs(
+    *,
+    convergence_params: tuple[float | None, float | None, float | None],
+    baseline_route_count_histogram_by_afi: Mapping[str, Mapping[int, int]] | None,
+    expanded_route_count_histogram_by_afi: Mapping[str, Mapping[int, int]] | None,
+    peer_prefix_exclusion_blocks_by_pool: Mapping[str, Sequence[Mapping[str, object]]]
+    | None,
+    expected_prefix_pool_names: Optional[Sequence[str]],
+) -> bool:
+    if any(value is not None for value in convergence_params) and not all(
+        value is not None for value in convergence_params
+    ):
+        raise ValueError(
+            "convergence_soft_threshold_seconds, "
+            "convergence_hard_timeout_seconds, and "
+            "convergence_poll_interval_seconds must be provided together"
+        )
+    if (baseline_route_count_histogram_by_afi is None) != (
+        expanded_route_count_histogram_by_afi is None
+    ):
+        raise ValueError(
+            "baseline and expanded route-count histograms must be provided together"
+        )
+    if baseline_route_count_histogram_by_afi is not None:
+        expected_afis = {"ipv4", "ipv6"}
+        for name, histogram in (
+            ("baseline", baseline_route_count_histogram_by_afi),
+            ("expanded", expanded_route_count_histogram_by_afi),
+        ):
+            if histogram is None or set(histogram) != expected_afis:
+                raise ValueError(
+                    f"{name} route-count histogram keys must be exactly "
+                    "'ipv4' and 'ipv6'"
+                )
+    if peer_prefix_exclusion_blocks_by_pool is not None:
+        expected_names = set(expected_prefix_pool_names or ())
+        if not expected_names or set(peer_prefix_exclusion_blocks_by_pool) != (
+            expected_names
+        ):
+            raise ValueError(
+                "peer-prefix exclusion blocks must exactly match the expected "
+                "prefix-pool names"
+            )
+    return all(value is not None for value in convergence_params)
+
+
 def create_route_registry_runtime_update_stage(
     device_name: str,
     ebgp_peer_description: str = "EBGP",
     prefix_pool_regex: str = ".*EBGP.*",
     prefix_start_index: int = 0,
     prefix_end_index: int = 100,
+    expected_prefix_pool_names: Optional[Sequence[str]] = None,
     soak_time_seconds: int = 600,
     baseline_route_count: int = 650,
+    baseline_route_count_histogram_by_afi: Mapping[str, Mapping[int, int]]
+    | None = None,
+    expanded_route_count_histogram_by_afi: Mapping[str, Mapping[int, int]]
+    | None = None,
+    peer_prefix_exclusion_blocks_by_pool: Mapping[str, Sequence[Mapping[str, object]]]
+    | None = None,
     convergence_soft_threshold_seconds: float | None = None,
     convergence_hard_timeout_seconds: float | None = None,
     convergence_poll_interval_seconds: float | None = None,
     expanded_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_750.json",
     baseline_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_650.json",
+    expanded_policy_prefix_sources: Mapping[str, Mapping[str, object]] | None = None,
+    baseline_policy_prefix_sources: Mapping[str, Mapping[str, object]] | None = None,
     exact_peer_group_names: list[str] | None = None,
+    verify_trigger_readback: bool = False,
+    verify_policy_readback: bool = False,
+    expected_established_sessions: int | None = None,
+    parent_prefixes_to_ignore: Sequence[str] | None = None,
 ) -> Stage:
     """
     Create a test stage to verify route registry runtime update behavior for prefix-lists.
@@ -3725,11 +4073,21 @@ def create_route_registry_runtime_update_stage(
         prefix_end_index: Ending index for the additional prefixes (default: 100)
         soak_time_seconds: Soak duration for BGP stability verification (default: 600 / 10 minutes)
         baseline_route_count: Expected baseline route count (default: 650)
+        baseline_route_count_histogram_by_afi: Optional exact contracted
+            distribution for each address family
+        expanded_route_count_histogram_by_afi: Optional exact expanded and
+            restored distribution for each address family
+        peer_prefix_exclusion_blocks_by_pool: Optional topology-authored sparse
+            activation blocks keyed by IXIA prefix-pool name
         convergence_soft_threshold_seconds: Optional exact-count SLA
         convergence_hard_timeout_seconds: Optional observation timeout
         convergence_poll_interval_seconds: Optional polling interval
         expanded_policy_path: Route-filter policy that includes the test slice
         baseline_policy_path: Route-filter policy that excludes the test slice
+        expected_established_sessions: Exact non-monitor session total for the
+            final restored-state check
+        parent_prefixes_to_ignore: Parent networks excluded from that session
+            check, including the bound BGP-MON network
 
     Returns:
         Stage object for route registry runtime update test
@@ -3739,15 +4097,13 @@ def create_route_registry_runtime_update_stage(
         convergence_hard_timeout_seconds,
         convergence_poll_interval_seconds,
     )
-    if any(value is not None for value in convergence_params) and not all(
-        value is not None for value in convergence_params
-    ):
-        raise ValueError(
-            "convergence_soft_threshold_seconds, "
-            "convergence_hard_timeout_seconds, and "
-            "convergence_poll_interval_seconds must be provided together"
-        )
-    convergence_enabled = all(value is not None for value in convergence_params)
+    convergence_enabled = _validate_route_registry_runtime_update_inputs(
+        convergence_params=convergence_params,
+        baseline_route_count_histogram_by_afi=baseline_route_count_histogram_by_afi,
+        expanded_route_count_histogram_by_afi=expanded_route_count_histogram_by_afi,
+        peer_prefix_exclusion_blocks_by_pool=peer_prefix_exclusion_blocks_by_pool,
+        expected_prefix_pool_names=expected_prefix_pool_names,
+    )
     added_route_count = baseline_route_count + (prefix_end_index - prefix_start_index)
     descriptions_to_check = None if exact_peer_group_names else [ebgp_peer_description]
     peer_scope = (
@@ -3757,17 +4113,55 @@ def create_route_registry_runtime_update_stage(
     )
     steps = []
 
+    def create_prefix_slice_steps(
+        advertise: bool, description: str, evidence_phase: str
+    ) -> list[Step]:
+        if expected_prefix_pool_names is None:
+            return [
+                create_advertise_withdraw_prefixes_step(
+                    device_name=device_name,
+                    advertise=advertise,
+                    prefix_pool_regex=prefix_pool_regex,
+                    prefix_start_index=prefix_start_index,
+                    prefix_end_index=prefix_end_index,
+                    runtime_route_operation=True,
+                    strict_range=verify_trigger_readback,
+                    verify_readback=verify_trigger_readback,
+                    evidence_label=evidence_phase,
+                    description=description,
+                )
+            ]
+        return [
+            create_advertise_withdraw_prefixes_step(
+                device_name=device_name,
+                advertise=advertise,
+                prefix_pool_regex=rf"^{re.escape(pool_name)}$",
+                prefix_start_index=prefix_start_index,
+                prefix_end_index=prefix_end_index,
+                runtime_route_operation=True,
+                expected_prefix_pool_names=(pool_name,),
+                strict_range=verify_trigger_readback,
+                verify_readback=verify_trigger_readback,
+                evidence_label=f"{evidence_phase}:{pool_name}",
+                peer_prefix_exclusion_blocks=(
+                    peer_prefix_exclusion_blocks_by_pool.get(pool_name)
+                    if peer_prefix_exclusion_blocks_by_pool
+                    else None
+                ),
+                description=f"{description} ({pool_name})",
+            )
+            for pool_name in expected_prefix_pool_names
+        ]
+
     # Step 1: Start advertising additional prefixes (per-AFI) from FAUU to DUT
     # These prefixes should be denied by prefix-list configured on EB-FA peer-groups
-    steps.append(
-        create_advertise_withdraw_prefixes_step(
-            device_name=device_name,
-            advertise=True,
-            prefix_pool_regex=prefix_pool_regex,
-            prefix_start_index=prefix_start_index,
-            prefix_end_index=prefix_end_index,
-            description=f"Start advertising {prefix_end_index - prefix_start_index} prefixes (per-AFI) from FAUU to DUT",
-        ),
+    steps.extend(
+        create_prefix_slice_steps(
+            True,
+            f"Start advertising {prefix_end_index - prefix_start_index} "
+            "prefixes (per-AFI) from FAUU to DUT",
+            "stage_advertise",
+        )
     )
 
     # Step 2: Verify these prefixes are denied by prefix-list on EB-FA peer-groups
@@ -3777,8 +4171,18 @@ def create_route_registry_runtime_update_stage(
             device_name=device_name,
             descriptions_to_check=descriptions_to_check,
             exact_peer_group_names=exact_peer_group_names,
-            expected_count=(baseline_route_count if convergence_enabled else None),
-            max_count=(None if convergence_enabled else baseline_route_count),
+            expected_count=(
+                baseline_route_count
+                if convergence_enabled and baseline_route_count_histogram_by_afi is None
+                else None
+            ),
+            expected_count_histogram_by_afi=(baseline_route_count_histogram_by_afi),
+            max_count=(
+                baseline_route_count
+                if not convergence_enabled
+                and baseline_route_count_histogram_by_afi is None
+                else None
+            ),
             description=f"Verify {prefix_end_index - prefix_start_index} additional prefixes are denied by prefix-list on {peer_scope} peers",
         ),
     )
@@ -3788,6 +4192,8 @@ def create_route_registry_runtime_update_stage(
         create_set_route_filter_step(
             device_name=device_name,
             config_path=expanded_policy_path,
+            formulaic_prefix_sources=expanded_policy_prefix_sources,
+            verify_readback=verify_policy_readback,
             description=f"Add {prefix_end_index - prefix_start_index} prefixes to prefix-list using setRouteFilterPolicy ({added_route_count} config)",
         ),
     )
@@ -3798,7 +4204,12 @@ def create_route_registry_runtime_update_stage(
                 device_name=device_name,
                 descriptions_to_check=descriptions_to_check,
                 exact_peer_group_names=exact_peer_group_names,
-                expected_count=added_route_count,
+                expected_count=(
+                    added_route_count
+                    if expanded_route_count_histogram_by_afi is None
+                    else None
+                ),
+                expected_count_histogram_by_afi=(expanded_route_count_histogram_by_afi),
                 convergence_soft_threshold_seconds=(convergence_soft_threshold_seconds),
                 convergence_hard_timeout_seconds=(convergence_hard_timeout_seconds),
                 convergence_poll_interval_seconds=(convergence_poll_interval_seconds),
@@ -3812,7 +4223,12 @@ def create_route_registry_runtime_update_stage(
             device_name=device_name,
             descriptions_to_check=descriptions_to_check,
             exact_peer_group_names=exact_peer_group_names,
-            expected_count=added_route_count,
+            expected_count=(
+                added_route_count
+                if expanded_route_count_histogram_by_afi is None
+                else None
+            ),
+            expected_count_histogram_by_afi=(expanded_route_count_histogram_by_afi),
             stability_duration_seconds=soak_time_seconds,
             stability_hard_timeout_seconds=soak_time_seconds + 30,
             stability_poll_interval_seconds=5,
@@ -3829,7 +4245,12 @@ def create_route_registry_runtime_update_stage(
                 device_name=device_name,
                 descriptions_to_check=descriptions_to_check,
                 exact_peer_group_names=exact_peer_group_names,
-                expected_count=added_route_count,
+                expected_count=(
+                    added_route_count
+                    if expanded_route_count_histogram_by_afi is None
+                    else None
+                ),
+                expected_count_histogram_by_afi=(expanded_route_count_histogram_by_afi),
                 description=f"Verify {prefix_end_index - prefix_start_index} prefixes were accepted after adding to prefix-list on {peer_scope} peers",
             ),
         )
@@ -3839,6 +4260,8 @@ def create_route_registry_runtime_update_stage(
         create_set_route_filter_step(
             device_name=device_name,
             config_path=baseline_policy_path,
+            formulaic_prefix_sources=baseline_policy_prefix_sources,
+            verify_readback=verify_policy_readback,
             description=f"Remove {prefix_end_index - prefix_start_index} prefixes from prefix-list using setRouteFilterPolicy ({baseline_route_count} config)",
         ),
     )
@@ -3849,7 +4272,12 @@ def create_route_registry_runtime_update_stage(
                 device_name=device_name,
                 descriptions_to_check=descriptions_to_check,
                 exact_peer_group_names=exact_peer_group_names,
-                expected_count=baseline_route_count,
+                expected_count=(
+                    baseline_route_count
+                    if baseline_route_count_histogram_by_afi is None
+                    else None
+                ),
+                expected_count_histogram_by_afi=(baseline_route_count_histogram_by_afi),
                 convergence_soft_threshold_seconds=(convergence_soft_threshold_seconds),
                 convergence_hard_timeout_seconds=(convergence_hard_timeout_seconds),
                 convergence_poll_interval_seconds=(convergence_poll_interval_seconds),
@@ -3863,7 +4291,12 @@ def create_route_registry_runtime_update_stage(
             device_name=device_name,
             descriptions_to_check=descriptions_to_check,
             exact_peer_group_names=exact_peer_group_names,
-            expected_count=baseline_route_count,
+            expected_count=(
+                baseline_route_count
+                if baseline_route_count_histogram_by_afi is None
+                else None
+            ),
+            expected_count_histogram_by_afi=(baseline_route_count_histogram_by_afi),
             stability_duration_seconds=soak_time_seconds,
             stability_hard_timeout_seconds=soak_time_seconds + 30,
             stability_poll_interval_seconds=5,
@@ -3880,18 +4313,73 @@ def create_route_registry_runtime_update_stage(
                 device_name=device_name,
                 descriptions_to_check=descriptions_to_check,
                 exact_peer_group_names=exact_peer_group_names,
-                expected_count=baseline_route_count,
+                expected_count=(
+                    baseline_route_count
+                    if baseline_route_count_histogram_by_afi is None
+                    else None
+                ),
+                expected_count_histogram_by_afi=(baseline_route_count_histogram_by_afi),
                 description=f"Verify {prefix_end_index - prefix_start_index} prefixes were denied after removing from prefix-list on {peer_scope} peers",
             ),
         )
 
-    # Step 9: Verify all BGP sessions are still established
+    # Restore the permissive full-route state before shared postchecks and the
+    # next playbook. Cleanup repeats this chain as an idempotent fallback.
+    steps.extend(
+        create_prefix_slice_steps(
+            True,
+            "Restore and verify the runtime-update IXIA prefix slice",
+            "stage_restore",
+        )
+    )
+    steps.append(
+        create_set_route_filter_step(
+            device_name=device_name,
+            config_path=expanded_policy_path,
+            formulaic_prefix_sources=expanded_policy_prefix_sources,
+            verify_readback=verify_policy_readback,
+            description="Restore and verify the permissive route filter policy",
+        )
+    )
+    if convergence_enabled:
+        steps.append(
+            create_verify_received_routes_step(
+                device_name=device_name,
+                descriptions_to_check=descriptions_to_check,
+                exact_peer_group_names=exact_peer_group_names,
+                expected_count=(
+                    added_route_count
+                    if expanded_route_count_histogram_by_afi is None
+                    else None
+                ),
+                expected_count_histogram_by_afi=(expanded_route_count_histogram_by_afi),
+                convergence_soft_threshold_seconds=(convergence_soft_threshold_seconds),
+                convergence_hard_timeout_seconds=(convergence_hard_timeout_seconds),
+                convergence_poll_interval_seconds=(convergence_poll_interval_seconds),
+                description=(
+                    f"Verify post-workload restoration to {added_route_count} routes"
+                ),
+            )
+        )
+
+    # Verify all BGP sessions are still established in the restored state.
     # This catches any actual session flaps that occurred during the test,
     # independent of the snapshot uptime check (which is skipped due to
     # BGP daemon restart during setup resetting all session uptimes).
     steps.append(
         create_validation_step(
-            point_in_time_checks=[create_bgp_session_establish_check()],
+            point_in_time_checks=[
+                create_bgp_session_establish_check(
+                    expected_established_sessions_static=(
+                        expected_established_sessions
+                    ),
+                    parent_prefixes_to_ignore=(
+                        list(parent_prefixes_to_ignore)
+                        if parent_prefixes_to_ignore is not None
+                        else None
+                    ),
+                )
+            ],
             stage=taac_types.ValidationStage.POST_TEST,
             description="Post-stage: Verify all BGP sessions are still Established (catch actual flaps)",
         ),
@@ -4117,6 +4605,11 @@ def create_speed_flip_stage(
 # lines, summary headers, and snapshot checkpoint keys.
 _MAX_DERIVED_STAGE_ID_STEPS = 4
 
+# jq variable holding the moment the permanent-disable patcher's agent restart
+# finished converging. SERVICE_RESTART_CHECK measures uptime against this so the
+# patcher's own restart is expected while a later crash still fails the check.
+PATCHER_RESTART_TIME_VAR = "lag_patcher_restart_time"
+
 
 def _derive_stage_id(steps: list[Step]) -> str:
     """Derive a stage ID by concatenating step names (without ``_STEP`` suffix)."""
@@ -4129,6 +4622,139 @@ def _derive_stage_id(steps: list[Step]) -> str:
         remaining = len(parts) - _MAX_DERIVED_STAGE_ID_STEPS
         parts = parts[:_MAX_DERIVED_STAGE_ID_STEPS] + [f"and_{remaining}_more"]
     return "__".join(parts)
+
+
+def create_characterization_bracket_stages(
+    *,
+    playbook_name: str,
+    phase: str,
+    device_name: str,
+    config: CharacterizationConfig,
+    span_label: str | None = None,
+) -> tuple[list[Stage], list[Stage]]:
+    """Build the START and STOP stages for a bgpcpp CPU/RSS characterization span.
+
+    Returns two lists to place around the stages being measured, so the span is
+    declared at the playbook level and is visible in one place:
+
+        start_stages, stop_stages = create_characterization_bracket_stages(
+            playbook_name="bgp_ebb_attribute_churn_playbook",
+            phase=PHASE_WORKLOAD,
+            device_name=device_name,
+            config=OBSERVE_ONLY,
+        )
+        stages = [*start_stages, create_attribute_churn_stage(...), *stop_stages]
+
+    Separate stages, rather than steps spliced into the measured stage, for three
+    reasons. A measured stage with ``iteration > 1`` would otherwise re-run START
+    each pass and collide with its own live session. A ``concurrent`` stage keeps
+    its work in ``concurrent_steps``, so prepending to ``steps`` would silently
+    measure nothing. And a span often needs to cover several stages, which
+    splicing cannot express.
+
+    Both measurements are collected only if enabled in ``config``; disabling both
+    returns two empty lists, so a caller can wire the bracket unconditionally and
+    let configuration decide.
+
+    Placement determines what the numbers mean, so choose ``phase`` to match:
+    PHASE_CONVERGENCE baselines pre-toggle and measures the cost of reaching the
+    converged state; PHASE_WORKLOAD and PHASE_SOAK baseline the already-settled
+    footprint and measure what the workload adds on top.
+
+    The span, ``span_label`` or ``phase``, scopes both the jq variables the STOP
+    steps write and the stage ids, so a playbook can carry more than one bracket.
+    Two brackets sharing a span in one playbook is a collision: the second
+    overwrites the first's summary and the stage ids clash. Give the second one a
+    distinct ``span_label`` and read it back with the matching
+    ``characterization_summary_jq_var(kind, span_label)``.
+
+    Args:
+        playbook_name: Playbook name, recorded in the session key and log line.
+        phase: One of PHASE_CONVERGENCE, PHASE_WORKLOAD, PHASE_SOAK.
+        device_name: DUT hostname.
+        config: Which brackets to place and how densely to sample.
+        span_label: Overrides ``phase`` as the span identity in jq variables and
+            stage ids. Only needed when one playbook brackets the same phase more
+            than once. Must be jq-safe: letters, digits, and underscores.
+
+    Returns:
+        (start_stages, stop_stages), each empty or holding one Stage.
+    """
+    span = span_label or phase
+    start_steps: list[Step] = []
+    stop_steps: list[Step] = []
+
+    if config.enable_rss:
+        rss_key = characterization_session_key(
+            KIND_RSS_DELTA, playbook_name, phase, device_name
+        )
+        start_steps.append(
+            create_rss_start_step(
+                device_name=device_name,
+                session_key=rss_key,
+                interval_seconds=config.rss_interval_seconds,
+                baseline_settle_max_seconds=config.rss_baseline_settle_max_seconds,
+                on_device=config.rss_on_device,
+                keep_ondevice_log=config.keep_ondevice_log,
+            )
+        )
+        stop_steps.append(
+            create_rss_stop_step(
+                session_key=rss_key,
+                summary_jq_var=characterization_summary_jq_var(KIND_RSS_DELTA, span),
+            )
+        )
+
+    if config.enable_cpu:
+        cpu_key = characterization_session_key(
+            KIND_CPU_PERCENTILE, playbook_name, phase, device_name
+        )
+        # CPU START goes after RSS START: the RSS baseline settle poll can hold
+        # for up to rss_baseline_settle_max_seconds, and that idle wait must not
+        # be inside the CPU sampling window or it drags the percentiles down.
+        start_steps.append(
+            create_cpu_percentile_start_step(
+                device_name=device_name,
+                session_key=cpu_key,
+                interval_seconds=config.cpu_interval_seconds,
+                on_device=config.cpu_on_device,
+                compare_with_legacy=config.cpu_on_device_compare,
+                keep_ondevice_log=config.keep_ondevice_log,
+            )
+        )
+        # CPU STOP goes before RSS STOP for the mirror-image reason: the RSS stop
+        # samples a settled current footprint, and that settle wait belongs
+        # outside the CPU window.
+        stop_steps.insert(
+            0,
+            create_cpu_percentile_stop_step(
+                session_key=cpu_key,
+                summary_jq_var=characterization_summary_jq_var(
+                    KIND_CPU_PERCENTILE, span
+                ),
+            ),
+        )
+
+    if not start_steps:
+        return ([], [])
+
+    label = f"{span}_characterization"
+    return (
+        [
+            create_steps_stage(
+                steps=start_steps,
+                stage_id=f"{label}_start",
+                description=f"Start bgpcpp CPU/RSS characterization ({span})",
+            )
+        ],
+        [
+            create_steps_stage(
+                steps=stop_steps,
+                stage_id=f"{label}_stop",
+                description=f"Stop bgpcpp CPU/RSS characterization ({span})",
+            )
+        ],
+    )
 
 
 def create_steps_stage(
@@ -4270,6 +4896,8 @@ def create_port_channel_concurrent_flap_stage(
     interfaces_to_flap: list[str],
     iteration: int = 5,
     cold_boot: bool = False,
+    interface_flap_method: taac_types.InterfaceFlapMethod = taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+    link_up_wait_s: int = DEFAULT_LINK_UP_WAIT_S,
 ) -> Stage:
     """
     Create a concurrent stage for port channel link flapping with agent restart.
@@ -4291,17 +4919,24 @@ def create_port_channel_concurrent_flap_stage(
         concurrent_steps=[
             ConcurrentStep(
                 steps=[
+                    # The restart in the sibling branch takes thrift and SSH away
+                    # for part of the window, so some flaps cannot be delivered.
+                    # That is the condition under test, not a test failure — the
+                    # port-channel state is asserted by the stage that follows.
                     create_interface_flap_step(
                         enable=False,
                         interfaces=interfaces_to_flap,
-                        interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                        interface_flap_method=interface_flap_method,
+                        tolerate_failures=True,
                     ),
                     create_longevity_step(duration=flap_hold_duration),
                     create_interface_flap_step(
                         enable=True,
                         interfaces=interfaces_to_flap,
-                        interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                        interface_flap_method=interface_flap_method,
+                        tolerate_failures=True,
                     ),
+                    create_longevity_step(duration=link_up_wait_s),
                 ]
             ),
             ConcurrentStep(
@@ -4321,6 +4956,8 @@ def create_port_channel_concurrent_flap_stage(
 def create_port_channel_flap_only_stage(
     interfaces_to_flap: list[str],
     iteration: int = 1,
+    interface_flap_method: taac_types.InterfaceFlapMethod = taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+    link_up_wait_s: int = DEFAULT_LINK_UP_WAIT_S,
 ) -> Stage:
     """
     Create a stage for port channel link flapping without agent restart.
@@ -4338,14 +4975,15 @@ def create_port_channel_flap_only_stage(
             create_interface_flap_step(
                 enable=False,
                 interfaces=interfaces_to_flap,
-                interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                interface_flap_method=interface_flap_method,
             ),
             create_longevity_step(duration=15),
             create_interface_flap_step(
                 enable=True,
                 interfaces=interfaces_to_flap,
-                interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                interface_flap_method=interface_flap_method,
             ),
+            create_longevity_step(duration=link_up_wait_s),
         ],
     )
 
@@ -4356,6 +4994,8 @@ def create_port_channel_cross_flap_stage(
     dut_name: str,
     remote_name: str,
     iterations: int = 1,
+    interface_flap_method: taac_types.InterfaceFlapMethod = taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+    link_up_wait_s: int = DEFAULT_LINK_UP_WAIT_S,
 ) -> Stage:
     """
     Create a stage for port channel cross link flapping on both sides.
@@ -4373,27 +5013,29 @@ def create_port_channel_cross_flap_stage(
                 enable=False,
                 interfaces=dut_flap_interfaces,
                 device_name=dut_name,
-                interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                interface_flap_method=interface_flap_method,
             ),
             create_interface_flap_step(
                 enable=False,
                 interfaces=remote_flap_interfaces,
                 device_name=remote_name,
-                interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                interface_flap_method=interface_flap_method,
             ),
             create_longevity_step(duration=20),
             create_interface_flap_step(
                 enable=True,
                 interfaces=dut_flap_interfaces,
                 device_name=dut_name,
-                interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                interface_flap_method=interface_flap_method,
             ),
+            create_longevity_step(duration=link_up_wait_s),
             create_interface_flap_step(
                 enable=True,
                 interfaces=remote_flap_interfaces,
                 device_name=remote_name,
-                interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                interface_flap_method=interface_flap_method,
             ),
+            create_longevity_step(duration=link_up_wait_s),
         ],
     )
 
@@ -4405,6 +5047,8 @@ def create_port_channel_concurrent_cross_flap_stage(
     remote_name: str,
     iterations: int = 1,
     cold_boot: bool = False,
+    interface_flap_method: taac_types.InterfaceFlapMethod = taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+    link_up_wait_s: int = DEFAULT_LINK_UP_WAIT_S,
 ) -> Stage:
     """
     Create a stage for port channel concurrent cross link flapping on both sides with agent restart/agent coldboot.
@@ -4423,31 +5067,39 @@ def create_port_channel_concurrent_cross_flap_stage(
         concurrent_steps=[
             ConcurrentStep(
                 steps=[
+                    # See create_port_channel_concurrent_flap_stage: the restart
+                    # in the sibling branch makes some of these undeliverable.
                     create_interface_flap_step(
                         enable=False,
                         interfaces=dut_flap_interfaces,
                         device_name=dut_name,
-                        interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                        interface_flap_method=interface_flap_method,
+                        tolerate_failures=True,
                     ),
                     create_interface_flap_step(
                         enable=False,
                         interfaces=remote_flap_interfaces,
                         device_name=remote_name,
-                        interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                        interface_flap_method=interface_flap_method,
+                        tolerate_failures=True,
                     ),
                     create_longevity_step(duration=20),
                     create_interface_flap_step(
                         enable=True,
                         interfaces=dut_flap_interfaces,
                         device_name=dut_name,
-                        interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                        interface_flap_method=interface_flap_method,
+                        tolerate_failures=True,
                     ),
+                    create_longevity_step(duration=link_up_wait_s),
                     create_interface_flap_step(
                         enable=True,
                         interfaces=remote_flap_interfaces,
                         device_name=remote_name,
-                        interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                        interface_flap_method=interface_flap_method,
+                        tolerate_failures=True,
                     ),
+                    create_longevity_step(duration=link_up_wait_s),
                 ]
             ),
             ConcurrentStep(
@@ -4467,6 +5119,7 @@ def create_port_channel_concurrent_cross_flap_stage(
 def create_port_channel_permanent_teardown_stage(
     portchannel_health_check: PointInTimeHealthCheck,
     interfaces_to_enable: list[str],
+    link_up_wait_s: int = DEFAULT_LINK_UP_WAIT_S,
 ) -> Stage:
     """
     Create the teardown stage for port channel testing.
@@ -4495,6 +5148,12 @@ def create_port_channel_permanent_teardown_stage(
                 trigger=taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
             ),
             create_service_convergence_step(),
+            # Overwrites the setup-stage timestamp, so the postcheck compares
+            # against the most recent intentional restart.
+            create_record_jq_timestamp_step(
+                PATCHER_RESTART_TIME_VAR,
+                description="Record completion of the permanent-teardown patcher restart",
+            ),
             create_longevity_step(duration=30),
             create_verify_port_operational_state_step(
                 interfaces=interfaces_to_enable,
@@ -4511,6 +5170,8 @@ def create_port_channel_permanent_teardown_stage(
 def create_port_channel_teardown_stage(
     portchannel_health_check: PointInTimeHealthCheck,
     interfaces_to_enable: list[str],
+    interface_flap_method: taac_types.InterfaceFlapMethod = taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+    link_up_wait_s: int = DEFAULT_LINK_UP_WAIT_S,
 ) -> Stage:
     """
     Create the teardown stage for port channel testing.
@@ -4535,8 +5196,9 @@ def create_port_channel_teardown_stage(
             create_interface_flap_step(
                 enable=True,
                 interfaces=interfaces_to_enable,
-                interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                interface_flap_method=interface_flap_method,
             ),
+            create_longevity_step(duration=link_up_wait_s),
             create_verify_port_operational_state_step(
                 interfaces=interfaces_to_enable,
                 operational_state=True,
@@ -4552,6 +5214,8 @@ def create_port_channel_teardown_stage(
 def create_port_channel_all_link_flaps_stage(
     port_channel_name: str,
     port_channel_member_ports: list[str],
+    interface_flap_method: taac_types.InterfaceFlapMethod = taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+    link_up_wait_s: int = DEFAULT_LINK_UP_WAIT_S,
 ) -> Stage:
     """
     Create a concurrent stage for flapping all port channel links with agent restart.
@@ -4570,15 +5234,20 @@ def create_port_channel_all_link_flaps_stage(
             ConcurrentStep(
                 steps=[
                     create_interface_flap_step(
-                        enable=False, interfaces=port_channel_member_ports
+                        enable=False,
+                        interfaces=port_channel_member_ports,
+                        interface_flap_method=interface_flap_method,
                     ),
                     create_verify_port_operational_state_step(
                         interfaces=[port_channel_name],
                         operational_state=False,
                     ),
                     create_interface_flap_step(
-                        enable=True, interfaces=port_channel_member_ports
+                        enable=True,
+                        interfaces=port_channel_member_ports,
+                        interface_flap_method=interface_flap_method,
                     ),
+                    create_longevity_step(duration=link_up_wait_s),
                     create_verify_port_operational_state_step(
                         interfaces=[port_channel_name],
                         operational_state=True,
@@ -4631,6 +5300,7 @@ def create_register_port_channel_patcher_stage(
 def create_port_channel_initial_setup_stage_with_permanent_disable(
     portchannel_health_check: PointInTimeHealthCheck,
     interfaces_to_disable: list[str],
+    interface_flap_method: taac_types.InterfaceFlapMethod = taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
 ) -> Stage:
     """
     Create the initial setup stage for port channel testing.
@@ -4659,6 +5329,14 @@ def create_port_channel_initial_setup_stage_with_permanent_disable(
                 trigger=taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
             ),
             create_service_convergence_step(),
+            # Recorded after convergence so the timestamp marks when the agent
+            # was back, not when the restart was issued. SERVICE_RESTART_CHECK
+            # measures uptime against this to tell the patcher's restart apart
+            # from a later crash.
+            create_record_jq_timestamp_step(
+                PATCHER_RESTART_TIME_VAR,
+                description="Record completion of the permanent-disable patcher restart",
+            ),
             create_longevity_step(duration=30),
             create_verify_port_operational_state_step(
                 interfaces=interfaces_to_disable,
@@ -4675,6 +5353,7 @@ def create_port_channel_initial_setup_stage_with_permanent_disable(
 def create_port_channel_initial_setup_stage(
     portchannel_health_check: PointInTimeHealthCheck,
     interfaces_to_disable: list[str],
+    interface_flap_method: taac_types.InterfaceFlapMethod = taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
 ) -> Stage:
     """
     Create the initial setup stage for port channel testing.
@@ -4698,7 +5377,7 @@ def create_port_channel_initial_setup_stage(
             create_interface_flap_step(
                 enable=False,
                 interfaces=interfaces_to_disable,
-                interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+                interface_flap_method=interface_flap_method,
             ),
             create_verify_port_operational_state_step(
                 interfaces=interfaces_to_disable,
@@ -4888,11 +5567,13 @@ def create_longevity_churn_stage(
     """Create wall-clock churn followed by quiescence and postchecks."""
     return create_steps_stage(
         steps=[
-            create_bgp_longevity_community_churn_step(
-                duration_seconds=test_duration_seconds,
-                cadence_seconds=churn_interval_seconds,
-                prefix_pool_regex=community_prefix_regex,
-                community_count=community_count,
+            create_longevity_community_churn_step(
+                LongevityCommunityChurn.create(
+                    duration_seconds=test_duration_seconds,
+                    cadence_seconds=churn_interval_seconds,
+                    prefix_pool_regex=community_prefix_regex,
+                    community_count=community_count,
+                )
             ),
             create_longevity_step(
                 duration=quiesce_seconds,
@@ -4930,6 +5611,8 @@ def create_enable_and_configure_stage(
     seed: int | None = None,
     random_mask_count: int | None = None,
     network_group_multiplier: int | None = None,
+    starting_prefix: str | None = None,
+    prefix_step: str | None = None,
 ) -> Stage:
     """Stage 1: Disable the other device groups, enable the target, then
     reconfigure its advertised prefixes (count + multiplier + prefix length /
@@ -4950,7 +5633,14 @@ def create_enable_and_configure_stage(
         if other_type != distribution_type:
             steps.append(create_toggle_device_group_step(other_type, enable=False))
 
-    steps.append(create_toggle_device_group_step(distribution_type, enable=True))
+    steps.append(
+        create_toggle_device_group_step(
+            distribution_type,
+            enable=True,
+            require_match=True,
+            expected_match_count=1,
+        )
+    )
 
     steps.append(
         create_update_prefix_count_step(
@@ -4985,6 +5675,8 @@ def create_enable_and_configure_stage(
                 network_group_regex=network_group_regex,
                 prefix_length=prefix_length,
                 distribution_type=distribution_type,
+                starting_ip=starting_prefix,
+                increment_ip=prefix_step,
             )
         )
 
@@ -5109,6 +5801,9 @@ def create_toggle_and_analyze_stage(
     iterations: int = 5,
     time_threshold: int = 35,
     wait_time_seconds: int = 60,
+    expected_route_count: int | None = None,
+    observation_timeout_seconds: int = 15,
+    observation_poll_interval_seconds: float = 1,
     stage_id: str | None = None,
 ) -> Stage:
     """Toggle BGP prefixes and analyze route convergence timing."""
@@ -5120,6 +5815,9 @@ def create_toggle_and_analyze_stage(
                 iterations=iterations,
                 time_threshold=time_threshold,
                 wait_time_seconds=wait_time_seconds,
+                expected_route_count=expected_route_count,
+                observation_timeout_seconds=observation_timeout_seconds,
+                observation_poll_interval_seconds=observation_poll_interval_seconds,
             ),
         ],
     )
@@ -5353,3 +6051,20 @@ def create_fpf_hardening_concurrent_stage(
         )
 
     return Stage(concurrent=True, concurrent_steps=concurrent_steps)
+
+
+def create_be_qos_stage(stage_id: str, steps: list[Step]) -> Stage:
+    """Build a stage for the backend (DSF/RTSW) QoS scheduling suite.
+
+    The BE QoS playbooks are step-sequence driven: each stage is just an
+    ordered list of IXIA/longevity steps under a stable `stage_id`, which the
+    suite's snapshot checks reference as
+    `stage.<stage_id>.step.<step_id>.start/.end`. Construction lives here so
+    `internal/test_configs/be_qos_scheduling_test_config.py` stays free of
+    inline `Stage()` calls.
+
+    Args:
+        stage_id: Stable stage id used to build checkpoint references.
+        steps: Ordered steps to run in this stage.
+    """
+    return Stage(id=stage_id, steps=steps)

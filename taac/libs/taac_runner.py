@@ -3,28 +3,26 @@
 # pyre-unsafe
 import asyncio
 import copy
+import ipaddress
 import json
+import logging
 import os
 import re
+import sys
 import time
+import traceback
 import typing as t
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
+
+if t.TYPE_CHECKING:
+    from confucius.analects.base.agentic_function import Function
+    from pydantic import BaseModel
 
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
 from urllib.parse import quote  # noqa: F401
-
-if not TAAC_OSS:
-    from neteng.netcastle.exceptions import TestbedError
-else:
-    # OSS stub — netcastle isn't shipped. The only use site is an
-    # `except TestbedError:` precheck-failure handler against Meta-internal
-    # testbeds; nothing under OSS raises this, so the handler simply never
-    # matches.
-    class TestbedError(Exception):
-        pass
-
 
 from taac.constants import (
     DNE_LOG_DIR,
@@ -33,7 +31,7 @@ from taac.constants import (
     FbossPackage,
     TestCaseFailure,
     TestDevice,
-    TestResult,
+    TestTopology,
 )
 from taac.custom_test_handlers.base_custom_test_handler import (
     BaseCustomTestHandler,
@@ -54,18 +52,63 @@ from taac.health_checks.all_health_checks import (
 from taac.ixia.abstract_traffic_generator import (
     AbstractTrafficGenerator,
 )
+from taac.ixia.config_render import (
+    DeclaredCheck,
+    render_ixia_config,
+    ResolvedCheck,
+)
+from neteng.test_infra.dne.taac.ixia.ixia_tracer import IxiaTraceSlice, slugify_phase
 from taac.ixia.taac_ixia import TaacIxia
 
-# taac.libs.collectors.registry is OSS-safe (no Meta-internal imports), so
-# the real setter is used in both modes. Internal callers get the same
-# function object re-exported from taac.libs.fpf.fpf_collector_registry.
+# taac.libs.collectors.registry is OSS-safe (no Meta-internal imports) and owns
+# the module global the FPF collectors read, so the real setter is used in both
+# modes. taac.libs.fpf.fpf_collector_registry only re-exports this same function
+# object, and importing it would drag neteng.netcastle / taac.internal in via
+# fpf_stress_checks, so there is nothing to guard here.
+from taac.libs.baseline_lifecycle import (
+    BaselineContext,
+    BaselineLifecycle,
+    BaselineOperationTimeoutError,
+    BaselineParticipant,
+    BaselineScope,
+    BaselineTimeouts,
+)
+from taac.libs.campaign_control import (
+    BoundaryAction,
+    CampaignControl,
+    NoopCampaignControl,
+)
 from taac.libs.collectors.registry import set_test_case_start_time
+
+if not TAAC_OSS:
+    from taac.libs.investigation_report import (
+        InvestigationReport,
+        render_headline,
+        render_report_lines,
+    )
+else:
+    # The investigation agent is unavailable in OSS. Keep its optional type
+    # annotations import-free so OSS does not need the agent's pydantic stack.
+    InvestigationReport = t.Any
+
+    def render_headline(_report: t.Any) -> str:
+        return ""
+
+    def render_report_lines(_report: t.Any) -> list[str]:
+        return []
+
+
 from taac.libs.ixia_candidate import (
     IxiaCandidate,
     normalize_ixia_candidates,
 )
+from taac.libs.ixia_config_baseline import (
+    IxiaConfigClient,
+    IxiaTopologyBaselineParticipant,
+)
 from taac.libs.parameter_evaluator import ParameterEvaluator
 from taac.libs.periodic_task_executor import PeriodicTaskExecutor
+from taac.libs.run_result import worst_check_status
 from taac.libs.test_setup_orchestrator import (
     TestSetupOrchestrator,
 )
@@ -82,14 +125,14 @@ else:
         )
 
 
+from taac.libs.oss_setup_tasks import resolve_oss_setup_tasks
 from taac.steps.all_steps import (  # oss-rewrite (force ShipIt re-export to taac.* root)
     NAME_TO_STEP,
     STEP_NAME_TO_INPUT,
 )
-from taac.steps.step import Step
+from neteng.test_infra.dne.taac.steps.step import Step, TestbedError
 from taac.steps.step_definitions import ValidationStep
 from taac.tasks.utils import run_task
-from taac.test_configs import get_test_config
 from taac.utils.common import (
     async_everpaste_str,
     async_write_test_result,
@@ -104,6 +147,10 @@ from taac.utils.driver_factory import (
     add_host_to_driver_args_data,
     async_get_device_driver,
 )
+from taac.utils.fb303_counter_utils import async_query_counters
+from taac.utils.investigation_log_marker import (
+    INVESTIGATION_LOG_PREFIX,
+)
 from taac.utils.json_thrift_utils import (
     json_to_thrift,
     thrift_to_json,
@@ -114,6 +161,12 @@ from taac.utils.oss_taac_lib_utils import (
     ConsoleFileLogger,
     get_root_logger,
     none_throws,
+)
+from taac.utils.result_rendering import (
+    check_stage_name,
+    format_epoch_timestamp,
+    message_with_url,
+    section_failed,
 )
 from taac.utils.taac_log_formatter import (
     format_step_label,
@@ -154,6 +207,7 @@ else:
     UTP_TEST_CATALOG: t.List[t.Any] = []
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
+from taac.test_run_result import types as trr_types
 from tabulate import tabulate
 
 if not TAAC_OSS:
@@ -161,11 +215,99 @@ if not TAAC_OSS:
         add_oss_mock_device_data,
     )
     from taac.internal.tasks.ixia_diagnostics_collection_task import (
+        DEFAULT_MANIFOLD_BUCKET,
+        ixia_artifact_manifold_key,
         IxiaDiagnosticsCollectionTask,
+    )
+    from taac.internal.utils import ondevice_sampler
+    from taac.internal.utils.manifold_utils import (
+        async_upload_file_to_manifold,
+    )
+else:
+    # OSS binding for the mock-device registration helper. ``_add_oss_mock_device_data``
+    # (called from ``async_test_setUp`` for any config that populates
+    # ``oss_mock_device_data``) invokes this unconditionally, so it must resolve
+    # under TAAC_OSS too — the OSS-safe implementation lives in taac.utils, not
+    # taac.internal. Without this the runner NameErrors before setup for such configs.
+    from taac.utils.netwhoami_utils import (
+        add_oss_mock_device_data,
     )
 
 DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID: str = "test_case_start"
 DEFAULT_POST_SNAPSHOT_CHECKPOINT_ID: str = "test_case_end"
+
+# Post-failure triage runs while the lab devices are still reserved, so the
+# agent's wall clock is a reservation cost, not just a latency cost. Sized for
+# ``xhigh`` thinking effort. ``run_agent`` treats this as the budget for the
+# whole call and withholds ``_FINISH_BUDGET_FRACTION`` of it from the
+# tool-calling loop, because a timeout in the synthesis and report passes
+# discards an investigation that already gathered its evidence.
+INVESTIGATION_TIMEOUT_SEC: float = 19000.0
+# TicTAAC's child process has a 55-minute deadline. Lifecycle investigations
+# share that budget with setup and teardown, so keep their bound substantially
+# smaller than the deep per-test-case investigation budget above.
+LIFECYCLE_INVESTIGATION_TIMEOUT_SEC: float = 1200.0
+# The agent harness is domain-neutral, so the label on its end-of-run stats
+# block is ours to supply.
+INVESTIGATION_STATS_LABEL: str = "INVESTIGATION AGENT STATS"
+
+_IXIA_HOST_TOKEN_RE: re.Pattern[str] = re.compile(
+    r"\bixia[0-9][0-9A-Za-z.-]*\b", re.IGNORECASE
+)
+_IPV4_TOKEN_RE: re.Pattern[str] = re.compile(
+    r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9.])"
+)
+
+
+def _chassis_hosts_in_message(message: str) -> t.Set[str]:
+    """Extract complete IXIA hostnames and valid IPv4 addresses."""
+    hosts = {host.casefold() for host in _IXIA_HOST_TOKEN_RE.findall(message)}
+    for candidate in _IPV4_TOKEN_RE.findall(message):
+        try:
+            hosts.add(str(ipaddress.ip_address(candidate)))
+        except ValueError:
+            pass
+    return hosts
+
+
+class HostLog(t.NamedTuple):
+    """One service's log for one host: an everpaste URL, or why collection failed."""
+
+    hostname: str
+    service: str
+    url: str = ""
+    error: str = ""
+
+
+class InvestigationLink(t.NamedTuple):
+    """The label and URL of one test case's investigation transcript."""
+
+    text: str
+    url: str
+
+
+def _topology_baseline_infra_error(
+    message: str, errors: t.Sequence[BaseException]
+) -> TestbedError:
+    details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+    infrastructure_error = TestbedError(f"{message}: {details}" if details else message)
+    if errors:
+        infrastructure_error.__cause__ = _group_exceptions(message, errors)
+    return infrastructure_error
+
+
+@dataclass(frozen=True)
+class PublishedIxiaTraceSlice:
+    """One phase of the IxNetwork REST trace, uploaded and ready to link.
+
+    `location` is a Manifold read URL, or the on-disk path under TAAC_OSS
+    where there is no Manifold to upload to.
+    """
+
+    phase: str
+    record_count: int
+    failure_count: int
+    location: str
 
 
 def _start_test_case_time_window(
@@ -173,6 +315,243 @@ def _start_test_case_time_window(
 ) -> None:
     jq_vars.pop("test_case_end_time", None)
     jq_vars["test_case_start_time"] = start_time
+
+
+def _render_host_log_evidence(
+    collected_logs: t.Sequence[HostLog],
+    failed_sections: t.Sequence[str] = (),
+) -> str:
+    lines: t.List[str] = []
+    if collected_logs:
+        lines.append("Collected device logs:")
+        lines.extend(
+            f"  - {log.hostname} / {log.service}: "
+            + (log.url if log.url else f"NOT COLLECTED ({log.error})")
+            for log in collected_logs
+        )
+    if failed_sections:
+        lines.append(f"Failed sections: {', '.join(failed_sections)}")
+    return "\n".join(lines) or "(no pre-collected evidence)"
+
+
+def _console_visible(
+    logger: ConsoleFileLogger,
+) -> t.ContextManager[None]:
+    """Undo an enclosing ``suppress_console_logs`` for the duration of the block.
+
+    Test-case teardown runs console-suppressed and every investigation event is
+    INFO, so without this an operator on a default (non ``--debug``) run watches
+    a silent console for the minutes the agent runs. Lowering the suppression
+    level back to INFO leaves an explicit ``--debug`` run at DEBUG.
+    """
+    return suppress_console_logs(logger, suppress_level=logging.INFO)
+
+
+def _require_known_host(topology: TestTopology, hostname: str) -> None:
+    if hostname not in topology.device_names:
+        raise ValueError(
+            f"host '{hostname}' is not one of this test's reserved devices. "
+            f"Valid hosts: {sorted(topology.device_names)}"
+        )
+
+
+def _group_exceptions(message: str, errors: t.Sequence[BaseException]) -> BaseException:
+    if all(isinstance(error, Exception) for error in errors):
+        return ExceptionGroup(message, t.cast(t.List[Exception], list(errors)))
+    return BaseExceptionGroup(message, list(errors))
+
+
+def _raise_primary_with_failures(
+    primary: BaseException,
+    failures: t.Sequence[BaseException],
+    *,
+    message: str,
+) -> t.NoReturn:
+    secondary: list[BaseException] = []
+    cause = primary.__cause__
+    if isinstance(cause, BaseExceptionGroup):
+        secondary.extend(cause.exceptions)
+    elif cause is not None:
+        secondary.append(cause)
+    secondary.extend(failures)
+    seen = {id(primary)}
+    unique_secondary = []
+    for error in secondary:
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        unique_secondary.append(error)
+    if not unique_secondary:
+        raise primary
+    raise primary from _group_exceptions(message, unique_secondary)
+
+
+def _contains_baseline_capture_timeout(error: BaseException) -> bool:
+    if isinstance(error, BaselineOperationTimeoutError):
+        return error.operation == "capture"
+    if isinstance(error, BaseExceptionGroup):
+        return any(
+            _contains_baseline_capture_timeout(child) for child in error.exceptions
+        )
+    return False
+
+
+# Full-scale IXIA exports have exceeded two minutes on loaded chassis.
+_BASELINE_CAPTURE_TIMEOUT_SECONDS = 300
+# A full-scale IXIA import includes protocol startup and can take several minutes.
+_BASELINE_RESTORE_TIMEOUT_SECONDS = 900
+_BASELINE_VERIFY_TIMEOUT_SECONDS = 300
+_BASELINE_RELEASE_TIMEOUT_SECONDS = 30
+_CLEANUP_CANCELLATION_GRACE_SECONDS = 30
+# How long a cancelled teardown task may take to unwind through its
+# finalizers before TAAC treats it as still mutating its device.
+_CLEANUP_DRAIN_SECONDS = 30
+# A snapshot restore interrupted by cancellation reruns itself before it
+# yields, so it gets a longer grace and drain than ordinary cleanup.
+_TERMINAL_RESTORE_GRACE_SECONDS = 300
+_TERMINAL_RESTORE_DRAIN_SECONDS = 300
+_TASK_ATTEMPTS = 2
+_TASK_RETRY_SLEEP_SECONDS = 60
+_TEARDOWN_TASK_FAILURE_GROUP_MESSAGE = "TAAC test-config teardown tasks failed"
+
+
+class _TeardownTaskFailureGroup(ExceptionGroup):
+    pass
+
+
+_TERMINAL_RESTORE_ACTIONS = frozenset(
+    {"routing_component_restore", "interface_config_restore"}
+)
+
+
+_LIFECYCLE_METADATA_KEYS = ("action", "operation_id", "hostname")
+
+
+def _lifecycle_metadata_overrides(task: taac_types.Task) -> list[str]:
+    """Lifecycle metadata keys a non-literal parameter source would rewrite."""
+    params = task.params
+    if params is None:
+        return []
+    return sorted(
+        key
+        for source in (params.static_params, params.jq_params, params.transform_params)
+        if source
+        for key in source
+        if key in _LIFECYCLE_METADATA_KEYS
+    )
+
+
+def _lifecycle_params(task: taac_types.Task) -> dict[str, t.Any] | None:
+    """Literal lifecycle parameters, the same ones the task will execute with.
+
+    A task whose action or operation ID comes from a non-literal source is
+    never classified here; `_check_lifecycle_metadata` refuses to run it.
+    """
+    if (
+        task.task_name != "eos_compiler_lifecycle"
+        or task.params is None
+        or _lifecycle_metadata_overrides(task)
+    ):
+        return None
+    try:
+        params = json.loads(task.params.json_params or "")
+    except ValueError:
+        return None
+    return params if isinstance(params, dict) else None
+
+
+def _check_lifecycle_metadata(
+    task: taac_types.Task,
+    evaluated: t.Mapping[str, t.Any],
+) -> None:
+    if task.task_name != "eos_compiler_lifecycle":
+        return
+    overrides = _lifecycle_metadata_overrides(task)
+    literal = _lifecycle_params(task) or {}
+    mismatched = [
+        key
+        for key in _LIFECYCLE_METADATA_KEYS
+        if evaluated.get(key) != literal.get(key)
+    ]
+    if overrides or mismatched:
+        raise ValueError(
+            "eos_compiler_lifecycle action, operation_id and hostname must be "
+            f"literal json_params; overridden={overrides}, mismatched={mismatched}"
+        )
+
+
+def _is_terminal_restore(task: taac_types.Task) -> bool:
+    params = _lifecycle_params(task)
+    action = params.get("action") if params is not None else None
+    return isinstance(action, str) and action in _TERMINAL_RESTORE_ACTIONS
+
+
+def _task_target_hostname(task: taac_types.Task) -> str | None:
+    hostname = task.hostname
+    return hostname if isinstance(hostname, str) and hostname else None
+
+
+_UndrainedCleanup = tuple[asyncio.Future[t.Any], str | None]
+
+
+def _state_guard_arm_operation_id(task: taac_types.Task) -> str | None:
+    # Declaration reads the literal JSON even when other sources override it:
+    # such an arm refuses to run, so its guard stays unarmed.
+    params = None
+    if task.task_name == "eos_compiler_lifecycle" and task.params is not None:
+        try:
+            params = json.loads(task.params.json_params or "")
+        except ValueError:
+            params = None
+    if not isinstance(params, dict) or params.get("action") != "state_guard_arm":
+        return None
+    operation_id = params.get("operation_id")
+    return operation_id if isinstance(operation_id, str) and operation_id else None
+
+
+def _state_guard_arm_operation_ids(tasks: t.Iterable[taac_types.Task]) -> set[str]:
+    return {
+        operation_id
+        for task in tasks
+        if (operation_id := _state_guard_arm_operation_id(task)) is not None
+    }
+
+
+def _split_terminal_teardown_tasks(
+    tasks: t.Sequence[taac_types.Task],
+) -> tuple[list[tuple[int, taac_types.Task]], list[tuple[int, taac_types.Task]]]:
+    """Split off the trailing run of snapshot restores.
+
+    Those restores return devices to their pre-test snapshot, so an ordinary
+    cleanup retried after them would undo the restoration. Only the trailing
+    run is terminal: an earlier restore keeps its place relative to the
+    cleanups that follow it.
+    """
+    indexed = list(enumerate(tasks, 1))
+    split = len(indexed)
+    while split > 0 and _is_terminal_restore(indexed[split - 1][1]):
+        split -= 1
+    return indexed[:split], indexed[split:]
+
+
+@dataclass
+class _CleanupCancellationBudget:
+    deadline: float | None = None
+
+    def arm(self, grace_seconds: float) -> None:
+        if self.deadline is None:
+            self.deadline = time.monotonic() + grace_seconds
+
+
+@dataclass
+class _TeardownCleanupState:
+    errors: list[Exception]
+    cancellation: asyncio.CancelledError | None = None
+
+
+# Description of the validation stage that inject_validation_stages() adds for
+# playbook prechecks; run_test_case keys the early PRE-HEALTH table on it.
+_PRECHECK_STAGE_DESCRIPTION = "Prechecks"
 
 
 class TaacRunner:
@@ -187,6 +566,7 @@ class TaacRunner:
         skip_testbed_isolation: bool = True,
         # Use with CAUTION!!  Should only be used for debugging or development purposes
         skip_basset_reservation: bool = False,
+        fail_on_foreign_basset_reservation: bool = False,
         desired_pkg_versions: t.Optional[t.Dict[FbossPackage, str]] = None,
         dsf_sequential_update: bool = False,
         allow_disruptive_configs: bool = False,
@@ -194,6 +574,7 @@ class TaacRunner:
         override_ixia_traffic_items: bool = False,
         cleanup_failed_setup: bool = True,
         skip_setup_tasks: bool = False,
+        skip_oss_setup_tasks: bool = False,
         skip_teardown_tasks: bool = False,
         skip_all_tasks: bool = False,
         skip_periodic_tasks: bool = False,
@@ -201,7 +582,6 @@ class TaacRunner:
         logger: t.Optional[ConsoleFileLogger] = None,
         # Netcastle runner specific
         is_autotester_run: bool = False,
-        test_results: t.Optional[t.List[TestResult]] = None,
         # EOS image ID for Arista device image deployment
         eos_image_id: t.Optional[str] = None,
         # Whether to clear old EOS images from flash before deployment
@@ -215,6 +595,8 @@ class TaacRunner:
         npi_status: str = "",
         # Trigger Confucius triage agent on failures
         call_triage_minion: bool = False,
+        # Run the in-process investigation agent on lifecycle and test-case errors
+        call_investigation_agent: bool = False,
         # Continue executing playbook stages even if prechecks fail (dev only)
         continue_on_precheck_failure: bool = False,
         # Skip prechecks entirely — go straight to stages (dev only)
@@ -224,17 +606,36 @@ class TaacRunner:
         # Pull the Keysight chassis diagnostics archive at Ixia teardown and
         # upload to Manifold. Best-effort — failures never break teardown.
         collect_ixia_diagnostics: bool = True,
+        # Record every IxNetwork REST call to a JSONL file and publish it in
+        # the test summary. Best-effort — failures never break teardown.
+        trace_ixia_api: bool = True,
         ixia_profile: str = "auto",
         setup_only: bool = False,
+        ixia_primary_chassis: t.Optional[str] = None,
+        force_take_ixia_port_ownership: bool = True,
+        ixia_use_tx_rx_sync: bool = True,
+        campaign_control: CampaignControl | NoopCampaignControl | None = None,
     ) -> None:
-        self.test_config = (
-            get_test_config(test_config)
-            if isinstance(test_config, str)
-            else test_config
-        )
+        if isinstance(test_config, str):
+            # Registry discovery imports hardware-specific configs and can do
+            # network I/O. A supplied TestConfig must not discover other DUTs.
+            from taac.test_configs import get_test_config
+
+            self.test_config = get_test_config(test_config)
+        else:
+            self.test_config = test_config
         self._validate_no_test_config_level_checks()
-        # results of the entire test run. test_results can be passed in as an empty list
-        self.test_run_results = test_results if test_results is not None else []
+        self.campaign_control = campaign_control or CampaignControl.from_environment()
+        if (
+            self.campaign_control.is_enabled
+            and self.campaign_control.manifest is not None
+            and self.campaign_control.manifest.test_config != self.test_config.name
+        ):
+            raise ValueError(
+                "campaign manifest TestConfig does not match the TAAC TestConfig"
+            )
+        # One entry per (playbook, dut, iteration) executed by this run.
+        self.playbook_results: t.List[trr_types.PlaybookResult] = []
         self.logger = logger or get_root_logger()
         self.duts: t.List[str] = [
             endpoint.name for endpoint in self.test_config.endpoints if endpoint.dut
@@ -242,13 +643,13 @@ class TaacRunner:
         self.skip_package_update = skip_package_update
         self.dsf_sequential_update = dsf_sequential_update
         self.skip_setup_tasks = skip_setup_tasks
+        self.skip_oss_setup_tasks = skip_oss_setup_tasks
         self.skip_teardown_tasks = skip_teardown_tasks
         self.skip_all_tasks = skip_all_tasks
+        self._skip_test_config_teardown_tasks = False
+        self._declared_state_guards: set[str] = set()
+        self._armed_state_guards: set[str] = set()
         self.skip_periodic_tasks = skip_periodic_tasks
-        # Skip PTP setup on IXIA
-        if skip_ptp_setup:
-            # pyrefly: ignore [read-only]
-            self.test_config.ptp_configs = []
         # EOS image ID for Arista device image deployment
         self.eos_image_id = eos_image_id or ""
         # Whether to clear old EOS images from flash before deployment
@@ -263,6 +664,8 @@ class TaacRunner:
         self._npi_iteration_outcomes: t.List[t.Tuple[str, t.Optional[str]]] = []
         # Trigger Confucius triage agent on failures
         self.call_triage_minion = call_triage_minion
+        # Run the in-process investigation agent on lifecycle and test-case errors
+        self.call_investigation_agent = call_investigation_agent
         self.continue_on_precheck_failure = continue_on_precheck_failure
         self.skip_prechecks = skip_prechecks
         self.skip_fboss_rsyslog = skip_fboss_rsyslog
@@ -274,6 +677,12 @@ class TaacRunner:
         self.is_autotester_run = is_autotester_run
 
         self.ixia: t.Optional[AbstractTrafficGenerator] = None
+        # How many closed REST-trace slices have already been offered for
+        # upload, so a second publish call does not re-upload them.
+        self._ixia_trace_slices_seen = 0
+        self._published_ixia_trace_slices: t.List[PublishedIxiaTraceSlice] = []
+        self.run_artifacts: t.List[trr_types.RunArtifact] = []
+        self._logged_missing_ixia_trace = False
         self.ixia_candidates = normalize_ixia_candidates(
             self.test_config,
             primary_api_server_ip=ixia_api_server,
@@ -291,6 +700,7 @@ class TaacRunner:
             skip_ixia_cleanup,
             skip_post_setup_wait=skip_post_setup_wait,
             skip_basset_reservation=skip_basset_reservation,
+            fail_on_foreign_basset_reservation=fail_on_foreign_basset_reservation,
             skip_testbed_isolation=skip_testbed_isolation,
             desired_pkg_versions=desired_pkg_versions,
             dsf_sequential_update=dsf_sequential_update,
@@ -302,8 +712,13 @@ class TaacRunner:
             clear_old_eos_images=clear_old_eos_images,
             ixia_candidates=self.ixia_candidates,
             ixia_profile=ixia_profile,
+            trace_ixia_api=trace_ixia_api,
+            ixia_primary_chassis=ixia_primary_chassis,
+            force_take_ixia_port_ownership=force_take_ixia_port_ownership,
+            ixia_use_tx_rx_sync=ixia_use_tx_rx_sync,
         )
         self.test_case_uuid = ""
+        self._test_case_investigation_attempted = False
         self.custom_test_handlers = []
         # pyrefly: ignore [bad-assignment]
         self._current_playbook: taac_types.Playbook = ...
@@ -313,15 +728,39 @@ class TaacRunner:
 
         self.jq_vars: t.Dict[str, t.Any] = {}
         self.dynamic_vars: t.Dict[str, str] = {}
+        self._basset_endpoint_bindings: t.Dict[str, str] = {}
         self.parameter_evaluator = ParameterEvaluator(self.jq_vars, self.dynamic_vars)
         self.periodic_task_executor: t.Optional[PeriodicTaskExecutor] = None
         self.test_case_periodic_task_executor: t.Optional[PeriodicTaskExecutor] = None
-        # Shared data dictionary that persists across all tasks (setup, test, teardown)
-        # This allows tasks to share information (e.g., backup filenames) across execution
+        self._test_case_cleanup_pending = False
+        self._test_case_handlers_pending_cleanup: t.List[BaseCustomTestHandler] = []
+        self._test_case_rsyslog_created = False
+        # TestConfig-lifecycle task state. Setup/teardown tasks may use this to
+        # exchange recovery information across the outer config lifecycle.
         self.shared_task_data: t.Dict[t.Any, t.Any] = {}
+        # Registered steps use a narrower store. It is reset before every
+        # playbook execution so state can cross that playbook's iterations,
+        # setup, stages, and cleanup, but can never leak into another playbook.
+        self._playbook_shared_task_data: t.Dict[t.Any, t.Any] = {}
         self.test_summary = TaacTestSummary(self.logger)
+        # The latest investigation, retained for the legacy Netcastle test-case
+        # link integration. Reset per test case so a prior result is not reused.
+        self.investigation_link: t.Optional[InvestigationLink] = None
+        # Durable records for every investigation in this TestConfig lifecycle.
+        # Unlike `investigation_link`, this is not reset between test cases.
+        self.investigation_artifacts: t.List[trr_types.InvestigationArtifact] = []
         self._current_playbook_section: t.Optional[SectionResult] = None
         self._last_completed_playbook_section: t.Optional[SectionResult] = None
+        self._baseline_lifecycle = BaselineLifecycle(
+            BaselineTimeouts(
+                capture_seconds=_BASELINE_CAPTURE_TIMEOUT_SECONDS,
+                restore_seconds=_BASELINE_RESTORE_TIMEOUT_SECONDS,
+                verify_seconds=_BASELINE_VERIFY_TIMEOUT_SECONDS,
+                release_seconds=_BASELINE_RELEASE_TIMEOUT_SECONDS,
+            )
+        )
+        self._topology_baseline_context: BaselineContext | None = None
+        self._topology_baseline_capture_failed = False
 
     def _validate_no_test_config_level_checks(self) -> None:
         """Validate that deprecated TestConfig-level checks are not used.
@@ -381,27 +820,580 @@ class TaacRunner:
             pass
         return " | ".join(desc_parts)
 
-    @async_retryable(retries=2, sleep_time=60, exceptions=(Exception,))
+    @async_retryable(
+        retries=_TASK_ATTEMPTS,
+        sleep_time=_TASK_RETRY_SLEEP_SECONDS,
+        exceptions=(Exception,),
+    )
+    async def _run_task_with_retry(self, task: taac_types.Task) -> ValueError | None:
+        """Retry one task without replaying already completed stateful tasks.
+
+        A lifecycle-metadata refusal is returned rather than raised so it is
+        never retried.
+        """
+        dict_params = self.parameter_evaluator.evaluate(task.params)
+        try:
+            _check_lifecycle_metadata(task, dict_params)
+        except ValueError as refusal:
+            return refusal
+        await run_task(
+            task,
+            dict_params,
+            t.cast(TaacIxia, self.ixia),
+            self.logger,
+            self.shared_task_data,
+        )
+        return None
+
+    async def _run_task_once(
+        self,
+        task: taac_types.Task,
+        *,
+        index: int,
+        total: int,
+    ) -> None:
+        task_desc = task.description or task.task_name
+        self.logger.warning(
+            f"[Task {index}/{total}] Running: {task_desc} (host: {task.hostname})"
+        )
+        start = time.time()
+        refusal = await self._run_task_with_retry(task)
+        if refusal is not None:
+            raise refusal
+        elapsed = time.time() - start
+        self.logger.warning(
+            f"[Task {index}/{total}] Completed: {task_desc} ({elapsed:.1f}s)"
+        )
+
     async def run_tasks(self, tasks: t.Sequence[taac_types.Task]) -> None:
+        self._declared_state_guards.update(_state_guard_arm_operation_ids(tasks))
         total = len(tasks)
         for idx, task in enumerate(tasks, 1):
-            task_desc = task.description or task.task_name
-            self.logger.warning(
-                f"[Task {idx}/{total}] Running: {task_desc} (host: {task.hostname})"
+            await self._run_task_once(task, index=idx, total=total)
+            operation_id = _state_guard_arm_operation_id(task)
+            if operation_id is not None:
+                self._armed_state_guards.add(operation_id)
+
+    def _unarmed_state_guards(self) -> list[str]:
+        """State guards this run's setup declares but never armed.
+
+        Setup arms a guard only after snapshotting every device it will
+        mutate, so an unarmed guard means setup changed nothing that its
+        teardown tasks could clean up or restore. Guards are read from the
+        setup this run executed and from the candidate whose pre-IXIA setup
+        runs first, never from a fallback candidate that never ran.
+        """
+        declared = set(self._declared_state_guards)
+        candidates = self.test_setup_orchestrator.ixia_candidates_to_try
+        candidate = candidates[0] if candidates else None
+        if candidate is not None:
+            declared.update(
+                _state_guard_arm_operation_ids(
+                    task for task in candidate.setup_tasks if not task.ixia_needed
+                )
             )
-            start = time.time()
-            dict_params = self.parameter_evaluator.evaluate(task.params)
-            await run_task(
-                task,
-                dict_params,
-                t.cast(TaacIxia, self.ixia),
-                self.logger,
-                self.shared_task_data,
+        return sorted(declared - self._armed_state_guards)
+
+    async def _await_cleanup_to_completion(  # noqa: C901
+        self,
+        cleanup: t.Awaitable[t.Any],
+        *,
+        phase: str,
+        cancellation_grace_seconds: float = _CLEANUP_CANCELLATION_GRACE_SECONDS,
+        cancellation_budget: _CleanupCancellationBudget | None = None,
+        drain_seconds: float | None = None,
+        undrained: list[_UndrainedCleanup] | None = None,
+        undrained_hostname: str | None = None,
+    ) -> tuple[asyncio.CancelledError | None, Exception | None]:
+        try:
+            cleanup_task = asyncio.ensure_future(cleanup)
+        except Exception as error:
+            return None, error
+        cancellation: asyncio.CancelledError | None = None
+        budget = cancellation_budget or _CleanupCancellationBudget()
+        while not cleanup_task.done():
+            try:
+                if budget.deadline is None:
+                    await asyncio.shield(cleanup_task)
+                else:
+                    remaining = budget.deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.wait_for(
+                        asyncio.shield(cleanup_task), timeout=remaining
+                    )
+            except asyncio.CancelledError as error:
+                externally_cancelled = self._consume_current_task_cancellation()
+                if cancellation is None:
+                    cancellation = error
+                else:
+                    if externally_cancelled:
+                        cancellation.add_note(
+                            f"Additional cancellation arrived during {phase}"
+                        )
+                    else:
+                        cancellation.add_note(
+                            f"{phase} raised cancellation while still running"
+                        )
+                if externally_cancelled:
+                    budget.arm(cancellation_grace_seconds)
+                if cleanup_task.done():
+                    break
+            except TimeoutError:
+                break
+            except Exception as error:
+                if cleanup_task.done():
+                    break
+                await self._abandon_cleanup(
+                    cleanup_task,
+                    phase=phase,
+                    drain_seconds=drain_seconds,
+                    undrained=undrained,
+                    undrained_hostname=undrained_hostname,
+                )
+                return cancellation, error
+
+        if not cleanup_task.done():
+            drained = await self._abandon_cleanup(
+                cleanup_task,
+                phase=phase,
+                drain_seconds=drain_seconds,
+                undrained=undrained,
+                undrained_hostname=undrained_hostname,
             )
-            elapsed = time.time() - start
-            self.logger.warning(
-                f"[Task {idx}/{total}] Completed: {task_desc} ({elapsed:.1f}s)"
+            timeout_error = TimeoutError(
+                f"{phase} did not finish before the teardown cancellation deadline"
             )
+            if drain_seconds is not None and not drained:
+                timeout_error.add_note(
+                    f"{phase} was still running {drain_seconds}s after cancellation"
+                )
+            return cancellation, timeout_error
+
+        try:
+            cleanup_task.result()
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            else:
+                cancellation.add_note(f"{phase} was itself cancelled")
+        except Exception as error:
+            return cancellation, error
+        return cancellation, None
+
+    async def _run_cleanup_phase(
+        self,
+        cleanup_factory: t.Callable[[], t.Awaitable[t.Any]],
+        *,
+        phase: str,
+        cancellation_budget: _CleanupCancellationBudget,
+        cancellation_grace_seconds: float | None = None,
+        drain_seconds: float | None = None,
+        undrained: list[_UndrainedCleanup] | None = None,
+        undrained_hostname: str | None = None,
+    ) -> tuple[asyncio.CancelledError | None, Exception | None]:
+        grace_seconds = (
+            _CLEANUP_CANCELLATION_GRACE_SECONDS
+            if cancellation_grace_seconds is None
+            else cancellation_grace_seconds
+        )
+        try:
+            cleanup = cleanup_factory()
+        except asyncio.CancelledError as error:
+            if self._consume_current_task_cancellation():
+                cancellation_budget.arm(grace_seconds)
+            return error, None
+        except Exception as error:
+            return None, error
+        return await self._await_cleanup_to_completion(
+            cleanup,
+            phase=phase,
+            cancellation_grace_seconds=grace_seconds,
+            cancellation_budget=cancellation_budget,
+            drain_seconds=drain_seconds,
+            undrained=undrained,
+            undrained_hostname=undrained_hostname,
+        )
+
+    async def _abandon_cleanup(
+        self,
+        cleanup_task: asyncio.Future[t.Any],
+        *,
+        phase: str,
+        drain_seconds: float | None,
+        undrained: list[_UndrainedCleanup] | None,
+        undrained_hostname: str | None,
+    ) -> bool:
+        """Cancel a cleanup TAAC stopped waiting for; with ``drain_seconds``,
+        wait that long for it to unwind and report whether it did."""
+        cleanup_task.cancel()
+        drained = drain_seconds is not None and await self._drain_cancelled_cleanup(
+            cleanup_task, drain_seconds
+        )
+        if not drained:
+            cleanup_task.add_done_callback(
+                lambda task: self._log_abandoned_cleanup_result(task, phase=phase)
+            )
+            if drain_seconds is not None and undrained is not None:
+                undrained.append((cleanup_task, undrained_hostname))
+        return drained
+
+    async def _drain_cancelled_cleanup(
+        self,
+        cleanup_task: asyncio.Future[t.Any],
+        drain_seconds: float,
+    ) -> bool:
+        deadline = time.monotonic() + drain_seconds
+        while not cleanup_task.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(asyncio.shield(cleanup_task), timeout=remaining)
+            except asyncio.CancelledError:
+                if not cleanup_task.done():
+                    self._consume_current_task_cancellation()
+            except TimeoutError:
+                return cleanup_task.done()
+            except Exception:
+                pass
+        if not cleanup_task.cancelled() and cleanup_task.exception() is not None:
+            self._log_abandoned_cleanup_result(cleanup_task, phase="drained cleanup")
+        return True
+
+    def _log_abandoned_cleanup_result(
+        self, task: asyncio.Future[t.Any], *, phase: str
+    ) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            self.logger.exception(f"{phase} failed after TAAC stopped waiting for it")
+
+    @staticmethod
+    def _consume_current_task_cancellation() -> bool:
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            current_task.uncancel()
+            return True
+        return False
+
+    @staticmethod
+    def _new_cleanup_budget(
+        previous_budget: _CleanupCancellationBudget,
+        grace_seconds: float | None = None,
+    ) -> _CleanupCancellationBudget:
+        budget = _CleanupCancellationBudget()
+        if previous_budget.deadline is not None:
+            budget.arm(
+                _CLEANUP_CANCELLATION_GRACE_SECONDS
+                if grace_seconds is None
+                else grace_seconds
+            )
+        return budget
+
+    @staticmethod
+    def _record_teardown_cancellation(
+        current: asyncio.CancelledError | None,
+        new: asyncio.CancelledError | None,
+        *,
+        phase: str,
+    ) -> asyncio.CancelledError | None:
+        if new is None:
+            return current
+        if current is None:
+            return new
+        current.add_note(f"Additional cancellation arrived during {phase}")
+        return current
+
+    @staticmethod
+    def _render_teardown_failure_details(
+        cancellation: asyncio.CancelledError | None,
+        errors: t.Sequence[Exception],
+    ) -> str:
+        details = []
+        if cancellation is not None:
+            details.append(
+                str(cancellation) or "TAAC test-config teardown was cancelled"
+            )
+        details.extend(f"{type(error).__name__}: {error}" for error in errors)
+        return "; ".join(details)
+
+    async def run_teardown_tasks(
+        self,
+        tasks: t.Sequence[taac_types.Task],
+        *,
+        cancellation_budget: _CleanupCancellationBudget | None = None,
+    ) -> None:
+        budget = cancellation_budget or _CleanupCancellationBudget()
+        total = len(tasks)
+        ordinary, terminal = _split_terminal_teardown_tasks(tasks)
+        undrained: list[_UndrainedCleanup] = []
+        failures, cancellation = await self._run_teardown_task_phase(
+            ordinary,
+            total=total,
+            cancellation_budget=budget,
+            allow_retry=True,
+            terminal=False,
+            undrained=undrained,
+        )
+        terminal_to_run = terminal
+        if terminal and undrained:
+            unknown_target = any(hostname is None for _future, hostname in undrained)
+            blocked_hostnames = {
+                hostname for _future, hostname in undrained if hostname is not None
+            }
+            blocked_terminal = [
+                (index, task)
+                for index, task in terminal
+                if unknown_target
+                or (hostname := _task_target_hostname(task)) is None
+                or hostname in blocked_hostnames
+            ]
+            blocked_indices = {index for index, _task in blocked_terminal}
+            terminal_to_run = [
+                entry for entry in terminal if entry[0] not in blocked_indices
+            ]
+            # A cancelled cleanup that has not unwound may still mutate its
+            # target; restoring that target now could be silently undone.
+            failures = [
+                *failures,
+                *(
+                    (
+                        index,
+                        task,
+                        RuntimeError(
+                            f"Test-config teardown task {index}/{total} not "
+                            f"attempted: {len(undrained)} cancelled cleanup "
+                            "task(s) targeting the same or an unknown device "
+                            "were still running"
+                        ),
+                    )
+                    for index, task in blocked_terminal
+                ),
+            ]
+        if terminal_to_run:
+            (
+                terminal_failures,
+                terminal_cancellation,
+            ) = await self._run_teardown_task_phase(
+                terminal_to_run,
+                total=total,
+                cancellation_budget=budget,
+                allow_retry=cancellation is None,
+                terminal=True,
+            )
+            failures = sorted(
+                (*failures, *terminal_failures),
+                key=lambda failure: failure[0],
+            )
+            cancellation = self._record_teardown_cancellation(
+                cancellation,
+                terminal_cancellation,
+                phase="terminal test-config teardown tasks",
+            )
+        self._raise_teardown_task_failures(failures, cancellation)
+
+    async def _run_teardown_task_phase(
+        self,
+        tasks: t.Sequence[tuple[int, taac_types.Task]],
+        *,
+        total: int,
+        cancellation_budget: _CleanupCancellationBudget,
+        allow_retry: bool,
+        terminal: bool,
+        undrained: list[_UndrainedCleanup] | None = None,
+    ) -> tuple[
+        list[tuple[int, taac_types.Task, Exception]],
+        asyncio.CancelledError | None,
+    ]:
+        pending = list(tasks)
+        failures_by_index: dict[int, tuple[int, taac_types.Task, Exception]] = {}
+        for attempt in range(_TASK_ATTEMPTS):
+            if not pending:
+                return [], None
+            (
+                failures,
+                cancellation,
+                successful_indices,
+            ) = await self._attempt_teardown_tasks(
+                pending,
+                total=total,
+                cancellation_budget=cancellation_budget,
+                terminal=terminal,
+                undrained=undrained,
+            )
+            for index in successful_indices:
+                failures_by_index.pop(index, None)
+            for failure in failures:
+                failures_by_index[failure[0]] = failure
+            cumulative_failures = [
+                failures_by_index[index] for index in sorted(failures_by_index)
+            ]
+            if (
+                cancellation is not None
+                or not failures
+                or not allow_retry
+                or attempt + 1 == _TASK_ATTEMPTS
+                or cancellation_budget.deadline is not None
+                or undrained
+            ):
+                return cumulative_failures, cancellation
+
+            try:
+                await asyncio.sleep(_TASK_RETRY_SLEEP_SECONDS)
+            except asyncio.CancelledError as error:
+                if self._consume_current_task_cancellation():
+                    cancellation_budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
+                return cumulative_failures, error
+            pending = [(index, task) for index, task, _error in failures]
+        return [], None
+
+    async def _attempt_teardown_tasks(
+        self,
+        indexed_tasks: t.Sequence[tuple[int, taac_types.Task]],
+        *,
+        total: int,
+        cancellation_budget: _CleanupCancellationBudget,
+        terminal: bool = False,
+        undrained: list[_UndrainedCleanup] | None = None,
+    ) -> tuple[
+        list[tuple[int, taac_types.Task, Exception]],
+        asyncio.CancelledError | None,
+        set[int],
+    ]:
+        """Attempt each task once.
+
+        Every cancelled task is drained before the next starts. A terminal
+        restore also gets its own, longer cancellation grace, so a cleanup
+        that exhausted the shared grace cannot cancel it before it starts.
+        """
+        failures: list[tuple[int, taac_types.Task, Exception]] = []
+        cancellation: asyncio.CancelledError | None = None
+        successful_indices: set[int] = set()
+        grace_seconds = (
+            _TERMINAL_RESTORE_GRACE_SECONDS
+            if terminal
+            else _CLEANUP_CANCELLATION_GRACE_SECONDS
+        )
+        drain_seconds = (
+            _TERMINAL_RESTORE_DRAIN_SECONDS if terminal else _CLEANUP_DRAIN_SECONDS
+        )
+        for idx, task in indexed_tasks:
+            description = self._get_task_description(task)
+            task_budget = (
+                self._new_cleanup_budget(cancellation_budget, grace_seconds)
+                if terminal
+                else cancellation_budget
+            )
+            task_cancellation, error = await self._run_cleanup_phase(
+                lambda task=task, idx=idx: self._run_task_once(
+                    task,
+                    index=idx,
+                    total=total,
+                ),
+                phase=f"test-config teardown task {idx}/{total}: {description}",
+                cancellation_budget=task_budget,
+                cancellation_grace_seconds=grace_seconds,
+                drain_seconds=drain_seconds,
+                undrained=undrained,
+                undrained_hostname=_task_target_hostname(task),
+            )
+            if task_budget.deadline is not None:
+                cancellation_budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
+            cancellation = self._record_teardown_cancellation(
+                cancellation,
+                task_cancellation,
+                phase=f"test-config teardown task {idx}/{total}: {description}",
+            )
+            if error is not None:
+                error.add_note(
+                    f"Test-config teardown task {idx}/{total} failed: {description}"
+                )
+                self.logger.error(
+                    f"[Teardown task {idx}/{total}] Failed: {description}",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                failures.append((idx, task, error))
+            elif task_cancellation is None:
+                successful_indices.add(idx)
+
+        return failures, cancellation, successful_indices
+
+    @staticmethod
+    def _raise_teardown_task_failures(
+        failures: t.Sequence[tuple[int, taac_types.Task, Exception]],
+        cancellation: asyncio.CancelledError | None,
+    ) -> None:
+        errors = [error for _index, _task, error in failures]
+        if cancellation is not None:
+            if errors:
+                cancellation.add_note(
+                    "Test-config teardown also failed: "
+                    + "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+                )
+                raise cancellation from _TeardownTaskFailureGroup(
+                    _TEARDOWN_TASK_FAILURE_GROUP_MESSAGE,
+                    errors,
+                )
+            raise cancellation
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise _TeardownTaskFailureGroup(
+                _TEARDOWN_TASK_FAILURE_GROUP_MESSAGE,
+                errors,
+            )
+
+    async def _run_teardown_tasks_best_effort(
+        self, tasks: t.Sequence[taac_types.Task]
+    ) -> None:
+        """Run every teardown task even when an earlier cleanup fails.
+
+        Setup tasks intentionally fail fast, but teardown owns restoration of
+        independent DUTs and nested config snapshots.  Stopping at the first
+        error can strand later devices in the test configuration.  Keep the
+        existing per-task retry behavior by invoking ``run_tasks`` with one
+        task at a time, then surface all failures after every cleanup was
+        attempted.
+        """
+        errors: list[Exception] = []
+        for task in tasks:
+            try:
+                await self.run_tasks((task,))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+                self.logger.error(
+                    "Teardown task failed; continuing remaining cleanup: "
+                    f"{self._get_task_description(task)}: {exc}"
+                )
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("Multiple TAAC teardown tasks failed", errors)
+
+    async def _async_run_oss_setup_tasks(self) -> None:
+        """Run the OSS setup-task stage.
+
+        Its own stage rather than part of the IXIA candidate's setup_tasks:
+        that list feeds the IXIA topology-cache key, so folding these in would
+        silently change caching behaviour for every OSS run.
+
+        `--skip-setup-tasks` suppresses these too. They are setup tasks, and
+        someone asking for no setup tasks would be surprised to still get a
+        bgpd restart; `--skip-oss-setup-tasks` is for skipping only these.
+        """
+        if self.skip_all_tasks or self.skip_setup_tasks or self.skip_oss_setup_tasks:
+            return
+        tasks = resolve_oss_setup_tasks(self.test_config)
+        if not tasks:
+            return
+        self.logger.warning(
+            f"Running {len(tasks)} OSS setup task(s) across "
+            f"{len(self.test_config.endpoints)} endpoint(s)"
+        )
+        await self.run_tasks(tasks)
 
     async def _async_prepare_ixia_candidate(self, candidate: IxiaCandidate) -> None:
         if self.skip_all_tasks or self.skip_setup_tasks:
@@ -420,6 +1412,36 @@ class TaacRunner:
             }
 
     async def async_test_setUp(self) -> None:
+        setup_start_time = int(time.time())
+        try:
+            self._skip_test_config_teardown_tasks = True
+            endpoint_bindings = (
+                await self.test_setup_orchestrator.async_resolve_basset_endpoints()
+            )
+            if endpoint_bindings:
+                self.test_config = self.test_setup_orchestrator.test_config
+                self.ixia_candidates = self.test_setup_orchestrator.ixia_candidates
+                self.duts[:] = self.test_setup_orchestrator.devices_under_test
+                self._basset_endpoint_bindings = endpoint_bindings
+                self.dynamic_vars.update(endpoint_bindings)
+            self._skip_test_config_teardown_tasks = False
+            await self._async_run_test_setup()
+        except BaseException as error:
+            # The setup slice is the only record of what the chassis was
+            # asked to do before it refused, and a setup that raises may
+            # never reach `async_test_tearDown`. Publish it here so the
+            # evidence survives; the seen-counter makes a later teardown
+            # publish a no-op rather than a duplicate upload.
+            await self._async_publish_ixia_api_trace(final=True)
+            if isinstance(error, Exception):
+                await self._async_run_lifecycle_investigation_if_enabled(
+                    phase=trr_types.InvestigationPhase.TEST_CONFIG_SETUP,
+                    error=error,
+                    start_time=setup_start_time,
+                )
+            raise
+
+    async def _async_run_test_setup(self) -> None:
         log_section("TEST CONFIG SETUP", logger=self.logger)
         setup_start = time.time()
         skip_setup_tasks = self.skip_all_tasks or self.skip_setup_tasks
@@ -428,6 +1450,11 @@ class TaacRunner:
         self._add_oss_mock_device_data()
         self._add_host_to_device_os_type_data()
         self._add_host_driver_args_data()
+
+        log_section("OSS SETUP TASKS", logger=self.logger)
+        with self.test_summary.tracked_section("OSS setup tasks"):
+            with suppress_console_logs(self.logger):
+                await self._async_run_oss_setup_tasks()
 
         log_section("PRE-IXIA SETUP TASKS", logger=self.logger)
         with self.test_summary.tracked_section("Pre-IXIA setup tasks"):
@@ -622,7 +1649,7 @@ class TaacRunner:
             # create_steps_stage factory.
             precheck_stage = create_steps_stage(
                 stage_id="prechecks",
-                description="Prechecks",
+                description=_PRECHECK_STAGE_DESCRIPTION,
                 steps=[
                     taac_types.Step(
                         name=taac_types.StepName.VALIDATION_STEP,
@@ -664,7 +1691,7 @@ class TaacRunner:
         device: TestDevice,
         test_case_name: str,
         test_case_start_time: int,
-        test_case_results: t.List[TestResult],
+        test_case_results: t.List[trr_types.CheckResult],
     ) -> Step:
         step_cls = NAME_TO_STEP[step.name]
         step_obj = step_cls(
@@ -681,6 +1708,10 @@ class TaacRunner:
             topology=self.topology,
             step=step,
         )
+        # Set after construction so third-party Step subclasses with explicit
+        # constructor signatures do not have to accept a new keyword merely to
+        # benefit from runner-owned registered-task state.
+        step_obj.shared_data = self._playbook_shared_task_data
         step_obj._input = (
             json_to_thrift(step.input_json, STEP_NAME_TO_INPUT[step.name])
             if step.input_json
@@ -698,7 +1729,7 @@ class TaacRunner:
         test_device: TestDevice,
         test_case_name: str,
         test_case_start_time: int,
-        test_case_results: t.List[TestResult],
+        test_case_results: t.List[trr_types.CheckResult],
     ) -> None:
         run_coros = []
         for concurrent_step in concurrent_steps:
@@ -720,7 +1751,7 @@ class TaacRunner:
         test_device: TestDevice,
         test_case_name: str,
         test_case_start_time: int,
-        test_case_results: t.List[TestResult],
+        test_case_results: t.List[trr_types.CheckResult],
         iteration: int = 1,
     ) -> None:
         step_objs_list = []
@@ -785,6 +1816,51 @@ class TaacRunner:
                 matched.append(device)
         return matched
 
+    def playbook_applies_to_device(
+        self,
+        playbook: taac_types.Playbook,
+        test_device: TestDevice,
+    ) -> bool:
+        """Whether a playbook's device filters select this DUT.
+
+        `device_regexes` and `attribute_filters` are ANDed. Step-level and
+        stage-level filtering instead treat them as mutually exclusive.
+
+        Public because the netcastle front end (`taac_test_framework.py`) calls
+        it to skip a test case before it builds a `CheckResult` for the DUT.
+        """
+        if playbook.device_regexes and not any(
+            re.match(regex, test_device.name) for regex in playbook.device_regexes
+        ):
+            return False
+        if (
+            playbook.attribute_filters
+            and not self._get_devices_matching_attribute_filters(
+                [test_device],
+                # pyre-fixme[6]: For 2nd argument expected `Dict[str, List[str]]`
+                #  but got `Mapping[str, Sequence[str]]`.
+                playbook.attribute_filters,
+            )
+        ):
+            return False
+        return True
+
+    def _playbooks_for_device(
+        self,
+        playbooks: t.Sequence[taac_types.Playbook],
+        test_device: TestDevice,
+    ) -> t.List[taac_types.Playbook]:
+        selected = []
+        for playbook in playbooks:
+            if self.playbook_applies_to_device(playbook, test_device):
+                selected.append(playbook)
+            else:
+                self.logger.info(
+                    f"\033[2m  Skipping playbook '{playbook.name}' on "
+                    f"{test_device.name}: device filters do not match\033[0m"
+                )
+        return selected
+
     async def run_test_case(
         self,
         playbook: taac_types.Playbook,
@@ -798,16 +1874,25 @@ class TaacRunner:
         # list of (status, error_type) where status is "passed"/"failed"/"error"
         npi_iteration_outcomes: t.List[t.Tuple[str, t.Optional[str]]] = []
         self._npi_iteration_outcomes = npi_iteration_outcomes
-        _run_exc: t.Optional[BaseException] = None
+        _run_exc: BaseException | None = None
         _npi_iteration_count = 0
+        recorded_iterations = 0
+        test_case_results: t.List[trr_types.CheckResult] = []
+        test_case_start_time = int(time.time())
+        iteration_count = self._get_test_case_iteration_count(playbook)
+        self._playbook_shared_task_data = {}
 
         try:
-            for _ in range(playbook.iteration if not self.is_autotester_run else 1):
+            for _ in range(iteration_count):
                 _npi_iteration_count += 1
+                self._test_case_investigation_attempted = False
+                test_case_results = []
+                test_case_start_time = int(time.time())
                 self._current_playbook_section = self.test_summary.start_section(
                     f"Playbook: {playbook.name} | {test_device.name}"
                 )
                 _start_test_case_time_window(self.jq_vars, int(time.time()))
+                await self._capture_topology_baseline(playbook)
                 with suppress_console_logs(self.logger):
                     await self.async_test_case_setUp(playbook, test_device)
                 test_case_start_time = int(time.time())
@@ -817,8 +1902,6 @@ class TaacRunner:
                     device_name=test_device.name,
                     logger=self.logger,
                 )
-                # results of a single playbook run
-                test_case_results = []
                 # Deprecated - snapshot_checks should be defined at playbook level
                 snapshot_checks = [
                     snapshot_check
@@ -902,7 +1985,22 @@ class TaacRunner:
                                     for test_device in test_devices
                                 ]
                             )
+                            if stage.description == _PRECHECK_STAGE_DESCRIPTION:
+                                # Tabulate prechecks as soon as they finish
+                                # (not at end-of-case) so someone tailing a
+                                # live run sees them before the stages start.
+                                await self._log_stage_health_results(
+                                    test_case_results,
+                                    taac_types.ValidationStage.PRE_TEST,
+                                    "PRE-HEALTH CHECK RESULTS",
+                                )
                         except TestbedError:
+                            if stage.description == _PRECHECK_STAGE_DESCRIPTION:
+                                await self._log_stage_health_results(
+                                    test_case_results,
+                                    taac_types.ValidationStage.PRE_TEST,
+                                    "PRE-HEALTH CHECK RESULTS",
+                                )
                             if self.continue_on_precheck_failure:
                                 self.logger.warning(
                                     f"[--continue-on-precheck-failure] "
@@ -962,12 +2060,41 @@ class TaacRunner:
                                 duration_secs=time.time() - _cleanup_start,
                                 logger=self.logger,
                             )
+                        # Last resort for the CPU/RSS characterization brackets.
+                        # Meta-internal: the brackets and their sampler live
+                        # under internal/, so there is nothing to reap in OSS.
+                        # Their STOP steps are a sibling Stage placed after the
+                        # measured work, so a failing workload stage skips them
+                        # and leaves a detached sampling loop running on the DUT
+                        # to its 24-hour iteration cap. This is the only point
+                        # that runs no matter which stage failed. A no-op on a
+                        # passing run, and it never raises: an exception here
+                        # would escape the finally and displace the stage
+                        # failure that is the run's actual result.
+                        if not TAAC_OSS:
+                            await ondevice_sampler.reap_all(self.logger)
                         self.jq_vars["test_case_end_time"] = int(time.time())
 
-                    # Log POST_TEST health check results table
-                    await self._log_post_test_results(test_case_results)
+                    # Health-check results tables. PRE_TEST was tabulated
+                    # right after the precheck stage ran (see the stage loop);
+                    # historically only POST_TEST was tabulated at all, which
+                    # read as if prechecks were skipped on a green run.
+                    for _stage, _title in (
+                        (
+                            taac_types.ValidationStage.MID_TEST,
+                            "MID-TEST HEALTH CHECK RESULTS",
+                        ),
+                        (
+                            taac_types.ValidationStage.POST_TEST,
+                            "POST-HEALTH CHECK RESULTS",
+                        ),
+                        (taac_types.ValidationStage.SNAPSHOT, "SNAPSHOT CHECK RESULTS"),
+                    ):
+                        await self._log_stage_health_results(
+                            test_case_results, _stage, _title
+                        )
 
-                    _teardown_exc = None
+                    _teardown_exc: BaseException | None = None
                     with suppress_console_logs(self.logger):
                         try:
                             await self.async_test_case_tearDown(
@@ -976,37 +2103,60 @@ class TaacRunner:
                                 test_case_results,
                                 test_case_start_time,
                             )
+                        except asyncio.CancelledError as e:
+                            if _stage_exc is not None:
+                                e.add_note(
+                                    "Test case execution also failed: "
+                                    f"{type(_stage_exc).__name__}: {_stage_exc}"
+                                )
+                            raise
                         except Exception as e:
                             _teardown_exc = e
 
-                    if _teardown_exc is not None:
-                        if _stage_exc is not None:
-                            message = "test case execution and teardown both failed"
-                            if isinstance(_stage_exc, Exception):
-                                raise ExceptionGroup(
-                                    message,
-                                    [_stage_exc, _teardown_exc],
-                                )
-                            raise BaseExceptionGroup(
-                                message,
-                                [_stage_exc, _teardown_exc],
-                            )
-                        raise _teardown_exc
+                    _cleanup_errors = (
+                        [_teardown_exc] if _teardown_exc is not None else []
+                    )
+                    self._raise_test_case_cleanup_errors(_stage_exc, _cleanup_errors)
+
+                self._record_playbook_result(
+                    playbook,
+                    test_device,
+                    _npi_iteration_count,
+                    test_case_results,
+                    empty_status=hc_types.HealthCheckStatus.PASS,
+                )
+                recorded_iterations = _npi_iteration_count
         except Exception as e:
+            await self._async_run_failed_test_case_investigation_if_enabled(
+                playbook=playbook,
+                test_device=test_device,
+                test_case_results=test_case_results,
+                test_case_start_time=test_case_start_time,
+                error=e,
+            )
             _run_exc = e
-            if self.npi_name and test_case_name:
-                if len(npi_iteration_outcomes) < _npi_iteration_count:
-                    # No outcome was recorded for this iteration (e.g. setUp
-                    # failure, setup_steps error, or tearDown crashed early).
-                    npi_iteration_outcomes.append(("error", str(e)))
-                elif (
-                    npi_iteration_outcomes and npi_iteration_outcomes[-1][0] == "passed"
-                ):
-                    # tearDown recorded "passed" but the iteration actually
-                    # errored (e.g. stage crash that isn't reflected in health
-                    # check results). Correct it to "error".
-                    npi_iteration_outcomes[-1] = ("error", str(e))
+            self._record_npi_iteration_error(
+                test_case_name,
+                npi_iteration_outcomes,
+                _npi_iteration_count,
+                e,
+            )
         finally:
+            _run_exc = await self._run_test_case_fallback_cleanup(
+                test_case_name,
+                test_case_results,
+                test_device,
+                test_case_start_time,
+                _run_exc,
+                sys.exception(),
+            )
+            # The iteration that was in flight when the run broke off, recorded
+            # only here so it carries the checks the fallback cleanup above
+            # just appended to test_case_results.
+            if _npi_iteration_count > recorded_iterations:
+                self._record_playbook_result(
+                    playbook, test_device, _npi_iteration_count, test_case_results
+                )
             # Publish NPI result immediately after all iterations complete,
             # before returning to run_tests for the next playbook.
             # This ensures the result reflects the full aggregated outcome
@@ -1016,6 +2166,244 @@ class TaacRunner:
             )
             if _run_exc is not None:
                 raise _run_exc
+
+    def _record_playbook_result(
+        self,
+        playbook: taac_types.Playbook,
+        test_device: TestDevice,
+        iteration: int,
+        results: t.Sequence[trr_types.CheckResult],
+        *,
+        empty_status: hc_types.HealthCheckStatus = hc_types.HealthCheckStatus.UNKNOWN,
+    ) -> None:
+        self.playbook_results.append(
+            trr_types.PlaybookResult(
+                playbook_name=playbook.name,
+                dut=test_device.name,
+                iteration=iteration,
+                status=worst_check_status(results) if results else empty_status,
+                results=list(results),
+            )
+        )
+
+    def _record_npi_iteration_error(
+        self,
+        test_case_name: str,
+        outcomes: list[tuple[str, str | None]],
+        iteration_count: int,
+        error: Exception,
+    ) -> None:
+        if not self.npi_name or not test_case_name:
+            return
+        if len(outcomes) < iteration_count:
+            # Setup failures have no teardown result to correct.
+            outcomes.append(("error", str(error)))
+            return
+        if outcomes and outcomes[-1][0] == "passed":
+            outcomes[-1] = ("error", str(error))
+
+    async def _capture_topology_baseline(self, playbook: taac_types.Playbook) -> None:
+        self._topology_baseline_context = None
+        self._topology_baseline_capture_failed = False
+        participants = self._baseline_participants_for(playbook)
+        if not participants:
+            return
+
+        invocation_id = uuid.uuid4().hex
+        test_config_name = self.test_config.name or "<unnamed>"
+        baseline_context = BaselineContext(
+            test_config_name=test_config_name,
+            invocation_id=invocation_id,
+        )
+        self._topology_baseline_context = baseline_context
+        try:
+            await self._baseline_lifecycle.capture(
+                BaselineScope.TOPOLOGY,
+                baseline_context,
+                participants,
+            )
+        except Exception as error:
+            if not _contains_baseline_capture_timeout(error):
+                raise
+            self._topology_baseline_context = None
+            self._topology_baseline_capture_failed = True
+            raise _topology_baseline_infra_error(
+                "IXIA topology baseline capture timed out after "
+                f"{_BASELINE_CAPTURE_TIMEOUT_SECONDS}s "
+                f"(invocation_id={baseline_context.invocation_id})",
+                [error],
+            )
+        self.logger.info(f"Captured topology baseline for playbook '{playbook.name}'")
+
+    @staticmethod
+    def _raise_test_case_cleanup_errors(
+        stage_error: BaseException | None,
+        cleanup_errors: t.Sequence[BaseException],
+    ) -> None:
+        if not cleanup_errors:
+            return
+        cancellation = next(
+            (
+                error
+                for error in cleanup_errors
+                if isinstance(error, asyncio.CancelledError)
+            ),
+            None,
+        )
+        if cancellation is not None:
+            additional_errors = [
+                error
+                for error in [stage_error, *cleanup_errors]
+                if error is not None and error is not cancellation
+            ]
+            if additional_errors:
+                cancellation.add_note(
+                    "Test case execution or cleanup also failed: "
+                    + "; ".join(
+                        f"{type(error).__name__}: {error}"
+                        for error in additional_errors
+                    )
+                )
+            raise cancellation
+        infrastructure_error = next(
+            (error for error in cleanup_errors if isinstance(error, TestbedError)),
+            None,
+        )
+        if infrastructure_error is not None:
+            if stage_error is None and len(cleanup_errors) == 1:
+                raise infrastructure_error
+            errors = [
+                *((stage_error,) if stage_error is not None else ()),
+                *cleanup_errors,
+            ]
+            raise _topology_baseline_infra_error(
+                "Test execution left the shared topology unsafe",
+                errors,
+            )
+        if stage_error is not None:
+            raise _group_exceptions(
+                "test case execution and restoration failed",
+                [stage_error, *cleanup_errors],
+            )
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        raise _group_exceptions("test case restoration failed", cleanup_errors)
+
+    def _baseline_participants_for(
+        self, playbook: taac_types.Playbook
+    ) -> tuple[BaselineParticipant, ...]:
+        if not playbook.restore_topology_baseline:
+            return ()
+        ixia = self.ixia
+        if ixia is None:
+            raise TestCaseFailure(
+                "restore_topology_baseline requires an IXIA traffic generator"
+            )
+        required_methods = (
+            "save_config_to_chassis",
+            "load_config_from_chassis",
+            "remove_config_from_chassis",
+        )
+        if not all(hasattr(ixia, method) for method in required_methods):
+            raise TestCaseFailure(
+                "restore_topology_baseline is not supported by the selected "
+                "traffic generator backend"
+            )
+        participant = IxiaTopologyBaselineParticipant(t.cast(IxiaConfigClient, ixia))
+        return (participant,)
+
+    async def _restore_topology_baseline(self) -> tuple[BaseException, ...]:
+        if BaselineScope.TOPOLOGY not in self._baseline_lifecycle.active_scopes:
+            return ()
+        context = self._topology_baseline_context
+        if context is None:
+            return ()
+        errors = await self._baseline_lifecycle.restore(BaselineScope.TOPOLOGY, context)
+        if not errors:
+            log_phase_end(
+                "Topology baseline restored | verification=load_completed | "
+                "participant=ixia_topology | "
+                f"invocation={context.invocation_id}",
+                logger=self.logger,
+            )
+        return errors
+
+    def _get_test_case_iteration_count(self, playbook: taac_types.Playbook) -> int:
+        iteration_count = 1 if self.is_autotester_run else playbook.iteration
+        if iteration_count <= 0:
+            raise ValueError(
+                f"Playbook '{playbook.name}' iteration must be a positive integer"
+            )
+        return iteration_count
+
+    async def _run_test_case_fallback_cleanup(
+        self,
+        test_case_name: str,
+        test_case_results: t.List[trr_types.CheckResult],
+        test_device: TestDevice,
+        test_case_start_time: int,
+        run_error: BaseException | None,
+        active_exception: BaseException | None,
+    ) -> BaseException | None:
+        fallback_errors: list[BaseException] = []
+        if self.test_case_periodic_task_executor is not None:
+            orphaned_executor = self._detach_test_case_periodic_task_executor(
+                test_case_name
+            )
+            fallback_errors.extend(
+                await self._finalize_test_case_periodic_task_executor(
+                    orphaned_executor,
+                    test_case_results,
+                    test_device,
+                    test_case_name,
+                    test_case_start_time,
+                )
+            )
+        if self._test_case_cleanup_pending:
+            self._test_case_cleanup_pending = False
+            fallback_errors.extend(await self._run_post_periodic_test_case_cleanup())
+
+        active_baseline_scopes = self._baseline_lifecycle.active_scopes
+        baseline_restore_errors = await self._baseline_lifecycle.restore_all()
+        fallback_errors.extend(baseline_restore_errors)
+        if active_baseline_scopes and not baseline_restore_errors:
+            self.logger.info(
+                "Restored and verified remaining baseline scopes during "
+                "fallback cleanup"
+            )
+
+        if not fallback_errors:
+            return run_error
+        if run_error is None and active_exception is not None:
+            self.logger.error(
+                "Test case fallback cleanup failed while propagating %s: %s",
+                type(active_exception).__name__,
+                "; ".join(
+                    f"{type(error).__name__}: {error}" for error in fallback_errors
+                ),
+            )
+            active_exception.add_note(
+                "Test case cleanup also failed: "
+                + "; ".join(
+                    f"{type(error).__name__}: {error}" for error in fallback_errors
+                )
+            )
+            return None
+        if BaselineScope.TOPOLOGY in active_baseline_scopes and baseline_restore_errors:
+            primary_errors = [
+                error for error in (run_error, active_exception) if error is not None
+            ]
+            return _topology_baseline_infra_error(
+                "Fallback topology baseline restoration failed",
+                [*primary_errors, *fallback_errors],
+            )
+        primary_error = run_error or active_exception
+        if primary_error is not None:
+            return _group_exceptions(
+                "test case execution and fallback cleanup failed",
+                [primary_error, *fallback_errors],
+            )
+        return _group_exceptions("test case fallback cleanup failed", fallback_errors)
 
     async def _publish_npi_result(
         self,
@@ -1090,11 +2478,8 @@ class TaacRunner:
         except Exception as e:
             self.logger.warning(f"NPI result publish failed (non-fatal): {e}")
 
-    def check_failure(self, test_case_results: t.List[TestResult]) -> bool:
-        return any(
-            result.test_status in [hc_status.name for hc_status in FAILED_HC_STATUSES]
-            for result in test_case_results
-        )
+    def check_failure(self, test_case_results: t.List[trr_types.CheckResult]) -> bool:
+        return any(result.status in FAILED_HC_STATUSES for result in test_case_results)
 
     async def initialize_and_setup_snapshot_checks(
         self,
@@ -1121,21 +2506,23 @@ class TaacRunner:
                 obj = self.topology
             else:
                 raise
-            checks.append(
+            check_instance = check_impl(
                 # pyrefly: ignore [bad-argument-type]
-                check_impl(
-                    # pyrefly: ignore [bad-argument-type]
-                    obj=obj,
-                    input=check_input or default_input,
-                    check_params=self.parameter_evaluator.evaluate(check.check_params),
-                    pre_snapshot_checkpoint_id=check.pre_snapshot_checkpoint_id
-                    or DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID,
-                    post_snapshot_checkpoint_id=check.post_snapshot_checkpoint_id
-                    or DEFAULT_POST_SNAPSHOT_CHECKPOINT_ID,
-                    logger=self.logger,
-                )
+                obj=obj,
+                input=check_input or default_input,
+                check_params=self.parameter_evaluator.evaluate(check.check_params),
+                pre_snapshot_checkpoint_id=check.pre_snapshot_checkpoint_id
+                or DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID,
+                post_snapshot_checkpoint_id=check.post_snapshot_checkpoint_id
+                or DEFAULT_POST_SNAPSHOT_CHECKPOINT_ID,
+                logger=self.logger,
             )
-        await asyncio.gather(*[check.setup(obj) for check in checks])  # pyre-ignore
+            checks.append((check_instance, obj))
+        await asyncio.gather(
+            # pyrefly: ignore [bad-argument-type]
+            *[check.setup(obj) for check, obj in checks]
+        )
+        checks = [check for check, _ in checks]
         # pyrefly: ignore [bad-return]
         return checks
 
@@ -1144,7 +2531,7 @@ class TaacRunner:
         snapshot_checks: t.List[AbstractSnapshotHealthCheck],
         id: str,
         current_timestamp: int,
-        test_case_results: t.List[TestResult],
+        test_case_results: t.List[trr_types.CheckResult],
         test_case_name: str,
     ) -> None:
         for check in snapshot_checks:
@@ -1212,48 +2599,42 @@ class TaacRunner:
             return stage.id
         return "Unnamed Stage"
 
-    async def _log_post_test_results(
-        self, test_case_results: t.List[TestResult]
+    async def _log_stage_health_results(
+        self,
+        test_case_results: t.List[trr_types.CheckResult],
+        stage: taac_types.ValidationStage,
+        title: str,
     ) -> None:
-        """Log a summary table of POST_TEST health check results.
+        """Log a summary table of health check results for one validation stage.
 
-        Filters test_case_results to only include POST_TEST checks and logs
-        them in a formatted table showing check name, status, and any failure message.
-        For failed checks, uploads the full failure details to Everpaste and
-        appends the URL to the message.
+        Filters test_case_results to checks whose ``check_stage`` equals
+        ``stage`` and logs them in a formatted table. Rows are prefixed with
+        the device name(s) so multi-DUT stages don't render as N
+        identical-looking rows. For failed checks, uploads the full failure
+        details to Everpaste and appends the URL to the message.
         """
-        # Filter for POST_TEST health check results
-        post_test_results = [
-            result
-            for result in test_case_results
-            if result.check_stage and "POST_TEST" in str(result.check_stage)
+        stage_results = [
+            result for result in test_case_results if result.check_stage == stage
         ]
 
-        if not post_test_results:
+        if not stage_results:
             return
 
         # Format results for the table
         formatted_results = []
-        for result in post_test_results:
-            status = result.test_status or "UNKNOWN"
-            # Normalize status display
-            if status.upper() in ("PASS", "PASSED", "SUCCESS"):
-                display_status = "PASS"
-            elif status.upper() in ("FAIL", "FAILED", "FAILURE"):
-                display_status = "FAIL"
-            else:
-                display_status = status
-
-            message = result.message or ""
+        for result in stage_results:
+            display_status = result.status.name
+            message = message_with_url(result.message, result.message_url)
 
             # For failed checks, upload details to Everpaste and append URL
             if display_status == "FAIL" and message:
                 try:
                     detail_lines = [
                         f"Health Check: {result.check_name}",
-                        f"Device: {result.hostnames or 'N/A'}",
-                        f"Stage: {result.check_stage or 'N/A'}",
-                        f"Time: {result.start_time} - {result.end_time}",
+                        f"Device: {', '.join(result.hostnames) or 'N/A'}",
+                        f"Stage: {check_stage_name(result.check_stage, absent='N/A')}",
+                        f"Time: {format_epoch_timestamp(result.start_time_epoch_s)} - "
+                        f"{format_epoch_timestamp(result.end_time_epoch_s)}",
                         "",
                         "Details:",
                         message,
@@ -1263,21 +2644,25 @@ class TaacRunner:
                 except Exception:
                     pass
 
+            devices = ", ".join(result.hostnames)
+            check_name = result.check_name or "Unknown"
             formatted_results.append(
                 {
-                    "check_name": result.check_name or "Unknown",
+                    "check_name": f"{devices}: {check_name}" if devices else check_name,
                     "status": display_status,
                     "message": message,
                 }
             )
 
         log_results_table(
-            title="POST-HEALTH CHECK RESULTS",
+            title=title,
             results=formatted_results,
             logger=self.logger,
         )
 
-    def _log_failed_health_checks(self, failed_checks: t.List[TestResult]) -> None:
+    def _log_failed_health_checks(
+        self, failed_checks: t.List[trr_types.CheckResult]
+    ) -> None:
         """Log detailed information about failed health checks."""
         self.logger.info("=" * 80)
         self.logger.info(f"{'FAILED HEALTH CHECK DETAILS':^80}")
@@ -1286,9 +2671,14 @@ class TaacRunner:
 
         for i, check in enumerate(failed_checks, 1):
             self.logger.info(f"  [{i}] {check.check_name or 'Unknown Check'}")
-            self.logger.info(f"      Stage: {check.check_stage or 'N/A'}")
-            self.logger.info(f"      Device: {check.hostnames or 'N/A'}")
-            self.logger.info(f"      Time: {check.start_time} - {check.end_time}")
+            self.logger.info(
+                f"      Stage: {check_stage_name(check.check_stage, absent='N/A')}"
+            )
+            self.logger.info(f"      Device: {', '.join(check.hostnames) or 'N/A'}")
+            self.logger.info(
+                f"      Time: {format_epoch_timestamp(check.start_time_epoch_s)} - "
+                f"{format_epoch_timestamp(check.end_time_epoch_s)}"
+            )
             if check.message:
                 # Log full message, splitting long messages across lines
                 msg_lines = check.message.split("\n")
@@ -1299,6 +2689,8 @@ class TaacRunner:
                     self.logger.info(
                         f"             ... ({len(msg_lines) - 10} more lines)"
                     )
+            if check.message_url:
+                self.logger.info(f"      Full message: {check.message_url}")
             self.logger.info("")
 
         self.logger.info("=" * 80)
@@ -1310,7 +2702,7 @@ class TaacRunner:
         test_device: TestDevice,
         test_case_name: str,
         test_case_start_time: int,
-        test_case_results: t.List[TestResult],
+        test_case_results: t.List[trr_types.CheckResult],
     ) -> None:
         stage_name = self._get_stage_display_name(stage)
         stage_section = self.test_summary.start_section(stage_name, indent_level=1)
@@ -1514,7 +2906,34 @@ class TaacRunner:
 
         return [config_playbooks[name] for name in target_playbook_names]
 
-    async def run_tests(
+    def _resolve_selected_playbooks(
+        self,
+        playbooks: t.Optional[t.List[t.Union[str, taac_types.Playbook]]],
+    ) -> t.List[taac_types.Playbook]:
+        """Return post-binding copies of playbooks selected before setup."""
+        configured_playbooks = {
+            playbook.name: playbook for playbook in self.test_config.playbooks
+        }
+        selected_playbooks = playbooks or self.test_config.playbooks
+        resolved_playbooks = []
+        for playbook in selected_playbooks:
+            if isinstance(playbook, str):
+                resolved_playbook = configured_playbooks.get(playbook)
+                if resolved_playbook is None:
+                    raise ValueError(
+                        f"Playbook {playbook!r} is not present in the current "
+                        f"TestConfig {self.test_config.name!r}"
+                    )
+                resolved_playbooks.append(resolved_playbook)
+            elif self._basset_endpoint_bindings:
+                resolved_playbooks.append(
+                    configured_playbooks.get(playbook.name, playbook)
+                )
+            else:
+                resolved_playbooks.append(playbook)
+        return resolved_playbooks
+
+    async def run_tests(  # noqa: C901
         self,
         playbooks: t.Optional[t.List[t.Union[str, taac_types.Playbook]]] = None,
         duts: t.Optional[t.List[str]] = None,
@@ -1541,37 +2960,39 @@ class TaacRunner:
             if not npi_playbooks:
                 self.logger.warning("No playbooks to run from NPI selection.")
                 return
-            # pyre-fixme[9]: playbooks has type `Optional[List[Union[str,
-            #  Playbook]]]`; used as `List[Playbook]`.
-            playbooks = npi_playbooks
+            resolved_playbooks = npi_playbooks
             # Fall through to normal execution with resolved playbooks
         else:
-            all_playbooks = {
-                playbook.name: playbook for playbook in self.test_config.playbooks
-            }
-            playbooks = [
-                (all_playbooks[playbook] if isinstance(playbook, str) else playbook)
-                for playbook in playbooks or self.test_config.playbooks
-            ]
+            resolved_playbooks = self._resolve_selected_playbooks(playbooks)
         duts = none_throws(duts or self.duts)
-        # pyre-fixme[16]: `Optional` has no attribute `__iter__`.
-        enabled_playbooks = [p for p in playbooks if p.enabled]
-        total_playbooks = len(enabled_playbooks)
+        enabled_playbooks = [p for p in resolved_playbooks if p.enabled]
         failed_playbooks: t.List[t.Tuple[str, str, Exception]] = []
+        stop_requested = False
         for dut in duts:
             # pyrefly: ignore [missing-attribute]
             test_device = self.topology.get_device_by_name(dut)
-            for pb_idx, playbook in enumerate(enabled_playbooks, 1):
+            dut_playbooks = self._playbooks_for_device(
+                enabled_playbooks,
+                test_device,
+            )
+            total_playbooks = len(dut_playbooks)
+            for pb_idx, playbook in enumerate(dut_playbooks, 1):
                 self.logger.info("")
                 self.logger.info(f"\033[1m\033[36m{'=' * 70}\033[0m")
                 self.logger.info(
-                    # pyrefly: ignore [missing-attribute]
                     f"\033[1m\033[36m  [{pb_idx}/{total_playbooks}] "
                     f"{playbook.name} | {dut}\033[0m"
                 )
                 self.logger.info(f"\033[1m\033[36m{'=' * 70}\033[0m")
-                # pyrefly: ignore [bad-assignment]
                 self._current_playbook = playbook
+                if self.campaign_control.is_enabled:
+                    self.campaign_control.publish_event(
+                        "PLAYBOOK_STARTED",
+                        playbook=playbook.name,
+                        dut=dut,
+                        index=pb_idx,
+                        total=total_playbooks,
+                    )
                 try:
                     # Cross-playbook IXIA health gate. Fires the in-band 5xx
                     # recovery if the chassis is in a Jetty-wedge state
@@ -1590,20 +3011,54 @@ class TaacRunner:
                             ),
                             testconfig_name=self.test_config.name,
                         )
-                    # pyrefly: ignore [bad-argument-type]
                     await self.run_test_case(playbook, test_device)
                 except Exception as e:
-                    # pyrefly: ignore [missing-attribute]
                     failed_playbooks.append((playbook.name, dut, e))
                     self.logger.error(
-                        # pyrefly: ignore [missing-attribute]
                         f"\033[31m  Playbook '{playbook.name}' failed on "
                         f"{dut}: {e}\033[0m"
                     )
+                    if self._topology_baseline_capture_failed:
+                        self.logger.error(
+                            "Stopping this TestConfig because the IXIA topology "
+                            "baseline could not be captured"
+                        )
+                        raise _topology_baseline_infra_error(
+                            "The IXIA topology baseline could not be captured; "
+                            "remaining Playbooks were not started",
+                            [error for _name, _dut, error in failed_playbooks],
+                        )
+                    self._ensure_baseline_safe_for_next_playbook(failed_playbooks)
+                    stop_requested = await self._campaign_boundary_requests_stop(
+                        playbook=playbook,
+                        dut=dut,
+                        outcome="FAILED",
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    if stop_requested:
+                        self.logger.warning(
+                            "Campaign requested normal teardown after failed "
+                            f"playbook {playbook.name!r}"
+                        )
+                        break
                     self.logger.info(
                         f"\033[33m  Continuing to next playbook "
                         f"({pb_idx}/{total_playbooks} complete)...\033[0m"
                     )
+                else:
+                    stop_requested = await self._campaign_boundary_requests_stop(
+                        playbook=playbook,
+                        dut=dut,
+                        outcome="PASSED",
+                    )
+                    if stop_requested:
+                        self.logger.warning(
+                            "Campaign requested normal teardown after successful "
+                            f"playbook {playbook.name!r}"
+                        )
+                        break
+            if stop_requested:
+                break
         if failed_playbooks:
             # Include each failed playbook's exception message in the outer
             # TestCaseFailure so the per-HC detail (introduced in D107926440
@@ -1622,6 +3077,64 @@ class TaacRunner:
                 f"{len(failed_playbooks)} playbook(s) failed:\n"
                 + "\n".join(detail_lines)
             ) from failed_playbooks[-1][2]
+
+    async def _campaign_boundary_requests_stop(
+        self,
+        *,
+        playbook: taac_types.Playbook,
+        dut: str,
+        outcome: str,
+        error: str | None = None,
+    ) -> bool:
+        if not self.campaign_control.is_enabled:
+            return False
+        self.campaign_control.publish_event(
+            "PLAYBOOK_FINISHED",
+            playbook=playbook.name,
+            dut=dut,
+            outcome=outcome,
+            error=error,
+        )
+        status = self.campaign_control.publish_status(
+            "WAITING_FOR_COMMAND",
+            playbook=playbook.name,
+            dut=dut,
+            outcome=outcome,
+            error=error,
+        )
+        action = await self.campaign_control.wait_for_boundary_action(
+            expected_state_version=status["state_version"],
+            allowed_actions={
+                BoundaryAction.CONTINUE,
+                BoundaryAction.STOP_FOR_PATCH,
+                BoundaryAction.ABORT_GRACEFULLY,
+            },
+        )
+        self.campaign_control.publish_event(
+            "BOUNDARY_DECISION",
+            playbook=playbook.name,
+            dut=dut,
+            action=action.value,
+        )
+        return action in {
+            BoundaryAction.STOP_FOR_PATCH,
+            BoundaryAction.ABORT_GRACEFULLY,
+        }
+
+    def _ensure_baseline_safe_for_next_playbook(
+        self, failed_playbooks: t.Sequence[t.Tuple[str, str, Exception]]
+    ) -> None:
+        if self._baseline_lifecycle.is_healthy:
+            return
+        self.logger.error(
+            "Stopping this TestConfig because baseline restoration could not "
+            "be verified"
+        )
+        raise _topology_baseline_infra_error(
+            "The topology baseline could not be restored; remaining Playbooks "
+            "were not started",
+            [error for _name, _dut, error in failed_playbooks],
+        )
 
     async def run_steps(
         self,
@@ -1698,6 +3211,7 @@ class TaacRunner:
     ) -> None:
         # Executed at the beginning of each test
         self.fail_on_periodic_task_error_if_exists(self.periodic_task_executor)
+        self.investigation_link = None
         self.test_case_uuid = uuid.uuid4().hex
         self.parameter_evaluator.set_cache_uuid(self.test_case_uuid)
         ixia = self.ixia
@@ -1722,6 +3236,7 @@ class TaacRunner:
                         settings.line_rate_type,
                         settings.frame_size_settings,
                         settings.qos_config,
+                        settings.transmission_control,
                     )
             traffic_regexes = (
                 playbook.traffic_items_to_start
@@ -1733,17 +3248,296 @@ class TaacRunner:
             )
             await asyncio.sleep(10)
         # Run custom test case set up logics
+        self._test_case_cleanup_pending = True
+        self._test_case_handlers_pending_cleanup = []
+        self._test_case_rsyslog_created = False
         for handler in self.custom_test_handlers:
             await handler._async_test_case_setUp()
-        if playbook.periodic_tasks:
-            self.test_case_periodic_task_executor = PeriodicTaskExecutor(
-                list(playbook.periodic_tasks),
-                self.logger,
-                t.cast(TaacIxia, self.ixia),
-            )
-            self.test_case_periodic_task_executor.create_periodic_tasks()
+            self._test_case_handlers_pending_cleanup.append(handler)
+        self._start_test_case_periodic_tasks(playbook)
         if not self.skip_fboss_rsyslog:
             await self.async_create_fboss_ryslog_configuration()
+            self._test_case_rsyslog_created = True
+
+    def _start_test_case_periodic_tasks(self, playbook: taac_types.Playbook) -> None:
+        if self.test_case_periodic_task_executor is not None:
+            raise RuntimeError(
+                "Cannot start periodic tasks for "
+                f"'{playbook.name}': the previous playbook still owns an executor"
+            )
+        if self.skip_periodic_tasks or not playbook.periodic_tasks:
+            self.logger.debug(
+                f"No periodic task executor created for playbook '{playbook.name}'"
+            )
+            return
+
+        executor = PeriodicTaskExecutor(
+            list(playbook.periodic_tasks),
+            self.logger,
+            t.cast(TaacIxia, self.ixia),
+        )
+        self.test_case_periodic_task_executor = executor
+        self.logger.debug(
+            f"Created periodic task executor {id(executor)} for "
+            f"playbook '{playbook.name}'"
+        )
+        executor.create_periodic_tasks()
+
+    def _detach_test_case_periodic_task_executor(
+        self, playbook_name: str
+    ) -> t.Optional[PeriodicTaskExecutor]:
+        executor = self.test_case_periodic_task_executor
+        self.test_case_periodic_task_executor = None
+        if executor is None:
+            self.logger.debug(
+                f"No periodic task executor to detach for playbook '{playbook_name}'"
+            )
+        else:
+            self.logger.debug(
+                f"Detached periodic task executor {id(executor)} from "
+                f"playbook '{playbook_name}'"
+            )
+        return executor
+
+    async def _finalize_test_case_periodic_task_executor(
+        self,
+        executor: t.Optional[PeriodicTaskExecutor],
+        test_case_results: t.List[trr_types.CheckResult],
+        test_device: TestDevice,
+        test_case_name: str,
+        test_case_start_time: int,
+        workers_stopped: t.Optional[bool] = None,
+        initial_errors: t.Optional[t.Iterable[Exception]] = None,
+    ) -> t.List[Exception]:
+        if executor is None:
+            return []
+
+        errors = list(initial_errors or [])
+        try:
+            if workers_stopped is None:
+                try:
+                    executor.stop_all_periodic_tasks()
+                    workers_stopped = True
+                except Exception as error:
+                    workers_stopped = False
+                    errors.append(error)
+
+            if workers_stopped:
+                try:
+                    await self.async_run_periodic_task_checks(
+                        test_case_results,
+                        test_device,
+                        test_case_name,
+                        test_case_start_time,
+                        executor,
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+                try:
+                    self.fail_on_periodic_task_error_if_exists(executor)
+                except Exception as error:
+                    errors.append(error)
+        finally:
+            try:
+                await executor.teardown(
+                    skip_log_upload=workers_stopped is True,
+                    stop_tasks=False,
+                )
+            except Exception as error:
+                errors.append(error)
+
+        self.logger.debug(
+            f"Finalized periodic task executor {id(executor)} for "
+            f"playbook '{test_case_name}'"
+        )
+        return errors
+
+    def _stop_test_case_periodic_task_executor(
+        self, executor: t.Optional[PeriodicTaskExecutor]
+    ) -> t.Tuple[t.Optional[bool], t.List[Exception]]:
+        if executor is None:
+            return None, []
+        try:
+            executor.stop_all_periodic_tasks()
+            return True, []
+        except Exception as error:
+            return False, [error]
+
+    def _end_ixia_test_case(
+        self,
+        playbook: taac_types.Playbook,
+        test_case_results: t.List[trr_types.CheckResult],
+        periodic_workers_stopped: t.Optional[bool],
+    ) -> t.Optional[str]:
+        if periodic_workers_stopped is False:
+            self.logger.error(
+                "Skipping IXIA test-case teardown because a periodic IXIA thread "
+                "is still running"
+            )
+            return None
+
+        ixia_config_snapshot = self._snapshot_ixia_config(playbook, test_case_results)
+        ixia = self.ixia
+        if not ixia:
+            return ixia_config_snapshot
+
+        traffic_regexes = (
+            playbook.traffic_items_to_start or self.test_config.traffic_items_to_start
+        )
+        ixia.end_test_case(
+            list(traffic_regexes) if traffic_regexes is not None else None
+        )
+        if playbook.backup_and_restore_ixia_config:
+            if hasattr(ixia, "import_saved_config"):
+                ixia.import_saved_config()  # type: ignore[attr-defined]
+            else:
+                self.logger.warning(
+                    "backup_and_restore_ixia_config is set but the traffic "
+                    "generator backend does not support import_saved_config "
+                    "— skipping config restore"
+                )
+        return ixia_config_snapshot
+
+    def _end_ixia_test_case_safely(
+        self,
+        playbook: taac_types.Playbook,
+        test_case_results: t.List[trr_types.CheckResult],
+        periodic_workers_stopped: t.Optional[bool],
+    ) -> tuple[t.Optional[str], list[BaseException]]:
+        ixia_teardown_errors: list[BaseException] = []
+        ixia_config_snapshot = None
+        try:
+            ixia_config_snapshot = self._end_ixia_test_case(
+                playbook,
+                test_case_results,
+                periodic_workers_stopped,
+            )
+        except Exception as error:
+            ixia_teardown_errors.append(error)
+        return ixia_config_snapshot, ixia_teardown_errors
+
+    async def _restore_topology_baseline_safely(self) -> list[BaseException]:
+        topology_restore_errors: list[BaseException] = []
+        try:
+            topology_restore_errors.extend(await self._restore_topology_baseline())
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            topology_restore_errors.append(error)
+        return topology_restore_errors
+
+    async def _run_post_periodic_test_case_cleanup(self) -> t.List[Exception]:
+        errors: t.List[Exception] = []
+        handlers = self._test_case_handlers_pending_cleanup
+        self._test_case_handlers_pending_cleanup = []
+        for handler in handlers:
+            try:
+                await handler._async_test_case_tearDown()
+            except Exception as error:
+                errors.append(error)
+        if not self.skip_fboss_rsyslog and self._test_case_rsyslog_created:
+            self._test_case_rsyslog_created = False
+            try:
+                await self.async_delete_fboss_ryslog_configuration()
+            except Exception as error:
+                errors.append(error)
+        return errors
+
+    def _finalize_playbook_section(
+        self,
+        exceptions: t.Sequence[BaseException],
+        topology_restore_errors: t.Sequence[BaseException],
+    ) -> None:
+        section = self._current_playbook_section
+        if section is None:
+            return
+        if exceptions:
+            status = (
+                SectionStatus.INFRA_ERROR
+                if topology_restore_errors
+                or any(isinstance(error, TestbedError) for error in exceptions)
+                else SectionStatus.FAIL
+            )
+            self.test_summary.end_section(
+                section,
+                status,
+                "; ".join(str(error) for error in exceptions),
+            )
+        else:
+            self.test_summary.end_section(section, SectionStatus.PASS)
+        self._last_completed_playbook_section = section
+        self._current_playbook_section = None
+
+    def _record_npi_teardown_outcome(
+        self,
+        test_case_name: str,
+        test_case_results: t.Sequence[trr_types.CheckResult],
+        exceptions: t.Sequence[BaseException],
+        topology_restore_errors: t.Sequence[BaseException],
+    ) -> None:
+        if not self.npi_name or not test_case_name:
+            return
+        if not exceptions:
+            self._npi_iteration_outcomes.append(("passed", None))
+            return
+        if topology_restore_errors:
+            self._npi_iteration_outcomes.append(("error", "topology_baseline_restore"))
+            return
+        if self.check_failure(list(test_case_results)):
+            self._npi_iteration_outcomes.append(("failed", "health_check"))
+            return
+        self._npi_iteration_outcomes.append(("error", str(exceptions[0])))
+
+    @staticmethod
+    def _raise_test_case_teardown_errors(
+        test_case_name: str,
+        test_device: TestDevice,
+        exceptions: t.Sequence[BaseException],
+        topology_restore_errors: t.Sequence[BaseException],
+        test_case_raise: TestCaseFailure | None,
+    ) -> None:
+        if not exceptions:
+            return
+        if topology_restore_errors:
+            raise _topology_baseline_infra_error(
+                (
+                    f"Topology baseline restoration failed for "
+                    f"{test_case_name} on {test_device.name}"
+                ),
+                exceptions,
+            )
+        infrastructure_error = next(
+            (error for error in exceptions if isinstance(error, TestbedError)),
+            None,
+        )
+        if infrastructure_error is not None:
+            if len(exceptions) == 1:
+                raise infrastructure_error
+            raise _topology_baseline_infra_error(
+                (
+                    f"Test case teardown encountered an infrastructure failure for "
+                    f"{test_case_name} on {test_device.name}"
+                ),
+                exceptions,
+            )
+        error_messages = [str(exc) for exc in exceptions]
+        failure_string = "Failure detected in test case teardown:\n"
+        combined_message = "\n".join([f"- {msg}" for msg in error_messages])
+        is_postcheck = getattr(test_case_raise, "is_postcheck_failure", False)
+        raise TestCaseFailure(
+            failure_string + combined_message,
+            is_postcheck_failure=is_postcheck,
+        )
+
+    def _get_periodic_task_executor_error(
+        self, executor: t.Optional[PeriodicTaskExecutor]
+    ) -> t.Optional[TestCaseFailure]:
+        try:
+            self.fail_on_periodic_task_error_if_exists(executor)
+        except TestCaseFailure as error:
+            return error
+        return None
 
     def convert_unixtime_to_log_timestamp(self, unix_time: int) -> str:
         """
@@ -1762,7 +3556,7 @@ class TaacRunner:
     async def async_fboss_collect_and_print_logs(
         self,
         start_time: int,
-    ) -> None:
+    ) -> t.List[HostLog]:
         log_subsection("Collecting Device Logs", logger=self.logger)
         start_timestamp = self.convert_unixtime_to_log_timestamp(start_time)
         end_timestamp = self.convert_unixtime_to_log_timestamp(int(time.time()))
@@ -1775,24 +3569,32 @@ class TaacRunner:
         ]
         # Run all host log collections in parallel
         agent_logs = await asyncio.gather(*coros)
-        flattened_logs = []
+        flattened_logs: t.List[HostLog] = []
         for host_logs in agent_logs:
             flattened_logs.extend(host_logs)
 
         agent_logs_table = tabulate(
-            flattened_logs,
-            headers=["Device", "Service", "Logs URL"],
+            [
+                (log.hostname, log.service, log.url or f"NOT COLLECTED: {log.error}")
+                for log in flattened_logs
+            ],
+            headers=["Device", "Service", "Logs URL or collection error"],
             tablefmt="grid",
         )
         self.logger.info(f"Binary log files:\n {agent_logs_table}")
+        # Returned so callers (e.g. the investigation agent at the failure seam)
+        # can reuse the collected evidence instead of re-collecting it.
+        return flattened_logs
 
     async def async_collect_logs_for_host(
         self,
         hostname: str,
         start_timestamp: str,
         end_timestamp: str,
-    ) -> list:
+    ) -> t.List[HostLog]:
         rsyslog_services = self.device_to_rsyslog_services.get(hostname, [])
+        if not rsyslog_services:
+            return []
         driver = await async_get_device_driver(hostname)
         # pyre-fixme[16]: `AbstractSwitch` has no attribute `async_is_netos`.
         is_netos = await driver.async_is_netos()
@@ -1800,7 +3602,7 @@ class TaacRunner:
         log_timeout = getattr(self.test_config, "log_collection_timeout", 180)
 
         max_everpaste_size = 50 * 1024 * 1024  # 50MB
-        results = []
+        results: t.List[HostLog] = []
         for service in rsyslog_services:
             service_name = taac_types.SERVICE_NAME_MAP[service]
             try:
@@ -1828,54 +3630,58 @@ class TaacRunner:
                 # don't additionally shorten it through the throttled fburl tier
                 # (this collects per host x service at test-case teardown).
                 everpaste_url = await async_everpaste_str(output)
-                results.append((hostname, service_name, everpaste_url))
+                results.append(HostLog(hostname, service_name, url=everpaste_url))
             except asyncio.TimeoutError:
                 self.logger.error(
                     f"Timeout ({log_timeout}s) while collecting logs for {hostname} {service_name}"
                 )
-                results.append((hostname, service_name, f"Timeout ({log_timeout}s)"))
+                results.append(
+                    HostLog(
+                        hostname, service_name, error=f"timed out after {log_timeout}s"
+                    )
+                )
             except Exception as e:
                 self.logger.error(
                     f"Error collecting logs for {hostname} {service_name}: {e}"
                 )
-                results.append((hostname, service_name, f"Error: {e}"))
+                results.append(HostLog(hostname, service_name, error=str(e)))
         return results
 
     async def async_test_case_tearDown(
         self,
         playbook: taac_types.Playbook,
         test_device: TestDevice,
-        test_case_results: t.List[TestResult],
+        test_case_results: t.List[trr_types.CheckResult],
         test_case_start_time: int,
     ) -> None:
         # Executed at the end of each test
-        ixia = self.ixia
         test_case_name = playbook.name
-        if ixia:
-            traffic_regexes = (
-                playbook.traffic_items_to_start
-                or self.test_config.traffic_items_to_start
+        periodic_workers_stopped, periodic_stop_errors = (
+            self._stop_test_case_periodic_task_executor(
+                self.test_case_periodic_task_executor
             )
-            ixia.end_test_case(
-                list(traffic_regexes) if traffic_regexes is not None else None
-            )
-            if playbook.backup_and_restore_ixia_config:
-                if hasattr(ixia, "import_saved_config"):
-                    ixia.import_saved_config()  # type: ignore[attr-defined]
-                else:
-                    self.logger.warning(
-                        "backup_and_restore_ixia_config is set but the traffic "
-                        "generator backend does not support import_saved_config "
-                        "— skipping config restore"
-                    )
-        if self.test_case_periodic_task_executor:
-            await self.async_run_periodic_task_checks(
+        )
+        # Preserve failure evidence before either the legacy restore or the
+        # topology boundary replaces the state that the Playbook exercised.
+        ixia_config_snapshot, ixia_teardown_errors = self._end_ixia_test_case_safely(
+            playbook,
+            test_case_results,
+            periodic_workers_stopped,
+        )
+        test_case_periodic_task_executor = (
+            self._detach_test_case_periodic_task_executor(test_case_name)
+        )
+        test_case_periodic_task_executor_errors = (
+            await self._finalize_test_case_periodic_task_executor(
+                test_case_periodic_task_executor,
                 test_case_results,
                 test_device,
                 test_case_name,
                 test_case_start_time,
-                self.test_case_periodic_task_executor,
+                workers_stopped=periodic_workers_stopped,
+                initial_errors=periodic_stop_errors,
             )
+        )
         test_case_raise = None
         try:
             if test_case_results:
@@ -1884,23 +3690,32 @@ class TaacRunner:
                     logger=self.logger,
                 )
                 self.logger.info(f"\n{tabulate_test_results(test_case_results)}")
-                self.test_run_results.extend(test_case_results)
                 if self.check_failure(test_case_results):
-                    await self.async_fboss_collect_and_print_logs(test_case_start_time)
+                    collected_logs = await self.async_fboss_collect_and_print_logs(
+                        test_case_start_time
+                    )
+                    # Right after the device logs, and before the raise below
+                    # skips the rest of this block, so a failing test case
+                    # reports its IXIA trace alongside its other evidence.
+                    await self._async_publish_ixia_api_trace()
+                    investigation_url = await self._async_run_investigation_if_enabled(
+                        playbook,
+                        test_device,
+                        test_case_results,
+                        test_case_start_time,
+                        collected_logs,
+                        ixia_config_snapshot,
+                    )
                     # Only mark as postcheck failure if ALL failures
                     # are from POST_TEST health checks. Pre-check failures
                     # and stage execution errors remain as ERROR.
-                    failed_statuses = [
-                        hc_status.name for hc_status in FAILED_HC_STATUSES
-                    ]
                     failed_results = [
                         result
                         for result in test_case_results
-                        if result.test_status in failed_statuses
+                        if result.status in FAILED_HC_STATUSES
                     ]
                     postcheck_only = bool(failed_results) and all(
-                        result.check_stage is not None
-                        and "POST_TEST" in str(result.check_stage)
+                        result.check_stage == taac_types.ValidationStage.POST_TEST
                         for result in failed_results
                     )
                     # Thread per-HC failure_detail into the exception so the
@@ -1912,87 +3727,62 @@ class TaacRunner:
                     # and consumers have to dig into worker logs.
                     hc_details = "\n".join(
                         f"  - {result.check_name or '<unnamed>'} "
-                        f"({result.check_stage or '<unknown_stage>'}): "
-                        f"{result.message or '<no detail>'}"
+                        f"({check_stage_name(result.check_stage, absent='<unknown_stage>')}): "
+                        f"{message_with_url(result.message, result.message_url) or '<no detail>'}"
                         for result in failed_results
+                    )
+                    investigation_suffix = (
+                        f"\nInvestigation: {investigation_url}"
+                        if investigation_url
+                        else ""
                     )
                     raise TestCaseFailure(
                         f"Health check failed for {test_case_name} on "
                         f"{test_device.name} ({len(failed_results)} "
-                        f"failing check(s)):\n{hc_details}",
+                        f"failing check(s)):\n{hc_details}{investigation_suffix}",
                         is_postcheck_failure=postcheck_only,
                     )
         except TestCaseFailure as e:
             test_case_raise = e
 
-        # Run custom test case tear down logics
-        for handler in self.custom_test_handlers:
-            await handler._async_test_case_tearDown()
-        if not self.skip_fboss_rsyslog:
-            await self.async_delete_fboss_ryslog_configuration()
-        await self.teardown_period_task_executor_if_exists(
-            self.test_case_periodic_task_executor, skip_log_upload=True
+        # No-op when the failure branch above already published this test
+        # case's slice; this is the passing path's publish.
+        await self._async_publish_ixia_api_trace()
+        self._test_case_cleanup_pending = False
+        post_periodic_teardown_errors = (
+            await self._run_post_periodic_test_case_cleanup()
         )
-        test_case_periodic_task_executor_raise = None
-        try:
-            self.fail_on_periodic_task_error_if_exists(
-                self.test_case_periodic_task_executor
-            )
-        except TestCaseFailure as e:
-            test_case_periodic_task_executor_raise = e
-
-        periodic_task_executor_raise = None
-        try:
-            self.fail_on_periodic_task_error_if_exists(self.periodic_task_executor)
-        except TestCaseFailure as e:
-            periodic_task_executor_raise = e
+        topology_restore_errors = await self._restore_topology_baseline_safely()
+        periodic_task_executor_raise = self._get_periodic_task_executor_error(
+            self.periodic_task_executor
+        )
         # Combine all exceptions into a single raise
         exceptions = [
             exc
             for exc in [
                 test_case_raise,
-                test_case_periodic_task_executor_raise,
+                *ixia_teardown_errors,
+                *topology_restore_errors,
+                *test_case_periodic_task_executor_errors,
+                *post_periodic_teardown_errors,
                 periodic_task_executor_raise,
             ]
             if exc is not None
         ]
-        # Finalize playbook section in test summary
-        if self._current_playbook_section is not None:
-            if exceptions:
-                self.test_summary.end_section(
-                    self._current_playbook_section,
-                    SectionStatus.FAIL,
-                    "; ".join(str(e) for e in exceptions),
-                )
-            else:
-                self.test_summary.end_section(
-                    self._current_playbook_section, SectionStatus.PASS
-                )
-            self._last_completed_playbook_section = self._current_playbook_section
-            self._current_playbook_section = None
-
-        # Record iteration outcome for NPI aggregation (published after all iterations)
-        if self.npi_name and test_case_name:
-            if exceptions:
-                # Distinguish health check failures from unhandled errors
-                has_hc_failure = self.check_failure(test_case_results)
-                if has_hc_failure:
-                    self._npi_iteration_outcomes.append(("failed", "health_check"))
-                else:
-                    self._npi_iteration_outcomes.append(("error", str(exceptions[0])))
-            else:
-                self._npi_iteration_outcomes.append(("passed", None))
-
-        if exceptions:
-            error_messages = [str(exc) for exc in exceptions]
-            failure_string = "Failure detected in test case teardown:\n"
-            combined_message = "\n".join([f"- {msg}" for msg in error_messages])
-            # Propagate is_postcheck_failure if the primary failure was a postcheck
-            is_postcheck = getattr(test_case_raise, "is_postcheck_failure", False)
-            raise TestCaseFailure(
-                failure_string + combined_message,
-                is_postcheck_failure=is_postcheck,
-            )
+        self._finalize_playbook_section(exceptions, topology_restore_errors)
+        self._record_npi_teardown_outcome(
+            test_case_name,
+            test_case_results,
+            exceptions,
+            topology_restore_errors,
+        )
+        self._raise_test_case_teardown_errors(
+            test_case_name,
+            test_device,
+            exceptions,
+            topology_restore_errors,
+            test_case_raise,
+        )
 
     async def async_create_fboss_ryslog_configuration(self) -> None:
         # pyrefly: ignore [missing-attribute]
@@ -2026,6 +3816,737 @@ class TaacRunner:
             )
         await asyncio.gather(*coroutines)
 
+    async def _async_run_investigation_if_enabled(
+        self,
+        playbook: taac_types.Playbook,
+        test_device: TestDevice,
+        test_case_results: t.List[trr_types.CheckResult],
+        test_case_start_time: int,
+        collected_logs: t.Sequence[HostLog],
+        ixia_config_snapshot: t.Optional[str],
+        error: BaseException | None = None,
+    ) -> t.Optional[str]:
+        """Run the in-process investigation agent on the still-reserved devices.
+
+        Gated behind the opt-in ``--call-investigation-agent`` flag. Best-effort:
+        any failure is logged and swallowed so investigation never turns a
+        failing test into an infra error. Returns the everpaste URL of the
+        transcript (appended to the ``TestCaseFailure`` message), or ``None``.
+        """
+        if (
+            not getattr(self, "call_investigation_agent", False)
+            or TAAC_OSS
+            or getattr(self, "_test_case_investigation_attempted", False)
+        ):
+            return None
+        self._test_case_investigation_attempted = True
+        try:
+            from taac.libs.investigation_report import (
+                investigation_task,
+            )
+
+            return await self._async_run_investigation(
+                task=investigation_task(),
+                prompt=self._build_investigation_prompt(
+                    playbook,
+                    test_device,
+                    test_case_results,
+                    test_case_start_time,
+                    collected_logs,
+                    error,
+                ),
+                tools=self._build_investigation_tools(
+                    test_case_start_time, ixia_config_snapshot
+                ),
+                phase=trr_types.InvestigationPhase.TEST_CASE,
+                label=f"TAAC investigation: {playbook.name} | {test_device.name}",
+                timeout_sec=INVESTIGATION_TIMEOUT_SEC,
+                playbook_name=playbook.name,
+                dut=test_device.name,
+            )
+        except Exception as e:
+            self.logger.warning(f"Investigation agent failed (non-fatal): {e}")
+            return None
+
+    async def _async_run_failed_test_case_investigation_if_enabled(
+        self,
+        playbook: taac_types.Playbook,
+        test_device: TestDevice,
+        test_case_results: t.List[trr_types.CheckResult],
+        test_case_start_time: int,
+        error: BaseException,
+    ) -> t.Optional[str]:
+        """Investigate an exception that escaped normal test-case teardown."""
+        if (
+            not getattr(self, "call_investigation_agent", False)
+            or TAAC_OSS
+            or getattr(self, "_test_case_investigation_attempted", False)
+        ):
+            return None
+        try:
+            try:
+                collected_logs = await self.async_fboss_collect_and_print_logs(
+                    test_case_start_time
+                )
+            except Exception as evidence_error:
+                self.logger.warning(
+                    "Failure log collection before investigation failed "
+                    f"(non-fatal): {evidence_error}"
+                )
+                collected_logs = []
+            try:
+                await self._async_publish_ixia_api_trace()
+            except Exception as evidence_error:
+                self.logger.warning(
+                    "IXIA trace publication before investigation failed "
+                    f"(non-fatal): {evidence_error}"
+                )
+            return await self._async_run_investigation_if_enabled(
+                playbook,
+                test_device,
+                test_case_results,
+                test_case_start_time,
+                collected_logs,
+                self._render_ixia_config_for_investigation(playbook),
+                error,
+            )
+        except Exception as investigation_error:
+            self.logger.warning(
+                f"Investigation agent failed (non-fatal): {investigation_error}"
+            )
+            return None
+
+    async def _async_run_lifecycle_investigation_if_enabled(
+        self,
+        phase: trr_types.InvestigationPhase,
+        error: BaseException,
+        start_time: int,
+    ) -> t.Optional[str]:
+        """Investigate a setup or teardown error without masking that error."""
+        if not self.call_investigation_agent or TAAC_OSS:
+            return None
+        try:
+            from taac.libs.investigation_report import (
+                lifecycle_investigation_task,
+            )
+
+            phase_label = phase.name.replace("_", " ").lower()
+            return await self._async_run_investigation(
+                task=lifecycle_investigation_task(),
+                prompt=self._build_lifecycle_investigation_prompt(
+                    phase, error, start_time
+                ),
+                tools=self._build_lifecycle_investigation_tools(start_time, error),
+                phase=phase,
+                label=f"TAAC investigation: {phase_label} | {self.test_config.name}",
+                timeout_sec=LIFECYCLE_INVESTIGATION_TIMEOUT_SEC,
+            )
+        except Exception as investigation_error:
+            self.logger.warning(
+                f"Investigation agent failed (non-fatal): {investigation_error}"
+            )
+            return None
+
+    async def _async_run_investigation(
+        self,
+        *,
+        task: str,
+        prompt: str,
+        tools: t.List["Function[str]"],
+        phase: trr_types.InvestigationPhase,
+        label: str,
+        timeout_sec: float,
+        playbook_name: t.Optional[str] = None,
+        dut: t.Optional[str] = None,
+    ) -> t.Optional[str]:
+        """Run the shared agent loop and retain its durable transcript."""
+        # Lazy: the agent pulls the whole confucius dependency tree.
+        from neteng.test_infra.dne.taac.agent.agent import AgentConfig, run_agent
+
+        with _console_visible(self.logger):
+            self._log_investigation_event(f"  Running {label}...")
+            run = await run_agent(
+                task=task,
+                prompt=prompt,
+                tools=tools,
+                # InvestigationReport is a real pydantic model
+                # internally; in OSS it is the Any placeholder, which the
+                # generic run_agent bound cannot accept unchecked.
+                output_format=t.cast("type[BaseModel]", InvestigationReport),
+                on_event=self._log_investigation_event,
+                config=AgentConfig(stats_label=INVESTIGATION_STATS_LABEL),
+                timeout_sec=timeout_sec,
+            )
+            self._log_investigation_report(run.output)
+        transcript_url = await async_everpaste_str(run.transcript.text)
+        self._record_investigation_artifact(
+            phase=phase,
+            label=label,
+            transcript_url=transcript_url,
+            report=run.output,
+            playbook_name=playbook_name,
+            dut=dut,
+        )
+        return transcript_url
+
+    def _log_investigation_event(self, event: str) -> None:
+        """Tag the agent's live events so the log-capture handler can exclude them.
+
+        Without the marker each investigation's transcript is replayed into the
+        next investigation's prompt. See ``utils/investigation_log_marker.py``.
+        """
+        self.logger.info(f"{INVESTIGATION_LOG_PREFIX}{event}")
+
+    def _log_investigation_report(
+        self, report: t.Optional[InvestigationReport]
+    ) -> None:
+        """Log the rendered report block as ONE marked record.
+
+        One record, not one per line: the marker is matched per log record, so a
+        line-by-line emit would leave every line after the first unmarked and
+        replay this investigation's verdict into the next one's prompt.
+        """
+        self._log_investigation_event("\n".join(render_report_lines(report)))
+
+    def _build_investigation_prompt(
+        self,
+        playbook: taac_types.Playbook,
+        test_device: TestDevice,
+        test_case_results: t.List[trr_types.CheckResult],
+        test_case_start_time: int,
+        collected_logs: t.Sequence[HostLog],
+        error: BaseException | None = None,
+    ) -> str:
+        """Compose the prompt out of what the runtime already recorded."""
+        sections = [
+            (
+                "Test identity",
+                self._render_investigation_identity(playbook, test_device),
+            ),
+            ("Test execution summary", self.test_summary.render_summary()),
+            (
+                "Declared checks and executed results",
+                tabulate_test_results(test_case_results)
+                if test_case_results
+                else "(no per-check results recorded)",
+            ),
+            (
+                "Timing window",
+                f"- Test case start (unix): {test_case_start_time}\n"
+                f"- Test case end (unix): {int(time.time())}\n"
+                "Scope journalctl and other time-ranged diagnostics to this window.",
+            ),
+            (
+                "Pre-collected evidence",
+                _render_host_log_evidence(collected_logs, self._failed_section_names()),
+            ),
+            (
+                "Full test execution log (all sections, in order)",
+                self.test_summary.get_all_logs(),
+            ),
+        ]
+        if error is not None:
+            sections.insert(
+                1,
+                (
+                    "Exception chain",
+                    "".join(traceback.format_exception(error)).rstrip(),
+                ),
+            )
+        return "\n\n".join(f"## {title}\n{body}" for title, body in sections if body)
+
+    def _build_lifecycle_investigation_prompt(
+        self,
+        phase: trr_types.InvestigationPhase,
+        error: BaseException,
+        start_time: int,
+    ) -> str:
+        """Compose setup/teardown evidence without assuming a test case ran."""
+        sections = [
+            (
+                "Failure identity",
+                self._render_lifecycle_investigation_identity(phase),
+            ),
+            (
+                "Exception chain",
+                "".join(traceback.format_exception(error)).rstrip(),
+            ),
+            ("Test execution summary", self.test_summary.render_summary()),
+            ("Lifecycle state", self._render_lifecycle_state()),
+            (
+                "Timing window",
+                f"- Phase start (unix): {start_time}\n"
+                f"- Failure observed (unix): {int(time.time())}\n"
+                "Scope time-ranged diagnostics to this window.",
+            ),
+            (
+                "Pre-collected evidence",
+                _render_host_log_evidence((), self._failed_section_names()),
+            ),
+            (
+                "Full test execution log (all sections, in order)",
+                self.test_summary.get_all_logs(),
+            ),
+        ]
+        return "\n\n".join(f"## {title}\n{body}" for title, body in sections if body)
+
+    def _render_lifecycle_investigation_identity(
+        self, phase: trr_types.InvestigationPhase
+    ) -> str:
+        lines = [
+            f"- Test config: {self.test_config.name}",
+            f"- Failure phase: {phase.name}",
+            f"- Configured DUTs: {', '.join(self.duts) or '(none)'}",
+        ]
+        sandcastle_id = os.environ.get("SANDCASTLE_INSTANCE_ID")
+        if sandcastle_id:
+            lines.append(f"- Sandcastle instance: {sandcastle_id}")
+        netcastle_run_id = os.environ.get("NETCASTLE_RUN_ID")
+        if netcastle_run_id:
+            lines.append(f"- Netcastle run: {netcastle_run_id}")
+        topology = self._available_topology()
+        if topology is None:
+            lines.append("- Discovered topology: unavailable")
+        else:
+            lines.append("- Discovered devices:")
+            for device in topology.devices:
+                lines.append(f"    - {device.name} (role={device.attributes.role})")
+        return "\n".join(lines)
+
+    def _render_lifecycle_state(self) -> str:
+        orchestrator = self.test_setup_orchestrator
+        selected_candidate = self.selected_ixia_candidate or getattr(
+            orchestrator, "selected_ixia_candidate", None
+        )
+        candidate_lines = [
+            f"    - {candidate.name}: api_server="
+            f"{candidate.api_server_ip or 'auto-discover'}"
+            for candidate in getattr(orchestrator, "ixia_candidates_to_try", ())
+        ]
+        traffic_generator = getattr(orchestrator, "traffic_generator", None)
+        partial_ixia = (
+            self.ixia
+            or getattr(orchestrator, "ixia", None)
+            or getattr(traffic_generator, "ixia", None)
+        )
+        lines = [
+            f"- Topology discovered: {self._available_topology() is not None}",
+            "- IXIA candidates:",
+            *(candidate_lines or ["    - (none)"]),
+            "- Selected IXIA candidate: "
+            + (selected_candidate.name if selected_candidate is not None else "none"),
+            f"- Traffic-generator wrapper constructed: {traffic_generator is not None}",
+            f"- IXIA session object established: {partial_ixia is not None}",
+        ]
+        if self._published_ixia_trace_slices:
+            lines.append("- Published IXIA REST traces:")
+            lines.extend(
+                f"    - {trace_slice.phase}: {trace_slice.location}"
+                for trace_slice in self._published_ixia_trace_slices
+            )
+        else:
+            lines.append("- Published IXIA REST traces: none")
+        return "\n".join(lines)
+
+    def _render_investigation_identity(
+        self,
+        playbook: taac_types.Playbook,
+        test_device: TestDevice,
+    ) -> str:
+        lines = [
+            f"- Test config: {self.test_config.name}",
+            f"- Playbook: {playbook.name}",
+            f"- Failed device (DUT): {test_device.name}",
+            f"- Test case UUID: {self.test_case_uuid}",
+        ]
+        if self.npi_name:
+            lines.append(f"- NPI: {self.npi_name}")
+        sandcastle_id = os.environ.get("SANDCASTLE_INSTANCE_ID")
+        if sandcastle_id:
+            lines.append(f"- Sandcastle instance: {sandcastle_id}")
+        netcastle_run_id = os.environ.get("NETCASTLE_RUN_ID")
+        if netcastle_run_id:
+            lines.append(f"- Netcastle run: {netcastle_run_id}")
+        lines.append("- Reserved devices (the only hosts the tools can reach):")
+        for device in self._reserved_topology().devices:
+            neighbors = ", ".join(device.neighbors)
+            lines.append(
+                f"    - {device.name} (role={device.attributes.role}) "
+                f"neighbors: [{neighbors}]"
+            )
+        return "\n".join(lines)
+
+    def _build_investigation_tools(
+        self,
+        test_case_start_time: int,
+        ixia_config_snapshot: t.Optional[str],
+        allow_missing_topology: bool = False,
+    ) -> t.List["Function[str]"]:
+        """The agent's tool set, as closures over this runner's live state.
+
+        Confucius' ``FunctionExtension`` derives each tool's name, description
+        and JSON schema from its ``__name__``/``__doc__``/signature, so the
+        runner must stay captured by closure and never appear as a parameter.
+        """
+        topology = self._available_topology()
+        if topology is None and not allow_missing_topology:
+            raise RuntimeError("topology has not been discovered yet")
+        tool_topology = t.cast(TestTopology, topology)
+
+        async def run_command(hostname: str, command: str) -> str:
+            """Run any shell command on a reserved lab device and return its output.
+
+            An unrestricted root shell: pipes, `&&` chains, redirection, command
+            substitution and commands that change device state all work.
+            `hostname` must be one of the reserved devices in this test's
+            topology. Returns the command's combined output as one string. Past
+            200,000 characters only the first 150,000 and last 50,000 come back,
+            with a `[TRUNCATED: ...]` marker naming what was dropped; narrow the
+            command (grep, tail, a time range) rather than re-running it.
+
+            Use for open-ended diagnostics: journalctl, dmesg, ethtool -S,
+            fboss2 show ..., cat of a /proc or /sys file, coredump listings. The
+            SSH call times out, so a command that follows a stream (`tail -f`,
+            `journalctl -f`) comes back with nothing.
+            """
+            _require_known_host(tool_topology, hostname)
+            driver = await async_get_device_driver(hostname)
+            output = await driver.async_run_cmd_on_shell(command)
+            return output
+
+        async def list_coredumps(hostname: str) -> str:
+            """List core dumps generated on a device since this phase started."""
+            _require_known_host(tool_topology, hostname)
+            driver = await async_get_device_driver(hostname)
+            core_dumps = await driver.async_check_for_core_dump(
+                float(test_case_start_time)
+            )
+            return str(core_dumps)
+
+        async def query_counters(
+            hostname: str, regex: str, source: str = "auto"
+        ) -> str:
+            """Read live fb303 counters matching a regex from a reserved device.
+
+            Returns the switch's fb303 counters whose NAMES match `regex`, fanning
+            out across every NPU on a multi-switch (mNPU/DNX) box so you never get
+            partial data. `matched_keys` is reported per endpoint: "matched 0" means
+            the counter is ABSENT (wrong name / not on this ASIC), which is NOT the
+            same as a counter that exists and reads 0 (a real "no drops"). This tool
+            does NOT interpret the numbers (units, DNX-vs-XGS queue numbering, VOQ
+            ingress-drop redirection, warmboot `.sum` resets); look those up with
+            the knowledge / code-search tools.
+
+            Past 5000 matched keys summed over every endpoint, the read is REFUSED:
+            you get the header, every errored endpoint, and a histogram of
+            counter-name stems with their key counts, but no values. A bare `.*` on
+            a 17-NPU DNX box matches hundreds of thousands of keys and always
+            refuses, so do not open with it and do not retry it unchanged: use the
+            returned stems to pick a regex that lands under the limit, or scope the
+            first read with `source="sw_agent"`.
+
+            Args:
+                hostname: one of this test's reserved devices.
+                regex: fb303 counter-name regex, e.g.
+                    `.*(drop|discard|ecn|wred).*`. Narrow enough to match under
+                    5000 keys across the fan-out.
+                source: "auto" (default; swagent + every NPU on mNPU), "sw_agent"
+                    (:5909 only), or "hw_agent" (per-NPU hwagent ports).
+            """
+            _require_known_host(tool_topology, hostname)
+            return await async_query_counters(hostname, regex, source)
+
+        async def get_ixia_config() -> str:
+            """Return the available traffic-generator configuration snapshot.
+
+            The IXIA is half the test, and the configuration the test gave it is a
+            first-class suspect: a port's PFC priority-to-queue map, a flow's
+            DSCP/traffic-class marking, its rate, or its endpoints can each
+            contradict what the test says it drives, and none of that is visible
+            from device-side counters. Returns the declarative thrift config as
+            JSON (every IXIA port with its chassis/slot/port and L1 PFC map, every
+            traffic item with its endpoints, rate, frame size and QoS marking),
+            then annotations naming what the JSON does not call out (a
+            non-identity PFC priority-to-queue map, a flow declared but disabled),
+            then each declared check's threshold restated as the check actually
+            evaluates it, with the unit and reference base. Finally lists the
+            traffic items the generator backend currently holds, so a flow the
+            test declared but never pushed shows up as a difference.
+
+            That a flow is enabled and running proves liveness, NOT correctness.
+            Reconcile these values against the test's stated intent before
+            attributing the failure to the device.
+            """
+            if ixia_config_snapshot is None:
+                return "(no traffic-generator configuration snapshot is available)"
+            return ixia_config_snapshot
+
+        async def upload_to_everpaste(text: str) -> str:
+            """Upload key evidence to Everpaste and return a durable URL string.
+
+            Upload the decisive evidence for a finding (an SSH command and its full
+            output, a coredump listing, or a decisive log excerpt) and cite the
+            returned URL in that suspect's evidence, so the finding links to durable,
+            full-fidelity evidence. Non-fatal: on failure a clear error string is
+            returned instead of raising.
+            """
+            return await self._everpaste_evidence(text)
+
+        tools: t.List["Function[str]"] = [get_ixia_config, upload_to_everpaste]
+        if topology is not None:
+            tools[0:0] = [run_command, list_coredumps, query_counters]
+        return tools
+
+    def _build_lifecycle_investigation_tools(
+        self, start_time: int, error: BaseException
+    ) -> t.List["Function[str]"]:
+        tools = self._build_investigation_tools(
+            start_time,
+            ixia_config_snapshot=None,
+            allow_missing_topology=True,
+        )
+        failure_message = str(error)
+        candidate_hosts = {
+            candidate.api_server_ip.casefold()
+            for candidate in getattr(
+                self.test_setup_orchestrator, "ixia_candidates_to_try", ()
+            )
+            if candidate.api_server_ip
+        }
+        failure_hosts = _chassis_hosts_in_message(failure_message)
+
+        async def inspect_ixia_chassis(chassis_hostname: str) -> str:
+            """Return the model and resource groups for an implicated IXIA chassis.
+
+            This is a read-only platform API query. The chassis must either be
+            explicitly configured as an IXIA candidate or occur as a complete
+            host token in the failure message. This prevents diagnostics from
+            escaping this run's scope. Resource-group state exposes the active
+            ports and speed mode needed to resolve a physical chassis port to
+            its logical port.
+            """
+            normalized_hostname = chassis_hostname.casefold()
+            if (
+                normalized_hostname not in candidate_hosts
+                and normalized_hostname not in failure_hosts
+            ):
+                raise ValueError(
+                    f"IXIA chassis {chassis_hostname!r} is not part of this failure"
+                )
+            from neteng.netcastle.utils.ixia_utils import (
+                async_get_ixia_model,
+                async_get_ixia_resource_groups,
+            )
+
+            model, resource_groups = await asyncio.gather(
+                async_get_ixia_model(chassis_hostname),
+                async_get_ixia_resource_groups(chassis_hostname),
+            )
+            return json.dumps(
+                {
+                    "chassis": chassis_hostname,
+                    "model": getattr(model, "name", None),
+                    "resource_groups": resource_groups,
+                },
+                indent=2,
+                default=str,
+            )
+
+        tools.append(inspect_ixia_chassis)
+        return tools
+
+    def _available_topology(self) -> t.Optional[TestTopology]:
+        topology = self.topology
+        if isinstance(topology, TestTopology):
+            return topology
+        orchestrator_topology = getattr(
+            self.test_setup_orchestrator, "test_topology", None
+        )
+        return (
+            orchestrator_topology
+            if isinstance(orchestrator_topology, TestTopology)
+            else None
+        )
+
+    def _reserved_topology(self) -> TestTopology:
+        """Return available complete or partial topology, or raise if absent."""
+        topology = self._available_topology()
+        if topology is None:
+            raise RuntimeError("topology has not been discovered yet")
+        return topology
+
+    def _failed_section_names(self) -> t.List[str]:
+        return [
+            section.name
+            for section in self.test_summary.sections
+            if section_failed(section.status)
+        ]
+
+    async def _everpaste_evidence(self, text: str) -> str:
+        try:
+            return await async_everpaste_str(content=text)
+        except Exception as exc:
+            self.logger.warning(f"upload_to_everpaste failed: {exc}")
+            return f"ERROR: failed to upload to Everpaste: {exc!r}"
+
+    def _snapshot_ixia_config(
+        self,
+        playbook: taac_types.Playbook,
+        test_case_results: t.List[trr_types.CheckResult],
+    ) -> t.Optional[str]:
+        """Render the generator's configuration while this test case's traffic is up.
+
+        Only for a failed test case that will be investigated: the render reads
+        live traffic items off the generator backend, and that is not a cost to
+        pay on every teardown.
+        """
+        will_investigate = (
+            self.call_investigation_agent
+            and not TAAC_OSS
+            and self.check_failure(test_case_results)
+        )
+        if not will_investigate:
+            return None
+        return self._render_ixia_config_for_investigation(playbook)
+
+    def _render_ixia_config_for_investigation(
+        self, playbook: taac_types.Playbook
+    ) -> t.Optional[str]:
+        if self.ixia is None:
+            return None
+        try:
+            return render_ixia_config(
+                self.ixia,
+                self.selected_ixia_candidate,
+                self._collect_declared_checks(playbook),
+            )
+        except Exception as exc:
+            self.logger.warning(f"ixia config snapshot failed (non-fatal): {exc!r}")
+            return None
+
+    def _collect_declared_checks(
+        self, playbook: taac_types.Playbook
+    ) -> t.List[ResolvedCheck]:
+        """The checks the framework would have evaluated for this playbook.
+
+        Joins the playbook's pre/post/snapshot checks, the config's startup
+        checks, and the mid-test checks embedded in ``VALIDATION_STEP`` stages,
+        applying the same skip lists the runtime applies so a check that never
+        ran is not reported as one that did. ``check_params`` are resolved
+        through ``ParameterEvaluator`` because that is the only resolution the
+        checks themselves ever see.
+        """
+
+        def resolve(check: DeclaredCheck) -> t.Optional[t.Mapping[str, t.Any]]:
+            # jq and transform params are evaluated here, either can raise.
+            try:
+                return self.parameter_evaluator.evaluate(check.check_params)
+            except Exception:
+                self.logger.warning(
+                    f"could not resolve check_params for {check.name.name}",
+                    exc_info=True,
+                )
+                return None
+
+        checks: t.List[DeclaredCheck] = []
+        if not self.skip_prechecks:
+            checks.extend(
+                self.get_checks_to_run(
+                    playbook.prechecks,
+                    None,  # Deprecated - prechecks are defined at playbook level
+                    playbook.skip_test_config_prechecks,
+                    playbook.prechecks_to_skip,
+                    playbook.check_ids_to_skip,
+                    playbook.override_duplicate_checks,
+                )
+            )
+        checks.extend(
+            self.get_checks_to_run(
+                playbook.postchecks,
+                None,  # Deprecated - postchecks are defined at playbook level
+                playbook.skip_test_config_postchecks,
+                playbook.postchecks_to_skip,
+                playbook.check_ids_to_skip,
+                playbook.override_duplicate_checks,
+            )
+        )
+        checks.extend(
+            snapshot_check
+            for snapshot_check in (playbook.snapshot_checks or [])
+            if snapshot_check.name not in (playbook.snapshot_checks_to_skip or [])
+        )
+        checks.extend(self.test_config.startup_checks or [])
+        for stage in playbook.stages or []:
+            steps = list(stage.steps or [])
+            for concurrent_step in stage.concurrent_steps or []:
+                steps.extend(concurrent_step.steps or [])
+            for step in steps:
+                is_validation = step.name == taac_types.StepName.VALIDATION_STEP
+                if not is_validation or not step.input_json:
+                    continue
+                try:
+                    validation_input = json_to_thrift(
+                        step.input_json, taac_types.ValidationInput
+                    )
+                except Exception:
+                    continue
+                checks.extend(validation_input.point_in_time_checks or [])
+        return [ResolvedCheck(check=check, params=resolve(check)) for check in checks]
+
+    def _record_investigation_link(
+        self,
+        playbook: taac_types.Playbook,
+        test_device: TestDevice,
+        transcript_url: str,
+        report: t.Optional[InvestigationReport],
+    ) -> None:
+        """Hold this test case's transcript for its own netcastle test result."""
+        label = f"TAAC investigation: {playbook.name} | {test_device.name}"
+        self._record_investigation_artifact(
+            phase=trr_types.InvestigationPhase.TEST_CASE,
+            label=label,
+            transcript_url=transcript_url,
+            report=report,
+            playbook_name=playbook.name,
+            dut=test_device.name,
+        )
+
+    def _record_investigation_artifact(
+        self,
+        *,
+        phase: trr_types.InvestigationPhase,
+        label: str,
+        transcript_url: str,
+        report: t.Optional[InvestigationReport],
+        playbook_name: t.Optional[str] = None,
+        dut: t.Optional[str] = None,
+    ) -> None:
+        """Retain one transcript for result serialization and Netcastle links."""
+        if not transcript_url:
+            return
+        headline = render_headline(report)
+        recommended_action = None
+        open_leads: t.List[str] = []
+        if report is not None:
+            recommended_action = report.recommended_action.strip() or None
+            open_leads = [lead.strip() for lead in report.open_leads if lead.strip()]
+        self.investigation_artifacts.append(
+            trr_types.InvestigationArtifact(
+                phase=phase,
+                headline=headline or None,
+                transcript_url=transcript_url,
+                playbook_name=playbook_name,
+                dut=dut,
+                recommended_action=recommended_action,
+                open_leads=open_leads,
+            )
+        )
+        if phase == trr_types.InvestigationPhase.TEST_CASE:
+            self.investigation_link = InvestigationLink(
+                text=f"{label} | {headline}" if headline else label,
+                url=transcript_url,
+            )
+
     async def _async_trigger_triage_minion(self) -> None:
         """Trigger the DNE PIT CI Triage Agent via Confucius Thrift API."""
         if TAAC_OSS:
@@ -2056,17 +4577,13 @@ class TaacRunner:
             CF_PROD_TIER = "confucius.server.prod"
 
             # Collect full logs from the test summary
-            all_logs = self.test_summary._log_handler.get_all_logs()
+            all_logs = self.test_summary.get_all_logs()
 
             # Build the prompt with test run context
             test_config_name = (
                 self.test_config.name if self.test_config.name else "unknown"
             )
-            failed_sections = [
-                s.name
-                for s in self.test_summary.sections
-                if s.status == SectionStatus.FAIL
-            ]
+            failed_sections = self._failed_section_names()
             prompt = (
                 f"Analyze the following TAAC test run logs and provide a detailed "
                 f"analysis of all failures. Include root cause analysis, identify "
@@ -2173,11 +4690,269 @@ class TaacRunner:
                 f"(swallowed to protect teardown): {exc!r}"
             )
 
-    async def async_test_tearDown(self) -> None:
-        log_section("TEST CONFIG TEARDOWN", logger=self.logger)
+    def _ixia_with_api_trace(self) -> t.Optional[TaacIxia]:
+        """The Ixia that owns the REST trace, including after a failed setup.
+
+        Each reference settles later than the one before it, so they are tried
+        most-settled first. `self.ixia` is assigned only once
+        `TestSetupOrchestrator.async_setUp` returns, and the orchestrator's own
+        `ixia` only once `async_create_ixia_setup` returns. A setup that died at
+        port assignment (the case this trace exists for) reaches neither: the
+        session, and its trace, is then only reachable through the traffic
+        generator, which holds it from the moment it is constructed. A candidate
+        retry rebuilds the traffic generator, so it always names the attempt that
+        actually ran.
+        """
+        traffic_generator = getattr(
+            self.test_setup_orchestrator, "traffic_generator", None
+        )
+        candidates = (
+            self.ixia,
+            self.test_setup_orchestrator.ixia,
+            getattr(traffic_generator, "ixia", None),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, TaacIxia) and candidate.api_tracer is not None:
+                return candidate
+        return None
+
+    async def _async_publish_ixia_api_trace(self, final: bool = False) -> None:
+        """Upload every trace slice closed since the last call and log them.
+
+        Mirrors `_async_collect_ixia_diagnostics_if_enabled`: runs while the
+        Ixia object is still live, best-effort, never turns a green test red.
+        Under TAAC_OSS the JSONL stays on local disk (no Manifold) and the
+        table carries the path instead of a URL.
+        """
+        try:
+            await self._async_publish_ixia_trace_slices(final)
+        except Exception as exc:
+            self.logger.error(
+                f"ixia api trace: publishing failed (swallowed to protect the "
+                f"test): {exc!r}"
+            )
+
+    async def _async_publish_ixia_trace_slices(self, final: bool) -> None:
+        ixia = self._ixia_with_api_trace()
+        if ixia is None:
+            # Silence here made an empty run indistinguishable from a tracer
+            # that failed to publish. Only on the final call: the per-test-case
+            # rotation would otherwise repeat it once per playbook.
+            if final and not self._logged_missing_ixia_trace:
+                self._logged_missing_ixia_trace = True
+                self.logger.info(
+                    "ixia api trace: no traced Ixia session was established, so "
+                    "this run has no REST trace to publish"
+                )
+            return
+        tracer = none_throws(ixia.api_tracer)
+        if final:
+            tracer.close()
+        closed_slices = tracer.slices
+        pending = closed_slices[self._ixia_trace_slices_seen :]
+        self._ixia_trace_slices_seen = len(closed_slices)
+        published_now = [
+            published
+            for published in [
+                await self._async_publish_ixia_trace_slice(ixia, trace_slice)
+                for trace_slice in pending
+            ]
+            if published is not None
+        ]
+        if not published_now:
+            return
+        self._published_ixia_trace_slices.extend(published_now)
+        self.run_artifacts.extend(
+            trr_types.RunArtifact(
+                name=f"IXIA REST trace ({published.phase})",
+                location=published.location,
+                description=(
+                    f"{published.record_count} REST calls, "
+                    f"{published.failure_count} failed"
+                ),
+            )
+            for published in published_now
+        )
+        self._log_ixia_trace_table()
+
+    async def _async_publish_ixia_trace_slice(
+        self, ixia: TaacIxia, trace_slice: IxiaTraceSlice
+    ) -> t.Optional[PublishedIxiaTraceSlice]:
+        if trace_slice.record_count == 0:
+            return None
+        self.logger.info(
+            f"ixia api trace: phase {trace_slice.phase!r}: "
+            f"{trace_slice.record_count} REST calls, "
+            f"{trace_slice.failure_count} failed, "
+            f"{trace_slice.dropped_count} dropped -> {trace_slice.path}"
+        )
+        if TAAC_OSS:
+            return PublishedIxiaTraceSlice(
+                phase=trace_slice.phase,
+                record_count=trace_slice.record_count,
+                failure_count=trace_slice.failure_count,
+                location=str(trace_slice.path),
+            )
+        # The phase suffix keeps slices of one run from colliding: the shared
+        # key builder only disambiguates down to the second.
+        key = ixia_artifact_manifold_key(
+            str(ixia.primary_chassis_ip),
+            self.test_config.name,
+            f"_api_trace_{trace_slice.index:02d}"
+            f"_{slugify_phase(trace_slice.phase)}.jsonl",
+        )
+        try:
+            url = await async_upload_file_to_manifold(
+                DEFAULT_MANIFOLD_BUCKET, key, trace_slice.path
+            )
+        except Exception as exc:
+            self.logger.error(
+                f"ixia api trace: Manifold upload failed for {trace_slice.path} "
+                f"-> {DEFAULT_MANIFOLD_BUCKET}/{key}: {exc!r}"
+            )
+            return None
+        return PublishedIxiaTraceSlice(
+            phase=trace_slice.phase,
+            record_count=trace_slice.record_count,
+            failure_count=trace_slice.failure_count,
+            location=url,
+        )
+
+    def _log_ixia_trace_table(self) -> None:
+        trace_table = tabulate(
+            [
+                (
+                    published.phase,
+                    published.record_count,
+                    published.failure_count,
+                    published.location,
+                )
+                for published in self._published_ixia_trace_slices
+            ],
+            headers=["Phase", "Calls", "Failures", "Trace URL"],
+            tablefmt="grid",
+        )
+        self.logger.info(f"IXIA REST trace:\n {trace_table}")
+
+    async def async_test_tearDown(self) -> None:  # noqa: C901
         teardown_start = time.time()
-        teardown_section = self.test_summary.start_section("TEST CONFIG TEARDOWN")
-        _teardown_error = None
+        teardown_section: SectionResult | None = None
+        teardown_failure: BaseException | None = None
+        summary_cleanup_error: BaseException | None = None
+        entry_cleanup_failures: list[BaseException] = []
+        entry_cleanup_cancellation: asyncio.CancelledError | None = None
+        implementation_started = False
+        try:
+            try:
+                log_section("TEST CONFIG TEARDOWN", logger=self.logger)
+                teardown_section = self.test_summary.start_section(
+                    "TEST CONFIG TEARDOWN"
+                )
+                implementation_started = True
+                await self._async_test_tearDown_impl(
+                    teardown_start,
+                    teardown_section,
+                )
+            except BaseException as error:  # noqa: B036
+                teardown_failure = error
+        finally:
+            if not implementation_started:
+                try:
+                    (
+                        release_cancellation,
+                        release_error,
+                    ) = await self._run_cleanup_phase(
+                        lambda: self.test_setup_orchestrator.async_tearDown(
+                            strict_ixia_cleanup=self.setup_only
+                        ),
+                        phase="TAAC entry-failure resource cleanup",
+                        cancellation_budget=_CleanupCancellationBudget(),
+                    )
+                    if release_cancellation is not None:
+                        entry_cleanup_cancellation = release_cancellation
+                    if release_error is not None:
+                        entry_cleanup_failures.append(release_error)
+                except BaseException as error:  # noqa: B036
+                    entry_cleanup_failures.append(error)
+            try:
+                self.test_summary.cleanup()
+            except BaseException as error:  # noqa: B036
+                error.add_note("TAAC test-summary cleanup failed")
+                summary_cleanup_error = error
+
+        if summary_cleanup_error is not None:
+            if teardown_section is not None:
+                existing_details = teardown_section.error_message
+                cleanup_detail = (
+                    f"{type(summary_cleanup_error).__name__}: {summary_cleanup_error}"
+                )
+                teardown_section.duration_secs = time.time() - teardown_start
+                teardown_section.status = SectionStatus.FAIL
+                teardown_section.error_message = "; ".join(
+                    detail
+                    for detail in (
+                        existing_details if isinstance(existing_details, str) else "",
+                        cleanup_detail,
+                    )
+                    if detail
+                )
+            entry_cleanup_failures.append(summary_cleanup_error)
+
+        if entry_cleanup_cancellation is not None:
+            secondary_failures = list(entry_cleanup_failures)
+            if teardown_failure is not None:
+                secondary_failures.insert(0, teardown_failure)
+            _raise_primary_with_failures(
+                entry_cleanup_cancellation,
+                secondary_failures,
+                message="TAAC entry cleanup was cancelled",
+            )
+
+        if teardown_failure is None:
+            if len(entry_cleanup_failures) == 1:
+                raise entry_cleanup_failures[0]
+            if entry_cleanup_failures:
+                raise _group_exceptions(
+                    "TAAC teardown finalization failed",
+                    entry_cleanup_failures,
+                )
+            return
+
+        if entry_cleanup_failures:
+            if isinstance(teardown_failure, ExceptionGroup) and all(
+                isinstance(error, Exception) for error in entry_cleanup_failures
+            ):
+                raise ExceptionGroup(
+                    "TAAC teardown failed",
+                    [
+                        *teardown_failure.exceptions,
+                        *t.cast(list[Exception], entry_cleanup_failures),
+                    ],
+                )
+            if isinstance(teardown_failure, Exception) and all(
+                isinstance(error, Exception) for error in entry_cleanup_failures
+            ):
+                raise ExceptionGroup(
+                    "TAAC teardown failed",
+                    [
+                        teardown_failure,
+                        *t.cast(list[Exception], entry_cleanup_failures),
+                    ],
+                )
+            _raise_primary_with_failures(
+                teardown_failure,
+                entry_cleanup_failures,
+                message="TAAC teardown failed",
+            )
+
+        raise teardown_failure
+
+    async def _async_run_pre_release_teardown(  # noqa: C901
+        self,
+        *,
+        state: _TeardownCleanupState,
+        cancellation_budget: _CleanupCancellationBudget,
+    ) -> None:
         try:
             with suppress_console_logs(self.logger):
                 await self.teardown_period_task_executor_if_exists(
@@ -2189,59 +4964,349 @@ class TaacRunner:
                         ixia.capturing = False  # type: ignore[attr-defined]
                     if isinstance(ixia, TaacIxia):
                         await self._async_collect_ixia_diagnostics_if_enabled(ixia)
-                await self.run_tasks(
-                    # pyrefly: ignore [bad-argument-type]
-                    (
-                        self.selected_ixia_candidate.teardown_tasks
-                        if self.selected_ixia_candidate is not None
-                        else self.ixia_candidates[0].teardown_tasks
+                # After diagnostics so the trace covers their REST calls too.
+                # Outside the `if ixia` above because a failed setup leaves
+                # `self.ixia` None while the orchestrator still holds a traced
+                # Ixia.
+                await self._async_publish_ixia_api_trace(final=True)
+        except asyncio.CancelledError as error:
+            externally_cancelled = self._consume_current_task_cancellation()
+            state.cancellation = error
+            if externally_cancelled:
+                cancellation_budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
+        except Exception as error:
+            state.errors.append(error)
+
+        if self._skip_test_config_teardown_tasks:
+            self.logger.info(
+                "Skipping test-config teardown tasks because endpoint resolution "
+                "did not complete"
+            )
+        teardown_candidate = (
+            self.selected_ixia_candidate
+            if self.selected_ixia_candidate is not None
+            else self.ixia_candidates[0]
+        )
+        unarmed_state_guards = self._unarmed_state_guards()
+        if unarmed_state_guards:
+            self.logger.info(
+                "Skipping test-config teardown tasks because setup never armed "
+                f"state guards {unarmed_state_guards}; an unarmed guard means "
+                "setup did not reach its first device mutation"
+            )
+        try:
+            with suppress_console_logs(self.logger):
+                await self.run_teardown_tasks(
+                    teardown_candidate.teardown_tasks
+                    if not (
+                        self.skip_all_tasks
+                        or self.skip_teardown_tasks
+                        or self._skip_test_config_teardown_tasks
+                        or unarmed_state_guards
                     )
-                    if not (self.skip_all_tasks or self.skip_teardown_tasks)
-                    else []
+                    else [],
+                    cancellation_budget=cancellation_budget,
                 )
-                for handler in self.custom_test_handlers:
-                    await handler._async_test_tearDown()
-        except Exception as e:
-            _teardown_error = e
+        except asyncio.CancelledError as error:
+            externally_cancelled = self._consume_current_task_cancellation()
+            cause = error.__cause__
+            if isinstance(cause, _TeardownTaskFailureGroup):
+                state.errors.extend(
+                    child for child in cause.exceptions if isinstance(child, Exception)
+                )
+            state.cancellation = self._record_teardown_cancellation(
+                state.cancellation,
+                error,
+                phase="test-config teardown tasks",
+            )
+            if externally_cancelled:
+                cancellation_budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
+        except _TeardownTaskFailureGroup as error:
+            state.errors.extend(error.exceptions)
+        except Exception as error:
+            state.errors.append(error)
+
+        for idx, handler in enumerate(self.custom_test_handlers, 1):
+            handler_phase = (
+                "custom test handler teardown "
+                f"{idx}/{len(self.custom_test_handlers)}: "
+                f"{type(handler).__name__}"
+            )
+            with suppress_console_logs(self.logger):
+                (
+                    handler_cancellation,
+                    handler_error,
+                ) = await self._run_cleanup_phase(
+                    lambda handler=handler: handler._async_test_tearDown(),
+                    phase=handler_phase,
+                    cancellation_budget=cancellation_budget,
+                )
+            state.cancellation = self._record_teardown_cancellation(
+                state.cancellation,
+                handler_cancellation,
+                phase=handler_phase,
+            )
+            if handler_error is not None:
+                handler_error.add_note(f"{handler_phase} failed")
+                state.errors.append(handler_error)
+
+    async def _async_test_tearDown_impl(  # noqa: C901
+        self,
+        teardown_start: float,
+        teardown_section: SectionResult,
+    ) -> None:
+        state = _TeardownCleanupState(errors=[])
+        teardown_errors = state.errors
+        pre_release_failure: BaseException | None = None
+        pre_release_budget = _CleanupCancellationBudget()
+        resource_release_budget = _CleanupCancellationBudget()
+        try:
+            try:
+                await self._async_run_pre_release_teardown(
+                    state=state,
+                    cancellation_budget=pre_release_budget,
+                )
+            except BaseException as error:  # noqa: B036
+                pre_release_failure = error
         finally:
+            if pre_release_budget.deadline is not None:
+                resource_release_budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
             try:
                 with suppress_console_logs(self.logger):
-                    await self.test_setup_orchestrator.async_tearDown(
-                        strict_ixia_cleanup=self.setup_only
+                    (
+                        orchestrator_cancellation,
+                        orchestrator_error,
+                    ) = await self._run_cleanup_phase(
+                        lambda: self.test_setup_orchestrator.async_tearDown(
+                            strict_ixia_cleanup=self.setup_only
+                        ),
+                        phase="TAAC resource cleanup",
+                        cancellation_budget=resource_release_budget,
                     )
-            except Exception as cleanup_error:
-                if _teardown_error:
-                    _teardown_error = ExceptionGroup(
-                        "TAAC teardown tasks and resource cleanup both failed",
-                        [_teardown_error, cleanup_error],
+            except BaseException as resource_release_failure:  # noqa: B036
+                if pre_release_failure is None:
+                    secondary_failures: list[BaseException] = list(teardown_errors)
+                    if state.cancellation is not None:
+                        secondary_failures.append(state.cancellation)
+                    _raise_primary_with_failures(
+                        resource_release_failure,
+                        secondary_failures,
+                        message="TAAC resource cleanup failed",
                     )
-                else:
-                    _teardown_error = cleanup_error
+                _raise_primary_with_failures(
+                    pre_release_failure,
+                    [
+                        *teardown_errors,
+                        *(
+                            [state.cancellation]
+                            if state.cancellation is not None
+                            else []
+                        ),
+                        resource_release_failure,
+                    ],
+                    message="TAAC pre-release and resource cleanup failed",
+                )
+
+        cancellation = self._record_teardown_cancellation(
+            state.cancellation,
+            orchestrator_cancellation,
+            phase="TAAC resource cleanup",
+        )
+        if orchestrator_error is not None:
+            orchestrator_error.add_note("TAAC resource cleanup failed")
+            teardown_errors.append(orchestrator_error)
+
+        if pre_release_failure is not None:
+            secondary_failures: list[BaseException] = list(teardown_errors)
+            if cancellation is not None:
+                secondary_failures.append(cancellation)
+            _raise_primary_with_failures(
+                pre_release_failure,
+                secondary_failures,
+                message="TAAC pre-release cleanup failed",
+            )
+
+        reporting_budget = self._new_cleanup_budget(resource_release_budget)
+
+        if len(teardown_errors) == 1:
+            teardown_error: Exception | None = teardown_errors[0]
+        elif teardown_errors:
+            teardown_error = ExceptionGroup(
+                "TAAC teardown cleanup failed",
+                teardown_errors,
+            )
+        else:
+            teardown_error = None
+        investigated_error_count = 0
+
+        try:
             log_phase_end(
                 "TEST CONFIG TEARDOWN",
                 duration_secs=time.time() - teardown_start,
                 logger=self.logger,
             )
-            if _teardown_error:
+            if cancellation is not None or teardown_errors:
                 self.test_summary.end_section(
-                    teardown_section, SectionStatus.FAIL, str(_teardown_error)
+                    teardown_section,
+                    SectionStatus.FAIL,
+                    self._render_teardown_failure_details(
+                        cancellation,
+                        teardown_errors,
+                    ),
                 )
             else:
                 self.test_summary.end_section(teardown_section, SectionStatus.PASS)
-            # Generate and upload test execution summary - always print even on errors
-            try:
-                await self.test_summary.async_upload_and_log_summary()
-            except Exception as e:
-                self.logger.error(f"Failed to generate test summary: {e}")
-            # Trigger triage minion if enabled and there were failures
-            has_failures = _teardown_error is not None or any(
-                s.status == SectionStatus.FAIL for s in self.test_summary.sections
+            if teardown_error is not None:
+                (
+                    investigation_cancellation,
+                    investigation_error,
+                ) = await self._run_cleanup_phase(
+                    lambda: self._async_run_lifecycle_investigation_if_enabled(
+                        phase=trr_types.InvestigationPhase.TEST_CONFIG_TEARDOWN,
+                        error=teardown_error,
+                        start_time=int(teardown_start),
+                    ),
+                    phase="teardown investigation",
+                    cancellation_budget=reporting_budget,
+                )
+                cancellation = self._record_teardown_cancellation(
+                    cancellation,
+                    investigation_cancellation,
+                    phase="teardown investigation",
+                )
+                if investigation_error is not None:
+                    investigation_error.add_note("TAAC teardown investigation failed")
+                    teardown_errors.append(investigation_error)
+                investigated_error_count = len(teardown_errors)
+                teardown_section.status = SectionStatus.FAIL
+                teardown_section.error_message = self._render_teardown_failure_details(
+                    cancellation,
+                    teardown_errors,
+                )
+        except asyncio.CancelledError as error:
+            externally_cancelled = self._consume_current_task_cancellation()
+            cancellation = self._record_teardown_cancellation(
+                cancellation,
+                error,
+                phase="test-config teardown reporting",
             )
-            if self.call_triage_minion and has_failures:
-                await self._async_trigger_triage_minion()
-            self.test_summary.cleanup()
-        if _teardown_error:
-            raise _teardown_error
+            if externally_cancelled:
+                reporting_budget.arm(_CLEANUP_CANCELLATION_GRACE_SECONDS)
+        except Exception as error:
+            error.add_note("TAAC test-config teardown reporting failed")
+            teardown_errors.append(error)
+
+        late_teardown_errors = teardown_errors[investigated_error_count:]
+        if late_teardown_errors:
+            if len(late_teardown_errors) == 1:
+                late_teardown_error: Exception = late_teardown_errors[0]
+            else:
+                late_teardown_error = ExceptionGroup(
+                    "Late TAAC teardown reporting failed",
+                    late_teardown_errors,
+                )
+            (
+                late_cancellation,
+                late_investigation_error,
+            ) = await self._run_cleanup_phase(
+                lambda: self._async_run_lifecycle_investigation_if_enabled(
+                    phase=trr_types.InvestigationPhase.TEST_CONFIG_TEARDOWN,
+                    error=late_teardown_error,
+                    start_time=int(teardown_start),
+                ),
+                phase="late teardown investigation",
+                cancellation_budget=reporting_budget,
+            )
+            cancellation = self._record_teardown_cancellation(
+                cancellation,
+                late_cancellation,
+                phase="late teardown investigation",
+            )
+            if late_investigation_error is not None:
+                late_investigation_error.add_note(
+                    "Late TAAC teardown investigation failed"
+                )
+                teardown_errors.append(late_investigation_error)
+
+        has_failures = (
+            cancellation is not None
+            or bool(teardown_errors)
+            or bool(self._failed_section_names())
+        )
+        if self.call_triage_minion and has_failures:
+            triage_cancellation, triage_error = await self._run_cleanup_phase(
+                self._async_trigger_triage_minion,
+                phase="teardown triage",
+                cancellation_budget=reporting_budget,
+            )
+            cancellation = self._record_teardown_cancellation(
+                cancellation,
+                triage_cancellation,
+                phase="teardown triage",
+            )
+            if triage_error is not None:
+                triage_error.add_note("TAAC teardown triage failed")
+                teardown_errors.append(triage_error)
+
+        if cancellation is not None or teardown_errors:
+            teardown_section.duration_secs = time.time() - teardown_start
+            teardown_section.status = SectionStatus.FAIL
+            teardown_section.error_message = self._render_teardown_failure_details(
+                cancellation,
+                teardown_errors,
+            )
+
+        # Publish last so every failure knowable before upload is represented in
+        # the persisted section. An upload failure necessarily has no artifact to
+        # update, but it is still retained in the final raised error below.
+        upload_cancellation, upload_error = await self._run_cleanup_phase(
+            lambda: self.test_summary.async_upload_and_log_summary(
+                self.investigation_artifacts
+            ),
+            phase="test-summary upload",
+            cancellation_budget=self._new_cleanup_budget(reporting_budget),
+        )
+        cancellation = self._record_teardown_cancellation(
+            cancellation,
+            upload_cancellation,
+            phase="test-summary upload",
+        )
+        if upload_error is not None:
+            upload_error.add_note("TAAC test-summary upload failed")
+            self.logger.error(
+                f"Failed to generate test summary: {upload_error}",
+                exc_info=(
+                    type(upload_error),
+                    upload_error,
+                    upload_error.__traceback__,
+                ),
+            )
+            teardown_errors.append(upload_error)
+        if upload_cancellation is not None or upload_error is not None:
+            teardown_section.duration_secs = time.time() - teardown_start
+            teardown_section.status = SectionStatus.FAIL
+            teardown_section.error_message = self._render_teardown_failure_details(
+                cancellation,
+                teardown_errors,
+            )
+
+        if cancellation is not None and teardown_errors:
+            cancellation.add_note(
+                "TAAC teardown also failed: "
+                + "; ".join(
+                    f"{type(error).__name__}: {error}" for error in teardown_errors
+                )
+            )
+        if cancellation is not None:
+            _raise_primary_with_failures(
+                cancellation,
+                teardown_errors,
+                message="TAAC teardown failed",
+            )
+        if len(teardown_errors) == 1:
+            raise teardown_errors[0]
+        if teardown_errors:
+            raise ExceptionGroup("TAAC teardown failed", teardown_errors)
 
     def get_checks_to_run(
         self,
@@ -2321,36 +5386,53 @@ class TaacRunner:
 
     async def async_run_periodic_task_checks(
         self,
-        test_case_results: t.List[TestResult],
+        test_case_results: t.List[trr_types.CheckResult],
         test_device: TestDevice,
         test_case_name: str,
         test_case_start_time: int,
         periodic_task_executor: PeriodicTaskExecutor,
     ) -> None:
+        errors: t.List[Exception] = []
         # First, teardown all workers to generate everpaste log URLs
         for periodic_task_worker in periodic_task_executor.periodic_task_workers:
-            await periodic_task_worker.teardown()
+            try:
+                await periodic_task_worker.teardown()
+            except Exception as error:
+                errors.append(error)
 
         # Now run final checks with log URLs available
         for periodic_task_worker in periodic_task_executor.periodic_task_workers:
-            periodic_check_result = await periodic_task_worker.run_final_check()
-            if periodic_check_result:
-                # Append log URL to the message if available
-                message = periodic_check_result.message
-                if periodic_task_worker._log_everpaste_url:
-                    message += f"\nLog: {periodic_task_worker._log_everpaste_url}"
+            try:
+                periodic_check_result = await periodic_task_worker.run_final_check()
+                if periodic_check_result:
+                    # Append log URL to the message if available
+                    message = periodic_check_result.message
+                    status = periodic_check_result.status
+                    if status == hc_types.HealthCheckStatus.SKIP:
+                        status = hc_types.HealthCheckStatus.ERROR
+                        message = f"Periodic task produced no usable data: {message}"
+                    if periodic_task_worker._log_everpaste_url:
+                        message += f"\nLog: {periodic_task_worker._log_everpaste_url}"
 
-                result = await async_write_test_result(
-                    test_case_name,
-                    devices=[test_device],
-                    test_status=periodic_check_result.status,
-                    start_time=test_case_start_time,
-                    check_name=periodic_check_result.name,
-                    # async_write_test_result already everpaste-shortens long
-                    # messages (no fburl); pass it through directly instead of
-                    # everpasting + fburl-ing here. This removes a duplicate
-                    # upload and a per-worker fburl-tier call at every test-case
-                    # teardown, and resolves the >100 vs >1000 gate conflict.
-                    message=message,
-                )
-                test_case_results.append(result)
+                    result = await async_write_test_result(
+                        test_case_name,
+                        devices=[test_device],
+                        test_status=status,
+                        start_time=test_case_start_time,
+                        check_name=periodic_check_result.name,
+                        # async_write_test_result already everpaste-shortens long
+                        # messages (no fburl); pass it through directly instead of
+                        # everpasting + fburl-ing here. This removes a duplicate
+                        # upload and a per-worker fburl-tier call at every test-case
+                        # teardown, and resolves the >100 vs >1000 gate conflict.
+                        message=message,
+                    )
+                    test_case_results.append(result)
+            except Exception as error:
+                errors.append(error)
+
+        if errors:
+            details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+            raise ExceptionGroup(
+                f"Periodic task finalization failed: {details}", errors
+            )

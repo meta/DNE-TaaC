@@ -1,0 +1,637 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+import json
+import typing as t
+import unittest
+
+from ixia.ixia import types as ixia_types
+from taac.playbooks import playbook_definitions
+from taac.testconfigs.fboss_solution_tests import (
+    speed_flip_test_configs,
+)
+from taac.health_check.health_check import types as hc_types
+from taac.test_as_a_config import types as taac_types
+
+
+_DUT = "ssw003.s001.m001.qzr1"
+_PEER = "fsw003.p002.m001.qzr1"
+_DUT_IXIA_PORT = "eth1/62/1"
+_PEER_IXIA_PORT = "eth1/63/1"
+_TRAFFIC_ITEM = "SPEED_FLIP_51T_IPV6_TRAFFIC"
+_ENDPOINTS = {
+    _DUT: ["eth1/10/1", "eth1/10/5"],
+    _PEER: ["eth1/3/1", "eth1/3/5"],
+}
+_REDUCED_TRANSITION_PLAYBOOK_NAMES = [
+    "SPEED_FLIP_51T_SPD_010_2X100G_TO_2X200G_REDUCED",
+    "SPEED_FLIP_51T_SPD_011_2X100G_TO_2X400G_REDUCED",
+    "SPEED_FLIP_51T_SPD_012_2X200G_TO_2X400G_REDUCED",
+    "SPEED_FLIP_51T_SPD_013_2X100G_TO_200G_400G_REDUCED",
+    "SPEED_FLIP_51T_SPD_014_2X100G_TO_400G_200G_REDUCED",
+    "SPEED_FLIP_51T_SPD_015_2X200G_TO_200G_400G_REDUCED",
+    "SPEED_FLIP_51T_SPD_016_2X200G_TO_400G_200G_REDUCED",
+    "SPEED_FLIP_51T_SPD_017_2X400G_TO_800G_REDUCED",
+    "SPEED_FLIP_51T_SPD_018_2X200G_TO_800G_REDUCED",
+    "SPEED_FLIP_51T_SPD_019_2X100G_TO_800G_REDUCED",
+    "SPEED_FLIP_51T_SPD_020_200G_400G_TO_800G_REDUCED",
+    "SPEED_FLIP_51T_SPD_021_400G_200G_TO_800G_REDUCED",
+]
+
+_REDUCED_TRANSITION_PLAYBOOK_NAMES = [
+    "SPEED_FLIP_51T_SPD_010_2X100G_TO_2X200G_REDUCED",
+    "SPEED_FLIP_51T_SPD_011_2X100G_TO_2X400G_REDUCED",
+    "SPEED_FLIP_51T_SPD_012_2X200G_TO_2X400G_REDUCED",
+    "SPEED_FLIP_51T_SPD_013_2X100G_TO_200G_400G_REDUCED",
+    "SPEED_FLIP_51T_SPD_014_2X100G_TO_400G_200G_REDUCED",
+    "SPEED_FLIP_51T_SPD_015_2X200G_TO_200G_400G_REDUCED",
+    "SPEED_FLIP_51T_SPD_016_2X200G_TO_400G_200G_REDUCED",
+    "SPEED_FLIP_51T_SPD_017_2X400G_TO_800G_REDUCED",
+    "SPEED_FLIP_51T_SPD_018_2X200G_TO_800G_REDUCED",
+    "SPEED_FLIP_51T_SPD_019_2X100G_TO_800G_REDUCED",
+    "SPEED_FLIP_51T_SPD_020_200G_400G_TO_800G_REDUCED",
+    "SPEED_FLIP_51T_SPD_021_400G_200G_TO_800G_REDUCED",
+]
+
+
+def _health_check_params(speed: int) -> dict[str, object]:
+    return {
+        hostname: {
+            "interfaces": [
+                {"interface_name": interface, "expected_speed": speed}
+                for interface in interfaces
+            ]
+        }
+        for hostname, interfaces in _ENDPOINTS.items()
+    }
+
+
+def _step_params(step: taac_types.Step) -> dict[str, object]:
+    params = step.step_params
+    if params is None or params.json_params is None:
+        return {}
+    return json.loads(params.json_params)
+
+
+def _task_params(task: taac_types.Task) -> dict[str, object]:
+    params = task.params
+    if params is None or params.json_params is None:
+        return {}
+    return json.loads(params.json_params)
+
+
+class ReusableSpeedFlipPlaybookTest(unittest.TestCase):
+    def test_builds_bidirectional_sequence_with_scoped_oper_checks(self) -> None:
+        factory = getattr(
+            playbook_definitions,
+            "create_bidirectional_speed_flip_playbook",
+            None,
+        )
+        self.assertIsNotNone(factory)
+        if factory is None:
+            return
+
+        target_trigger = taac_types.Stage(description="target trigger")
+        baseline_trigger = taac_types.Stage(description="baseline trigger")
+        playbook = factory(
+            name="SPEED_FLIP_TEST",
+            endpoints=_ENDPOINTS,
+            target_speed_in_gbps=100,
+            baseline_health_check_params=_health_check_params(200),
+            target_health_check_params=_health_check_params(100),
+            patcher_name="change_speed_test_100",
+            target_port_cage_count=1,
+            target_trigger_stages=[target_trigger],
+            baseline_trigger_stages=[baseline_trigger],
+            iteration=3,
+        )
+
+        self.assertEqual(playbook.name, "SPEED_FLIP_TEST")
+        self.assertEqual(playbook.iteration, 3)
+        self.assertEqual(len(playbook.stages), 6)
+        self.assertEqual(playbook.stages[2], target_trigger)
+        self.assertEqual(playbook.stages[5], baseline_trigger)
+
+        register_params = _step_params(playbook.stages[0].steps[0])
+        self.assertTrue(register_params["register_patcher"])
+        self.assertEqual(register_params["speed_in_gbps"], 100)
+        self.assertEqual(register_params["target_port_cage_count"], 1)
+        self.assertEqual(register_params["endpoints"], _ENDPOINTS)
+
+        target_oper_steps = playbook.stages[1].steps[:-1]
+        self.assertEqual(len(target_oper_steps), 2)
+        self.assertEqual(target_oper_steps[0].device_regexes, [_DUT])
+        self.assertEqual(target_oper_steps[1].device_regexes, [_PEER])
+        self.assertEqual(
+            _step_params(target_oper_steps[0])["interfaces"],
+            _ENDPOINTS[_DUT],
+        )
+        self.assertEqual(
+            _step_params(target_oper_steps[1])["interfaces"],
+            _ENDPOINTS[_PEER],
+        )
+
+        unregister_params = _step_params(playbook.stages[3].steps[0])
+        self.assertFalse(unregister_params["register_patcher"])
+        self.assertEqual(unregister_params["patcher_name"], "change_speed_test_100")
+
+        cleanup_steps = list(playbook.cleanup_steps or [])
+        self.assertEqual(len(cleanup_steps), 1)
+        self.assertFalse(_step_params(cleanup_steps[0])["register_patcher"])
+
+    def test_test_config_wrapper_preserves_cleanup_steps(self) -> None:
+        factory = getattr(
+            playbook_definitions,
+            "create_bidirectional_speed_flip_playbook",
+            None,
+        )
+        self.assertIsNotNone(factory)
+        if factory is None:
+            return
+
+        playbook = factory(
+            name="SPEED_FLIP_TEST",
+            endpoints=_ENDPOINTS,
+            target_speed_in_gbps=100,
+            baseline_health_check_params=_health_check_params(200),
+            target_health_check_params=_health_check_params(100),
+            patcher_name="change_speed_test_100",
+            target_port_cage_count=1,
+        )
+        wrapped = playbook_definitions.create_speed_flip_test_config_playbook(
+            built_playbook=playbook,
+            snapshot_checks=[],
+        )
+
+        self.assertEqual(wrapped.cleanup_steps, playbook.cleanup_steps)
+
+    def test_builds_stateful_transition_and_unwinds_patchers_lifo(self) -> None:
+        factory = getattr(
+            playbook_definitions,
+            "create_stateful_bidirectional_speed_flip_playbook",
+            None,
+        )
+        patcher_spec = getattr(playbook_definitions, "SpeedFlipPatcherSpec", None)
+        self.assertIsNotNone(factory)
+        self.assertIsNotNone(patcher_spec)
+        if factory is None or patcher_spec is None:
+            return
+
+        initial = patcher_spec(
+            name="initial_100",
+            endpoints=_ENDPOINTS,
+            speed_in_gbps=100,
+        )
+        target_200 = patcher_spec(
+            name="target_200",
+            endpoints={_DUT: ["eth1/10/1"], _PEER: ["eth1/3/1"]},
+            speed_in_gbps=200,
+        )
+        target_400 = patcher_spec(
+            name="target_400",
+            endpoints={_DUT: ["eth1/10/5"], _PEER: ["eth1/3/5"]},
+            speed_in_gbps=400,
+        )
+
+        playbook = factory(
+            name="STATEFUL_SPEED_FLIP",
+            initial_patchers=[initial],
+            target_patchers=[target_200, target_400],
+            initial_health_check_params=_health_check_params(100),
+            target_health_check_params={
+                _DUT: {
+                    "interfaces": [
+                        {"interface_name": "eth1/10/1", "expected_speed": 200},
+                        {"interface_name": "eth1/10/5", "expected_speed": 400},
+                    ]
+                },
+                _PEER: {
+                    "interfaces": [
+                        {"interface_name": "eth1/3/1", "expected_speed": 200},
+                        {"interface_name": "eth1/3/5", "expected_speed": 400},
+                    ]
+                },
+            },
+            target_port_cage_count=1,
+            iteration=1,
+        )
+
+        patcher_operations = [
+            (
+                t.cast(str, params["patcher_name"]),
+                t.cast(bool, params["register_patcher"]),
+            )
+            for stage in playbook.stages
+            for step in stage.steps
+            if "register_patcher" in (params := _step_params(step))
+        ]
+        self.assertEqual(
+            patcher_operations,
+            [
+                ("initial_100", True),
+                ("target_200", True),
+                ("target_400", True),
+                ("target_400", False),
+                ("target_200", False),
+                ("initial_100", False),
+            ],
+        )
+        self.assertEqual(playbook.iteration, 1)
+        self.assertEqual(
+            [
+                t.cast(str, _step_params(step)["patcher_name"])
+                for step in playbook.cleanup_steps or []
+                if "patcher_name" in _step_params(step)
+            ],
+            ["target_400", "target_200", "initial_100"],
+        )
+
+
+class SpeedFlip51TTestConfigTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.test_config = (
+            speed_flip_test_configs.SPEED_FLIP_51T_SINGLE_CAGE_TWO_PORT_TEST_CONFIG
+        )
+
+    def test_exposes_independent_supported_cases_for_the_ko3_pair(self) -> None:
+        test_config = getattr(
+            speed_flip_test_configs,
+            "SPEED_FLIP_51T_SINGLE_CAGE_TWO_PORT_TEST_CONFIG",
+            None,
+        )
+        self.assertIsNotNone(test_config)
+        if test_config is None:
+            return
+
+        self.assertEqual(
+            test_config.name,
+            "SPEED_FLIP_51T_SINGLE_CAGE_TWO_PORT_TEST_CONFIG",
+        )
+        self.assertEqual(
+            [endpoint.name for endpoint in test_config.endpoints],
+            [_DUT, _PEER],
+        )
+        self.assertEqual(
+            [playbook.name for playbook in test_config.playbooks],
+            [
+                "SPEED_FLIP_51T_SPD_001_100G_TO_200G_WARMBOOT",
+                "SPEED_FLIP_51T_SPD_004_100G_TO_200G_AGENT_CRASH",
+                "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
+            ]
+            + _REDUCED_TRANSITION_PLAYBOOK_NAMES,
+        )
+
+        for playbook in test_config.playbooks[:3]:
+            self.assertEqual(playbook.iteration, 1)
+            self.assertEqual(len(playbook.cleanup_steps or []), 1)
+            register_params = _step_params(playbook.stages[0].steps[0])
+            self.assertEqual(register_params["endpoints"], _ENDPOINTS)
+            self.assertEqual(register_params["target_port_cage_count"], 1)
+
+        for playbook in test_config.playbooks:
+            for stage in playbook.stages:
+                for step in stage.steps:
+                    params = _step_params(step)
+                    if "register_patcher" in params:
+                        self.assertEqual(params["target_port_cage_count"], 1)
+
+    def test_reduced_transition_cases_use_one_iteration(self) -> None:
+        playbooks_by_name = {
+            playbook.name: playbook for playbook in self.test_config.playbooks
+        }
+
+        for name in _REDUCED_TRANSITION_PLAYBOOK_NAMES:
+            self.assertEqual(playbooks_by_name[name].iteration, 1)
+
+    def test_reduced_cases_wait_for_the_native_state_before_postchecks(self) -> None:
+        playbooks_by_name = {
+            playbook.name: playbook for playbook in self.test_config.playbooks
+        }
+
+        for name in _REDUCED_TRANSITION_PLAYBOOK_NAMES:
+            last_stage = playbooks_by_name[name].stages[-1]
+            self.assertEqual(
+                [step.name for step in last_stage.steps],
+                [
+                    taac_types.StepName.VERIFY_PORT_OPERATIONAL_STATE,
+                    taac_types.StepName.VERIFY_PORT_OPERATIONAL_STATE,
+                    taac_types.StepName.VALIDATION_STEP,
+                ],
+            )
+
+    def test_reduced_cases_encode_every_requested_speed_transition(self) -> None:
+        playbooks_by_name = {
+            playbook.name: playbook for playbook in self.test_config.playbooks
+        }
+
+        def speed_operations(name: str) -> list[tuple[int, bool]]:
+            return [
+                (
+                    t.cast(int, params["speed_in_gbps"]),
+                    t.cast(bool, params["register_patcher"]),
+                )
+                for stage in playbooks_by_name[name].stages
+                for step in stage.steps
+                if "register_patcher" in (params := _step_params(step))
+            ]
+
+        expected_operations = [
+            [(100, True), (200, True), (200, False), (100, False)],
+            [(100, True), (400, True), (400, False), (100, False)],
+            [(200, True), (400, True), (400, False), (200, False)],
+            [
+                (100, True),
+                (200, True),
+                (400, True),
+                (400, False),
+                (200, False),
+                (100, False),
+            ],
+            [
+                (100, True),
+                (200, True),
+                (400, True),
+                (400, False),
+                (200, False),
+                (100, False),
+            ],
+            [
+                (200, True),
+                (200, True),
+                (400, True),
+                (400, False),
+                (200, False),
+                (200, False),
+            ],
+            [
+                (200, True),
+                (400, True),
+                (200, True),
+                (200, False),
+                (400, False),
+                (200, False),
+            ],
+        ]
+        for name, expected in zip(
+            _REDUCED_TRANSITION_PLAYBOOK_NAMES[:7], expected_operations
+        ):
+            self.assertEqual(speed_operations(name), expected)
+
+    def test_spd_017_through_021_cover_subsumable_up_and_down_sequentially(
+        self,
+    ) -> None:
+        playbooks_by_name = {
+            playbook.name: playbook for playbook in self.test_config.playbooks
+        }
+
+        for name in _REDUCED_TRANSITION_PLAYBOOK_NAMES[7:]:
+            playbook = playbooks_by_name[name]
+            flap_operations = [
+                (
+                    t.cast(bool, params["enable"]),
+                    t.cast(str, params["device_name"]),
+                    tuple(t.cast(list[str], params["interfaces"])),
+                )
+                for stage in playbook.stages
+                for step in stage.steps
+                if step.name == taac_types.StepName.INTERFACE_FLAP_STEP
+                for params in [_step_params(step)]
+            ]
+            self.assertIn((True, _DUT, ("eth1/10/5",)), flap_operations)
+            self.assertIn((True, _PEER, ("eth1/3/5",)), flap_operations)
+            self.assertIn((False, _DUT, ("eth1/10/5",)), flap_operations)
+            self.assertIn((False, _PEER, ("eth1/3/5",)), flap_operations)
+
+            speed_operations = [
+                (
+                    t.cast(int, params["speed_in_gbps"]),
+                    t.cast(bool, params["register_patcher"]),
+                )
+                for stage in playbook.stages
+                for step in stage.steps
+                if "register_patcher" in (params := _step_params(step))
+            ]
+            self.assertEqual(sum(speed == 800 for speed, _ in speed_operations), 4)
+
+    def test_800g_cleanup_unregisters_each_patcher_once(self) -> None:
+        playbooks_by_name = {
+            playbook.name: playbook for playbook in self.test_config.playbooks
+        }
+
+        for name in _REDUCED_TRANSITION_PLAYBOOK_NAMES[7:]:
+            cleanup_patcher_names = [
+                t.cast(str, params["patcher_name"])
+                for step in playbooks_by_name[name].cleanup_steps or []
+                if "patcher_name" in (params := _step_params(step))
+            ]
+            self.assertEqual(
+                cleanup_patcher_names,
+                list(dict.fromkeys(cleanup_patcher_names)),
+            )
+
+    def test_100g_to_mixed_cases_transition_through_2x200g(self) -> None:
+        playbooks_by_name = {
+            playbook.name: playbook for playbook in self.test_config.playbooks
+        }
+
+        for name in _REDUCED_TRANSITION_PLAYBOOK_NAMES[3:5]:
+            registered_200g = [
+                params
+                for stage in playbooks_by_name[name].stages
+                for step in stage.steps
+                if (params := _step_params(step)).get("register_patcher") is True
+                and params.get("speed_in_gbps") == 200
+            ]
+            self.assertEqual(len(registered_200g), 1)
+            self.assertEqual(registered_200g[0]["endpoints"], _ENDPOINTS)
+
+    def test_replaces_the_old_bundled_ko3_config(self) -> None:
+        names = [
+            config.name for config in speed_flip_test_configs.SPEED_FLIP_TEST_CONFIGS
+        ]
+
+        self.assertIn("SPEED_FLIP_51T_SINGLE_CAGE_TWO_PORT_TEST_CONFIG", names)
+        self.assertNotIn("SPEED_FLIP_51T_KO3_SSW_FSW_TEST_PORTS_UP", names)
+
+    def test_configures_two_ixia_endpoints_and_custom_imix_traffic(self) -> None:
+        endpoint_ixia_ports = {
+            endpoint.name: list(endpoint.ixia_ports or [])
+            for endpoint in self.test_config.endpoints
+        }
+        self.assertEqual(
+            endpoint_ixia_ports,
+            {
+                _DUT: [_DUT_IXIA_PORT],
+                _PEER: [_PEER_IXIA_PORT],
+            },
+        )
+
+        port_configs = list(self.test_config.basic_port_configs or [])
+        self.assertEqual(
+            [port_config.endpoint for port_config in port_configs],
+            [f"{_DUT}:{_DUT_IXIA_PORT}", f"{_PEER}:{_PEER_IXIA_PORT}"],
+        )
+        for port_config in port_configs:
+            device_groups = list(port_config.device_group_configs or [])
+            self.assertEqual(len(device_groups), 1)
+            self.assertEqual(device_groups[0].multiplier, 1)
+            self.assertIsNotNone(device_groups[0].v6_bgp_config)
+
+        traffic_items = list(self.test_config.basic_traffic_item_configs or [])
+        self.assertEqual(len(traffic_items), 1)
+        traffic_item = traffic_items[0]
+        self.assertEqual(traffic_item.name, _TRAFFIC_ITEM)
+        self.assertEqual(
+            traffic_item.line_rate_type,
+            ixia_types.RateType.PERCENT_LINE_RATE,
+        )
+        self.assertEqual(traffic_item.line_rate, 50)
+        self.assertTrue(traffic_item.bidirectional)
+        self.assertEqual(traffic_item.traffic_type, ixia_types.TrafficType.IPV6)
+        self.assertEqual(
+            traffic_item.src_dest_mesh,
+            ixia_types.SrcDestMeshType.ONE_TO_ONE,
+        )
+        self.assertIsNotNone(traffic_item.frame_size_settings)
+        self.assertEqual(
+            traffic_item.frame_size_settings.type,
+            ixia_types.FrameSizeType.CUSTOM_IMIX,
+        )
+        self.assertEqual(
+            [endpoint.name for endpoint in traffic_item.src_endpoints],
+            [f"{_DUT}:{_DUT_IXIA_PORT}"],
+        )
+        self.assertEqual(
+            [endpoint.name for endpoint in traffic_item.dest_endpoints],
+            [f"{_PEER}:{_PEER_IXIA_PORT}"],
+        )
+
+    def test_every_playbook_runs_traffic_and_recovery_checks(self) -> None:
+        expected_prechecks = {
+            hc_types.CheckName.DRAIN_STATE_CHECK,
+            hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK,
+            hc_types.CheckName.BGP_SESSION_ESTABLISH_CHECK,
+            hc_types.CheckName.LLDP_CHECK,
+            hc_types.CheckName.PORT_STATE_CHECK,
+            hc_types.CheckName.IXIA_PACKET_LOSS_CHECK,
+            hc_types.CheckName.IXIA_PORT_STATS_CHECK,
+        }
+        expected_postchecks = {
+            hc_types.CheckName.BGP_SESSION_ESTABLISH_CHECK,
+            hc_types.CheckName.LLDP_CHECK,
+            hc_types.CheckName.PORT_STATE_CHECK,
+            hc_types.CheckName.IXIA_PACKET_LOSS_CHECK,
+            hc_types.CheckName.IXIA_PORT_STATS_CHECK,
+        }
+        expected_snapshots = {
+            hc_types.CheckName.PORT_SPEED_SNAPSHOT_CHECK,
+            hc_types.CheckName.CORE_DUMPS_CHECK,
+        }
+
+        for playbook in self.test_config.playbooks:
+            self.assertEqual(playbook.traffic_items_to_start, [_TRAFFIC_ITEM])
+            self.assertNotIn(
+                hc_types.CheckName.IXIA_TRAFFIC_RATE_CHECK,
+                {check.name for check in playbook.prechecks or []},
+            )
+            self.assertNotIn(
+                hc_types.CheckName.IXIA_TRAFFIC_RATE_CHECK,
+                {check.name for check in playbook.postchecks or []},
+            )
+            self.assertTrue(
+                expected_prechecks.issubset(
+                    {check.name for check in playbook.prechecks or []}
+                )
+            )
+            self.assertTrue(
+                expected_postchecks.issubset(
+                    {check.name for check in playbook.postchecks or []}
+                )
+            )
+            self.assertTrue(
+                expected_snapshots.issubset(
+                    {check.name for check in playbook.snapshot_checks or []}
+                )
+            )
+            self.assertNotIn(
+                hc_types.CheckName.BGP_PEER_ROUTE_CHECK,
+                {check.name for check in playbook.snapshot_checks or []},
+            )
+
+    def test_bgp_checks_are_scoped_to_the_two_ixia_peers(self) -> None:
+        expected_peers = [
+            "2401:db00:e50d:11:9::11",
+            "2401:db00:e50d:11:8::11",
+            "2401:db00:e719:2:1000::d",
+            "2401:db00:e719:2:1000::2d",
+            "2401:db00:e719:2:1000::c",
+            "2401:db00:e719:2:1000::2c",
+        ]
+
+        for playbook in self.test_config.playbooks:
+            bgp_checks = [
+                check
+                for check in list(playbook.prechecks or [])
+                + list(playbook.postchecks or [])
+                if check.name == hc_types.CheckName.BGP_SESSION_ESTABLISH_CHECK
+            ]
+            self.assertEqual(len(bgp_checks), 2)
+            for check in bgp_checks:
+                self.assertIsNotNone(check.check_params)
+                params = t.cast(taac_types.Params, check.check_params)
+                self.assertIsNotNone(params.json_params)
+                self.assertEqual(
+                    json.loads(t.cast(str, params.json_params))[
+                        "ignore_all_prefixes_except"
+                    ],
+                    expected_peers,
+                )
+
+    def test_configures_and_cleans_device_side_bgp_peers(self) -> None:
+        setup_tasks = list(self.test_config.setup_tasks or [])
+        self.assertEqual(
+            [task.task_name for task in setup_tasks],
+            [
+                "configure_parallel_bgp_peers",
+                "configure_parallel_bgp_peers",
+                "coop_apply_patchers",
+                "wait_for_agent_convergence",
+                "wait_for_bgp_convergence",
+            ],
+        )
+        peer_task_params = [_task_params(task) for task in setup_tasks[:2]]
+        self.assertEqual(
+            [params["hostname"] for params in peer_task_params],
+            [_DUT, _PEER],
+        )
+        self.assertEqual(
+            [
+                next(iter(json.loads(t.cast(str, params["config_json"]))))
+                for params in peer_task_params
+            ],
+            [_DUT_IXIA_PORT, _PEER_IXIA_PORT],
+        )
+        peer_configs = [
+            next(iter(json.loads(t.cast(str, params["config_json"])).values()))[0]
+            for params in peer_task_params
+        ]
+        self.assertEqual(
+            [config["peer_group_name"] for config in peer_configs],
+            ["PEERGROUP_SSW_FSW_V6", "PEERGROUP_FSW_RSW_V6"],
+        )
+        self.assertEqual(
+            [config["remote_as_4_byte"] for config in peer_configs],
+            [7001, 7001],
+        )
+
+        teardown_tasks = list(self.test_config.teardown_tasks or [])
+        self.assertEqual(
+            [task.task_name for task in teardown_tasks],
+            ["coop_unregister_patchers"],
+        )
+        cleanup_params = _task_params(teardown_tasks[0])
+        self.assertEqual(cleanup_params["hostnames"], [_DUT, _PEER])
+        self.assertEqual(
+            cleanup_params["config_names"],
+            ["agent", "bgpcpp", "bgpcpp_softdrain"],
+        )
+        self.assertEqual(cleanup_params.get("regex"), "^speed_flip_51t_")

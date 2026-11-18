@@ -14,7 +14,10 @@ each catalog entry's stated scale (64 / 32 / 32 eBGP sessions).
 """
 
 from taac.abstractions.physical_inventory import PhysicalInventory
-from neteng.test_infra.dne.taac.constants import BgpPlusPlusProfile, Gigabyte
+from taac.constants import (  # oss-rewrite-touch
+    BgpPlusPlusProfile,
+    Gigabyte,
+)
 from taac.playbooks.routing.factories.qual_bgp_update_group.tc2_peer_lifecycle import (
     create_bgp_ug_peer_down_remaining_unaffected_playbook,
     create_bgp_ug_peer_reconnect_shadow_rib_playbook,
@@ -36,6 +39,7 @@ from taac.testconfigs.routing.util.bgp_ebb_constants import (
     PEERGROUP_IBGP_V6,
 )
 from taac.testconfigs.routing.util.bgp_ebb_health_checks import (
+    BgpMonScope,
     create_standard_prechecks,
 )
 from taac.test_as_a_config import types as taac_types
@@ -162,10 +166,10 @@ def create_bgp_ug_peer_lifecycle_test_config(
     are best-effort and 2.2.3's 1-min flap cadence is infra-gated.
 
     Args:
-        physical_inventory: Device physical inventory (BAG011_ASH6 expected)
+        physical_inventory: Compatible EBB physical inventory
 
     Returns:
-        TestConfig wiring the 2.2.1/2.2.2/2.2.3 playbooks on the bag conveyor
+        TestConfig wiring the 2.2.1/2.2.2/2.2.3 playbooks on the EBB
         topology
     """
     bgp_mon_ignore_prefixes = [f"{IXIA_BGP_MON_IC_PARENT_NETWORK}::/80"]
@@ -185,7 +189,7 @@ def create_bgp_ug_peer_lifecycle_test_config(
             peergroup_ibgp_v6=PEERGROUP_IBGP_V6,
             peergroup_ibgp_v4=PEERGROUP_IBGP_V4,
             expected_established_sessions=_EXPECTED_ESTABLISHED_SESSIONS,
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
             # Precheck runs ~15-20s after the heavy full-scale setup, while bgpcpp
             # is still churning through initial convergence (~1272 sessions / ~1M
             # routes), so the 1-min load transiently exceeds the default 4.0
@@ -271,11 +275,10 @@ def create_bgp_ug_peer_lifecycle_test_config(
 
     return build_bag_conveyor_test_config(
         physical_inventory,
-        # Explicit name matching the sibling UG qualification TestConfigs
-        # (e.g. BAG011_ASH6_BGP_UG_EDGE_CASES_TEST) and the golden-manifest
-        # convention -- NOT _derive_test_config_name (which drops _ASH6 and
-        # appends _CONFIG_UG). --test-config resolves against this .name.
-        name="BAG011_ASH6_BGP_UG_PEER_LIFECYCLE_TEST",
+        name=(
+            f"{physical_inventory.device_name.upper().replace('.', '_')}"
+            "_BGP_UG_PEER_LIFECYCLE_TEST"
+        ),
         playbooks=[
             peer_down_playbook,
             peer_reconnect_playbook,

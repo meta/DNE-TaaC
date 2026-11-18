@@ -2,12 +2,17 @@
 # pyre-strict
 
 from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
+    EBB_BGPCPP_LOGGING_CONFIG,
     PEERGROUP_EBGP_V4,
     PEERGROUP_EBGP_V6,
     PEERGROUP_IBGP_V4,
     PEERGROUP_IBGP_V6,
 )
 from taac.abstractions.compatibility.legacy_ebb_binding import (
+    IXIA03_EBGP_IC_PARENT_NETWORK_V4,
+    IXIA03_EBGP_IC_PARENT_NETWORK_V6,
+    IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+    IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
     IXIA_EBGP_IC_PARENT_NETWORK_V4,
     IXIA_EBGP_IC_PARENT_NETWORK_V6,
     IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
@@ -41,6 +46,7 @@ from taac.abstractions.topology import (
     RoutingDeviceConfig,
     SelfNextHopRealization,
     StandardCommunity,
+    TaskCompatibilityProfile,
 )
 
 
@@ -53,6 +59,12 @@ BOUNDED_ECMP_PARENT_NETWORKS = {
     "ebgp_v4": IXIA_EBGP_IC_PARENT_NETWORK_V4,
     "ibgp_v6": IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
     "ibgp_v4": IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+}
+BOUNDED_ECMP_PARENT_NETWORKS_IXIA03 = {
+    "ebgp_v6": IXIA03_EBGP_IC_PARENT_NETWORK_V6,
+    "ebgp_v4": IXIA03_EBGP_IC_PARENT_NETWORK_V4,
+    "ibgp_v6": IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+    "ibgp_v4": IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
 }
 BOUNDED_ECMP_AS_NUMBERS = {
     "ebgp": EBGP_REMOTE_AS,
@@ -206,7 +218,8 @@ def _ibgp_child(
 
 BOUNDED_ECMP = LogicalTopology(
     name="bounded_ecmp",
-    legacy_profile="bounded_ecmp",
+    legacy_profile=None,
+    task_compatibility_profile=TaskCompatibilityProfile.BOUNDED_ECMP,
     endpoints=(
         EndpointSpec(name="dut0", role="dut", kind="dut", setup_mode="full"),
         EndpointSpec(name="ixia", role="trafficgen", kind="ixia", setup_mode="full"),
@@ -289,6 +302,7 @@ BOUNDED_ECMP = LogicalTopology(
     ),
     device_config=RoutingDeviceConfig(
         update_group_enable=True,
+        bgpcpp_logging_config_override=EBB_BGPCPP_LOGGING_CONFIG,
         openr_mode=OpenRMode.NONE,
     ),
     peer_groups=tuple(BOUNDED_ECMP_PEER_GROUPS.values()),
@@ -321,6 +335,7 @@ __all__ = (
     "BOUNDED_ECMP_IBGP_V4_PEER_GROUP",
     "BOUNDED_ECMP_IBGP_V6_PEER_GROUP",
     "BOUNDED_ECMP_PARENT_NETWORKS",
+    "BOUNDED_ECMP_PARENT_NETWORKS_IXIA03",
     "BOUNDED_ECMP_PEER_COUNT",
     "BOUNDED_ECMP_PEER_GROUPS",
     "BOUNDED_ECMP_PORT_MAP",

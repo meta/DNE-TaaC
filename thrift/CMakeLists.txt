@@ -287,6 +287,13 @@ add_taac_thrift_python_library(
     OPTIONS json
     DEPENDS thrift_roots
 )
+add_taac_thrift_python_library(
+    agent_config_py
+    "${FBOSS_THRIFT_DIR}/fboss/agent/agent_config.thrift"
+    NAMESPACE "neteng.fboss"
+    OPTIONS json
+    DEPENDS thrift_roots switch_config_py platform_config_py
+)
 # Distinct from fboss_common_py above (fboss/lib/if/fboss_common.thrift);
 # this is the configerator-side common thrift included by ctrl.thrift
 # with the alias 'as fboss_common'.
@@ -375,7 +382,7 @@ add_taac_thrift_python_library(
 
 # BGP thrift schemas. bgp_attr / bgp_config / bgp_policy / rib_policy
 # (plus their transitive deps nsf_policy / routing_policy) are pulled
-# directly from the public facebook/fboss repo via the fboss-thrift-defs
+# directly from the public meta/fboss repo via the fboss-thrift-defs
 # manifest — no need to vendor a local copy.
 # Required by several TAAC health checks and fboss_switch.py driver
 # imports of neteng.fboss.bgp_thrift.* and neteng.fboss.bgp_attr.*.
@@ -398,7 +405,7 @@ add_taac_thrift_python_library(
     "${FBOSS_THRIFT_DIR}/configerator/structs/neteng/bgp_policy/thrift/rib_policy.thrift"
     NAMESPACE "neteng.bgp_policy.thrift"
     OPTIONS json
-    DEPENDS thrift_roots
+    DEPENDS thrift_roots fboss_configerator_common_py
 )
 add_taac_thrift_python_library(
     nsf_policy_py
@@ -458,6 +465,13 @@ add_taac_thrift_python_library(
     OPTIONS json
     DEPENDS thrift_roots health_check_py ixia_py
 )
+add_taac_thrift_python_library(
+    test_run_result_py
+    "${UPSTREAM_THRIFT_DIR}/taac/test_run_result.thrift"
+    NAMESPACE "taac"
+    OPTIONS json
+    DEPENDS thrift_roots health_check_py test_as_a_config_py
+)
 
 # ============================================================================
 # SECTION C: Install generated Python to site-packages
@@ -494,6 +508,7 @@ add_custom_target(all_thrift_bindings ALL DEPENDS
     asic_config_py.py_sources_built
     asic_config_v2_py.py_sources_built
     platform_config_py.py_sources_built
+    agent_config_py.py_sources_built
     fboss_configerator_common_py.py_sources_built
     mka_structs_py.py_sources_built
     patch_py.py_sources_built
@@ -515,6 +530,7 @@ add_custom_target(all_thrift_bindings ALL DEPENDS
     bgp_thrift_py.py_sources_built
     health_check_py.py_sources_built
     test_as_a_config_py.py_sources_built
+    test_run_result_py.py_sources_built
 )
 
 # Per-library install rules are emitted inside the add_taac_thrift_python_library

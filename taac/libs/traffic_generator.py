@@ -34,6 +34,7 @@ from taac.utils.ixia_utils import (
     async_create_optical_switch_ixia_connection_assets,
     async_get_ixia_logical_port,
     fetch_ixia_password,
+    fetch_ixia_username,
     get_attr_value,
     get_next_available_ipv6_address,
 )
@@ -50,7 +51,6 @@ from taac.utils.oss_taac_lib_utils import (
     ConsoleFileLogger,
     get_root_logger,
     none_throws,
-    retryable,
     string_is_ip,
 )
 from taac.utils.serf_utils import (
@@ -89,6 +89,9 @@ DEFAULT_DEVICE_GROUP_CONFIG = taac_types.DeviceGroupConfig(
     v6_addresses_config=taac_types.IpAddressesConfig(),
 )
 
+IXIA_LLDP_DISCOVERY_ATTEMPTS: int = 6
+IXIA_LLDP_DISCOVERY_INTERVAL_SECONDS: int = 30
+
 
 class TrafficGenerator:
     def __init__(
@@ -97,6 +100,7 @@ class TrafficGenerator:
         basset_pool: t.Optional[str] = None,
         session_name: t.Optional[str] = None,
         primary_chassis_ip: t.Optional[str] = None,
+        ixia_primary_chassis: t.Optional[str] = None,
         cleanup_config: bool = True,
         tear_down_session: bool = True,
         session_id: t.Optional[int] = None,
@@ -120,6 +124,10 @@ class TrafficGenerator:
         ixia_recovery: t.Optional[taac_types.IxiaRecovery] = None,
         setup_tasks: t.Optional[t.Sequence[taac_types.Task]] = None,
         cache_candidate_name: t.Optional[str] = None,
+        trace_api_calls: bool = False,
+        wait_for_lldp_reconvergence: bool = False,
+        force_take_port_ownership: bool = True,
+        use_tx_rx_sync: bool = True,
         *args,
         **kwargs,
     ) -> None:
@@ -127,12 +135,15 @@ class TrafficGenerator:
         self.name_to_endpoint = {endpoint.name: endpoint for endpoint in self.endpoints}
         self.endpoint_names = list(self.name_to_endpoint.keys())
         self.primary_chassis_ip = primary_chassis_ip
+        self.ixia_primary_chassis = ixia_primary_chassis
+        self.force_take_port_ownership = force_take_port_ownership
+        self.use_tx_rx_sync = use_tx_rx_sync
         self.cleanup_config: bool = cleanup_config
         self.session_id = session_id
         self.tear_down_session = tear_down_session
         self.cleanup_failed_setup = cleanup_failed_setup
         self.override_traffic_items = override_traffic_items
-        self.ixia: t.Optional[AbstractTrafficGenerator] = None  # pyre-ignore[8]
+        self.ixia: t.Optional[AbstractTrafficGenerator] = None
         self.logger = logger or get_root_logger()
         self.session_name = session_name
         self.basic_traffic_item_configs = basic_traffic_item_configs or []
@@ -154,6 +165,9 @@ class TrafficGenerator:
         self.ixia_config_cache = ixia_config_cache
         # Opt-in IXIA REST API soft recovery — see IxiaRecovery Thrift docstring
         self.ixia_recovery = ixia_recovery
+        self.wait_for_lldp_reconvergence = wait_for_lldp_reconvergence
+        # Record every IxNetwork REST call to a JSONL file — see ixia_tracer.py
+        self.trace_api_calls = trace_api_calls
         # TestConfig setup_tasks — used by the v3 IXIA topology-cache key so
         # the cache auto-invalidates when an engineer edits a setup task
         # during testconfig development. Hashed via
@@ -188,6 +202,7 @@ class TrafficGenerator:
 
         self._port_configs: t.List[ixia_types.PortConfig] = []
         self._traffic_items: t.List[ixia_types.TrafficItem] = []
+        self._ixia_asset_snapshot_by_endpoint: dict[str, list[IxiaEndpointInfo]] = {}
 
     def teardown_ixia_setup(self) -> None:
         if not self.ixia:
@@ -242,10 +257,11 @@ class TrafficGenerator:
 
     @async_retryable(retries=3, sleep_time=10)
     async def async_create_ixia_config(self) -> ixia_types.IxiaConfig:
+        self._ixia_asset_snapshot_by_endpoint.clear()
         await self.async_update_all_endpoints()
 
         ixia_config = ixia_types.IxiaConfig(
-            api_server_ip=await self.async_get_primary_ixia_chassis_ip(),
+            api_server_ip=await self.async_get_ixia_api_server(),
             port_configs=await self.async_create_ixia_port_configs(),
             traffic_items=await self.async_create_all_traffic_items(),
             ptp_configs=self.ptp_configs,
@@ -254,11 +270,10 @@ class TrafficGenerator:
 
     async def async_create_ixia_setup(self) -> None:
         try:
-            # Build the IxiaConfig once — used both for the TaacIxia constructor
-            # AND for computing the cache key (if cache is enabled).
-            built_ixia_config: t.Optional[ixia_types.IxiaConfig] = None
-            if not self.session_id or self.override_traffic_items:
-                built_ixia_config = await self.async_create_ixia_config()
+            # Always provide the declarative config to TaacIxia. Retained
+            # sessions need its port/device-group structure to rehydrate the
+            # process-local vport index even when traffic items are reused.
+            built_ixia_config = await self.async_create_ixia_config()
 
             self.ixia = TaacIxia(
                 ixia_config=built_ixia_config,
@@ -266,13 +281,13 @@ class TrafficGenerator:
                 session_name=self.get_session_name(),
                 cleanup_config=False if self.session_id else self.cleanup_config,
                 teardown_session=self.tear_down_session,
-                force_take_port_ownership=True,
+                force_take_port_ownership=self.force_take_port_ownership,
+                use_tx_rx_sync=self.use_tx_rx_sync,
                 session_id=self.session_id,
                 password=fetch_ixia_password(),
+                username=fetch_ixia_username(),
                 chassis_ip=(
-                    await self.async_get_primary_ixia_chassis_ip()
-                    if self.session_id
-                    else None
+                    await self.async_get_ixia_api_server() if self.session_id else None
                 ),
                 override_traffic_items=self.override_traffic_items,
                 skip_advertised_prefixes_check=(
@@ -284,18 +299,20 @@ class TrafficGenerator:
                 skip_ixia_protocol_verification=self.skip_ixia_protocol_verification,
                 ixia_protocol_verification_timeout=self.ixia_protocol_verification_timeout,
                 ixia_recovery=self.ixia_recovery,
+                trace_api_calls=self.trace_api_calls,
+                ixia_primary_chassis=self.ixia_primary_chassis,
             )
 
-            # Topology cache — only when (a) cache is enabled in TestConfig AND
-            # (b) we have an IxiaConfig to hash. Without an IxiaConfig (session
-            # reuse path) there's nothing to key on.
+            # Topology cache is only for newly-created sessions. An explicit
+            # session ID always wins and is rehydrated directly from that
+            # session instead of loading a cached topology over it.
             cache_mgr = None
             cache_key = None
             cache_hit = False
             if (
                 self.ixia_config_cache
                 and self.ixia_config_cache.enabled
-                and built_ixia_config is not None
+                and not self.session_id
             ):
                 # Best-effort: catch any unexpected exception during cache
                 # lookup so cache bugs degrade to cold setup, never fail the
@@ -413,7 +430,8 @@ class TrafficGenerator:
                 is_logical_port=direct_ixia_connection.is_logical_port,
             )
             direct_ixia_connection_assets.append(ixia_endpoint)
-        return list(set(direct_ixia_connection_assets))
+        # The declared order decides which port IXIA creates first.
+        return list(dict.fromkeys(direct_ixia_connection_assets))
 
     def create_ixia_endpoint(
         self, endpoint: taac_types.TrafficEndpoint
@@ -711,11 +729,12 @@ class TrafficGenerator:
         local_as: int,
     ) -> ixia_types.BgpPeerConfig:
         """
-        Create a BgpPeerConfig with optional as_set_mode support.
+        Create a BgpPeerConfig with optional ``as_set_mode`` support.
 
-        The as_set_mode field may not be available in all versions of the IXIA types.
-        This method handles the field conditionally to maintain backward compatibility.
+        A declared ``tcp_window_size_bytes`` value requires schema support.
+        Older IXIA output schemas can omit ``as_set_mode``.
         """
+        tcp_window_size_bytes = bgp_config.tcp_window_size_bytes
         # Build base kwargs
         peer_config_kwargs = {
             "local_as": local_as,
@@ -751,6 +770,8 @@ class TrafficGenerator:
             "hold_timer": bgp_config.hold_timer,
             "keepalive_timer": bgp_config.keepalive_timer,
         }
+        if tcp_window_size_bytes is not None:
+            peer_config_kwargs["tcp_window_size_bytes"] = tcp_window_size_bytes
 
         # Try to add as_set_mode if the field is supported
         if bgp_config.as_set_mode is not None:
@@ -766,8 +787,17 @@ class TrafficGenerator:
                     f"ignoring value: {bgp_config.as_set_mode}"
                 )
 
-        # pyre-ignore[6]: Pyre can't infer types from dict unpacking
-        return ixia_types.BgpPeerConfig(**peer_config_kwargs)
+        try:
+            return ixia_types.BgpPeerConfig(**peer_config_kwargs)
+        except TypeError as error:
+            if tcp_window_size_bytes is None or "tcp_window_size_bytes" not in str(
+                error
+            ):
+                raise
+            raise RuntimeError(
+                "Could not construct IXIA BgpPeerConfig with declared "
+                f"tcp_window_size_bytes={tcp_window_size_bytes}: {error}"
+            ) from error
 
     def get_matching_basic_port_config(
         self,
@@ -775,12 +805,11 @@ class TrafficGenerator:
     ) -> taac_types.BasicPortConfig:
         if not self.basic_port_configs:
             return self.default_basic_port_config
-        for basic_port_config in self.basic_port_configs:  # pyre-ignore
+        for basic_port_config in self.basic_port_configs:
             if basic_port_config.endpoint == endpoint_str:
                 return basic_port_config
         return self.default_basic_port_config
 
-    @retryable(num_tries=3, sleep_time=60, debug=True)
     def select_ixia_assets(
         self, endpoint: taac_types.Endpoint, ixia_assets: t.List[IxiaEndpointInfo]
     ) -> t.List[IxiaEndpointInfo]:
@@ -818,14 +847,42 @@ class TrafficGenerator:
         ]
         return desired_ixia_assets
 
-    @async_memoize_timed(3600)
-    @async_retryable(retries=3, sleep_time=30, exceptions=(Exception,))
+    async def _async_get_complete_lldp_ixia_assets(
+        self, endpoint: taac_types.Endpoint
+    ) -> t.List[IxiaEndpointInfo]:
+        from taac.internal.internal_utils import (
+            async_create_lldp_ixia_connection_assets,
+        )
+
+        lldp_assets = await async_create_lldp_ixia_connection_assets(endpoint.name)
+        self.logger.debug(f"lldp ixia assets: {lldp_assets}")
+        desired_ixia_assets = self.select_ixia_assets(endpoint, lldp_assets)
+        if not desired_ixia_assets:
+            raise InsufficientInputError(
+                f"Unable to find any LLDP ixia assets for endpoint {endpoint.name}"
+            )
+        return desired_ixia_assets
+
+    @async_retryable(
+        num_tries=IXIA_LLDP_DISCOVERY_ATTEMPTS,
+        sleep_time=IXIA_LLDP_DISCOVERY_INTERVAL_SECONDS,
+        exceptions=(ValueError, InsufficientInputError),
+    )
+    async def _async_wait_for_complete_lldp_ixia_assets(
+        self, endpoint: taac_types.Endpoint
+    ) -> t.List[IxiaEndpointInfo]:
+        return await self._async_get_complete_lldp_ixia_assets(endpoint)
+
     async def async_get_endpoint_desired_ixia_assets(
         self, endpoint: taac_types.Endpoint
     ) -> t.List[IxiaEndpointInfo]:
         """
         Fetches the Ixia assets that are needed for the given endpoint
         """
+        snapshot = self._ixia_asset_snapshot_by_endpoint.get(endpoint.name)
+        if snapshot is not None:
+            return snapshot
+
         direct_ixia_connection_assets = self.create_direct_ixia_connection_assets(
             endpoint
         )
@@ -837,7 +894,11 @@ class TrafficGenerator:
                     f"[OSS Mode] Using {len(direct_ixia_connection_assets)} direct IXIA connection(s) "
                     f"for endpoint {endpoint.name}"
                 )
-                return list(set(direct_ixia_connection_assets))
+                desired_ixia_assets = direct_ixia_connection_assets
+                self._ixia_asset_snapshot_by_endpoint[endpoint.name] = (
+                    desired_ixia_assets
+                )
+                return desired_ixia_assets
             else:
                 raise InsufficientInputError(
                     f"[OSS Mode] No direct IXIA connections provided for endpoint {endpoint.name}. "
@@ -854,22 +915,30 @@ class TrafficGenerator:
                 f"Using {len(direct_ixia_connection_assets)} direct IXIA connection(s) "
                 f"for endpoint {endpoint.name}, skipping LLDP/optical switch discovery"
             )
-            return list(set(direct_ixia_connection_assets))
+            desired_ixia_assets = direct_ixia_connection_assets
+            self._ixia_asset_snapshot_by_endpoint[endpoint.name] = desired_ixia_assets
+            return desired_ixia_assets
 
-        # Lazy import for OSS compatibility - only needed in internal mode
-        from taac.internal.internal_utils import (
-            async_create_lldp_ixia_connection_assets,
-        )
-
-        lldp_assets = await async_create_lldp_ixia_connection_assets(endpoint.name)
-        self.logger.debug(f"lldp ixia assets: {lldp_assets}")
-        ixia_assets = (
-            lldp_assets
-            or await async_create_optical_switch_ixia_connection_assets(endpoint.name)
-        )
-        desired_ixia_assets: t.List[IxiaEndpointInfo] = []
-        if ixia_assets:
-            desired_ixia_assets = self.select_ixia_assets(endpoint, ixia_assets)
+        try:
+            if self.wait_for_lldp_reconvergence:
+                desired_ixia_assets = (
+                    await self._async_wait_for_complete_lldp_ixia_assets(endpoint)
+                )
+            else:
+                desired_ixia_assets = await self._async_get_complete_lldp_ixia_assets(
+                    endpoint
+                )
+        except (ValueError, InsufficientInputError) as error:
+            self.logger.warning(
+                f"LLDP IXIA discovery did not resolve {endpoint.name}: {error}. "
+                "Falling back to optical-switch discovery."
+            )
+            optical_switch_assets = (
+                await async_create_optical_switch_ixia_connection_assets(endpoint.name)
+            )
+            desired_ixia_assets = self.select_ixia_assets(
+                endpoint, optical_switch_assets
+            )
         if not desired_ixia_assets:
             raise InsufficientInputError(
                 f"Unable to find any ixia assets for endpoint {endpoint.name}"
@@ -886,7 +955,9 @@ class TrafficGenerator:
                     # Type is guaranteed to be str here since we checked primary_chassis_ip is truthy
                     asset.ixia_chassis_ip = str(self.primary_chassis_ip)
 
-        return list(set(desired_ixia_assets))
+        desired_ixia_assets = list(set(desired_ixia_assets))
+        self._ixia_asset_snapshot_by_endpoint[endpoint.name] = desired_ixia_assets
+        return desired_ixia_assets
 
     async def async_create_endpoint_ixia_port_configs(
         self, endpoint: taac_types.Endpoint
@@ -898,16 +969,23 @@ class TrafficGenerator:
             raise InsufficientInputError(
                 f"Unable to find any ixia assets for endpoint {endpoint.name}"
             )
-        driver = await async_get_device_driver(hostname)
-        await asyncio.gather(
-            *[
-                driver.async_check_interface_status(
-                    ixia_asset.remote_intf_name,
-                    state=InterfaceEventState.STABLE,
-                )
-                for ixia_asset in ixia_assets
-            ]
-        )
+        if endpoint.direct_ixia_connections:
+            self.logger.info(
+                "Skipping pre-session DUT link-state validation for explicitly "
+                f"mapped IXIA ports on {hostname}; IXIA port assignment will "
+                "validate availability and establish the links"
+            )
+        else:
+            driver = await async_get_device_driver(hostname)
+            await asyncio.gather(
+                *[
+                    driver.async_check_interface_status(
+                        ixia_asset.remote_intf_name,
+                        state=InterfaceEventState.STABLE,
+                    )
+                    for ixia_asset in ixia_assets
+                ]
+            )
         for asset in ixia_assets:
             chassis_hostname = await async_get_hostname_from_ip(asset.ixia_chassis_ip)
             try:
@@ -933,7 +1011,10 @@ class TrafficGenerator:
             if self.is_standalone:
                 port_configs.append(
                     self.create_standalone_port_config(
-                        endpoint_str, asset, logical_port_num
+                        endpoint_str,
+                        asset,
+                        logical_port_num,
+                        l1_config=basic_port_config.l1_config,
                     )
                 )
             elif basic_port_config.device_group_configs:
@@ -1005,6 +1086,7 @@ class TrafficGenerator:
         endpoint_str: str,
         ixia_asset: IxiaEndpointInfo,
         ixia_logical_port_num: int,
+        l1_config: t.Optional[ixia_types.L1Config] = None,
     ) -> ixia_types.PortConfig:
         ixia_starting_ip, prefix_v6, prefix_len = self.get_standalone_ip_fields(
             endpoint_str
@@ -1034,6 +1116,7 @@ class TrafficGenerator:
                 slot_number=int(ixia_asset.ixia_slot_num),
                 port_number=ixia_logical_port_num,
             ),
+            l1_config=l1_config,
             device_group_configs=device_group_configs,
         )
         return port_config
@@ -1203,14 +1286,17 @@ class TrafficGenerator:
             )
         return as_path_prepends
 
+    async def async_get_ixia_api_server(self) -> str:
+        """Return the explicit REST endpoint or the discovered chassis address."""
+        return self.primary_chassis_ip or await self.async_get_primary_ixia_chassis_ip()
+
     @async_memoize_timed(60)
     async def async_get_primary_ixia_chassis_ip(self) -> str:
         if self.primary_chassis_ip:
             if string_is_ip(self.primary_chassis_ip):
-                return self.primary_chassis_ip  # pyre-ignore
+                return self.primary_chassis_ip
             else:
                 try:
-                    # pyre-fixme[6]: For 1st argument expected `str` but got
                     #  `Optional[str]`.
                     return await async_get_ip_from_hostname(self.primary_chassis_ip)
                 except Exception as error:
@@ -1245,10 +1331,12 @@ class TrafficGenerator:
         reference_values = []
         for i in reference.indices:
             value = None
-            src_hostname = src_endpoints[i].name.split(":")[0]
-            dst_hostname = dest_endpoints[i].name.split(":")[0]
-            src_port_config = self.get_port_config_by_name(src_hostname)
-            dst_port_config = self.get_port_config_by_name(dst_hostname)
+            src_endpoint_name = src_endpoints[i].name
+            dst_endpoint_name = dest_endpoints[i].name
+            src_hostname = src_endpoint_name.split(":")[0]
+            dst_hostname = dst_endpoint_name.split(":")[0]
+            src_port_config = self.get_port_config_by_name(src_endpoint_name)
+            dst_port_config = self.get_port_config_by_name(dst_endpoint_name)
             match reference.type:
                 case taac_types.ReferenceType.SRC_MAC_ADDRESS:
                     value = self.name_to_endpoint[src_hostname].mac_address
@@ -1356,6 +1444,9 @@ class TrafficGenerator:
         return ixia_packet_headers
 
     def get_port_config_by_name(self, port_name: str) -> ixia_types.PortConfig:
+        for port_config in self._port_configs:
+            if port_config.port_name == port_name:
+                return port_config
         for port_config in self._port_configs:
             if port_config.port_name.split(":")[0] == port_name:
                 return port_config

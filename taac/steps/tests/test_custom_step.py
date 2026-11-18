@@ -6,24 +6,138 @@ import time
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, call, MagicMock, Mock, patch
 
 from facebook.network.Address.thrift_types import BinaryAddress
-from neteng.fboss.ctrl.thrift_types import NdpEntryThrift
+from neteng.fboss.ctrl.thrift_types import NdpEntryThrift, PortInfoThrift
+from neteng.fboss.switch_config.thrift_types import PortType
 from taac.constants import (
     TestCaseFailure,
     TestDevice,
     TestTopology,
 )
+from taac.driver.driver_constants import SwitchLldpData
 from taac.internal.steps.custom_step import (
     BgpCounterFetchTimeout,
     CustomStep,
 )
 from taac.libs.parameter_evaluator import ParameterEvaluator
+from taac.steps.step import TestbedError
+from taac.health_check.health_check import types as hc_types
+from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.thrift_types import CustomStepInput, Step, TestConfig
 
 BASE_PATH = "neteng.test_infra.dne.taac.internal.steps.custom_step"
+
+
+class CustomStepSetupTest(unittest.IsolatedAsyncioTestCase):
+    async def test_nhg_storm_failure_is_recorded_without_skipping_postchecks(
+        self,
+    ) -> None:
+        step = CustomStep.__new__(CustomStep)
+        step.test_case_name = "ebb16"
+        step.device = cast(
+            TestDevice,
+            SimpleNamespace(name="bag013", attributes=SimpleNamespace()),
+        )
+        step.test_case_start_time = 1.0
+        step.test_case_results = []
+        step.logger = MagicMock()
+        result = object()
+        writer = AsyncMock(return_value=result)
+        workload_error = RuntimeError("programmed NHG ceiling breach")
+        workload_error.add_note("sample=7")
+        with (
+            patch(f"{BASE_PATH}.BgpNhgRandomStormCustomStep") as component,
+            patch(f"{BASE_PATH}.async_write_test_result", writer),
+        ):
+            component.return_value.last_result = {"restore_error": None}
+            component.return_value.run = AsyncMock(side_effect=workload_error)
+            await step.bgp_nhg_random_storm({"epoch_count": 1})
+
+        self.assertEqual([result], step.test_case_results)
+        writer.assert_awaited_once()
+        await_args = writer.await_args
+        if await_args is None:
+            self.fail("deferred failure writer was not awaited")
+        writer_kwargs = await_args.kwargs
+        self.assertEqual(
+            taac_types.ValidationStage.MID_TEST,
+            writer_kwargs["check_stage"],
+        )
+        self.assertEqual(
+            hc_types.HealthCheckStatus.FAIL,
+            writer_kwargs["test_status"],
+        )
+        self.assertIn("programmed NHG ceiling breach", writer_kwargs["message"])
+        self.assertIn("sample=7", writer_kwargs["message"])
+
+    async def test_nhg_storm_cancellation_is_not_deferred(self) -> None:
+        step = CustomStep.__new__(CustomStep)
+        with patch(f"{BASE_PATH}.BgpNhgRandomStormCustomStep") as component:
+            component.return_value.run = AsyncMock(side_effect=asyncio.CancelledError())
+            with self.assertRaises(asyncio.CancelledError):
+                await step.bgp_nhg_random_storm({"epoch_count": 1})
+
+    async def test_nhg_storm_testbed_error_is_not_deferred(self) -> None:
+        step = CustomStep.__new__(CustomStep)
+        with patch(f"{BASE_PATH}.BgpNhgRandomStormCustomStep") as component:
+            component.return_value.run = AsyncMock(
+                side_effect=TestbedError("device transport failed")
+            )
+            with self.assertRaisesRegex(TestbedError, "device transport failed"):
+                await step.bgp_nhg_random_storm({"epoch_count": 1})
+
+    async def test_nhg_storm_wrapped_testbed_error_is_not_deferred(self) -> None:
+        step = CustomStep.__new__(CustomStep)
+        transport_error = TestbedError("device transport failed")
+        observation_error = RuntimeError("sample observation failed")
+        observation_error.__cause__ = transport_error
+        with patch(f"{BASE_PATH}.BgpNhgRandomStormCustomStep") as component:
+            component.return_value.last_result = {"restore_error": None}
+            component.return_value.run = AsyncMock(side_effect=observation_error)
+            with self.assertRaisesRegex(RuntimeError, "sample observation failed"):
+                await step.bgp_nhg_random_storm({"epoch_count": 1})
+
+    async def test_nhg_storm_restoration_failure_is_not_deferred(self) -> None:
+        step = CustomStep.__new__(CustomStep)
+        with patch(f"{BASE_PATH}.BgpNhgRandomStormCustomStep") as component:
+            component.return_value.last_result = {
+                "restore_error": {"message": "IXIA restore failed"}
+            }
+            component.return_value.run = AsyncMock(
+                side_effect=RuntimeError("primary product failure")
+            )
+            with self.assertRaisesRegex(RuntimeError, "primary product failure"):
+                await step.bgp_nhg_random_storm({"epoch_count": 1})
+
+    async def test_runner_local_cleanup_skips_device_setup(self) -> None:
+        step = CustomStep.__new__(CustomStep)
+        parent_setup = AsyncMock()
+        with patch(f"{BASE_PATH}.Step.setUp", parent_setup):
+            for custom_step_name in (
+                "openr_scale_kvstore_state_cleanup",
+                "openr_scale_performance_cleanup",
+            ):
+                await step.setUp(
+                    MagicMock(spec=CustomStepInput),
+                    {"custom_step_name": custom_step_name},
+                )
+
+        parent_setup.assert_not_awaited()
+
+    async def test_performance_cleanup_dispatches_to_local_component(self) -> None:
+        step = CustomStep.__new__(CustomStep)
+        params = {
+            "custom_step_name": "openr_scale_performance_cleanup",
+            "action": "cleanup",
+        }
+        with patch(f"{BASE_PATH}.OpenRScalePerformanceCustomStep") as component:
+            component.return_value.run = AsyncMock()
+            await step.openr_scale_performance_cleanup(params)
+
+        component.return_value.run.assert_awaited_once_with(params)
 
 
 class TestNdpClear(unittest.IsolatedAsyncioTestCase):
@@ -1721,3 +1835,263 @@ class VerifyBgpSentRouteCountsUniformMinCountToleranceTest(
             tolerance=1,
             min_count_tolerance=0,
         )
+
+
+class TestSnakeRapidAEndFlap(unittest.IsolatedAsyncioTestCase):
+    """Covers snake A-end resolution + the wall-clock rapid-flap loop.
+
+    These guard the two defects found on fboss159 hardware: the management
+    port being selected as a snake circuit, and `duration_sec` being treated
+    as a flap count rather than a deadline.
+    """
+
+    def setUp(self) -> None:
+        self.device = MagicMock(spec=TestDevice)
+        self.device.name = "fboss159.99.ash6"
+        attributes_mock = MagicMock()
+        attributes_mock.operating_system = "FBOSS"
+        attributes_mock.role = ""
+        attributes_mock.device_name = "fboss159.99.ash6"
+        attributes_mock.hardware = ""
+        attributes_mock.ai_zone = ""
+        self.device.attributes = attributes_mock
+
+        self.custom_step = CustomStep(
+            name="test_step",
+            device=self.device,
+            topology=MagicMock(spec=TestTopology),
+            test_case_results=[],
+            test_config=MagicMock(spec=TestConfig),
+            test_case_name="test_case",
+            test_case_start_time=time.time(),
+            parameter_evaluator=MagicMock(spec=ParameterEvaluator),
+            step=MagicMock(spec=Step),
+        )
+        self.driver_mock = AsyncMock()
+        self.custom_step.driver = self.driver_mock
+
+    @staticmethod
+    def _lldp(local: str, remote_dev: str, remote_intf: str) -> SwitchLldpData:
+        """Build the real dataclass `async_get_lldp_neighbors` returns."""
+        return SwitchLldpData(
+            remote_device_name=remote_dev, remote_intf_name=remote_intf
+        )
+
+    def _set_topology(self, lldp: dict, port_types: dict) -> None:
+        """Wire the driver's LLDP + getAllPortInfo responses.
+
+        Both use the real types the driver returns -- `SwitchLldpData` and
+        thrift `PortInfoThrift` -- so enum comparison on `portType` and field
+        access are exercised as they are in production, not duck-typed.
+
+        port_types maps interface name -> PortType.
+        """
+        self.driver_mock.async_get_lldp_neighbors.return_value = lldp
+        self.driver_mock.async_get_all_port_info.return_value = {
+            idx: PortInfoThrift(portId=idx, name=name, portType=ptype)
+            for idx, (name, ptype) in enumerate(port_types.items())
+        }
+
+    async def test_resolves_one_a_end_per_circuit(self) -> None:
+        """Each cabled pair yields exactly one A-end: the lower interface."""
+        host = "fboss159.99.ash6"
+        self._set_topology(
+            lldp={
+                "eth1/2/1": self._lldp("eth1/2/1", host, "eth1/3/1"),
+                "eth1/3/1": self._lldp("eth1/3/1", host, "eth1/2/1"),
+                "eth1/4/1": self._lldp("eth1/4/1", host, "eth1/5/1"),
+                "eth1/5/1": self._lldp("eth1/5/1", host, "eth1/4/1"),
+            },
+            port_types={
+                "eth1/2/1": PortType.INTERFACE_PORT,
+                "eth1/3/1": PortType.INTERFACE_PORT,
+                "eth1/4/1": PortType.INTERFACE_PORT,
+                "eth1/5/1": PortType.INTERFACE_PORT,
+            },
+        )
+        self.assertEqual(
+            await self.custom_step._resolve_snake_a_ends(),
+            ["eth1/2/1", "eth1/4/1"],
+        )
+
+    async def test_excludes_management_port(self) -> None:
+        """A MANAGEMENT_PORT is never a snake A-end.
+
+        Regression test for fboss159: the montblanc 100G management port
+        eth1/65/1 advertises ITSELF as its own LLDP peer, which otherwise
+        satisfies every self-loop condition and got it optically flapped.
+        """
+        host = "fboss159.99.ash6"
+        self._set_topology(
+            lldp={
+                "eth1/2/1": self._lldp("eth1/2/1", host, "eth1/3/1"),
+                "eth1/3/1": self._lldp("eth1/3/1", host, "eth1/2/1"),
+                "eth1/65/1": self._lldp("eth1/65/1", host, "eth1/65/1"),
+            },
+            port_types={
+                "eth1/2/1": PortType.INTERFACE_PORT,
+                "eth1/3/1": PortType.INTERFACE_PORT,
+                "eth1/65/1": PortType.MANAGEMENT_PORT,
+            },
+        )
+        a_ends = await self.custom_step._resolve_snake_a_ends()
+        self.assertEqual(a_ends, ["eth1/2/1"])
+        self.assertNotIn("eth1/65/1", a_ends)
+
+    async def test_rejects_self_referential_interface_port(self) -> None:
+        """A front-panel port claiming itself as its peer is not a circuit."""
+        host = "fboss159.99.ash6"
+        self._set_topology(
+            lldp={"eth1/9/1": self._lldp("eth1/9/1", host, "eth1/9/1")},
+            port_types={"eth1/9/1": PortType.INTERFACE_PORT},
+        )
+        self.assertEqual(await self.custom_step._resolve_snake_a_ends(), [])
+
+    async def test_excludes_external_and_ixia_neighbors(self) -> None:
+        """Only self-loops count; IXIA taps / external neighbors are dropped."""
+        host = "fboss159.99.ash6"
+        self._set_topology(
+            lldp={
+                "eth1/2/1": self._lldp("eth1/2/1", host, "eth1/3/1"),
+                "eth1/3/1": self._lldp("eth1/3/1", host, "eth1/2/1"),
+                "eth1/1/1": self._lldp("eth1/1/1", "ixia16.netcastle.ash6", "1/21"),
+                "eth1/64/1": self._lldp("eth1/64/1", "", ""),
+            },
+            port_types={
+                "eth1/1/1": PortType.INTERFACE_PORT,
+                "eth1/2/1": PortType.INTERFACE_PORT,
+                "eth1/3/1": PortType.INTERFACE_PORT,
+                "eth1/64/1": PortType.INTERFACE_PORT,
+            },
+        )
+        self.assertEqual(await self.custom_step._resolve_snake_a_ends(), ["eth1/2/1"])
+
+    async def test_resolves_local_ends_for_cross_device_circuits(self) -> None:
+        peer = "fboss336024506.ash6"
+        self._set_topology(
+            lldp={
+                "eth1/2/1": self._lldp("eth1/2/1", peer, "eth1/2/5"),
+                "eth1/2/3": self._lldp("eth1/2/3", peer, "eth1/2/6"),
+                "eth1/1/1": self._lldp("eth1/1/1", "ixia27.netcastle.ash6", "1/49"),
+                "eth1/65/1": self._lldp("eth1/65/1", peer, "eth1/65/1"),
+            },
+            port_types={
+                "eth1/1/1": PortType.INTERFACE_PORT,
+                "eth1/2/1": PortType.INTERFACE_PORT,
+                "eth1/2/3": PortType.INTERFACE_PORT,
+                "eth1/65/1": PortType.MANAGEMENT_PORT,
+            },
+        )
+
+        self.assertEqual(
+            await self.custom_step._resolve_snake_a_ends([peer]),
+            ["eth1/2/1", "eth1/2/3"],
+        )
+
+    async def test_raises_when_no_a_ends_resolved(self) -> None:
+        self._set_topology(lldp={}, port_types={})
+        with self.assertRaises(TestCaseFailure):
+            await self.custom_step.snake_rapid_a_end_flap({"duration_sec": 10})
+
+    async def test_flap_loop_honors_wall_clock_deadline(self) -> None:
+        """duration_sec is a deadline, NOT duration_sec // flap_interval_sec.
+
+        Regression test for the ~3.1x overrun on fboss159: each flap cost
+        ~18.7s against a 6s interval, so the old division form ran 10 flaps
+        (186s) for a 60s request. Here each flap advances the fake clock by
+        25s, so a 60s budget stops after 3 flaps (75s elapsed) -- not
+        60 // 6 == 10. 25s is deliberately not a divisor of 60, so this also
+        pins the documented "overrun by at most one flap" bound.
+        """
+        host = "fboss159.99.ash6"
+        self._set_topology(
+            lldp={
+                "eth1/2/1": self._lldp("eth1/2/1", host, "eth1/3/1"),
+                "eth1/3/1": self._lldp("eth1/3/1", host, "eth1/2/1"),
+            },
+            port_types={
+                "eth1/2/1": PortType.INTERFACE_PORT,
+                "eth1/3/1": PortType.INTERFACE_PORT,
+            },
+        )
+        clock = {"now": 1000.0}
+
+        async def _advance(**_kwargs) -> None:
+            clock["now"] += 25.0
+
+        self.driver_mock.async_do_rapid_interface_flaps.side_effect = _advance
+
+        with patch(f"{BASE_PATH}.time.monotonic", side_effect=lambda: clock["now"]):
+            await self.custom_step.snake_rapid_a_end_flap(
+                {"duration_sec": 60, "flap_interval_sec": 6}
+            )
+
+        self.assertEqual(self.driver_mock.async_do_rapid_interface_flaps.await_count, 3)
+        # Stopped past the deadline, but by strictly less than one more flap.
+        self.assertGreaterEqual(clock["now"], 1060.0)
+        self.assertLess(clock["now"] - 1060.0, 25.0)
+        # Every call flaps the A-end set once; the driver's own loop is not
+        # used to count flaps, so the deadline stays authoritative.
+        for kwargs in [
+            c.kwargs
+            for c in self.driver_mock.async_do_rapid_interface_flaps.await_args_list
+        ]:
+            self.assertEqual(kwargs["total_flaps"], 1)
+            self.assertEqual(kwargs["interface_names"], ("eth1/2/1",))
+            self.assertEqual(kwargs["interval_to_link_up"], 6)
+
+    async def test_flap_loop_always_flaps_at_least_once(self) -> None:
+        """A duration shorter than one flap still performs one full flap."""
+        host = "fboss159.99.ash6"
+        self._set_topology(
+            lldp={
+                "eth1/2/1": self._lldp("eth1/2/1", host, "eth1/3/1"),
+                "eth1/3/1": self._lldp("eth1/3/1", host, "eth1/2/1"),
+            },
+            port_types={
+                "eth1/2/1": PortType.INTERFACE_PORT,
+                "eth1/3/1": PortType.INTERFACE_PORT,
+            },
+        )
+        clock = {"now": 500.0}
+
+        async def _advance(**_kwargs) -> None:
+            clock["now"] += 20.0
+
+        self.driver_mock.async_do_rapid_interface_flaps.side_effect = _advance
+
+        with patch(f"{BASE_PATH}.time.monotonic", side_effect=lambda: clock["now"]):
+            await self.custom_step.snake_rapid_a_end_flap({"duration_sec": 1})
+
+        self.assertEqual(self.driver_mock.async_do_rapid_interface_flaps.await_count, 1)
+
+
+class TestSnakeClearPortStats(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.device = MagicMock(spec=TestDevice)
+        self.device.name = "fboss159.99.ash6"
+        attributes_mock = MagicMock()
+        attributes_mock.operating_system = "FBOSS"
+        attributes_mock.role = ""
+        attributes_mock.device_name = "fboss159.99.ash6"
+        attributes_mock.hardware = ""
+        attributes_mock.ai_zone = ""
+        self.device.attributes = attributes_mock
+
+        self.custom_step = CustomStep(
+            name="test_step",
+            device=self.device,
+            topology=MagicMock(spec=TestTopology),
+            test_case_results=[],
+            test_config=MagicMock(spec=TestConfig),
+            test_case_name="test_case",
+            test_case_start_time=time.time(),
+            parameter_evaluator=MagicMock(spec=ParameterEvaluator),
+            step=MagicMock(spec=Step),
+        )
+        self.driver_mock = AsyncMock()
+        self.custom_step.driver = self.driver_mock
+
+    async def test_clears_all_port_counters(self) -> None:
+        await self.custom_step.snake_clear_port_stats({})
+        self.driver_mock.async_clear_all_port_counters.assert_awaited_once()

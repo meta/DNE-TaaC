@@ -1,19 +1,28 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
+import os
 import time
 import typing as t
 from abc import ABC, abstractmethod
 
 
-# TestbedError defined locally for OSS compatibility
-class TestbedError(Exception):
-    pass
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+if t.TYPE_CHECKING:
+    from neteng.netcastle.exceptions import TestbedError
+elif not TAAC_OSS:
+    from neteng.netcastle.exceptions import TestbedError
+else:
+
+    class TestbedError(Exception):
+        """OSS stub - netcastle TestbedError isn't shipped."""
+
+        pass
 
 
 from taac.constants import (
     TestCaseFailure,
     TestDevice,
-    TestResult,
     TestTopology,
 )
 from taac.driver.abstract_switch import AbstractSwitch
@@ -48,6 +57,7 @@ from taac.utils.taac_log_formatter import (
 )
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
+from taac.test_run_result import types as trr_types
 
 
 StepInput = t.TypeVar("StepInput", bound=t.Any)
@@ -66,7 +76,7 @@ class Step(t.Generic[StepInput], ABC):
         name: str,
         device: TestDevice,
         topology: TestTopology,
-        test_case_results: t.List[TestResult],
+        test_case_results: t.List[trr_types.CheckResult],
         test_config: taac_types.TestConfig,
         test_case_name: str,
         test_case_start_time: float,
@@ -88,6 +98,9 @@ class Step(t.Generic[StepInput], ABC):
         self.hostname: str = self.device.name
         self.logger = logger or get_root_logger()
         self.parameter_evaluator = parameter_evaluator
+        # One runner-owned store lets registered tasks in separate RUN_TASK
+        # steps exchange keyed state without process-global caches.
+        self.shared_data: dict[t.Any, t.Any] | None = None
         # pyrefly: ignore [bad-assignment]
         self.driver: AbstractSwitch = ...
         self.failures = []
@@ -103,7 +116,7 @@ class Step(t.Generic[StepInput], ABC):
     async def _run(self, input: StepInput, params: t.Dict[str, t.Any]) -> None:
         step_start_time = time.time()
         try:
-            if self.ixia:
+            if self.ixia and not params.get("skip_start_traffic", False):
                 self.ixia.start_traffic()
             log_step_info(
                 self.__class__.STEP_NAME.name,
@@ -255,6 +268,7 @@ class Step(t.Generic[StepInput], ABC):
 
     def raise_failure_if_exists(self) -> None:
         if self.failures:
+            failure_text = "\n".join(self.failures)
             raise TestCaseFailure(
-                f"Test case failed with the following failures: {'\n'.join(self.failures)}"
+                f"Test case failed with the following failures: {failure_text}"
             )

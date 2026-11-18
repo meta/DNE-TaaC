@@ -25,13 +25,13 @@ to emit `CompiledTaacArtifacts` for existing consumers.
 
 ## Current position
 
-DICE now has a migration parity harness, enforced import boundaries, a
-task-free common compilation plan, explicit physical network roles, typed EB
-policy selection, and a complete semantic IXIA plan for the current topology
-families. The candidate compiler can project bound device groups into DUT and
-IXIA resources without invoking a renderer. The established compiler remains
-authoritative for production artifacts and still renders the current BAG setup
-sequence.
+DICE now has enforced import boundaries, a task-free common compilation plan,
+explicit physical network roles, typed EB policy selection, and a complete
+semantic IXIA plan for the current topology families. The temporary migration
+parity harness was retired after cutover; reusable topology cases remain in
+`abstractions/tests/compiler_test_cases.py` for focused planner and renderer
+tests. The candidate compiler can project bound device groups into DUT and IXIA
+resources without invoking a renderer.
 
 It is not generalized yet:
 
@@ -40,8 +40,11 @@ It is not generalized yet:
 - established setup phases and component plans contain rendered TAAC `Task`
   objects;
 - the established EOS `IxiaPlan` contains already-rendered TAAC configs, while
-  the new semantic `IxiaPlan` does not yet have a native renderer;
-- component-role and lifecycle dependency intent are not yet projected;
+  the new semantic `IxiaPlan` does not yet have a complete authoritative
+  renderer;
+- physical-interface, routing-config, and routing-component lifecycle intent
+  is lowered in shadow mode, but it is not materialized into executable TAAC
+  tasks;
 - the candidate artifact adapter delegates DUT and IXIA rendering as one
   monolithic compatibility operation;
 - IXIA endpoint wiring and route-mutation lifecycle are still embedded in the
@@ -248,12 +251,12 @@ The plan models:
 ```text
 RoutingConfigPlan
   source: ConfigArtifactRef
-  requirements: RoutingConfigRequirements
-  variant: None | RoutingConfigVariant
+  required_features: tuple[str, ...]
+  variant: None
 ```
 
-`RoutingConfigVariant` is the single intentional override seam for A/B
-comparisons such as feature enabled versus disabled:
+A future typed `RoutingConfigVariant` is the single intentional override seam
+for A/B comparisons such as feature enabled versus disabled:
 
 - absent by default;
 - platform-specific, typed, and allowlisted;
@@ -445,7 +448,10 @@ Establish the generalized internal structure and remove reverse helper
 dependencies without changing existing factory APIs or BAG behavior. Phase 1.5
 does not claim profile-free compilation.
 
-### Diff 1.5.0: compatibility and parity harness
+### Diff 1.5.0: compatibility and parity harness (historical)
+
+This migration-only gate was removed after cutover. The following records the
+constraints it enforced while both compiler paths coexisted.
 
 Implement the migration harness before extracting planner or renderer code:
 
@@ -732,6 +738,92 @@ The compatibility adapter is still allowed for production profiles whose
 capabilities are not yet covered. Existing catalog TestConfigs and the golden
 manifest remain unchanged.
 
+### Bounded implementation stack: DICE 31-38
+
+This is the stopping point for the generalized setup-task compiler before
+playbook-model work resumes. It proves one complete profile-free EOS/BGP++
+capability set; it does not migrate every existing topology.
+
+**DICE 31: lifecycle task-materialization boundary.** Define the backend-owned
+intent-to-task protocol and fail closed if materialization changes operation
+coverage, pre/post-IXIA placement, cleanup grouping, or teardown order. Keep
+the common plan task-free and keep the established adapter authoritative.
+
+Status: implemented as a shadow-only boundary. Materialized output must
+preserve fragment order, lane presence, intent cardinality, cleanup grouping,
+and non-null tasks before it is exposed for later assembly work.
+
+**DICE 32: physical lifecycle tasks.** Materialize snapshot, realization,
+exact-readback, and restoration tasks for aggregate EOS physical interfaces.
+
+Status: implemented with first-snapshot reuse, exact EOS interface readback,
+and reverse-order restoration. Routing-config and routing-component values
+remain typed deferred intent in the shadow result.
+
+**DICE 33: routing-config lifecycle tasks.** Materialize first-snapshot
+capture, atomic Configerator installation, exact readback, and restoration of
+prior bytes or prior absence.
+
+Status: implemented with a pre-install presence/byte snapshot, the existing
+verified Configerator transfer, exact source-byte comparison, and restoration
+of either the prior file or its absence.
+
+**DICE 34: routing-component lifecycle tasks.** Materialize the ordered
+BGP++/FibAgent daemon reconciliation, startup option, acknowledged readiness,
+and component-state restoration.
+
+Status: implemented with launcher and running-config snapshots, reverse-order
+disable, dependency-order enable, explicit daemon/startup acknowledgement, and
+exact component rollback. The lifecycle shadow is now fully task-materialized.
+
+**DICE 35: baseline shared IXIA rendering.** Complete native endpoint, port,
+device-group, BGP-session, advertisement, and cleanup output for the
+profile-free acceptance capability without a legacy identity sidecar.
+
+Status: implemented with full partitioned dual-stack port, device-group,
+session, advertisement, and endpoint rendering. Default presentation identity
+is derived from stable resource IDs, so no legacy IXIA sidecar is required.
+
+**DICE 36: lifecycle scheduling and artifact assembly.** Schedule native DUT
+and IXIA fragments from stable dependencies and assemble a complete shadow
+`CompiledTaacArtifacts`. Reject missing, duplicate, or mixed native/delegated
+ownership.
+
+Status: implemented with exact endpoint, host-OS, lifecycle, and IXIA ownership
+reconciliation. Setup tasks are scheduled in pre-IXIA, IXIA-configuration, then
+post-IXIA order; teardown follows the validated lifecycle restoration order.
+
+**DICE 37: profile-free acceptance.** Freeze a dual-stack eBGP+iBGP fixture
+with `legacy_profile=None`, no `legacy_ixia_*` identity, exact setup/teardown
+coverage, topology-name independence, inventory-only realization changes, and
+a second equivalent topology requiring no compiler edit.
+
+Status: implemented with a production compiler factory and two profile-free
+bounded-ECMP logical fixtures. Acceptance freezes exact lifecycle coverage,
+topology-name independence, inventory-only physical drift, and generic handling
+of an equivalent topology with different logical resource identities.
+
+**DICE 38: capability-gated cutover.** Return the native artifact for the
+accepted capability set and retain the established compiler only as the
+fail-closed fallback for unsupported profiles. Remove temporary shadow gates
+that have durable semantic and golden coverage.
+
+Status: implemented. Profile-free EOS/BGP++ topologies now select the native
+candidate pipeline and return its assembled artifact with native renderer
+reports. Legacy-profile topologies continue to select the established compiler,
+and native authority rejects any mixed delegated adapter.
+
+For DICE 31-37, returned artifacts and all renderer reports remain
+compatibility-delegated. Every diff must preserve the existing golden manifest
+and pass focused drift tests, the complete abstraction suite, lint, and type
+checking. DICE 38 may change authority but must preserve consumer-visible
+serialization exactly.
+
+The following remain explicitly outside this stopping point: migration of all
+catalog profiles, traffic-item and playbook compilation, generalized
+OpenR/helper behavior, multi-DUT transactions, FBOSS emission, and additional
+routing or traffic-generator backends.
+
 ## Phase 1.7 implementation plan: EOS route and policy capabilities
 
 ### Objective
@@ -901,11 +993,340 @@ of Phase 1.5:
 16. **Completed shadow capability:** Diff 1.5.5j, lower partitioned dual-stack
     IXIA device-group bodies from semantic resources and compose them by
     resource ID for both bounded-ECMP cases.
+17. **Completed Phase 1.6 identity prerequisite:** Diff 1.6.2a, derive
+    partitioned IXIA group, session, and advertisement presentation from
+    stable resource IDs while retaining field-scoped compatibility overrides.
+18. **Completed Phase 1.6 identity prerequisite:** Diff 1.6.2b, normalize
+    endpoint-label style into `IxiaPortPlan` and remove planner-synthesized
+    port identities.
+19. **Completed Phase 1.6 integration gate:** Diff 1.6.2c, compile a
+    profile-free bounded topology with an empty identity sidecar through the
+    real EOS endpoint and shared IXIA `BasicPortConfig` composition chains
+    while a compatibility stub remains artifact authority.
+20. **Completed Phase 1.6 routing-config prerequisite:** Diff 1.6.2d,
+    normalize a typed Configerator artifact source through binding and common
+    planning, fail closed on malformed ownership, and reject unsupported
+    preloaded EOS lifecycle without changing artifact authority.
+21. **Completed Phase 1.6 component prerequisite:** Diff 1.6.2e, project one
+    task-free routing-control-plane component per routed DUT, depend on the
+    typed routing config, and fail closed on unsupported EOS component
+    contracts without changing artifact or task authority.
+22. **Completed Phase 1.6 physical-interface prerequisite:** Diff 1.6.2f,
+    normalize typed rate/lane profiles at inventory binding and project one
+    task-free physical owner per logical port-sharing group without changing
+    established EOS rendering, artifact, lifecycle, or task authority.
+23. **Completed Phase 1.6 lifecycle prerequisite:** Diff 1.6.2g, project
+    deterministic full-setup lifecycle operations for aggregate physical
+    interfaces, routing config, and the routing-control-plane component while
+    leaving established artifacts authoritative.
+24. **Completed Phase 1.6 physical-lifecycle shadow prerequisite:** Diff
+    1.6.3a, lower exact EOS physical-interface realization and reverse-cleanup
+    intent from the common lifecycle while leaving executable tasks and
+    established artifacts authoritative.
+25. **Completed Phase 1.6 routing-config lifecycle shadow prerequisite:** Diff
+    1.6.3b, lower Configerator installation, exact-readback, and
+    first-snapshot restoration intent after physical realization without
+    changing executable tasks or artifact authority.
+26. **Completed Phase 1.6 routing-component lifecycle shadow prerequisite:**
+    Diff 1.6.3c, lower the acknowledged EOS BGP++ daemon reconciliation graph
+    after routing-config installation and restore its snapshot before config
+    and physical cleanup without changing executable tasks or artifact
+    authority.
+
+#### Resource-derived IXIA presentation
+
+Partitioned dual-stack lowering no longer requires group, session, or
+advertisement entries in `LegacyIxiaIdentitySidecar`. A task-free presentation
+resolver derives versioned, fixed-length names from typed `ResourceId` values
+and allocates zero-based device-group indices from per-port plan order.
+Explicit sidecar fields remain resource-keyed overrides. They do not reorder
+resources or shift other defaults, and resolved name or index collisions fail
+closed.
+
+`IxiaDeviceGroupChild` legacy presentation fields are now optional. A
+bounded-ECMP topology with `legacy_profile=None` and those fields omitted
+produces the same semantic IXIA plan, while the existing overrides preserve
+the established artifacts exactly.
+
+Endpoint port labels now derive from typed style and normalized physical fields
+on `IxiaPortPlan`; optional `LegacyIxiaPortIdentity` entries remain
+resource-keyed overrides. A profile-free bounded plan therefore emits a
+completely empty `LegacyIxiaIdentitySidecar`, while endpoint,
+direct-connection, BasicPort base, and partitioned device-group shadows
+compose without legacy identity.
+
+The current bounded fixture continues authoring child legacy names and indices
+solely to preserve established artifact bytes until its Phase 1.7 migration.
+Diff 1.6.2c now proves that independently named profile-free bounded
+topologies produce identical semantic plans and resource-ordered endpoint and
+`BasicPortConfig` compositions from an empty identity sidecar. The adapter
+returns marker artifacts only, proving that this integration gate does not
+change facade or artifact authority.
+
+#### Bound routing-config source extraction
+
+`ConfigArtifactRef` is a task-free leaf contract containing a typed provider
+and path. `PhysicalInventory.routing_config_artifacts` converts the existing
+BGP++ and FBOSS Configerator fields at the inventory compatibility boundary.
+Binding selects the artifact by the already resolved routing driver and records
+one `BoundRoutingConfig` per routed DUT. The common planner projects that source
+into `RoutingConfigPlan` without reading platform-specific inventory fields,
+install paths, daemon names, topology names, or `legacy_profile`.
+
+The mapping key is the canonical endpoint identity. Unknown, non-DUT,
+untyped, missing, driver-mismatched, and driverless-surplus entries fail
+closed. A source-only binding change changes only the corresponding plan field.
+Independent binding and planning tests prove that topology name and legacy
+profile do not select the source.
+
+EOS/BGP++ preflight requires a Configerator source for full setup before the
+established adapter can run. Skip and verify-only modes do not require one.
+Preloaded setup is rejected until its setup/teardown ownership is defined.
+The variant seam accepts only `None`; a comparison experiment must eventually
+use a typed explicit override instead of an ad hoc BGP++ patch.
+
+Inventory `dut_bgp_as` and `router_id` are intentionally not projected as
+routing-config mutation requirements. The current ASN is EOS native-BGP
+bootstrap identity, while the fetched artifact owns the BGP++ protocol ASN.
+Router-ID application also differs across established BAG topology families.
+Both need explicit typed ownership before a native renderer may consume them.
+Config installation destination, restoration ownership, executable restart
+and readiness realization, and a non-empty override variant remain later
+Phase 1.6 work. Structural inventory test doubles must expose the typed
+`routing_config_artifacts` boundary instead of relying on the old flat path by
+accident.
+
+#### Task-free routing-control-plane component contract
+
+The common planner now projects one `ROUTING_CONTROL_PLANE` component for each
+routed DUT. Its stable ID derives from endpoint identity and semantic role. It
+requests desired state `RUNNING`, reconciliation
+`RESTART_AFTER_CONFIGURATION`, readiness `ACKNOWLEDGED`, and depends on that
+endpoint's `RoutingConfigPlan`.
+
+`ACKNOWLEDGED` means only that the backend accepted the lifecycle command. It
+does not claim daemon health, BGP-session readiness, or permission to remove
+the established fixed wait. EOS/BGP++ preflight accepts only this exact
+contract. A future EOS lifecycle renderer may expand the composite into its
+private BGP++/FibAgent/OpenR daemon ordering, but those daemon names and edges
+do not belong in the common plan.
+
+This slice creates no `LifecycleOperation`, renders no `Task`, changes no
+setup-mode activation, and owns no teardown. Full, skip, and verify-only
+planning retain the same semantic component graph; later lifecycle lowering
+decides which operations each mode executes. Preloaded EOS setup remains
+unsupported.
+
+Config-install snapshot/restoration, executable interface state and L2 mode,
+component-state restoration, native-BGP and `BgpTcpdump` ownership, and a
+concrete health probe remain prerequisites for native lifecycle generation.
+
+#### Task-free physical-interface ownership contract
+
+`PhysicalLinkRate` and `PhysicalInterfaceProfile` carry aggregate Gbps and
+lane count as typed common intent. `PhysicalInventory` accepts a typed default
+plus exact DUT-interface overrides. Its old `speed` string is parsed only at
+that compatibility boundary and only for interfaces not covered by typed
+input; complete typed overrides are authoritative. The fallback is
+transitional for inventories outside the migrated EBB set and is not exposed
+to binding or common planning.
+
+Binding attaches one resolved profile to each `ResolvedIxiaPortAssignment`.
+The common planner groups physical ownership by endpoint plus `reuse_group`,
+falling back to a dedicated logical role when no sharing group is authored.
+The stable `PHYSICAL_INTERFACE` ID contains that typed discriminator and
+logical key. It never contains a bound interface name, IXIA port, inventory
+index, topology name, or legacy profile.
+
+Each physical resource owns its exact logical link IDs. Per-AFI
+`InterfacePlan` resources reference that owner. Their `bound_interface` field
+remains a transitional projection of the owner's physical identity until
+lifecycle lowering consumes the owner directly. Common validation rejects
+multiple physical owners for one endpoint/link, multiple owners for one bound
+connection, duplicate or
+incomplete logical membership, cross-endpoint references, AFI mismatches, and
+logical-role fallback mismatches. Logical endpoint, link, role, and AFI
+references are validated even when an interface is intentionally unbound.
+EOS/BGP++ preflight additionally requires
+every EOS interface to be bound, every DUT link to have physical ownership,
+and the currently supported `100G/2-lane` profile.
+
+The all-case harness fixes the expected physical-group inventory for all 16
+EOS parity cases. Its BAG010 anchor proves one uplink owner for two links, one
+iBGP owner for sixteen links, and one BGP-monitor owner for one link, with the
+IPv4/IPv6 logical interfaces referencing those owners. The profile-free
+candidate harness includes the two bounded-ECMP physical resources in its
+exact resource inventory.
+
+This slice does not render EOS `speed`, description, admin-state, switchport,
+FEC, autonegotiation, wait, snapshot, or daemon tasks. Those remain established
+backend authority. OpenR standalone's separate `400g-8` link is intentionally
+excluded until Phase 1.9 defines helper ownership and lifecycle.
+
+#### Profile-free lifecycle projection
+
+Full setup now projects one task-free, snapshot-restored operation for each
+aggregate `PhysicalInterfacePlan`, followed by the endpoint's routing config
+and routing-control-plane component. Physical operations require exact
+readback. Routing config depends on every physical owner for that endpoint and
+also requires exact readback. The component retains its typed config dependency
+and requires acknowledgement. Stable declaration order breaks independent
+physical-operation ties, and teardown is the exact eligible reverse order.
+
+Logical per-AFI `InterfacePlan` resources remain children of their aggregate
+physical owner. They do not receive independent snapshot operations because
+several logical interfaces can share one bound runtime interface. IXIA ports,
+device groups, sessions, and advertisements remain artifact-owned; only
+explicit traffic-generator mutations use the separate IXIA lifecycle-fragment
+lane. Skip and verify-only setup modes therefore project an empty common
+lifecycle while retaining their existing artifact-realization semantics.
+
+The snapshot contract is intentionally stronger than established cleanup. A
+native renderer must capture physical state before prelink or address mutation,
+capture routing-config bytes or prior absence before installation, and capture
+the component's prior enable/running state before reconciliation. Existing
+profiles remain compatibility-delegated, so this safety contract does not shift
+their returned artifacts or golden output.
+
+Final local validation passed on 2026-08-08: the full abstraction suite passed
+599/599 tests (TestInfra `1407375402294830`), the factory golden gate passed
+2/2 tests (TestInfra `27303072778109275`), and changed-target Pyre found no
+errors across 15 owning targets. Golden regeneration found 294 unchanged
+configurations, with zero additions, changes, or removals. The manifest
+SHA-256 remained
+`741b81402258cf9feb3047e0e000441d332308823d20a00e909ef3a53cd282bf`.
+
+Phase 1.6.2f final local validation passed on 2026-08-08: the full abstraction
+suite passed 614/614 tests (TestInfra `24769797987710712`), the factory golden
+gate passed 2/2 tests (TestInfra `24769797987711009`), and changed-target Pyre
+found no errors across 23 owning targets. Golden regeneration found 294
+unchanged configurations, with zero additions, changes, or removals. The
+manifest SHA-256 remained
+`741b81402258cf9feb3047e0e000441d332308823d20a00e909ef3a53cd282bf`.
+Two independent final architecture audits found no remaining P0 blocker.
+
+Phase 1.6.2g final local validation passed on 2026-08-11: the focused lifecycle,
+planner, candidate, import-boundary, capability, and parity targets passed
+74/74 tests (TestInfra `31806672393087913`); the full abstraction suite passed
+680/680 tests (TestInfra `4222125033827932`); and the factory golden gate passed
+2/2 tests (TestInfra `18858823477284245`). Changed-target Pyre found no errors
+across 25 owning targets. Golden regeneration found 294 unchanged
+configurations, with zero additions, changes, or removals. The manifest SHA-256
+remained `b6ec7a338ef8132af61387d3e2f314cede06482d41bb88b5682f0dfd6c99c03f`.
+
+This completes the task-free routing-config, routing-control-plane,
+physical-interface, and lifecycle-planning prerequisites of Diff 1.6.2. EOS
+setup/teardown task lowering, snapshot/readback realization, artifact assembly,
+and facade authority remain required for Phase 1.6 exit.
+
+#### EOS physical-lifecycle shadow rendering
+
+The candidate compiler now accepts a separate DUT lifecycle renderer and
+exposes its validated result as a shadow. Generic lifecycle results bind every
+fragment to one consumed operation, preserve common setup order, and require
+cleanup coverage in exact common teardown order. They do not contain TAAC
+tasks and cannot affect returned artifacts.
+
+The EOS/BGP++ shadow consumes only the aggregate physical-interface operations
+from the common lifecycle. Full setup requires the exact
+snapshot-restored/first-snapshot/exact-readback contract with no dependency and
+emits one pre-IXIA realization intent per physical owner. Each intent carries
+the bound hostname and interface, typed aggregate rate and lane count, and
+canonical IPv4/IPv6 interface CIDRs. Cleanup groups the same operation IDs in
+reverse teardown order. Skip and verify-only modes consume no operations and
+emit no lifecycle fragments.
+
+Interface CIDRs now derive from the bound peer prefix instead of carrying a
+prefix-free address. Full setup fails when that exact prefix is absent or does
+not contain the selected DUT address. `InterfacePlan` validates canonical,
+unique CIDRs and their AFI before a renderer can consume them. Logical topology
+renames leave the shadow unchanged; inventory hostname and interface remaps
+change only physical realization fields.
+
+This remains a task-free comparison seam. It does not capture snapshots,
+execute EOS configuration, perform readback, construct cleanup tasks, merge
+fragments into artifacts, or change facade authority. Those executable and
+authority transitions remain later Phase 1.6 work.
+
+Final local validation passed on 2026-08-11: the full abstraction suite passed
+689/689 tests (TestInfra `1407375402910859`), the factory golden gate passed
+2/2 tests (TestInfra `27303072778727256`), and changed-target Pyre found no
+errors across 10 owning targets. Golden regeneration found 294 unchanged
+configurations, with zero additions, changes, or removals. The manifest
+SHA-256 remained
+`b6ec7a338ef8132af61387d3e2f314cede06482d41bb88b5682f0dfd6c99c03f`.
+
+#### EOS routing-config lifecycle shadow rendering
+
+The EOS lifecycle renderer now consumes the routed DUT's single
+`RoutingConfigPlan` after its aggregate physical owners. Full setup requires a
+typed Configerator source, the `bgpcpp` driver, exact-readback readiness,
+first-snapshot restoration, and dependencies on every physical owner in plan
+order. Missing sources, driver drift, dependency drift, weaker readiness, and
+non-snapshot ownership fail before an intent is emitted.
+
+The task-free post-IXIA intent binds the stable config operation to its typed
+artifact source, required feature contract, and backend-owned
+`/mnt/flash/bgpcpp_config` destination. Cleanup restores the routing config
+before the reverse-ordered physical cleanup, matching the common lifecycle's
+exact teardown order. Changing only the Configerator source changes only the
+install intent; skip and verify-only modes still emit no lifecycle fragments.
+
+This remains a shadow contract. It does not fetch or install the artifact,
+capture prior bytes or absence, perform content readback, restore or remove the
+destination, create TAAC tasks, merge fragments into artifacts, or change
+facade authority.
+
+Final local validation passed on 2026-08-11: the focused lifecycle and
+candidate tests passed 23/23 (TestInfra `27021597802079640`), the full
+abstraction suite passed 692/692 tests (TestInfra `2251800199512017`), and the
+factory golden gate passed 2/2 tests (TestInfra `21110623291151448`).
+Changed-target Pyre found no errors across 9 owning targets. Golden
+regeneration found 294 unchanged configurations, with zero additions, changes,
+or removals. The manifest SHA-256 remained
+`b6ec7a338ef8132af61387d3e2f314cede06482d41bb88b5682f0dfd6c99c03f`.
+
+#### EOS routing-component lifecycle shadow rendering
+
+The EOS lifecycle renderer now consumes the routed DUT's single
+`ROUTING_CONTROL_PLANE` component after routing-config installation. Full
+setup requires the exact common contract: desired state `RUNNING`, reconcile
+mode `RESTART_AFTER_CONFIGURATION`, acknowledged readiness, a dependency on
+the routed DUT's config, and first-snapshot restoration. The endpoint must
+also have exactly one `OpenRPlan` in `NONE` mode. Component-contract,
+dependency, ownership, readiness, and OpenR drift fail before an intent is
+emitted.
+
+The task-free post-IXIA intent carries an ordered backend-private daemon graph:
+`FibGrpc` and `FibBgpGrpc`; `FibAgent` after `FibGrpc`; `FibAgentBgp` after
+`FibBgpGrpc`; disabled `Openr`; and `Bgp` after both FibAgent variants. It also
+sets the BGP startup option
+`bgp_resolve_nexthops_from_interface_state=true`. Cleanup identifies the same
+daemon and startup-option snapshot surface, then restores component state
+before routing-config and reverse physical restoration. Skip and verify-only
+modes still emit no lifecycle fragments.
+
+This remains an acknowledged shadow contract. It does not snapshot daemon or
+startup-option state, issue EOS component commands, probe daemon or session
+health, restore prior state, construct TAAC tasks, merge fragments into
+artifacts, or change facade authority.
+
+Final local validation passed on 2026-08-11: the focused lifecycle and
+candidate tests passed 26/26 (TestInfra `9288674420601902`), the full
+abstraction suite passed 695/695 tests (TestInfra `9851624374015023`), and the
+factory golden gate passed 2/2 tests (TestInfra `34621422160392463`).
+Changed-target Pyre found no errors across 3 owning targets. Golden
+regeneration found 294 unchanged configurations, with zero additions, changes,
+or removals. The manifest SHA-256 remained
+`b6ec7a338ef8132af61387d3e2f314cede06482d41bb88b5682f0dfd6c99c03f`.
+
+Initial/tagged and compact/named group, session, and advertisement identities
+remain deferred to their Phase 1.7 profile migrations.
 
 Remaining IXIA families and lifecycle capabilities, EOS
-lifecycle/config/interface rendering, facade cutover, Phase 1.6, Phase 1.7,
-traffic-item compilation, generalized OpenR/helper behavior, and FBOSS task
-emission remain independently gated.
+executable lifecycle/interface/policy/OpenR/finalization rendering, facade
+cutover, Phase 1.6, Phase 1.7, traffic-item compilation, generalized
+OpenR/helper behavior, and FBOSS task emission remain independently gated.
 Do not substitute topology-selected compatibility constants for missing typed
 inputs merely to make the weekend stack appear complete.
 
@@ -930,9 +1351,10 @@ populate them safely:
 - `BgpPolicy` does not encode DUT import versus export direction. Diff 1.5.3
   resolves directional DUT bindings from typed network role, relationship,
   AFI, and direction instead of misusing advertisement `BgpPolicy` intent.
-- Current topology intent does not declare semantic component roles or their
-  dependencies. `ComponentPlan` projection remains in Diff 1.5.5 with EOS
-  renderer extraction; the common planner must not infer daemon roles.
+- At the Phase 1.5.2 checkpoint, topology intent did not yet project semantic
+  component roles. Diff 1.6.2e supersedes that deferred state with one generic
+  routing-control-plane composite per routed DUT; the common planner still
+  does not infer EOS daemon roles.
 - Final EOS and IXIA artifact rendering remains compatibility-delegated in the
   Phase 1.5.2 harness composition. Native renderer reports replace those
   delegations in Diffs 1.5.4-1.5.6.
@@ -1385,10 +1807,12 @@ binding. All 16 frozen EOS cases satisfy this contract; monitor IPv4 and other
 unsupported mappings fail before any artifact or shadow renderer call.
 
 The preflight does not yet claim that the selected Configerator artifact
-satisfies every `RoutingConfigPlan.required_features` entry. The plan still
-lacks the typed artifact reference, router-ID, experiment variant, and restart
-requirements needed for that check. Those remain explicit routing-config
-extraction work rather than an inferred compatibility rule.
+satisfies every `RoutingConfigPlan.required_features` entry. The plan now
+carries a typed Configerator artifact reference and an explicitly absent
+variant seam. It still lacks a typed non-empty experiment override,
+router-ID mutation ownership, installation destination, and restart/readiness
+requirements. Those remain explicit routing-config and lifecycle work rather
+than inferred compatibility rules.
 
 Established `CompiledTaacArtifacts` identity and the three
 `COMPATIBILITY_DELEGATED` renderer reports remain unchanged. The new gate
@@ -1711,7 +2135,7 @@ One worker owns the harness implementation, one reviews fixture coverage, and
 the gatekeeper adversarially tests the comparator. No production compiler file
 changes in this diff.
 
-The proposed test-only surface is:
+The retired test-only surface was:
 
 ```text
 abstractions/tests/compiler_parity_harness.py

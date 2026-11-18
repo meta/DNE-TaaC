@@ -7,14 +7,17 @@ import typing as t
 from dataclasses import dataclass, field
 from enum import Enum
 
+from taac.abstractions.compilation.ixia_presentation import (
+    resolve_ixia_port_presentations,
+)
 from taac.abstractions.compilation.legacy_ixia_identity import (
     LegacyIxiaIdentitySidecar,
 )
 from taac.abstractions.compilation.model import (
     EndpointSetupMode,
-    IxiaNextHopMode,
     IxiaPlan,
     IxiaPortPlan,
+    IxiaRouteScaleMode,
     ResourceId,
     ResourceKind,
     TopologyCompilationPlan,
@@ -165,6 +168,13 @@ class TrafficGeneratorEndpointRenderRequest:
         sessions_by_group = {
             session.device_group_id: session for session in request.plan.bgp_sessions
         }
+        presentations_by_port_id = {
+            presentation.resource_id: presentation
+            for presentation in resolve_ixia_port_presentations(
+                request.plan,
+                request.legacy_identity,
+            )
+        }
         ports = []
         for port in request.plan.ports:
             relationships: set[PeerRelationship] = set()
@@ -182,16 +192,15 @@ class TrafficGeneratorEndpointRenderRequest:
                     "relationship; found "
                     f"{tuple(sorted(relationships, key=lambda item: item.value))}"
                 )
-            identity = request.legacy_identity.port_identity(port.resource_id)
-            if identity is None:
-                raise ValueError(
-                    f"IXIA port {port.resource_id} has no endpoint label identity"
-                )
             ports.append(
                 TrafficGeneratorEndpointPortRequest(
                     port=port,
                     relationship=next(iter(relationships)),
-                    ixia_port_label=identity.endpoint_ixia_port_label,
+                    ixia_port_label=(
+                        presentations_by_port_id[
+                            port.resource_id
+                        ].endpoint_ixia_port_label
+                    ),
                 )
             )
         return cls(
@@ -540,17 +549,13 @@ class TrafficGeneratorPortDeviceGroupRenderResult(t.Generic[TDeviceGroupConfig_c
             tuple(port.resource_id for port in active_ports),
             tuple(fragment.port_id for fragment in self.fragments),
         )
-        fragments_by_port_id = {
-            fragment.port_id: fragment for fragment in self.fragments
-        }
-        for port in active_ports:
-            fragment = fragments_by_port_id[port.resource_id]
+        for port, fragment in zip(active_ports, self.fragments, strict=True):
             group_ids = tuple(
                 group.resource_id
                 for group in plan.device_groups
                 if group.port_id == port.resource_id
             )
-            _validate_exact_resource_order(
+            _validate_exact_resource_coverage(
                 "traffic-generator port device-group fragment",
                 group_ids,
                 fragment.device_group_ids,
@@ -664,15 +669,18 @@ class TrafficGeneratorRenderResult:
                 f"expected={expected_port_count}, "
                 f"actual={len(self.basic_port_configs)}"
             )
-        if self.basic_traffic_item_configs:
+        if len(self.basic_traffic_item_configs) != len(request.plan.traffic_flows):
             raise ValueError(
-                "traffic-generator traffic-item rendering is outside Phase 1.5"
+                "traffic-generator traffic-item config count mismatch: "
+                f"expected={len(request.plan.traffic_flows)}, "
+                f"actual={len(self.basic_traffic_item_configs)}"
             )
         lifecycle_is_active = any(
             activation.emit_lifecycle for activation in request.endpoint_activations
         )
         requires_configuration = lifecycle_is_active and any(
-            advertisement.next_hop.mode is IxiaNextHopMode.FORMULAIC
+            advertisement.prefix_window.route_scale_mode is IxiaRouteScaleMode.FLAT
+            or advertisement.requires_route_mutation
             for advertisement in request.plan.advertisements
         )
         expected_slots = (

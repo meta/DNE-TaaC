@@ -2,11 +2,14 @@
 
 **Scope**: `fbcode/neteng/test_infra/dne/taac/abstractions/`.
 
-**Applies to**: optional high-level authoring helpers that compile to the same
-flat TAAC `TestConfig` fields the runner already consumes.
+**Applies to**: optional high-level authoring helpers and device-independent
+behavior abstractions that compile or adapt to the same flat TAAC contracts the
+runner already consumes.
 
-**Purpose**: give factory authors a typed source of truth for topology intent
-without changing TAAC runtime behavior or making flat TAAC authoring obsolete.
+**Purpose**: give factory authors a typed source of truth for topology and test
+behavior intent without making flat TAAC authoring obsolete. Runtime-neutral
+contracts may coordinate that intent, while TAAC-specific execution remains in
+`taac/internal`.
 
 Design reference: `P2421897026`.
 
@@ -21,7 +24,7 @@ TAAC remains flat. A `TestConfig` is still a flat bundle of endpoints, setup
 tasks, teardown tasks, IXIA configs, playbooks, checks, and related thrift
 fields.
 
-DICE is a factory-side authoring layer:
+DICE is an abstraction layer with a factory-side authoring path:
 
 ```text
 LogicalTopology + PhysicalInventory
@@ -37,6 +40,159 @@ into the existing `TestConfig` shape.
 Existing flat factory authoring remains supported. Use an abstraction when it
 removes duplicated topology intent or gives useful validation; do not use it as
 a mandatory wrapper around simple flat configs.
+
+DICE may also define device-independent behavior contracts, such as churn
+specifications, policies, selectors, outcomes, and generic orchestration. These
+contracts must not depend on TAAC runtime handlers, concrete IXIA objects, DUT
+RPC clients, result stores, logging, or `TestCaseFailure`. The concrete adapters
+that satisfy those contracts remain under `taac/internal`; reusable IXIA
+mechanics remain under `taac/ixia`.
+
+The dependency direction is:
+
+```text
+taac/internal/steps
+    -> taac/internal
+        -> taac/abstractions
+        -> taac/ixia
+```
+
+Code under `taac/abstractions` must never import `taac/internal`.
+
+### Churn ownership
+
+Churn code follows the same abstraction-to-runtime boundary:
+
+- `taac/abstractions/churn` owns typed scenarios, policies, selectors,
+  observations, results, action protocols, generic bounded orchestration, and
+  lowering to flat step parameters.
+- `taac/internal/churn` owns TAAC handler adapters, DUT RPC integration,
+  coordination, result publication, recovery decisions, and test-framework
+  failure translation.
+- `taac/ixia` owns reusable vendor-specific operations such as session access,
+  mutations, bounded apply, readback, restoration, and quarantine mechanisms.
+- `taac/internal/steps` remains a thin bridge from `CustomStep` execution into
+  the churn runtime adapter.
+
+The abstraction package describes what a churn scenario requires. Internal and
+vendor adapters decide how those requirements are executed against live test
+infrastructure.
+
+All churn families use the same TAAC playbook renderer. Family-specific
+builders supply typed DICE specifications and action-stage factories:
+
+```python
+create_dice_unified_churn_playbook(spec=attribute_churn_spec(...))
+create_dice_unified_churn_playbook(spec=route_churn_spec(...))
+create_dice_unified_churn_playbook(spec=session_churn_spec(...))
+create_dice_unified_churn_playbook(spec=igp_churn_spec(...))
+create_dice_unified_churn_playbook(spec=multipath_churn_spec(...))
+create_dice_unified_churn_playbook(spec=longevity_churn_spec(...))
+```
+
+The unified renderer owns only common `Playbook` assembly. Each family retains
+its own target selection, stage parameters, verification, and recovery
+behavior. Typed Step and Stage adapters lower the intent to the existing
+`CustomStep` payload; the runtime handler and its IXIA or DUT operations remain
+unchanged.
+
+#### Churn target authority
+
+The Playbook and TestConfig factory inputs are the source of authored churn
+intent. Live device or IXIA state is observation evidence, not an alternate
+configuration source. Current EBB factories supply Open/R route starts, link
+definitions, peer expressions, pool names, counts, and timing values to the
+typed contracts. Those contracts reject invalid geometry before lowering.
+
+Target ownership differs by family:
+
+- Attribute and route churn use explicit topology-authored prefix pools and
+  half-open route windows.
+- Session churn uses explicit peer expressions, session counts, per-cycle
+  widths, and a schedule. The runtime resolves those expressions to IXIA
+  sessions and verifies the requested width.
+- IGP metric churn uses the configured dual-stack plane starts and link
+  definitions. Its runtime captures the live Open/R adjacency and route
+  baseline, applies metric states, and restores and verifies that captured
+  baseline.
+- IGP unresolvable churn uses `start_ipv4s` and `start_ipv6s` as the removal
+  subset. `restore_start_ipv4s` and `restore_start_ipv6s` define the complete
+  reinjection set; the typed contract requires the removal subset to be
+  contained in that restore set. Runtime observations verify the selected
+  FibAgent, hardware, and BGP nexthop state before deletion and after restore.
+- Multipath churn discovers the live installed-path cohort because the exact
+  active next hops are runtime state. The typed contract bounds peer matching,
+  session capacity, cycle geometry, and the minimum acceptable width.
+- Longevity churn fixes the topology-owned Plane-4 pool selection and bounds
+  the wall-clock duration, cadence, and community count.
+
+This split ensures restoration uses the same declared target set that produced
+the mutation while still requiring independent live-state acknowledgement.
+
+### Baseline lifecycle and failure ownership
+
+DICE distinguishes two nested restoration boundaries:
+
+- The **topology baseline** is the shared state established by TestConfig
+  topology setup. The TAAC runner owns this boundary. For an opted-in Playbook,
+  it captures the baseline immediately before Playbook setup and restores it
+  before finalizing the Playbook result, including when setup or execution
+  fails.
+- The **Playbook baseline** is the workload-specific state established after
+  Playbook setup, such as selected paths, advertised prefixes, and route
+  attributes. The churn implementation owns this boundary and restores it
+  after its mutations. For attribute churn, this is an exact restoration of
+  the captured IXIA backing vectors rather than a second full-config import.
+
+Implementation note: `BaselineLifecycle` defines a `PLAYBOOK` scope for nested
+restoration boundaries, but `TaacRunner` does not currently capture or restore
+that scope. In CICD-EBB-10, "Playbook baseline" refers to the attribute-churn
+implementation's own `baseline_snapshot` and cleanup phases. Only the outer
+topology baseline is currently managed by `TaacRunner` through
+`BaselineScope.TOPOLOGY` and `IxiaTopologyBaselineParticipant`.
+
+Successful restoration is reported at each ownership boundary with explicit
+messages:
+
+```text
+[DONE]  Playbook baseline restored and verified | participant=attribute_churn
+[DONE]  Topology baseline restored and verified | participant=ixia_topology | invocation=<id>
+```
+
+The intended lifecycle is:
+
+```text
+topology setup
+  -> capture topology baseline
+  -> Playbook setup
+  -> capture Playbook baseline
+  -> apply and measure churn
+  -> restore and verify Playbook baseline
+  -> Playbook teardown
+  -> restore and verify topology baseline
+  -> next Playbook
+```
+
+Topology restoration uses the explicit `Playbook.restore_topology_baseline`
+opt-in, which defaults to `false`. It does not reuse
+`backup_and_restore_ixia_config`; that legacy flag retains its existing
+behavior for current consumers. CICD-EBB-10 is the first adopter, so landing
+the framework does not enable the topology boundary for every TAAC Playbook.
+
+The two boundaries also have different failure ownership:
+
+- A Playbook-baseline restore failure is a Playbook `FAIL` when the outer
+  topology restore succeeds. The workload failed its own restoration contract,
+  but the shared environment is safe for the next Playbook.
+- A topology-baseline restore timeout, import failure, or verification mismatch
+  is an `INFRA_ERROR`. The runner poisons the lifecycle and blocks subsequent
+  Playbooks because the shared environment can no longer be trusted.
+- If both boundaries fail, `INFRA_ERROR` takes precedence while the original
+  Playbook failure remains attached as diagnostic evidence.
+
+The topology IXIA participant verifies the restored configuration against a
+canonical JSON digest of the captured snapshot. A successful import without an
+exact verification match is therefore still an infrastructure failure.
 
 ---
 
@@ -64,14 +220,36 @@ Factories should import concrete topology instances from:
 
 ```python
 from taac.abstractions.topologies.ebb_full_scale import (
-    EBB_FULL_SCALE_NO_BGPMON,
-    EBB_FULL_SCALE_WITH_BGPMON,
+    EBB_FY26_TOPOLOGY_NO_BGPMON,
+    EBB_FY26_TOPOLOGY_WITH_BGPMON,
 )
 ```
 
 Do not add an `abstractions/routing/` layer. Routing-specific behavior belongs
 in concrete topology or compiler names, such as `ebb_full_scale.py` and
 `EosBgpCppCompiler`.
+
+### BGP slow-peer control
+
+An IXIA BGP device group can opt in to slow-peer behavior:
+
+```python
+DeviceGroupSpec(
+    name="dg_ibgp_v4_dc_p1",
+    ...,
+    slow_peer=BgpSlowPeerConfig(),
+)
+```
+
+`BgpSlowPeerConfig()` uses a 1,500-byte TCP receive window. Set
+`tcp_window_size_bytes` from 1 through 65,535 bytes to use a different value.
+The setting applies to all BGP peers in the device group. DICE does not support
+a peer-level override inside one device group.
+
+Leave `slow_peer` unset for normal IXIA behavior. DICE does not write a TCP
+window for a normal device group because the NGPF default is not a stable
+contract. The setting is independent of DUT Update Group configuration and
+can be used by any DICE logical topology.
 
 ---
 
@@ -161,6 +339,13 @@ Adjacencies are NOT learned — they are injected into KvStore via
 graph and programs FibAgent normally. From FibAgent's perspective the
 synthetic routes are indistinguishable from real ones.
 
+The EBB full-scale TestConfig factory also translates `OpenRMode.STANDALONE`
+into the `testbed_isolation:bypass` lifecycle-policy tag. The setup
+orchestrator honors that tag like an explicit `--skip-testbed-isolation`
+request during both setup and teardown. This preserves the physical helper
+link that brings up the synthetic OpenR Port-Channel without relying on DUT
+hostnames or callers remembering an extra CLI flag.
+
 ### 4.3. Component call-chain
 
 How each `PhysicalInventory` field is consumed by the STANDALONE
@@ -183,7 +368,90 @@ moves platform realization behind the EOS/BGP++ backend and prohibits
 `abstractions/**` from importing `testconfigs/**`. Other backends implementing
 STANDALONE must satisfy the same field-to-role mapping above.
 
-### 4.4. Single-ownership invariant
+### 4.4. Injection scale and ownership
+
+How much synthetic reachability a STANDALONE topology injects is intent, not a
+renderer constant. Three types carry it, and each owns exactly one decision:
+
+| Type | Owns | Lives in |
+|---|---|---|
+| `OpenRInjectionScale` | How many synthetic nodes per range, and their address stride. No addresses. | `abstractions/topology/model.py` |
+| `OpenRInjectionPlan` | A resolved injection: the per-range start addresses plus that scale. | `abstractions/topology/model.py` |
+| `OpenRInjectionExpansion` | The exact KvStore keys and prefixes one plan owns on one DUT. Pure; no device. | `abstractions/topology/model.py` |
+
+A family-level profile sits above them and is owned by the family, not by
+DICE. EBB's is `EbbScaleProfile` in `topologies/ebb_full_scale.py`, which
+expresses a fiscal-year fleet target as HE sites per DC plane:
+
+| Profile | HE sites per range | Ranges | Synthetic nodes | Injected prefixes | KvStore keys |
+|---|---|---|---|---|---|
+| `EBB_FY26_SCALE` | 63 | 4 | 252 | 504 (252 v4 /32 + 252 v6 /128) | 757 |
+| `EBB_FY27_SCALE` | 100 | 4 | 400 | 800 (400 v4 /32 + 400 v6 /128) | 1,201 |
+
+Every scheduled EBB binding runs `EBB_FY26_SCALE`. `EBB_FY27_SCALE` is defined
+and unit-tested but deliberately unscheduled, so the FY27 target is a
+reviewable number before a testbed is committed to it. The key total is
+`1 + 3n` for `n` synthetic nodes: one adjacency database per node, one v4 and
+one v6 prefix database per node, and the owner's own `adj:<DUT>` database
+listing all of them.
+
+**Addresses come from the bound topology, never from a constant.** A device
+group declares `openr_injection_range_ordinal` to say that its advertised
+route next hops form range N. `BoundTopology.resolve_openr_injection_plan()`
+reads each range's start back out of the bound advertisements and pairs it
+with the scale from `RoutingDeviceConfig.openr_injection_scale`. Nothing reads
+IXIA session peer addresses, and a group that declares no ordinal contributes
+nothing — which is how EBB's MP planes stay out of the injection while its
+four DC planes define it. Expressing the advertised and injected sets
+separately is what previously let a secondary chassis advertise one next-hop
+space while injecting another: the routes still arrive and still sit in the
+RIB, so nothing errors and the shadow RIB silently collapses.
+
+**Advertised next hops are evidence, not input.** The resolver requires every
+advertised next hop of every declared range to fall inside the injected host
+routes, and rejects the topology otherwise. At FY26 that is 62 emulated peers
+per plane covered by 63 injected routes, and at FY27 100 covered by exactly
+100. The check only ever reads the bound advertisements; it never widens the
+injection to make a topology pass.
+
+**The advertised population is carried separately from the injection.** The
+resolver records how many leading rows of each range the peers advertise as
+`OpenRInjectionPlan.advertised_pnh_count`, rejecting gaps and ranges that
+disagree. Anything that observes injected rows through BGP must be bounded by
+it, never by `count`: FY26 injects 63 rows per range for 62 advertised next
+hops, so row 62 carries no BGP path, while FY27 injects exactly its 100
+advertised rows, so rows 0-99 all do.
+
+**Setup and teardown are rendered from one plan.** The same resolved
+`OpenRInjectionPlan` produces the `inject` task and the `delete` task, so the
+withdrawal cannot address a different range, count, or stride than the
+injection did. The compiler and the playbook factories both resolve it through
+`resolve_validated_openr_injection_plan()`, so an unusable range declaration
+fails as one `unresolvable_openr_injection` topology issue whichever layer
+reaches it first.
+
+Scale parameterization does **not** make teardown delete every injected
+KvStore key, and nothing here should be read as claiming it does. The
+withdrawal task passes no `delete_count`, so the runtime applies its own
+default; the effective cleanup boundary is still stopping the Open/R daemon
+and tearing down the port channel, exactly as before. Making teardown
+withdraw each injected key explicitly is separate work with its own
+behavioral risk, and is deliberately not part of this parameterization.
+
+Two capacity notes, because both have been misapplied to this path:
+
+- TAAC's guard of 500 DUT-side addresses per EOS interface and AFI
+  (`_EOS_SECONDARY_IP_LIMIT_PER_INTERFACE_AFI` in `topology/binding.py`)
+  constrains *interface addressing*. It is a TAAC binding check, not a
+  documented Arista EOS limit. It has no bearing on KvStore injection:
+  synthetic nodes carry their prefixes in KvStore, not as addresses on an
+  interface, so the injected scale is not bounded by it.
+- No KvStore capacity ceiling is asserted here. The FY27 figures above are
+  what the model resolves to, not an observed limit. Any claim about how much
+  KvStore content a DUT sustains needs measurement on hardware, and none has
+  been taken for this change.
+
+### 4.5. Single-ownership invariant
 
 Framework contract enforced by every consumer of `OpenRStandaloneLink`:
 
@@ -202,7 +470,7 @@ for `port_channel_id` (e.g. the EBB BAG family's `po1003NN → bag0NN`
 rule). Those conventions live in the owning testbed module's docstring,
 not here.
 
-### 4.5. Enforcement
+### 4.6. Enforcement
 
 `OpenRStandaloneLink.__post_init__` in `abstractions/topology/model.py`
 rejects, at import time:
@@ -291,7 +559,7 @@ factory has durable authored, bound, compiled, and catalog assertions.
 
 The checked production topologies are:
 
-- `EBB_FULL_SCALE_NO_BGPMON` and `EBB_FULL_SCALE_WITH_BGPMON`
+- `EBB_FY26_TOPOLOGY_NO_BGPMON` and `EBB_FY26_TOPOLOGY_WITH_BGPMON`
 - `UG_NEW_PEER_JOIN` and `UG_BACKPRESSURE`
 - `IPV6_UPDATE_PACKING`, `EGRESS_PEER_SCALE`, and `BOUNDED_ECMP`
 

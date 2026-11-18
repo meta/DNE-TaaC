@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import typing as t
 from dataclasses import dataclass
 
@@ -18,25 +19,30 @@ from taac.abstractions.topology.attributes import (
 )
 from taac.abstractions.topology.model import (
     BgpPeerGroup,
+    BgpSlowPeerConfig,
     DeviceGroupPartition,
     IxiaDeviceGroupChild,
     IxiaEndpointPortLabelStyle,
     IxiaPortAssignment,
     OpenRMode,
+    TaskCompatibilityProfile,
 )
 from taac.abstractions.topology.prefix import (
     NextHopDistribution,
     NextHopIntent,
     NextHopMode,
     PeerPrefixDistribution,
+    RouteScaleMode,
     SelfNextHopRealization,
 )
 
 if t.TYPE_CHECKING:
     from taac.abstractions.topology.model import (
+        BoundTopology,
         DeviceGroupSpec,
         EndpointSpec,
         LogicalTopology,
+        OpenRInjectionPlan,
         PrefixAdvertisement,
         PrefixPool,
         PrefixSet,
@@ -46,6 +52,7 @@ if t.TYPE_CHECKING:
 
 
 VALID_AFIS = frozenset({"v4", "v6"})
+_DEVICE_STATE_GUARD_NAMESPACE = re.compile(r"[A-Za-z0-9_.-]+")
 VALID_ENDPOINT_REQUIRED_OS = frozenset({"eos", "fboss", "ixia"})
 VALID_ENDPOINT_SETUP_MODES = frozenset({"full", "preloaded", "skip", "verify_only"})
 VALID_ENDPOINT_KINDS = frozenset({"dut", "ixia", "traffic", "trafficgen"})
@@ -62,6 +69,36 @@ VALID_LEGACY_PROFILES = frozenset(
 )
 IXIA_MAX_4BYTE_ASN = (1 << 32) - 1
 BGP_STANDARD_COMMUNITY_FIELD_MAX = (1 << 16) - 1
+_THRIFT_I32_MAX = (1 << 31) - 1
+
+
+def validate_fibagent_bgp_nhg_watermarks(
+    high: int | None,
+    low: int | None,
+) -> tuple[int, int] | None:
+    if high is None and low is None:
+        return None
+    if high is None or low is None:
+        raise ValueError("FibAgentBgp NHG watermarks must be supplied together")
+    if (
+        isinstance(high, bool)
+        or not isinstance(high, int)
+        or isinstance(low, bool)
+        or not isinstance(low, int)
+    ):
+        raise ValueError("FibAgentBgp NHG watermarks must be supplied as integers")
+    if (
+        low <= 0
+        or high <= 0
+        or low > high
+        or high > _THRIFT_I32_MAX
+        or (high == _THRIFT_I32_MAX and low != _THRIFT_I32_MAX)
+    ):
+        raise ValueError(
+            "FibAgentBgp NHG watermarks require 0 < low <= high <= INT32_MAX; "
+            "the INT32_MAX unlimited sentinel must be supplied as INT32_MAX/INT32_MAX"
+        )
+    return high, low
 
 
 @dataclass(frozen=True)
@@ -92,6 +129,34 @@ def validate_logical_topology(logical_topology: LogicalTopology) -> None:
     issues = collect_logical_topology_issues(logical_topology)
     if issues:
         raise TopologyValidationError(logical_topology.name or "<unnamed>", issues)
+
+
+def resolve_validated_openr_injection_plan(
+    bound: BoundTopology,
+) -> OpenRInjectionPlan | None:
+    """Resolve ``bound``'s Open/R injection, failing as a topology error.
+
+    The compiler and the playbook factories both read the plan, and either can
+    be first to resolve it, so both resolve through here and an unusable range
+    declaration fails the same way whichever layer reaches it.
+
+    Raises:
+        TopologyValidationError: The declared injection ranges cannot be
+            resolved; the issue message names the offending declaration.
+    """
+    try:
+        return bound.resolve_openr_injection_plan()
+    except ValueError as error:
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path="device_config.openr_injection_scale",
+                    code="unresolvable_openr_injection",
+                    message=str(error),
+                )
+            ],
+        ) from error
 
 
 def collect_logical_topology_issues(
@@ -166,6 +231,24 @@ def _validate_logical_topology_identity(
                 f"unsupported legacy profile {logical_topology.legacy_profile!r}",
             )
         )
+    compatibility_profile = logical_topology.task_compatibility_profile
+    if compatibility_profile is not None:
+        if not isinstance(compatibility_profile, TaskCompatibilityProfile):
+            issues.append(
+                _issue(
+                    "task_compatibility_profile",
+                    "invalid_task_compatibility_profile",
+                    "task compatibility profile must be typed",
+                )
+            )
+        elif logical_topology.legacy_profile is not None:
+            issues.append(
+                _issue(
+                    "task_compatibility_profile",
+                    "legacy_task_compatibility_conflict",
+                    "task compatibility projection requires a profile-free topology",
+                )
+            )
 
 
 def _validate_logical_topology_endpoints(
@@ -324,10 +407,13 @@ def _validate_prefix_set(
                 "prefix_step must be positive and in the prefix-set AFI",
             )
         )
+    parents = _validated_prefix_parents(
+        source, parsed_parent, prefix_set.afi, path, issues
+    )
     span = _validated_prefix_span(source, path, issues)
     if span is None:
         return
-    if parsed_start is None or parsed_parent is None or step is None:
+    if parsed_start is None or parents is None or step is None:
         return
     block_size = 1 << (parsed_start.max_prefixlen - source.prefix_length)
     if int(parsed_start) % block_size or step % block_size:
@@ -348,9 +434,9 @@ def _validate_prefix_set(
                 "formulaic prefix set overflows its AFI",
             )
         )
-    elif (
-        parsed_start not in parsed_parent
-        or ipaddress.ip_address(terminal) not in parsed_parent
+    elif not any(
+        int(first) <= int(parsed_start) and terminal <= int(last)
+        for first, last in parents
     ):
         issues.append(
             _issue(
@@ -359,6 +445,72 @@ def _validate_prefix_set(
                 "formulaic prefix set is not contained by parent_network",
             )
         )
+
+
+def _validated_prefix_parents(
+    source: t.Any,
+    parsed_parent: ipaddress.IPv4Network | ipaddress.IPv6Network | None,
+    afi: str,
+    path: str,
+    issues: list[ValidationIssue],
+) -> list[tuple[t.Any, t.Any]] | None:
+    """Merge the parent and its extensions into one contiguous address range."""
+    extensions = source.extension_parent_networks
+    if not isinstance(extensions, tuple) or not all(
+        isinstance(network, str) for network in extensions
+    ):
+        issues.append(
+            _issue(
+                f"{path}.source.extension_parent_networks",
+                "invalid_parent_network",
+                "extension_parent_networks must be a tuple of network strings",
+            )
+        )
+        return None
+    networks = [parsed_parent]
+    for index, network in enumerate(extensions):
+        parsed = _parse_network(network, afi)
+        if parsed is None:
+            issues.append(
+                _issue(
+                    f"{path}.source.extension_parent_networks[{index}]",
+                    "invalid_parent_network",
+                    "extension parent must be a network in the prefix-set AFI",
+                )
+            )
+        networks.append(parsed)
+    if any(network is None for network in networks):
+        return None
+    ordered = sorted(
+        t.cast(list[ipaddress.IPv4Network | ipaddress.IPv6Network], networks),
+        key=lambda network: int(network.network_address),
+    )
+    merged: list[tuple[t.Any, t.Any]] = []
+    for network in ordered:
+        if merged and int(network.network_address) <= int(merged[-1][1]):
+            issues.append(
+                _issue(
+                    f"{path}.source.extension_parent_networks",
+                    "overlapping_parent_networks",
+                    f"parent networks overlap at {network}",
+                )
+            )
+            return None
+        if merged and int(network.network_address) > int(merged[-1][1]) + 1:
+            issues.append(
+                _issue(
+                    f"{path}.source.extension_parent_networks",
+                    "non_contiguous_parent_networks",
+                    f"parent networks must form one contiguous range; {network} "
+                    f"starts after a gap following {merged[-1][1]}",
+                )
+            )
+            return None
+        if merged:
+            merged[-1] = (merged[-1][0], network.broadcast_address)
+        else:
+            merged.append((network.network_address, network.broadcast_address))
+    return merged
 
 
 def _validated_prefix_span(
@@ -522,6 +674,14 @@ def _validate_prefix_advertisement_geometry(
                 f"{path}.allocation.network_group_index",
                 "invalid_network_group_index",
                 "network_group_index must be a non-negative integer",
+            )
+        )
+    if not isinstance(allocation.route_scale_mode, RouteScaleMode):
+        issues.append(
+            _issue(
+                f"{path}.allocation.route_scale_mode",
+                "invalid_route_scale_mode",
+                "route_scale_mode must be WINDOWED or FLAT",
             )
         )
     membership = advertisement.membership
@@ -1033,6 +1193,7 @@ def _validate_device_group(
     )
     _validate_device_group_routing_driver(dg, path, issues)
     _validate_device_group_port_assignment(dg, path, endpoint_by_name, issues)
+    _validate_device_group_slow_peer(dg, path, endpoint_by_name, issues)
     _validate_device_group_partition(dg, path, issues)
     _validate_ixia_children(dg, path, endpoint_by_name, issues)
     _validate_route_attribute_pool(
@@ -1271,6 +1432,55 @@ def _validate_device_group_port_assignment(
         )
 
 
+def _device_group_is_ixia_facing(
+    dg: DeviceGroupSpec,
+    endpoint_by_name: t.Mapping[str, EndpointSpec],
+) -> bool:
+    # IXIA children inherit their parent endpoints and cannot declare endpoints.
+    return any(
+        _endpoint_is_ixia(endpoint_by_name.get(endpoint_name))
+        for endpoint_name in (dg.a_endpoint, dg.z_endpoint)
+    )
+
+
+def _validate_device_group_slow_peer(
+    dg: DeviceGroupSpec,
+    path: str,
+    endpoint_by_name: t.Mapping[str, EndpointSpec],
+    issues: list[ValidationIssue],
+) -> None:
+    if dg.slow_peer is None:
+        return
+    if not isinstance(dg.slow_peer, BgpSlowPeerConfig):
+        issues.append(
+            _issue(
+                f"{path}.slow_peer",
+                "invalid_slow_peer_config",
+                "slow_peer must be a BgpSlowPeerConfig",
+            )
+        )
+        return
+    if all(
+        endpoint_name in endpoint_by_name
+        for endpoint_name in (dg.a_endpoint, dg.z_endpoint)
+    ) and not _device_group_is_ixia_facing(dg, endpoint_by_name):
+        issues.append(
+            _issue(
+                f"{path}.slow_peer",
+                "slow_peer_requires_ixia",
+                "slow_peer requires an IXIA-backed device group",
+            )
+        )
+    if dg.peer_group is None:
+        issues.append(
+            _issue(
+                f"{path}.slow_peer",
+                "slow_peer_requires_bgp",
+                "slow_peer requires a BGP peer group",
+            )
+        )
+
+
 def _validate_ixia_children(
     dg: DeviceGroupSpec,
     path: str,
@@ -1318,11 +1528,11 @@ def _validate_ixia_child_indices(
 ) -> None:
     owner_by_index: dict[int, int] = {}
     for child_index, child in enumerate(parent.ixia_children):
-        if not isinstance(child, IxiaDeviceGroupChild) or not _is_non_negative_int(
-            child.legacy_ixia_device_group_index
-        ):
+        if not isinstance(child, IxiaDeviceGroupChild):
             continue
         index = child.legacy_ixia_device_group_index
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            continue
         prior_child_index = owner_by_index.get(index)
         if prior_child_index is not None:
             issues.append(
@@ -1348,11 +1558,7 @@ def _validate_ixia_child_parent(
     endpoint_by_name: t.Mapping[str, EndpointSpec],
     issues: list[ValidationIssue],
 ) -> None:
-    ixia_facing = any(
-        _endpoint_is_ixia(endpoint_by_name.get(endpoint_name))
-        for endpoint_name in (dg.a_endpoint, dg.z_endpoint)
-    )
-    if not ixia_facing and all(
+    if not _device_group_is_ixia_facing(dg, endpoint_by_name) and all(
         endpoint_name in endpoint_by_name
         for endpoint_name in (dg.a_endpoint, dg.z_endpoint)
     ):
@@ -1384,28 +1590,12 @@ def _validate_ixia_child_metadata(
     parent: DeviceGroupSpec,
     issues: list[ValidationIssue],
 ) -> None:
+    _validate_ixia_child_name(child, path, issues)
     for field_name in (
-        "name",
         "legacy_ixia_device_group_name",
         "legacy_ixia_bgp_peer_name",
     ):
-        value = getattr(child, field_name)
-        if not isinstance(value, str) or not value.strip():
-            issues.append(
-                _issue(
-                    f"{path}.{field_name}",
-                    f"ixia_child_{field_name}_required",
-                    f"IXIA child {field_name} must be a non-empty string",
-                )
-            )
-        elif value != value.strip():
-            issues.append(
-                _issue(
-                    f"{path}.{field_name}",
-                    f"invalid_ixia_child_{field_name}",
-                    f"IXIA child {field_name} cannot contain surrounding whitespace",
-                )
-            )
+        _validate_optional_ixia_child_name(child, path, field_name, issues)
     prefix_pool_name = child.legacy_ixia_prefix_pool_name
     if prefix_pool_name is not None and (
         not isinstance(prefix_pool_name, str)
@@ -1430,7 +1620,6 @@ def _validate_ixia_child_metadata(
     for field_name in (
         "ordinal",
         "start_index",
-        "legacy_ixia_device_group_index",
     ):
         if not _is_non_negative_int(getattr(child, field_name)):
             issues.append(
@@ -1440,12 +1629,72 @@ def _validate_ixia_child_metadata(
                     f"IXIA child {field_name} must be a non-negative integer",
                 )
             )
+    if child.legacy_ixia_device_group_index is not None and not _is_non_negative_int(
+        child.legacy_ixia_device_group_index
+    ):
+        issues.append(
+            _issue(
+                f"{path}.legacy_ixia_device_group_index",
+                "invalid_ixia_child_legacy_ixia_device_group_index",
+                "legacy IXIA child device-group index must be non-negative",
+            )
+        )
     if not _is_non_negative_int(child.peer_count) or child.peer_count == 0:
         issues.append(
             _issue(
                 f"{path}.peer_count",
                 "invalid_ixia_child_peer_count",
                 "IXIA child peer_count must be a positive integer",
+            )
+        )
+
+
+def _validate_ixia_child_name(
+    child: IxiaDeviceGroupChild,
+    path: str,
+    issues: list[ValidationIssue],
+) -> None:
+    if not isinstance(child.name, str) or not child.name.strip():
+        issues.append(
+            _issue(
+                f"{path}.name",
+                "ixia_child_name_required",
+                "IXIA child name must be a non-empty string",
+            )
+        )
+    elif child.name != child.name.strip():
+        issues.append(
+            _issue(
+                f"{path}.name",
+                "invalid_ixia_child_name",
+                "IXIA child name cannot contain surrounding whitespace",
+            )
+        )
+
+
+def _validate_optional_ixia_child_name(
+    child: IxiaDeviceGroupChild,
+    path: str,
+    field_name: str,
+    issues: list[ValidationIssue],
+) -> None:
+    value = getattr(child, field_name)
+    if value is None:
+        return
+    if not isinstance(value, str) or not value.strip():
+        issues.append(
+            _issue(
+                f"{path}.{field_name}",
+                f"invalid_ixia_child_{field_name}",
+                f"IXIA child {field_name} must be a non-empty string",
+            )
+        )
+    elif value != value.strip():
+        issues.append(
+            _issue(
+                f"{path}.{field_name}",
+                f"invalid_ixia_child_{field_name}",
+                f"IXIA child {field_name} cannot contain surrounding whitespace",
             )
         )
 
@@ -1710,6 +1959,7 @@ def _partition_advertisement_geometry(dg: DeviceGroupSpec) -> tuple[t.Any, ...]:
             advertisement.prefix_set,
             advertisement.allocation.prefixes_per_peer,
             advertisement.allocation.peer_distribution,
+            advertisement.allocation.route_scale_mode,
         )
         for advertisement in dg.prefix_advertisements
     )
@@ -2313,6 +2563,79 @@ def collect_routing_device_config_issues(
     return issues
 
 
+def _validate_fibagent_bgp_nhg_watermarks(
+    config: RoutingDeviceConfig,
+    path: str,
+    issues: list[ValidationIssue],
+) -> None:
+    high = config.fibagent_bgp_nhg_watermark_high
+    low = config.fibagent_bgp_nhg_watermark_low
+    if (high is None) != (low is None):
+        issues.append(
+            _issue(
+                f"{path}.fibagent_bgp_nhg_watermark",
+                "incomplete_nhg_watermark",
+                "FibAgentBgp NHG high and low watermarks must be set together",
+            )
+        )
+        return
+    try:
+        validate_fibagent_bgp_nhg_watermarks(high, low)
+    except ValueError:
+        issues.append(
+            _issue(
+                f"{path}.fibagent_bgp_nhg_watermark",
+                "invalid_nhg_watermark",
+                "FibAgentBgp NHG watermarks require integer "
+                "0 < low <= high <= INT32_MAX; the INT32_MAX unlimited "
+                "sentinel must be supplied as INT32_MAX/INT32_MAX",
+            )
+        )
+
+
+def _validate_bgp_total_path_limit(
+    config: RoutingDeviceConfig,
+    path: str,
+    issues: list[ValidationIssue],
+) -> None:
+    limit = config.bgp_total_path_limit
+    if limit is None:
+        return
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        issues.append(
+            _issue(
+                f"{path}.bgp_total_path_limit",
+                "invalid_total_path_limit",
+                "bgp_total_path_limit must be None or a positive integer",
+            )
+        )
+
+
+def is_valid_device_state_guard_namespace(value: object) -> bool:
+    """Whether ``value`` can prefix ``:``-joined lifecycle operation ids."""
+    return isinstance(value, str) and (
+        _DEVICE_STATE_GUARD_NAMESPACE.fullmatch(value) is not None
+    )
+
+
+def _validate_device_state_guard_namespace(
+    config: RoutingDeviceConfig,
+    path: str,
+    issues: list[ValidationIssue],
+) -> None:
+    namespace = config.device_state_guard_namespace
+    if namespace is None or is_valid_device_state_guard_namespace(namespace):
+        return
+    issues.append(
+        _issue(
+            f"{path}.device_state_guard_namespace",
+            "invalid_device_state_guard_namespace",
+            "device_state_guard_namespace must be None or a nonempty string of "
+            "ASCII letters, digits, '_', '.' or '-'",
+        )
+    )
+
+
 def _validate_routing_device_config(
     config: RoutingDeviceConfig,
     path: str,
@@ -2339,6 +2662,25 @@ def _validate_routing_device_config(
                 "openr_mode must be an OpenRMode member",
             )
         )
+    logging_config_override = config.bgpcpp_logging_config_override
+    if logging_config_override is not None and (
+        not isinstance(logging_config_override, str)
+        or not logging_config_override
+        or any(char in logging_config_override for char in "\x00\r\n")
+    ):
+        issues.append(
+            _issue(
+                f"{path}.bgpcpp_logging_config_override",
+                "invalid_logging_config",
+                (
+                    "bgpcpp_logging_config_override must be None or a non-empty "
+                    "single-line string"
+                ),
+            )
+        )
+    _validate_fibagent_bgp_nhg_watermarks(config, path, issues)
+    _validate_bgp_total_path_limit(config, path, issues)
+    _validate_device_state_guard_namespace(config, path, issues)
     for attr in ("route_limit", "prefix_limit", "per_peer_max_route_limit"):
         value = getattr(config, attr)
         if isinstance(value, bool):

@@ -1,4 +1,7 @@
 # pyre-unsafe
+import dataclasses
+import typing as t
+
 from taac.constants import Gigabyte
 from taac.health_checks.healthcheck_definitions import (
     create_bgp_convergence_check,
@@ -21,10 +24,12 @@ from taac.health_checks.healthcheck_definitions import (
     create_system_cpu_load_average_check,
     create_unclean_exit_check,
 )
+from taac.health_checks.retry_policy import get_retry_kwargs
 from taac.utils.hardware_capacity_utils import (
     get_postcheck_thresholds,
     get_precheck_thresholds,
 )
+from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config.types import PointInTimeHealthCheck, SnapshotHealthCheck
 
 _MEMORY_THRESHOLD_BY_SERVICE_PRECHECK = {
@@ -105,19 +110,85 @@ _BGP_SESSION_RETRY_DELAY_SECONDS = 10.0
 _BGP_CONVERGENCE_THRESHOLD_SECONDS = 600
 
 
+def bgp_mon_ignore_prefix(bgp_mon_parent_network: str | None = None) -> str:
+    """Return the BGP-MON parent prefix these checks exclude.
+
+    The monitors sit on a chassis-specific parent network, so the prefix is
+    derived rather than constant. Deriving it in one place is the point: three
+    check factories need the same value, and a copy that drifts would exclude
+    the wrong subnet, silently changing what every standard check counts. That
+    is the same class of duplication that put ixia11 next hops on ixia03.
+
+    Args:
+        bgp_mon_parent_network: Chassis BGP-MON parent network. None selects
+            the ixia11 default, matching the behaviour of the call sites this
+            replaced.
+
+    Returns:
+        The ``/80`` parent prefix to ignore.
+    """
+    # Deferred for the same reason as the call sites this replaced: importing
+    # bgp_ebb_constants at module scope closes an import cycle that only
+    # surfaces under TAAC_OSS=1.
+    from taac.testconfigs.routing.util.bgp_ebb_constants import (
+        IXIA_BGP_MON_IC_PARENT_NETWORK,
+    )
+
+    return f"{bgp_mon_parent_network or IXIA_BGP_MON_IC_PARENT_NETWORK}::/80"
+
+
+@dataclasses.dataclass(frozen=True)
+class BgpMonScope:
+    """Which BGP-MON peers the standard checks exclude, and on which chassis.
+
+    ``exclude`` and ``parent_network`` are meaningless apart: excluding without
+    knowing the chassis excludes the wrong subnet, and naming a chassis while
+    not excluding does nothing. Passing them as two independent kwargs made it
+    possible to thread one and forget the other -- which is exactly what
+    happened in ``_soak_no_precheck``, whose postchecks took ``exclude_bgp_mon``
+    but not the parent network. Binding them into one value makes that class of
+    omission unrepresentable, and means a future chassis-varying field is added
+    here rather than at every call site.
+    """
+
+    exclude: bool = True
+    parent_network: str | None = None
+
+    def ignore_prefixes(self) -> list[str] | None:
+        """Return the ``parent_prefixes_to_ignore`` entries for this scope.
+
+        Returns:
+            A single-entry list holding the chassis BGP-MON parent prefix, or
+            None when BGP-MON peers are not excluded (the checks' own "no
+            prefixes to ignore" sentinel).
+        """
+        return [bgp_mon_ignore_prefix(self.parent_network)] if self.exclude else None
+
+
+# Shared default for the three factories. Hoisted to module scope because a
+# constructor call in an argument default is evaluated once at definition time
+# (FLAKE8 B008); BgpMonScope is frozen, so one shared instance is safe.
+DEFAULT_BGP_MON_SCOPE = BgpMonScope()
+
+
 def create_standard_prechecks(
     peergroup_ibgp_v6: str,
     peergroup_ibgp_v4: str,
     precheck_thresholds=None,
-    expected_established_sessions: int = 0,
-    cpu_baseline: float = 4.0,
+    expected_established_sessions: int | None = 0,
+    cpu_baseline: float = 5.0,
+    check_cpu_load_average: bool = True,
     check_ibgp_pnh: bool = False,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
     check_bgp_convergence: bool = True,
     check_hardware_capacity: bool = True,
     rp_file_path: str | None = None,
     bgp_session_retry_count: int = _BGP_SESSION_RETRY_COUNT,
     bgp_session_retry_delay_seconds: float = _BGP_SESSION_RETRY_DELAY_SECONDS,
-    exclude_bgp_mon: bool = True,
+    bgp_mon: BgpMonScope = DEFAULT_BGP_MON_SCOPE,
     rib_fib_precheck_json_params: dict | None = None,
     rib_fib_precheck_retry_count: int = _RIB_FIB_RETRY_COUNT,
     rib_fib_precheck_retry_delay_seconds: int = _RIB_FIB_RETRY_DELAY_SECONDS,
@@ -134,13 +205,30 @@ def create_standard_prechecks(
         peergroup_ibgp_v4: IPv4 iBGP peer group name
         precheck_thresholds: Hardware capacity thresholds (optional)
         expected_established_sessions: Expected number of established BGP sessions
-        cpu_baseline: CPU load average baseline threshold
+        cpu_baseline: CPU load average baseline threshold. The gate fails when
+            the 1, 5 OR 15-minute average exceeds it, so in practice the
+            volatile 1-minute figure decides. Applies to the callers that do
+            not pass a value of their own, currently the churn/storm and
+            drain-undrain profiles; the standard-shape profiles thread 8.0
+            (6.0 for runtime update) through ProfileContext. Raised from 4.0
+            because the gate samples immediately after setup has converged the
+            full session count, so the 1-minute average still carries that
+            convergence and 4.0 left no headroom for it.
+        check_cpu_load_average: Add the startup CPU load-average gate. Disable
+            when resource utilization is collected by non-terminating periodic
+            telemetry instead.
         check_ibgp_pnh: Enable iBGP PNH metric check (only for Open/R profiles)
+        ibgp_pnh_start_ipv4s: IPv4 route-range starts from the bound topology.
+        ibgp_pnh_start_ipv6s: IPv6 route-range starts from the bound topology.
+        ibgp_pnh_count: Synthetic nodes per range, from the resolved Open/R
+            injection plan, so readiness covers the whole injected range
+            rather than its first address.
+        ibgp_pnh_step: Address stride within a range, from the same plan.
         check_bgp_convergence: Add the BGP++ initialization-events convergence
             precheck (default True). Asserts the device reached INITIALIZED
             within the convergence threshold (self-waits up to it). The strict
-            canonical-sequence and EOR-timer-expiry assertions are temporarily
-            disabled pending the BGP++ cold-start EOR-timer fix.
+            canonical-sequence and EOR-timer-expiry assertions stay relaxed;
+            see the comment at the check for why.
         check_hardware_capacity: Add the startup FEC/ECMP capacity gate.
             Defaults to True for existing EBB callers. Set False when the
             qualification case does not define hardware-capacity preconditions.
@@ -152,9 +240,10 @@ def create_standard_prechecks(
         bgp_session_retry_delay_seconds: Base delay in seconds before the
             first retry (default 10.0). Subsequent delays grow by 1.5x:
             10s, 15s, 22.5s.
-        exclude_bgp_mon: When True, exclude BGP_MON peers from session
-            establish checks via ``parent_prefixes_to_ignore``. BGP_MON IXIA peers
-            flap frequently and cause false health check failures.
+        bgp_mon: Which BGP-MON peers to exclude from session establish checks
+            via ``parent_prefixes_to_ignore``, and on which chassis. BGP_MON
+            IXIA peers flap frequently and cause false health check failures,
+            so the default excludes them on the default chassis.
         rib_fib_precheck_json_params: Optional extra params forwarded to the
             RIB-FIB consistency precheck (e.g. parent prefixes to ignore).
             Mirrors ``rib_fib_json_params`` on ``create_standard_postchecks``.
@@ -191,16 +280,10 @@ def create_standard_prechecks(
     # playbook_definitions. Deferring to call-time breaks the cycle. This only
     # surfaced under TAAC_OSS=1, where the internal-module load order that
     # otherwise masks the cycle is absent.
-    from taac.testconfigs.routing.util.bgp_ebb_constants import (
-        IXIA_BGP_MON_IC_PARENT_NETWORK,
-    )
-
     if precheck_thresholds is None:
         precheck_thresholds = get_precheck_thresholds()
 
-    bgp_mon_ignore = (
-        [f"{IXIA_BGP_MON_IC_PARENT_NETWORK}::/80"] if exclude_bgp_mon else None
-    )
+    bgp_mon_ignore = bgp_mon.ignore_prefixes()
 
     prechecks = [
         # Pre-condition 1: Verify no established BGP sessions between DUT and traffic generators
@@ -211,10 +294,16 @@ def create_standard_prechecks(
             retry_count=bgp_session_retry_count,
             retry_delay_seconds=bgp_session_retry_delay_seconds,
         ),
-        # Pre-condition 2: Confirm CPU load-average is stable and within baseline levels
-        create_system_cpu_load_average_check(
-            baseline=cpu_baseline,
-            check_id="startup_cpu_load_average_baseline",
+        *(
+            [
+                # Pre-condition 2: Confirm CPU load-average is stable and within baseline levels
+                create_system_cpu_load_average_check(
+                    baseline=cpu_baseline,
+                    check_id="startup_cpu_load_average_baseline",
+                )
+            ]
+            if check_cpu_load_average
+            else []
         ),
         # Pre-condition 3: Make sure that GR is not enabled on iBGP-mesh (IPv6)
         create_bgp_graceful_restart_check(
@@ -241,6 +330,7 @@ def create_standard_prechecks(
                 watermark_delta_threshold=precheck_thresholds.watermark_delta_threshold,
                 check_watermarks=precheck_thresholds.check_watermarks,
                 check_id="startup_hardware_capacity_baseline",
+                **get_retry_kwargs(hc_types.CheckName.HARDWARE_CAPACITY_CHECK),
             )
         )
 
@@ -248,12 +338,13 @@ def create_standard_prechecks(
     # device reached INITIALIZED within the threshold. Self-waits up to the
     # threshold for post-restart convergence.
     #
-    # The strict canonical-sequence and EOR-timer-expiry assertions are
-    # TEMPORARILY relaxed (fail_on_eor_expired/validate_sequence=False): on a
-    # cold start the EOR timer is started prematurely at PeerManager startup
-    # (rather than on first session up), so it always expires before all peers'
-    # EoRs arrive — emitting EOR_TIMER_EXPIRED plus an out-of-order late
-    # ALL_EOR_RECEIVED. Re-enable both once the BGP++ EOR-timer fix lands.
+    # The strict canonical-sequence and EOR-timer-expiry assertions are relaxed
+    # (fail_on_eor_expired/validate_sequence=False). They were relaxed for a
+    # premature EoR timer that BGP++ has since fixed (D109742699, PeerManagerBB:
+    # the wait now starts at the first established session). The timer can
+    # still expire when an IXIA peer never establishes -- ixia03 peers stall
+    # after OPEN, BGP-MON included -- which also emits an out-of-order late
+    # ALL_EOR_RECEIVED. Re-enable both once runs converge without expiry.
     if check_bgp_convergence:
         prechecks.append(
             create_bgp_convergence_check(
@@ -271,6 +362,10 @@ def create_standard_prechecks(
                 expected_openr_metric=10,
                 expected_openr_ad=10,
                 check_id="startup_ibgp_pnh_verification",
+                start_ipv4s=ibgp_pnh_start_ipv4s,
+                start_ipv6s=ibgp_pnh_start_ipv6s,
+                count=ibgp_pnh_count,
+                step=ibgp_pnh_step,
             )
         )
 
@@ -326,7 +421,7 @@ def create_standard_postchecks(
     bgp_session_retry_delay_seconds: float = _BGP_SESSION_RETRY_DELAY_SECONDS,
     rib_fib_retry_count: int = _RIB_FIB_RETRY_COUNT,
     rib_fib_retry_delay_seconds: float = _RIB_FIB_RETRY_DELAY_SECONDS,
-    exclude_bgp_mon: bool = True,
+    bgp_mon: BgpMonScope = DEFAULT_BGP_MON_SCOPE,
     rib_fib_record_heal_latency: bool = True,
     rib_fib_heal_latency_max_sec: int = _RIB_FIB_HEAL_LATENCY_MAX_SEC,
     rib_fib_heal_latency_poll_sec: int = _RIB_FIB_HEAL_LATENCY_POLL_SEC,
@@ -342,7 +437,7 @@ def create_standard_postchecks(
             breach remains a failure while observation continues to capture the
             actual convergence time.
         services_to_check: List of EOS Sand agents to check via 'show agent uptime'
-            (optional, defaults to ["Bgp", "FibAgent", "FibAgentBgp"])
+            (optional, defaults to ["Bgpcpp", "FibAgent", "FibAgentBgp"])
         daemons_to_check: List of EOS daemons to check via 'show daemon'. Daemons
             are distinct from Sand agents and must be checked with a different EOS
             command. (optional, defaults to ["FibBgpGrpc"])
@@ -378,11 +473,12 @@ def create_standard_postchecks(
         rib_fib_retry_delay_seconds: Base delay in seconds before the
             first retry (default 30.0). Subsequent delays grow by 1.5x:
             30s, 45s, 67.5s, 101s, 152s (re-checks at ~30/75/142/244/396s).
-        exclude_bgp_mon: When True, exclude BGP_MON peers from session
-            establish checks via ``parent_prefixes_to_ignore``, and skip the
-            BGP_TCPDUMP_CHECK (tcpdump captures on ``interface: any``
-            which includes BGP_MON traffic that cannot be filtered by
-            peer address in the grep-based analyzer).
+        bgp_mon: Which BGP-MON peers to exclude from the session establish and
+            peer-route checks via ``parent_prefixes_to_ignore``, and on which
+            chassis. BGP_MON IXIA peers flap frequently and cause false health
+            check failures, so the default excludes them on the default
+            chassis. Note this does NOT gate the BGP_TCPDUMP_CHECK, which is
+            added purely on the message-type args above.
         rib_fib_record_heal_latency: Opt in to the post-verdict heal-latency
             probe on RIB-FIB postcheck FAIL (paste P2390924278). Default
             **True** for all EBB conveyor configs so a postcheck FAIL is
@@ -399,29 +495,24 @@ def create_standard_postchecks(
     """
     # Lazy import to break a load-time circular import (see
     # create_standard_prechecks); required for TAAC_OSS=1.
-    from taac.testconfigs.routing.util.bgp_ebb_constants import (
-        IXIA_BGP_MON_IC_PARENT_NETWORK,
-    )
-
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
     if services_to_check is None:
-        services_to_check = ["Bgp", "FibAgent", "FibAgentBgp"]
+        services_to_check = ["Bgpcpp", "FibAgent", "FibAgentBgp"]
 
     if daemons_to_check is None:
         daemons_to_check = ["FibBgpGrpc"]
 
-    bgp_mon_ignore = (
-        [f"{IXIA_BGP_MON_IC_PARENT_NETWORK}::/80"] if exclude_bgp_mon else None
-    )
+    bgp_mon_ignore = bgp_mon.ignore_prefixes()
 
     postchecks: list[PointInTimeHealthCheck] = []
 
-    # Conditionally add BGP convergence check. validate_sequence is temporarily
-    # disabled: cold start / restart can emit an out-of-order late
-    # ALL_EOR_RECEIVED once the prematurely-started EOR timer expires. Re-enable
-    # once the BGP++ EOR-timer fix lands.
+    # Conditionally add BGP convergence check. validate_sequence is disabled: a
+    # peer that never sends End-of-RIB (e.g. an IXIA peer that never establishes)
+    # lets the EoR timer expire and emits an out-of-order late ALL_EOR_RECEIVED.
+    # The BGP++ premature-timer fix (D109742699) has landed; re-enable once runs
+    # converge without expiry.
     if check_bgp_convergence:
         postchecks.append(
             create_bgp_convergence_check(
@@ -456,7 +547,7 @@ def create_standard_postchecks(
             # System-level log parsing check
             create_log_parsing_check(
                 json_params={
-                    "agent_name": "Bgp",
+                    "agent_name": "Bgpcpp",
                     "exclude_regex": "Memory Limit Reached",
                 },
                 start_time_jq_var="test_case_start_time",
@@ -509,7 +600,7 @@ def create_standard_snapshot_checks(
     post_snapshot_checkpoint_id: str | None = None,
     expected_peer_identity: dict[str, str] | None = None,
     parent_prefixes_to_ignore: list[str] | None = None,
-    exclude_bgp_mon: bool = True,
+    bgp_mon: BgpMonScope = DEFAULT_BGP_MON_SCOPE,
 ) -> list[SnapshotHealthCheck]:
     """
     Create standard snapshot checks for BGP tests.
@@ -524,22 +615,18 @@ def create_standard_snapshot_checks(
             or get_update_packing_setup_tasks.
         parent_prefixes_to_ignore: Optional list of CIDR prefixes to ignore in
             BGP session snapshot checks (e.g. ["10.171.28.0/24"] to skip iBGP MP Plane 4 IPv4 peers)
-        exclude_bgp_mon: When True, exclude BGP_MON peers from snapshot
-            checks via ``parent_prefixes_to_ignore``. BGP_MON IXIA peers
-            flap frequently and cause false snapshot check failures.
+        bgp_mon: Which BGP-MON peers to exclude from snapshot checks (appended
+            to ``parent_prefixes_to_ignore``), and on which chassis. BGP_MON
+            IXIA peers flap frequently and cause false snapshot check
+            failures, so the default excludes them on the default chassis.
 
     Returns:
         List of standard snapshot health checks
     """
     # Lazy import to break a load-time circular import (see
     # create_standard_prechecks); required for TAAC_OSS=1.
-    from taac.testconfigs.routing.util.bgp_ebb_constants import (
-        IXIA_BGP_MON_IC_PARENT_NETWORK,
-    )
-
     all_prefixes_to_ignore = list(parent_prefixes_to_ignore or [])
-    if exclude_bgp_mon:
-        all_prefixes_to_ignore.append(f"{IXIA_BGP_MON_IC_PARENT_NETWORK}::/80")
+    all_prefixes_to_ignore.extend(bgp_mon.ignore_prefixes() or [])
 
     return [
         create_core_dumps_snapshot_check(),

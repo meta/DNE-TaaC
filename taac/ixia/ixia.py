@@ -4,18 +4,23 @@
 # pyre-unsafe
 
 import functools
+import importlib.metadata
+import inspect
 import ipaddress
 import itertools
+import json
 import logging
 import operator
 import os
 import random
 import re
+import socket
 import threading
 import time
 import typing as t
+import uuid
 import warnings
-from collections import defaultdict, namedtuple
+from collections import Counter, defaultdict, namedtuple
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from ipaddress import ip_address, IPv6Address
@@ -23,6 +28,7 @@ from ipaddress import ip_address, IPv6Address
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
 if not TAAC_OSS:
+    import pyjk as justknobs
     from configerator.client import ConfigeratorClient
 else:
     # OSS mode: no Meta config service. Stub the client to a no-op so the
@@ -52,8 +58,26 @@ from ixnetwork_restpy.assistants.statistics.statviewassistant import (
 )
 from ixnetwork_restpy.errors import IxNetworkError as IxnIxNetworkError
 from ixnetwork_restpy.files import Files
+from taac.abstractions.ixia_semantics import (
+    validate_ixia_bgp_tcp_window_size_bytes,
+)
+from taac.ixia.ixia_tracer import (
+    build_trace_path,
+    extract_request_body,
+    extract_request_method_and_url,
+    IxiaTracePortMapping,
+    IxiaTracer,
+    IxiaTraceSessionPreamble,
+    IxiaTraceSlice,
+    IxiaTraceSpan,
+    RECORD_TYPE_SESSION_PREAMBLE,
+)
 from taac.libs.custom_payload_registry import (
     get_custom_frame_payload,
+)
+from taac.ixia.route_geometry import (
+    IxiaPatternSnapshot,
+    IxiaValueVector,
 )
 from taac.utils.common import timeit
 from taac.utils.oss_taac_constants import (
@@ -62,9 +86,11 @@ from taac.utils.oss_taac_constants import (
     IxiaSessionUnavailableError,
 )
 from taac.utils.oss_taac_lib_utils import (
+    get_ipv6_for_host,
     memoize_forever,
     none_throws,
     retryable,
+    string_is_ip,
     to_fb_uqdn,
 )
 from requests.exceptions import RequestException, Timeout as RequestsTimeout
@@ -111,17 +137,75 @@ else:
         DESIRED_V6_BGP_PREFIX_NAME,
         DESIRED_VPORT_NAME,
     )
-from uhd_restpy.assistants.sessions.sessionassistant import (
-    SessionAssistant as UhdSessionAssistant,
-)
-from uhd_restpy.assistants.statistics.statviewassistant import (
-    StatViewAssistant as UhdStatViewAssistant,
-)
-from uhd_restpy.errors import IxNetworkError as UhdIxNetworkError
+if TAAC_OSS:
+    # uhd_restpy is Meta-only and was removed from the OSS dependency surface
+    # in D96670156. UHD chassis are not supported in OSS mode, so keep the
+    # shared implementation type-correct without importing that package.
+    UhdSessionAssistant = IxnSessionAssistant
+    UhdStatViewAssistant = IxnStatViewAssistant
+    UhdIxNetworkError = IxnIxNetworkError
+else:
+    from uhd_restpy.assistants.sessions.sessionassistant import (
+        SessionAssistant as UhdSessionAssistant,
+    )
+    from uhd_restpy.assistants.statistics.statviewassistant import (
+        StatViewAssistant as UhdStatViewAssistant,
+    )
+    from uhd_restpy.errors import IxNetworkError as UhdIxNetworkError
 
 
 warnings.filterwarnings(action="ignore", category=ResourceWarning)
 warnings.filterwarnings(action="ignore", category=DeprecationWarning)
+
+# Retry for 1.75 seconds before the outer setup retry rebuilds the IXIA session.
+_BGP_TCP_WINDOW_READBACK_ATTEMPTS = 4
+_BGP_TCP_WINDOW_READBACK_RETRY_SECONDS = 0.25
+# The imperative API uses a short delay because it runs during route storms.
+_BGP_TCP_WINDOW_IMPERATIVE_READBACK_ATTEMPTS = 3
+_BGP_TCP_WINDOW_IMPERATIVE_READBACK_RETRY_SECONDS = 0.05
+
+
+class _BgpPeerTcpWindowUnsupportedError(RuntimeError):
+    """The IXIA BGP peer does not expose TCP-window configuration."""
+
+
+class _BgpPeerTcpWindowOperationError(RuntimeError):
+    """An expected IXIA operation failed while setting a TCP window."""
+
+
+@dataclass(frozen=True)
+class _BgpPeerTcpWindowWriteResult:
+    matched: int
+    unsupported: int
+    verified: int
+
+
+@dataclass(frozen=True)
+class _BgpPeerActiveWrite:
+    peer_name: str
+    baseline: IxiaValueVector
+    expected_active: tuple[t.Any, ...]
+    write_active: tuple[t.Any, ...]
+
+
+@dataclass(frozen=True)
+class _BgpPeerRangeRestoration:
+    label: str
+    regex: str
+    session_start_idx: int
+    session_end_idx: int
+    expected_peer_count: int
+    writes: tuple[_BgpPeerActiveWrite, ...]
+
+
+def _filter_bgp_stats_by_port(
+    stats: t.Iterable[t.Mapping[str, t.Any]], port: str
+) -> t.List[t.Dict[str, t.Any]]:
+    return [
+        dict(stat)
+        for stat in stats
+        if port in str(stat.get("Port Name") or stat.get("Port", ""))
+    ]
 
 
 def _normalize_ixia_boolean(value: t.Any) -> t.Optional[bool]:
@@ -402,31 +486,20 @@ def _apply_and_verify_device_group_toggle(
         )
 
 
-from ixnetwork_restpy.testplatform.sessions.ixnetwork.topology.bgpipv6peer_8b9aa9838ebd53702954aa471913ed1e import (
-    BgpIpv6Peer as IxnBgpIpv6Peer,
-)
-from uhd_restpy.testplatform.sessions.ixnetwork.topology.bgpipv6peer_d4ac277d9da759fd5a152b8e6eb0ab20 import (
-    BgpIpv6Peer as UhdBgpIpv6Peer,
-)
+def _is_ipv4_prefix_pool(prefix_pool: t.Any) -> bool:
+    """Identify a RESTPy prefix pool across public/internal module hashes.
 
-BgpIpv6Peer = t.Union[IxnBgpIpv6Peer, UhdBgpIpv6Peer]
+    True only for IPv4 pools. Anything else — an IPv6 pool, or a pool-like
+    stand-in that is not an IPv4 pool — takes the IPv6 branch at every call
+    site, matching the pre-adapter ``isinstance``-against-a-union semantics
+    that ``test_bgp_session_indices`` pins with its ``_PrefixPool`` fake.
+    """
+    return isinstance(prefix_pool, Ipv4PrefixPools)
 
-from ixnetwork_restpy.testplatform.sessions.ixnetwork.topology.ipv4prefixpools_2d6f2aedde61c058965d4e1b21741352 import (
-    Ipv4PrefixPools as IxnIpv4PrefixPools,
-)
-from uhd_restpy.testplatform.sessions.ixnetwork.topology.ipv4prefixpools_2d6f2aedde61c058965d4e1b21741352 import (
-    Ipv4PrefixPools as UhdIpv4PrefixPools,
-)
 
-Ipv4PrefixPools = t.Union[IxnIpv4PrefixPools, UhdIpv4PrefixPools]
-from ixnetwork_restpy.testplatform.sessions.ixnetwork.topology.ipv6prefixpools_f83aba85ff769655b348dc60ddcb30f2 import (
-    Ipv6PrefixPools as IxnIpv6PrefixPools,
-)
-from uhd_restpy.testplatform.sessions.ixnetwork.topology.ipv6prefixpools_f83aba85ff769655b348dc60ddcb30f2 import (
-    Ipv6PrefixPools as UhdIpv6PrefixPools,
-)
-
-Ipv6PrefixPools = t.Union[IxnIpv6PrefixPools, UhdIpv6PrefixPools]
+def _is_ipv6_bgp_peer(peer: t.Any) -> bool:
+    """Identify a RESTPy IPv6 BGP peer across public/internal module hashes."""
+    return isinstance(peer, BgpIpv6Peer)
 
 
 if t.TYPE_CHECKING:
@@ -494,6 +567,27 @@ if t.TYPE_CHECKING:
         BgpIpv4Peer as UhdBgpIpv4Peer,
     )
     BgpIpv4Peer = t.Union[IxnBgpIpv4Peer, UhdBgpIpv4Peer]
+    from ixnetwork_restpy.testplatform.sessions.ixnetwork.topology.bgpipv6peer_8b9aa9838ebd53702954aa471913ed1e import (
+        BgpIpv6Peer as IxnBgpIpv6Peer,
+    )
+    from uhd_restpy.testplatform.sessions.ixnetwork.topology.bgpipv6peer_d4ac277d9da759fd5a152b8e6eb0ab20 import (
+        BgpIpv6Peer as UhdBgpIpv6Peer,
+    )
+    BgpIpv6Peer = t.Union[IxnBgpIpv6Peer, UhdBgpIpv6Peer]
+    from ixnetwork_restpy.testplatform.sessions.ixnetwork.topology.ipv4prefixpools_2d6f2aedde61c058965d4e1b21741352 import (
+        Ipv4PrefixPools as IxnIpv4PrefixPools,
+    )
+    from uhd_restpy.testplatform.sessions.ixnetwork.topology.ipv4prefixpools_2d6f2aedde61c058965d4e1b21741352 import (
+        Ipv4PrefixPools as UhdIpv4PrefixPools,
+    )
+    Ipv4PrefixPools = t.Union[IxnIpv4PrefixPools, UhdIpv4PrefixPools]
+    from ixnetwork_restpy.testplatform.sessions.ixnetwork.topology.ipv6prefixpools_f83aba85ff769655b348dc60ddcb30f2 import (
+        Ipv6PrefixPools as IxnIpv6PrefixPools,
+    )
+    from uhd_restpy.testplatform.sessions.ixnetwork.topology.ipv6prefixpools_f83aba85ff769655b348dc60ddcb30f2 import (
+        Ipv6PrefixPools as UhdIpv6PrefixPools,
+    )
+    Ipv6PrefixPools = t.Union[IxnIpv6PrefixPools, UhdIpv6PrefixPools]
     from ixnetwork_restpy.testplatform.sessions.ixnetwork.topology.bgpiprouteproperty_3dbf4edca5d6573869a4ee79cda6644b import (
         BgpIPRouteProperty as IxnBgpIPRouteProperty,
     )
@@ -564,6 +658,32 @@ if t.TYPE_CHECKING:
     StatViewAssistant = t.Union[IxnStatViewAssistant, UhdStatViewAssistant]
 
     # fmt: on
+else:
+    # Runtime-only definitions. Under ``TYPE_CHECKING`` the names above are
+    # unions of the generated RESTPy classes; at runtime they are
+    # version-neutral ``isinstance`` adapters keyed on the generated class
+    # name, so hash drift in generated module names never breaks imports.
+
+    class _RestPyClassName(type):
+        """Version-neutral ``isinstance`` adapter for generated RESTPy classes."""
+
+        def __instancecheck__(cls, instance: t.Any) -> bool:
+            return type(instance).__name__.lower() == cls.restpy_class_name
+
+    class Ipv4PrefixPools(metaclass=_RestPyClassName):
+        """Runtime protocol for public/internal RESTPy IPv4 prefix-pool objects."""
+
+        restpy_class_name = "ipv4prefixpools"
+
+    class Ipv6PrefixPools(metaclass=_RestPyClassName):
+        """Runtime protocol for public/internal RESTPy IPv6 prefix-pool objects."""
+
+        restpy_class_name = "ipv6prefixpools"
+
+    class BgpIpv6Peer(metaclass=_RestPyClassName):
+        """Runtime protocol for public/internal RESTPy IPv6 BGP-peer objects."""
+
+        restpy_class_name = "bgpipv6peer"
 
 
 class AsPathValuesNotFoundError(Exception):
@@ -602,6 +722,57 @@ class InvalidInputError(Exception):
     pass
 
 
+def _bgp_session_indices_spec(indices: t.Iterable[int]) -> str:
+    """Render 1-based session indices in IxNetwork's ``1-4;6;7-12`` form."""
+    runs: list[list[int]] = []
+    for index in sorted(indices):
+        if runs and index == runs[-1][1] + 1:
+            runs[-1][1] = index
+        else:
+            runs.append([index, index])
+    return ";".join(
+        str(first) if first == last else f"{first}-{last}" for first, last in runs
+    )
+
+
+def _is_resolved_gateway_mac(value: object) -> bool:
+    """True only for a non-zero 48-bit MAC, such as `00:1c:73:aa:bb:cc`.
+
+    Anything else, including IxNetwork's unresolved placeholder text, an
+    all-zero MAC or an empty value, counts as unresolved.
+    """
+    hex_digits = re.sub(r"[\s:.-]", "", str(value)).lower()
+    return (
+        re.fullmatch(r"[0-9a-f]{12}", hex_digits) is not None
+        and hex_digits != "0" * 12
+    )
+
+
+def _sampled_session_values(
+    values: t.Sequence[object], indices: t.Sequence[int]
+) -> list[str]:
+    """Read per-session `values` at the 1-based `indices`.
+
+    A single value applies to every session, and an index past the end of a
+    shorter list reads `missing` instead of failing the whole sample.
+    """
+    if len(values) == 1:
+        return [str(values[0])] * len(indices)
+    return [
+        str(values[index - 1]) if 0 < index <= len(values) else "missing"
+        for index in indices
+    ]
+
+
+@dataclass(frozen=True)
+class _GatewayStack:
+    """One IPv4 or IPv6 stack whose gateway MACs a resolution gate checks."""
+
+    device_group_name: str
+    family: str
+    stack: t.Any
+
+
 class IxiaSetupError(Exception):
     pass
 
@@ -618,6 +789,21 @@ class IxiaOperationStateError(RuntimeError):
 
 class IxiaSessionQuarantinedError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class IxiaScenarioQuarantineRecord:
+    generation: int
+    reason: str
+    baseline: object
+    mutation_journal: object
+    created_at_monotonic: float
+    expires_at_monotonic: float
+    session_identity: t.Optional[t.Tuple[str, int]]
+
+    @property
+    def expired(self) -> bool:
+        return time.monotonic() >= self.expires_at_monotonic
 
 
 class NetworkGroupNotFoundError(Exception):
@@ -698,6 +884,7 @@ class VportIndex:
 def require_traffic_item(func: t.Callable) -> t.Callable:
     """Decorator to skip the function execution if no traffic items are found"""
 
+    @functools.wraps(func)
     def wrapper(self, *args, **kwargs) -> t.Any:
         if not self.has_traffic_items():
             self.logger.debug(
@@ -710,7 +897,7 @@ def require_traffic_item(func: t.Callable) -> t.Callable:
 
 
 # `source` values emitted into `inband_502_observed` Scuba rows. Mirrored
-# from `ixia_recovery_lib.SOURCE_INBAND_API_CALL` /
+# from `recovery.SOURCE_INBAND_API_CALL` /
 # `SOURCE_BETWEEN_PLAYBOOK_GATE` so the per-RPC wrapper can use them without
 # a non-OSS import at module load. A unit test
 # (`test_ixia_inband_recovery.SourceConstantsTest`) pins these equal to the
@@ -719,6 +906,123 @@ def require_traffic_item(func: t.Callable) -> t.Callable:
 _INBAND_SOURCE_API_CALL: str = "inband_api_call"
 _INBAND_SOURCE_BETWEEN_PLAYBOOK_GATE: str = "between_playbook_gate"
 
+# `DeviceGroup.Status` values in which IxNetwork accepts a property write. The
+# full enum is configured|error|mixed|notStarted|started|starting|stopping; only
+# these two mean "not running". `stopping` is deliberately excluded -- it is the
+# transitional state a queued-but-unapplied StopAllProtocols leaves behind, and
+# writing during it is what raises "Changing the property in a started element
+# is not permitted". `error` is excluded so a broken element surfaces as a
+# timeout naming it, rather than being treated as safely stopped.
+_PROTOCOLS_STOPPED_STATES: t.FrozenSet[str] = frozenset({"notStarted", "configured"})
+
+# Bound on the ERROR path for protocol-state settling, not an estimate of how
+# long stopping takes: `wait_for_protocols_stopped` returns as soon as the state
+# actually flips, so a healthy stop never approaches this. Generous enough that
+# a large topology under load does not trip it spuriously.
+_PROTOCOL_STATE_SETTLE_TIMEOUT_SECONDS: int = 120
+# Each poll is one REST round-trip per device group, so keep it coarse.
+_PROTOCOL_STATE_POLL_SECONDS: int = 2
+# ApplyOnTheFly failures are commonly transient while a large topology settles.
+_APPLY_CHANGES_MAX_ATTEMPTS: int = 3
+_APPLY_CHANGES_RETRY_DELAY_SECONDS: float = 10.0
+
+# A successful BGP peer Start can still leave some sessions `notStarted` (seen on
+# NRQEB008 SC1: 62 of 100 IPv6 sessions accepted TCP and closed it for the whole
+# run). A started session leaves `notStarted` within seconds even when the DUT
+# never answers (it goes `down`), so this window only bounds the stuck case.
+_BGP_START_SETTLE_SECONDS: int = 15
+_BGP_START_POLL_SECONDS: int = 3
+_BGP_START_MAX_RESTARTS: int = 2
+_BGP_START_FAILURE_SAMPLE_SIZE: int = 20
+# Leaving `notStarted` does not prove the emulated peer accepts the DUT: on
+# NRQEB008 SC1 (2026-11-06) 65 of 100 IPv6 sessions passed the check above yet
+# reset every DUT OPEN for 20 minutes. Stopping and restarting a stuck session
+# is the recovery; the poll interval matches the notStarted wait.
+_BGP_UP_STATUS: str = "up"
+# A dead port shows up only in the server's appErrors ("Port ... is not CPU
+# ready"), not in per-session state, so the failure quotes the latest ones.
+_BGP_START_FAILURE_SERVER_ERRORS: int = 5
+
+# Gateways resolve within seconds of ARP/NS once the DUT owns the gateway
+# addresses, so the timeout only bounds the unanswered case.
+_GATEWAY_RESOLUTION_TIMEOUT_SECONDS: int = 60
+_GATEWAY_RESOLUTION_POLL_SECONDS: int = 3
+_GATEWAY_RESOLUTION_FAILURE_SAMPLE_SIZE: int = 10
+_IXIA_SERVER_ERROR_LEVELS: t.FrozenSet[str] = frozenset({"kError", "kWarning"})
+
+# Stamped on the installed transport wrapper, holding the `Ixia` that owns it,
+# and read back by the installer as its idempotency guard.
+_TRACED_REQUEST_OWNER: str = "_taac_ixia_request_wrapper_owner"
+
+# The tracer's own appErrors GET runs inside the transport wrapper, on the
+# thread whose call just failed. It is capped tightly so a wedged API server
+# cannot turn diagnostic collection into a test-length stall.
+_APP_ERRORS_FETCH_TIMEOUT_SECONDS: int = 15
+
+# 100G NRZ is the one Ethernet rate where FEC is optional, so IxNetwork's IEEE L1
+# defaults run it with FEC off, while FBOSS 100G NRZ profiles (`..._RS528_...`)
+# expect RS-FEC (CL91). The optics lock but the DUT never finds FEC alignment, so
+# the link stays down. PAM4 rates always run RS-FEC (RS544) and are unaffected.
+_NRZ_100G_SPEED: str = "speed100g"
+# Resource group modes that predate the explicit NRZ/PAM4 naming but only run
+# 100G as 4x25G NRZ.
+_LEGACY_NRZ_100G_RESOURCE_MODES: t.FrozenSet[str] = frozenset(
+    {
+        "hundredGigNonFanOut",
+        "novusHundredGigNonFanOut",
+        "novusHundredGigNonFanOutHighStream",
+        "novus5GOneByHundredGigNonFanOut",
+        "novus5GOneByHundredGigNonFanOutHighStream",
+    }
+)
+_VPORT_LINK_UP_STATE: str = "connectedLinkUp"
+# How long a 100G NRZ port gets to link up, first on IEEE defaults and then on
+# RS-FEC. A matching FEC links up within seconds; this only bounds a DUT port
+# that is down for an unrelated reason, which costs at most two windows.
+_NRZ_100G_FEC_LINK_WAIT_SECONDS: int = 30
+_NRZ_100G_FEC_LINK_POLL_SECONDS: int = 2
+
+
+def cap_timeout_at_deadline(existing_timeout: t.Any, remaining: float) -> t.Any:
+    """Cap a `requests` timeout at the seconds left on the current deadline.
+
+    A tuple is `requests`' independent connect/read pair, so each element is
+    capped on its own rather than collapsed into a single value.
+    """
+    if isinstance(existing_timeout, tuple):
+        return tuple(
+            remaining if value is None else min(value, remaining)
+            for value in existing_timeout
+        )
+    if existing_timeout is None:
+        return remaining
+    return min(existing_timeout, remaining)
+
+
+def _restpy_version() -> t.Optional[str]:
+    """The `ixnetwork-restpy` version, which pins the wire format Keysight
+    has to replay a trace against. Absent from a stripped par, hence best
+    effort."""
+    try:
+        return importlib.metadata.version("ixnetwork-restpy")
+    except Exception:
+        return None
+
+
+def resolve_decorated_name(func: t.Callable) -> str:
+    """The name of the method under `func`, not of the decorator wrapping it.
+
+    `@external_api` sits above `@require_traffic_item` and `@retryable`, so
+    `func.__name__` names whichever wrapper is directly underneath. Both of
+    those use `functools.wraps`, which sets `__wrapped__`, so `inspect.unwrap`
+    walks down to the real method. A decorator that sets neither leaves its
+    own name, which is still better than crashing on a missing attribute.
+    """
+    unwrapped = inspect.unwrap(func)
+    return getattr(unwrapped, "__name__", None) or getattr(
+        func, "__name__", "<unknown>"
+    )
+
 
 def external_api(func: t.Callable) -> t.Callable:
     """Marks a method that issues IxNetwork SDK RPCs to the chassis and routes
@@ -726,7 +1030,7 @@ def external_api(func: t.Callable) -> t.Callable:
 
     On a 502/503 from the wrapped call, the wrapper emits a Scuba
     `inband_502_observed` row, invokes the already-tested-e2e recovery CLI
-    (`ixia._attempt_inband_recovery` → `ixia_recovery_lib.restart_ixnetwork`),
+    (`ixia._attempt_inband_recovery` → `recovery.restart_ixnetwork`),
     and retries the RPC once if recovery succeeded. A 504 is emitted but
     propagated without an application-wide restart: it proves that one
     operation exceeded the gateway deadline, not that the global API is down.
@@ -744,47 +1048,62 @@ def external_api(func: t.Callable) -> t.Callable:
     The OSS guard lives inside `_attempt_inband_recovery`, which returns
     False under `TAAC_OSS`; this wrapper therefore degrades to its previous
     no-op behavior in OSS builds.
+
+    Also publishes the operation name on `_request_deadline_state` so the
+    REST tracer can attribute each recorded call to the TAAC operation that
+    issued it. The name is restored on exit rather than cleared, so a nested
+    `@external_api` call unwinds to its caller's name instead of to None.
     """
+    op_name = resolve_decorated_name(func)
 
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs) -> t.Any:
+        # The label exists only so the REST tracer can attribute a recorded
+        # call, so skip the bookkeeping when nothing is recording.
+        state = self._request_deadline_state if self._tracer is not None else None
+        previous_op = getattr(state, "op", None)
+        if state is not None:
+            state.op = op_name
         try:
-            return func(self, *args, **kwargs)
-        except Exception as exc:
-            # Use the budget-free eligibility check: the per-connect
-            # `_ixia_recovery_attempts_remaining` counter must NOT gate the
-            # per-RPC wrapper (a single connect-time recovery would exhaust
-            # it and silently block every mid-test recovery for the rest of
-            # the run — see Devmate review of D109398929 V1).
-            if not self._is_recovery_eligible_5xx(exc):
-                raise
-            # Telemetry must never mask the original 5xx: a Scuba write
-            # failure here would otherwise replace the real operational
-            # error (e.g. the propagated 504) in the traceback.
             try:
-                self._emit_inband_502(
-                    func.__name__, exc, source=_INBAND_SOURCE_API_CALL
-                )
-            except Exception:
-                self.logger.exception(
-                    f"{_YELLOW}[IXIA]{_RESET} failed to emit inband_502 "
-                    f"telemetry for {func.__name__}"
-                )
-            if self._extract_5xx_status(exc) == 504:
+                return func(self, *args, **kwargs)
+            except Exception as exc:
+                # Use the budget-free eligibility check: the per-connect
+                # `_ixia_recovery_attempts_remaining` counter must NOT gate the
+                # per-RPC wrapper (a single connect-time recovery would exhaust
+                # it and silently block every mid-test recovery for the rest of
+                # the run — see Devmate review of D109398929 V1).
+                if not self._is_recovery_eligible_5xx(exc):
+                    raise
+                # Telemetry must never mask the original 5xx: a Scuba write
+                # failure here would otherwise replace the real operational
+                # error (e.g. the propagated 504) in the traceback.
+                try:
+                    self._emit_inband_502(op_name, exc, source=_INBAND_SOURCE_API_CALL)
+                except Exception:
+                    self.logger.exception(
+                        f"{_YELLOW}[IXIA]{_RESET} failed to emit inband_502 "
+                        f"telemetry for {op_name}"
+                    )
+                if self._extract_5xx_status(exc) == 504:
+                    self.logger.warning(
+                        f"{_YELLOW}[IXIA]{_RESET} {op_name} hit an "
+                        "operation-scoped 504 — skipping application-wide recovery"
+                    )
+                    raise
                 self.logger.warning(
-                    f"{_YELLOW}[IXIA]{_RESET} {func.__name__} hit an "
-                    "operation-scoped 504 — skipping application-wide recovery"
+                    f"{_YELLOW}[IXIA]{_RESET} {op_name} hit 5xx mid-test — "
+                    f"invoking in-band recovery"
                 )
-                raise
-            self.logger.warning(
-                f"{_YELLOW}[IXIA]{_RESET} {func.__name__} hit 5xx mid-test — "
-                f"invoking in-band recovery"
-            )
-            if not self._attempt_inband_recovery():
-                # cooldown / auth / no_password / refusal / failure — keep the
-                # original 5xx in the traceback so triage sees the real cause.
-                raise
-            return func(self, *args, **kwargs)
+                if not self._attempt_inband_recovery():
+                    # cooldown / auth / no_password / refusal / failure — keep
+                    # the original 5xx in the traceback so triage sees the real
+                    # cause.
+                    raise
+                return func(self, *args, **kwargs)
+        finally:
+            if state is not None:
+                state.op = previous_op
 
     return wrapper
 
@@ -794,6 +1113,14 @@ def split_list_into_chunks(list_to_split: list, chunk_size: int) -> t.List[list]
         list_to_split[i : i + chunk_size]
         for i in range(0, len(list_to_split), chunk_size)
     ]
+
+
+def _same_host(left: str, right: str) -> bool:
+    """IxNetwork may store a chassis IPv6 address expanded or compressed."""
+    try:
+        return ipaddress.ip_address(left) == ipaddress.ip_address(right)
+    except ValueError:
+        return left.lower() == right.lower()
 
 
 def _ixia_value_equals(current: t.Any, desired: t.Any) -> bool:
@@ -824,12 +1151,15 @@ def _ixia_value_equals(current: t.Any, desired: t.Any) -> bool:
     return str(current) == str(desired)
 
 
-def _set_multivalue_if_changed(multivalue: t.Any, desired: t.Any) -> bool:
+def _set_multivalue_if_changed(
+    multivalue: t.Any,
+    desired: t.Any,
+) -> bool:
     """Set an IxNetwork Multivalue to `desired` only if its current value differs.
 
-    Reads `multivalue.Values[0]` first, compares against `desired` via
-    `_ixia_value_equals`. If unchanged, skip the write and return False.
-    Otherwise issue `multivalue.Single(value=desired)` and return True.
+    Compare `multivalue.Values[0]` against `desired`. If unchanged, skip the
+    write and return False. Otherwise issue `multivalue.Single(value=desired)`
+    and return True.
 
     On ANY exception during the Values read (multivalue in a non-Single
     pattern, network blip, missing attribute), falls through to the write
@@ -842,7 +1172,8 @@ def _set_multivalue_if_changed(multivalue: t.Any, desired: t.Any) -> bool:
     """
     try:
         current_values = multivalue.Values
-        if current_values and _ixia_value_equals(current_values[0], desired):
+        values_match = current_values and _ixia_value_equals(current_values[0], desired)
+        if values_match:
             return False  # already converged, no PATCH issued
     except Exception:
         # Conservative fallback — when the read path is unreliable, prefer
@@ -853,8 +1184,71 @@ def _set_multivalue_if_changed(multivalue: t.Any, desired: t.Any) -> bool:
     return True
 
 
+def _set_single_pattern_if_changed(multivalue: t.Any, desired: t.Any) -> bool:
+    """Set a Single multivalue only when its compact pattern differs."""
+    try:
+        pattern_type = str(multivalue.PatternType).strip().lower()
+        if pattern_type in {"single", "singlevalue"} and _ixia_value_equals(
+            multivalue.Pattern, desired
+        ):
+            return False
+    except (
+        IxnIxNetworkError,
+        UhdIxNetworkError,
+        RequestException,
+        AttributeError,
+        IndexError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        pass
+    multivalue.Single(value=desired)
+    return True
+
+
+def _read_ixia_single_pattern(
+    multivalue: t.Any,
+) -> tuple[t.Any | None, Exception | None]:
+    """Return the Single-pattern value or retain a read failure for retries."""
+    try:
+        return multivalue.Pattern, None
+    except (
+        IxnIxNetworkError,
+        UhdIxNetworkError,
+        RequestException,
+        AttributeError,
+        IndexError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        return None, error
+
+
+# IxNetwork FieldTypeId segment of each IPv4 PHB (ipv4.header.priority.ds.phb.<x>).
+_IPV4_PHB_FIELD = {
+    ixia_types.PHBTypes.DEFAULT: "defaultPHB",
+    ixia_types.PHBTypes.CLASSSELECTOR: "classSelectorPHB",
+    ixia_types.PHBTypes.AF: "assuredForwardingPHB",
+    ixia_types.PHBTypes.EF: "expeditedForwardingPHB",
+}
+
+
 class Ixia:
     OPERATION_TIMEOUT_ERROR = IxiaOperationTimeoutError
+
+    # Class-level defaults so the transport wrapper and the trace phase
+    # boundaries can read these unconditionally, including on the 11 test
+    # fixtures that construct an `Ixia` with `__init__` patched out.
+    # `__init__` overrides all three per instance.
+    _tracer: t.Optional[IxiaTracer] = None
+    _current_playbook_name: t.Optional[str] = None
+    _current_testconfig_name: t.Optional[str] = None
+    _defer_traffic_preparation: bool = False
+    auto_nrz_100g_rs_fec: bool = True
+    ixia_primary_chassis: t.Optional[str] = None
+    use_tx_rx_sync: bool = True
 
     def __init__(
         self,
@@ -875,6 +1269,10 @@ class Ixia:
         password: t.Optional[str] = API_SERVER_PASSWORD,
         username: t.Optional[str] = API_SERVER_USERNAME,
         ixia_recovery: t.Optional[t.Any] = None,
+        trace_api_calls: bool = False,
+        auto_nrz_100g_rs_fec: bool = True,
+        ixia_primary_chassis: t.Optional[str] = None,
+        use_tx_rx_sync: bool = True,
     ) -> None:
         """Instantiates the object of class Ixia
 
@@ -948,9 +1346,25 @@ class Ixia:
                 the default password will be used for logging in.
             username: Provide a username to log in to Ixia chassis. When not provided,
                 the default username will be used for logging in.
+
+            trace_api_calls: Record every IxNetwork REST call to a JSONL file
+                (see `ixia_tracer.py`). The file path is logged at construction
+                and exposed via the `api_tracer` property so the caller can
+                publish it once the run is over.
+
+            auto_nrz_100g_rs_fec: After assigning ports, enable RS-FEC (CL91)
+                on 100G NRZ ports that are still on IEEE L1 defaults and do not
+                link up, and revert any that still stay down. See
+                `configure_nrz_100g_rs_fec`.
+
+            ixia_primary_chassis: Hostname or IP of the chassis-chain primary,
+                when it differs from the API server (e.g. every port is on a
+                secondary chassis). When set, chassis chain configuration
+                always runs, even for single-chassis port configs.
         """
 
         self.logger = logger if logger else get_logger()
+        self._snapshot_lock = threading.RLock()
 
         if not (ixia_config or session_id):
             raise InvalidInputError("Either ixia_config or session_id is required")
@@ -959,6 +1373,7 @@ class Ixia:
         self.primary_chassis_ip = (
             self.ixia_config.api_server_ip if self.ixia_config else chassis_ip
         )
+        self.ixia_primary_chassis = ixia_primary_chassis
 
         if session_id and not self.primary_chassis_ip:
             raise InvalidInputError("chassis_ip is required when using session_id")
@@ -973,6 +1388,8 @@ class Ixia:
         # By default, we will NOT let the automation to grab IXIA ports
         # that is already reserved
         self.force_take_port_ownership: bool = force_take_port_ownership
+        self.auto_nrz_100g_rs_fec = auto_nrz_100g_rs_fec
+        self.use_tx_rx_sync = use_tx_rx_sync
         self.cleanup_config: bool = cleanup_config
         self.teardown_session: bool = teardown_session
 
@@ -992,19 +1409,16 @@ class Ixia:
         self.skip_advertised_prefixes_check = skip_advertised_prefixes_check
         self.skip_ixia_protocol_verification = skip_ixia_protocol_verification
         self.ixia_protocol_verification_timeout = ixia_protocol_verification_timeout
-        # Python-side index of vport metadata, populated ONLY by
-        # `assign_ports()` (gated by `is_existing_session` — see
-        # `create_basic_setup`). On IXIA topology-cache HIT (Tier 1
-        # LoadConfig / Tier 2 Manifold via `taac_ixia.load_config_from_chassis`
-        # or `ixia_config_cache_manager.try_load_from_manifold`) the server-
-        # side vports are restored but this dict stays empty. Any TAAC step,
-        # health check, or helper that reads `vport_indices` (e.g.
-        # `register_cpu_queue_static_route_patcher`) will KeyError on cache
-        # hit — the owning TestConfig MUST opt out of the cache via
-        # `ixia_config_cache=taac_types.IxiaConfigCache(enabled=False)`
-        # until the cache layer learns to rehydrate this dict.
+        # Python-side index of vport metadata. Fresh topologies populate it in
+        # `assign_ports` / `create_device_groups`; retained sessions and cache
+        # hits rebuild it with `rehydrate_vport_indices`.
         self.vport_indices: t.Dict[str, VportIndex] = {}
         self._traffic_start_time: float = 0.0
+        self._defer_traffic_preparation = False
+        self._deferred_traffic_item_replacements: t.List[t.Tuple[str, str]] = []
+        self._deferred_traffic_item_replacement_swaps_started: set[
+            tuple[str, str]
+        ] = set()
         self.cfgr_client = ConfigeratorClient()
         self.ptp_configured: bool = False
         self.tag_name_to_device_group_name_list = defaultdict(list)
@@ -1045,6 +1459,19 @@ class Ixia:
         self._deadline_request_wrapper: t.Optional[t.Any] = None
         self._session_quarantine_reason: t.Optional[str] = None
         self._quarantined_session_identity: t.Optional[t.Tuple[str, int]] = None
+        self._scenario_quarantine_generation = 0
+        self._scenario_quarantine_record: t.Optional[IxiaScenarioQuarantineRecord] = (
+            None
+        )
+        self._tracer: t.Optional[IxiaTracer] = (
+            IxiaTracer(path=build_trace_path(), logger=self.logger)
+            if trace_api_calls
+            else None
+        )
+        if self._tracer is not None:
+            self.logger.info(
+                f"{_CYAN}[IXIA]{_RESET} REST API tracing enabled -> {self._tracer.path}"
+            )
 
     @staticmethod
     def get_formatted_ip_address(ixia_server_ip: str) -> str:
@@ -1196,14 +1623,17 @@ class Ixia:
                 "SessionAssistant returned a session without a stable remote identity"
             )
         _chassis, replacement_session_id = replacement_identity
+        # pyrefly: ignore [missing-attribute]
         replacement_session_name = str(replacement_session.Session.Name)
 
         with self._bounded_apply_lock:
             with self._request_deadline_wrapper_lock:
                 self._install_request_deadline_wrapper_locked(replacement_session)
+                # pyrefly: ignore [bad-assignment]
                 self.session = replacement_session
                 self.session_id = replacement_session_id
                 self.session_name = replacement_session_name
+                # pyrefly: ignore [missing-attribute]
                 self.ixnetwork = replacement_session.Ixnetwork
                 if (
                     self._session_quarantine_reason is not None
@@ -1226,6 +1656,11 @@ class Ixia:
                 f"after reconnect: {replacement_identity}"
             )
 
+        # Emitted here rather than after port assignment so that a trace of a
+        # setup that died AT port assignment (the force-take-ownership
+        # collision this tracer exists for) still names its session.
+        self._publish_trace_session_preamble()
+
     def _remote_session_identity(
         self, session: t.Optional[t.Any] = None
     ) -> t.Optional[t.Tuple[str, int]]:
@@ -1239,58 +1674,270 @@ class Ixia:
         except (AttributeError, TypeError, ValueError):
             return None
 
+    @property
+    def api_tracer(self) -> t.Optional[IxiaTracer]:
+        """The REST call tracer, or None when `trace_api_calls` was not set."""
+        return self._tracer
+
+    def rotate_api_trace_phase(self, phase: str) -> t.Optional[IxiaTraceSlice]:
+        """Close the current trace slice and start recording into `phase`.
+
+        Returns the slice that was just closed so the caller can publish it,
+        or None when tracing is off or the trace is already closed.
+        """
+        tracer = self._tracer
+        if tracer is None:
+            return None
+        try:
+            return tracer.rotate(phase)
+        except Exception as exc:
+            self.logger.warning(
+                f"{_YELLOW}[IXIA]{_RESET} ixia api trace: phase rotation to "
+                f"{phase!r} failed: {exc!r}"
+            )
+            return None
+
+    def _publish_trace_session_preamble(self) -> None:
+        """Record the chassis, session and port map the trace was taken against.
+
+        Without this a slice is a list of URLs against an anonymous session:
+        Keysight cannot replay it, and nobody reading it six weeks later can
+        tell which physical ports the calls drove.
+        """
+        tracer = self._tracer
+        if tracer is None:
+            return
+        try:
+            tracer.set_session_preamble(
+                IxiaTraceSessionPreamble(
+                    record_type=RECORD_TYPE_SESSION_PREAMBLE,
+                    seq=0,
+                    recorded_at=time.time(),
+                    chassis_ip=str(self.primary_chassis_ip),
+                    session_id=self.session_id,
+                    session_name=self.session_name,
+                    restpy_version=_restpy_version(),
+                    is_uhd_chassis=self.is_uhd_chassis,
+                    force_take_port_ownership=self.force_take_port_ownership,
+                    ports=self._trace_port_mappings(),
+                    traffic_items=self._trace_traffic_item_names(),
+                )
+            )
+        except Exception as exc:
+            self.logger.warning(
+                f"{_YELLOW}[IXIA]{_RESET} ixia api trace: session preamble "
+                f"failed: {exc!r}"
+            )
+
+    def _trace_port_mappings(self) -> t.Tuple[IxiaTracePortMapping, ...]:
+        """Slot/port to vport to DUT interface, from the declarative config.
+
+        Read from `ixia_config` so trace preamble construction does not depend
+        on whether fresh setup or retained-session rehydration has completed.
+        The vport name is the same deterministic `DESIRED_VPORT_NAME` render
+        used by both paths.
+        """
+        config = self.ixia_config
+        port_configs = getattr(config, "port_configs", None) if config else None
+        mappings = []
+        for port_config in port_configs or []:
+            phy = port_config.phy_port_config
+            port_identifier = self.get_port_identifier(port_config.port_name)
+            mappings.append(
+                IxiaTracePortMapping(
+                    dut_interface=port_config.port_name,
+                    chassis_ip=phy.chassis_ip,
+                    slot=phy.slot_number,
+                    port=phy.port_number,
+                    vport_name=DESIRED_VPORT_NAME.format(
+                        port_identifier=port_identifier
+                    ),
+                )
+            )
+        return tuple(mappings)
+
+    def _trace_traffic_item_names(self) -> t.Tuple[str, ...]:
+        """The names `create_traffic_items` gives the items on the chassis."""
+        config = self.ixia_config
+        traffic_items = getattr(config, "traffic_items", None) if config else None
+        return tuple(
+            item.name or Ixia.get_traffic_item_name(item)
+            for item in traffic_items or []
+        )
+
     def _install_request_deadline_wrapper(self) -> None:
         with self._request_deadline_wrapper_lock:
             self._install_request_deadline_wrapper_locked(self.session)
 
     def _install_request_deadline_wrapper_locked(self, session: t.Any) -> None:
-        transport = session.TestPlatform._connection._session
+        """Replace the restpy transport callable with the deadline + trace wrapper.
+
+        Every IxNetwork REST call funnels through this one `requests.Session`
+        method, so tracing wraps the whole call rather than living inside the
+        deadline branch: calls made outside a `request_deadline()` scope take
+        the no-deadline early return in `_send_with_deadline` and would
+        otherwise never be recorded.
+
+        Re-entrant by design: `connect()` and every `request_deadline()`
+        scope call this under lock, including after in-band 5xx recovery.
+        """
+        connection = session.TestPlatform._connection
+        transport = connection._session
         current_request = transport.request
-        if getattr(
-            self, "_deadline_wrapped_transport", None
-        ) is transport and current_request is getattr(
-            self, "_deadline_request_wrapper", None
-        ):
+        # The guard reads a mark on the wrapper rather than the single-slot
+        # bookkeeping below, which only remembers the most recently wrapped
+        # transport: reinstalling against an earlier one would otherwise nest
+        # a second wrapper and double both the deadline layer and the trace.
+        if getattr(current_request, _TRACED_REQUEST_OWNER, None) is self:
+            self._deadline_wrapped_transport = transport
+            self._deadline_request_wrapper = current_request
             return
-        deadline_state = self._request_deadline_state
 
         @functools.wraps(current_request)
-        def request_with_deadline(*args: t.Any, **kwargs: t.Any) -> t.Any:
-            deadline = getattr(deadline_state, "deadline", None)
-            if deadline is None:
-                return current_request(*args, **kwargs)
-            remaining = deadline - time.monotonic()
-            phase = getattr(deadline_state, "phase", "IXIA operation")
-            if remaining <= 0:
-                raise IxiaOperationTimeoutError(
-                    f"{phase} request deadline expired",
-                    deadline_expired=True,
-                )
-            existing_timeout = kwargs.get("timeout")
-            if isinstance(existing_timeout, tuple):
-                # Requests interprets this tuple as independent connect/read
-                # caps, so preserve each caller value while capping both.
-                kwargs["timeout"] = tuple(
-                    remaining if value is None else min(value, remaining)
-                    for value in existing_timeout
-                )
-            elif existing_timeout is None:
-                kwargs["timeout"] = remaining
-            else:
-                kwargs["timeout"] = min(existing_timeout, remaining)
-            try:
-                return current_request(*args, **kwargs)
-            except IxiaOperationTimeoutError:
-                raise
-            except (TimeoutError, RequestsTimeout) as error:
-                raise IxiaOperationTimeoutError(
-                    f"{phase} transport request timed out",
-                    deadline_expired=time.monotonic() >= deadline,
-                ) from error
+        def traced_request_with_deadline(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            return self._trace_and_send(current_request, args, kwargs)
 
-        transport.request = request_with_deadline
+        setattr(traced_request_with_deadline, _TRACED_REQUEST_OWNER, self)
+        transport.request = traced_request_with_deadline
         self._deadline_wrapped_transport = transport
-        self._deadline_request_wrapper = request_with_deadline
+        self._deadline_request_wrapper = traced_request_with_deadline
+        if self._tracer is not None:
+            self._tracer.set_app_errors_fetch(
+                self._build_app_errors_fetch(connection, current_request)
+            )
+
+    def _build_app_errors_fetch(
+        self, connection: t.Any, send: t.Callable[..., t.Any]
+    ) -> t.Callable[[str], t.Any]:
+        """A GET of `/globals/appErrors/error` that cannot recurse.
+
+        `send` is the transport callable captured BEFORE the tracing wrapper
+        replaced it, so the fetch the tracer issues from inside that wrapper
+        does not re-enter it. The tracer's reentrancy flag is a second line of
+        defense, not the only one.
+
+        No deadline is applied either: the fetch runs after the call it
+        explains has already failed, and inheriting an expired deadline would
+        drop exactly the evidence being collected.
+        """
+
+        def fetch(url: str) -> t.Any:
+            return send(
+                "GET",
+                url,
+                headers=getattr(connection, "_headers", None),
+                verify=getattr(connection, "_verify_cert", False),
+                allow_redirects=False,
+                timeout=_APP_ERRORS_FETCH_TIMEOUT_SECONDS,
+            )
+
+        return fetch
+
+    def _trace_and_send(
+        self,
+        send: t.Callable[..., t.Any],
+        args: t.Tuple[t.Any, ...],
+        kwargs: t.Dict[str, t.Any],
+    ) -> t.Any:
+        tracer = self._tracer
+        if tracer is None:
+            return self._send_with_deadline(send, args, kwargs)
+        span = self._begin_trace_span(tracer, args, kwargs)
+        if span is None:
+            return self._send_with_deadline(send, args, kwargs)
+        try:
+            response = self._send_with_deadline(send, args, kwargs)
+        except BaseException as error:
+            self._record_trace_outcome(tracer.fail, span, error)
+            raise
+        self._record_trace_outcome(tracer.finish, span, response)
+        return response
+
+    def _send_with_deadline(
+        self,
+        send: t.Callable[..., t.Any],
+        args: t.Tuple[t.Any, ...],
+        kwargs: t.Dict[str, t.Any],
+    ) -> t.Any:
+        state = self._request_deadline_state
+        deadline = getattr(state, "deadline", None)
+        if deadline is None:
+            return send(*args, **kwargs)
+        remaining = deadline - time.monotonic()
+        phase = getattr(state, "phase", "IXIA operation")
+        if remaining <= 0:
+            raise IxiaOperationTimeoutError(
+                f"{phase} request deadline expired",
+                deadline_expired=True,
+            )
+        kwargs["timeout"] = cap_timeout_at_deadline(kwargs.get("timeout"), remaining)
+        try:
+            return send(*args, **kwargs)
+        except IxiaOperationTimeoutError:
+            raise
+        except (TimeoutError, RequestsTimeout) as error:
+            raise IxiaOperationTimeoutError(
+                f"{phase} transport request timed out",
+                deadline_expired=time.monotonic() >= deadline,
+            ) from error
+
+    def _begin_trace_span(
+        self,
+        tracer: IxiaTracer,
+        args: t.Tuple[t.Any, ...],
+        kwargs: t.Dict[str, t.Any],
+    ) -> t.Optional[IxiaTraceSpan]:
+        """Open a trace span, or None when the call cannot be described.
+
+        restpy drives the transport two ways. `Connection._request` forwards
+        everything as keywords; the file-transfer, 409-retry and async-poll
+        helpers pass `("GET", url, ...)` positionally. A call shape the
+        extractors do not understand is therefore a real possibility, and
+        returning None sends the request untraced rather than failing a REST
+        call that tracing was only ever meant to observe.
+        """
+        try:
+            state = self._request_deadline_state
+            method, url = extract_request_method_and_url(args, kwargs)
+            return tracer.begin(
+                method=method,
+                url=url,
+                request_body=extract_request_body(kwargs),
+                # The stats sampler thread never enters an `@external_api`
+                # scope, so its rows carry op=None. The URL still names them.
+                op=getattr(state, "op", None),
+                phase=getattr(state, "phase", None),
+                playbook=self._current_playbook_name,
+                testconfig=self._current_testconfig_name,
+            )
+        except Exception:
+            self.logger.exception(
+                f"{_YELLOW}[IXIA]{_RESET} ixia api trace: span setup failed, "
+                "issuing the request untraced"
+            )
+            return None
+
+    def _record_trace_outcome(
+        self,
+        write: t.Callable[[IxiaTraceSpan, t.Any], None],
+        span: IxiaTraceSpan,
+        outcome: t.Any,
+    ) -> None:
+        """Write one trace record, swallowing any tracer failure.
+
+        A tracer fault must never replace the REST result the caller is
+        waiting on: on the success path it would turn a good call into a
+        failed one, and on the failure path it would hide the real exception
+        behind the tracer's. Same discipline `_emit_inband_502` applies to
+        its Scuba write.
+        """
+        try:
+            write(span, outcome)
+        except Exception:
+            self.logger.exception(
+                f"{_YELLOW}[IXIA]{_RESET} ixia api trace: failed to record "
+                f"{span.method} {span.url}"
+            )
 
     def request_deadline(
         self, timeout_seconds: float, phase: str
@@ -1346,18 +1993,107 @@ class Ixia:
             else:
                 state.phase = previous_phase
 
+    def mutation_transaction(self) -> AbstractContextManager[None]:
+        """Serialize a complete same-session IXIA mutation transaction."""
+        return self._mutation_transaction_scope()
+
+    @contextmanager
+    def _mutation_transaction_scope(self) -> t.Iterator[None]:
+        with self._bounded_apply_lock:
+            self.assert_session_not_quarantined()
+            yield
+
     @property
     def session_quarantined(self) -> bool:
         with self._bounded_apply_lock:
-            return self._session_quarantine_reason is not None
+            return (
+                self._session_quarantine_reason is not None
+                or self._scenario_quarantine_record is not None
+            )
+
+    @property
+    def scenario_quarantine_record(
+        self,
+    ) -> t.Optional[IxiaScenarioQuarantineRecord]:
+        with self._bounded_apply_lock:
+            return self._scenario_quarantine_record
 
     def assert_session_not_quarantined(self) -> None:
         with self._bounded_apply_lock:
             reason = self._session_quarantine_reason
+            record = self._scenario_quarantine_record
+        if record is not None:
+            expiry = (
+                "expired; explicit recovery is required" if record.expired else "active"
+            )
+            raise IxiaSessionQuarantinedError(
+                "IXIA session is quarantined after an unverified churn restore: "
+                f"{record.reason} (generation={record.generation}, {expiry})"
+            )
         if reason is not None:
             raise IxiaSessionQuarantinedError(
                 f"IXIA session is quarantined after an ambiguous operation: {reason}"
             )
+
+    def quarantine_scenario(
+        self,
+        reason: str,
+        baseline: object,
+        mutation_journal: object,
+        expires_at_monotonic: float,
+    ) -> IxiaScenarioQuarantineRecord:
+        created_at = time.monotonic()
+        if expires_at_monotonic <= created_at:
+            raise ValueError("scenario quarantine expiry must be in the future")
+        with self._bounded_apply_lock:
+            self._scenario_quarantine_generation += 1
+            record = IxiaScenarioQuarantineRecord(
+                generation=self._scenario_quarantine_generation,
+                reason=reason,
+                baseline=baseline,
+                mutation_journal=mutation_journal,
+                created_at_monotonic=created_at,
+                expires_at_monotonic=expires_at_monotonic,
+                session_identity=self._remote_session_identity(),
+            )
+            self._scenario_quarantine_record = record
+            return record
+
+    def reset_scenario_quarantine(
+        self,
+        generation: int,
+        *,
+        restoration_verified: bool = False,
+        session_reset: bool = False,
+    ) -> None:
+        with self._bounded_apply_lock:
+            record = self._scenario_quarantine_record
+            if record is None:
+                raise IxiaSessionQuarantinedError("no scenario quarantine to reset")
+            if record.generation != generation:
+                raise IxiaSessionQuarantinedError(
+                    f"scenario quarantine generation changed from {generation} "
+                    f"to {record.generation}"
+                )
+            current_identity = self._remote_session_identity()
+            verified_same_session = (
+                restoration_verified
+                and record.session_identity is not None
+                and current_identity is not None
+                and current_identity == record.session_identity
+            )
+            replaced_session = (
+                session_reset
+                and record.session_identity is not None
+                and current_identity is not None
+                and current_identity != record.session_identity
+            )
+            if not verified_same_session and not replaced_session:
+                raise IxiaSessionQuarantinedError(
+                    "scenario quarantine reset requires verified restoration on the "
+                    "captured session or an explicitly replaced remote session"
+                )
+            self._scenario_quarantine_record = None
 
     def _quarantine_session(self, reason: str) -> None:
         with self._bounded_apply_lock:
@@ -1498,13 +2234,13 @@ class Ixia:
         return True
 
     def _attempt_inband_recovery(self) -> bool:
-        """Best-effort soft restart of `ixnetworkweb` via `ixia_recovery_lib`.
+        """Best-effort soft restart of `ixnetworkweb` via the recovery module.
 
         Returns True iff the lib reports success AND `/api/v1/sessions`
         returned 200 within the poll window. Any exception inside the lib
         is logged and treated as a recovery failure.
         """
-        # OSS guard: `ixia_recovery_lib` is internal-only (the surrounding
+        # OSS guard: recovery telemetry is internal-only (the surrounding
         # file is OSS-shared). Skip in OSS builds without even attempting
         # the import, matching the convention used by `fetch_ixia_credentials`
         # elsewhere in this module. See `.llms/skills/taac_oss_privacy_rules.md`.
@@ -1513,12 +2249,10 @@ class Ixia:
         # Lazy import: keeps the dep chain off the hot connect path and
         # prevents a circular import.
         try:
-            from taac.internal.utils.ixia_recovery_lib import (
-                restart_ixnetwork,
-            )
+            from taac.ixia.recovery import restart_ixnetwork
         except ImportError as ie:
             self.logger.warning(
-                f"{_YELLOW}[IXIA]{_RESET} ixia_recovery_lib not importable "
+                f"{_YELLOW}[IXIA]{_RESET} IXIA recovery module not importable "
                 f"({ie!r}) — skipping in-band recovery"
             )
             return False
@@ -1573,9 +2307,7 @@ class Ixia:
         if TAAC_OSS:
             return
         try:
-            from taac.internal.utils.ixia_recovery_lib import (
-                emit_inband_502_scuba,
-            )
+            from taac.ixia.recovery import emit_inband_502_scuba
         except ImportError:
             return
         try:
@@ -1632,7 +2364,7 @@ class Ixia:
         ):
             return
         try:
-            from taac.internal.utils.ixia_recovery_lib import (
+            from taac.ixia.recovery import (
                 classify_health,
                 HealthStatus,
             )
@@ -1687,18 +2419,9 @@ class Ixia:
             port_configs: t.List of type PortConfig containing port config
                 details.
 
-        WARNING — Cache caveat:
-            This method is the ONLY producer of `self.vport_indices`. It is
-            skipped by `create_basic_setup` when `is_existing_session=True`,
-            which is the state after an IXIA topology-cache HIT
-            (`taac_ixia.load_config_from_chassis` /
-            `ixia_config_cache_manager.try_load_from_manifold`). On cache
-            hit the server-side vports are restored but `vport_indices`
-            stays empty — any downstream API that traverses through
-            `vport_indices` will KeyError. TestConfigs that use such APIs
-            (e.g. `register_cpu_queue_static_route_patcher`) MUST opt out
-            of the cache via
-            `ixia_config_cache=taac_types.IxiaConfigCache(enabled=False)`.
+        Existing sessions and cached configurations use
+        `rehydrate_vport_indices` instead, because their server-side objects
+        already exist and must not be recreated.
         """
 
         portmap_obj = self.session.PortMapAssistant()
@@ -1739,8 +2462,24 @@ class Ixia:
             f"{_CYAN}[IXIA]{_RESET} Connecting {len(port_configs)} port(s)... "
             f"{_DIM}(force_ownership={self.force_take_port_ownership}){_RESET}"
         )
+        # Ports whose L1 requests RS-FEC cannot be link-up at connect time:
+        # the chassis only programs FEC once the vport exists. Skip the
+        # link-up gate when (and only when) such a port is present, push FEC
+        # below, then verify link explicitly before setup proceeds.
+        # IgnoreLinkUp is omitted entirely otherwise so the connect call is
+        # byte-identical to the pre-RS-FEC behavior for non-FEC batches.
+        fec_requested = any(
+            getattr(port_config.l1_config, "enable_rs_fec", False)
+            for port_config in port_configs
+            if port_config.l1_config is not None
+        )
+        connect_kwargs: t.Dict[str, t.Any] = {
+            "ForceOwnership": self.force_take_port_ownership,
+        }
+        if fec_requested:
+            connect_kwargs["IgnoreLinkUp"] = True
         try:
-            portmap_obj.Connect(ForceOwnership=self.force_take_port_ownership)
+            portmap_obj.Connect(**connect_kwargs)
         except Exception as connect_ex:
             # Log per-port link state to identify which port(s) failed
             self.logger.error(
@@ -1760,12 +2499,430 @@ class Ixia:
                     f"{_MAGENTA}[IXIA]{_RESET}   Failed to query vport states: {log_ex}"
                 )
             raise IxiaPortUnavailableError(
-                f"Unable to assign IXIA physical ports: {connect_ex}"
+                f"Unable to assign IXIA physical ports: {connect_ex}. "
+                f"Hardware port state: {self._hardware_port_states(port_configs)}"
             ) from connect_ex
+        if fec_requested:
+            self._push_rs_fec_and_verify_link(port_configs)
         elapsed_time = time.time() - start_time
         self.logger.info(
             f"{_GREEN}{_BOLD}[IXIA]{_RESET} All ports reserved in "
             f"{_YELLOW}{elapsed_time:.1f}s{_RESET}"
+        )
+
+    def _push_rs_fec_and_verify_link(
+        self,
+        port_configs: t.Sequence[ixia_types.PortConfig],
+        timeout_seconds: float = 300,
+    ) -> None:
+        """Push requested RS-FEC and verify every port's link comes up.
+
+        Runs only when at least one port config asks for RS-FEC (the connect
+        above skipped the link-up gate for the whole batch in that case).
+        Pushes each FEC port's own L1 config, then polls until EVERY port in
+        the batch — FEC and non-FEC alike — reports link-up, restoring the
+        skipped gate; raises like a connect failure if the deadline passes.
+        """
+        all_ports: t.List[str] = []
+        fec_ports: t.Set[str] = set()
+        for port_config in port_configs:
+            desired_vport_name = DESIRED_VPORT_NAME.format(
+                port_identifier=self.get_port_identifier(port_config.port_name)
+            )
+            vports = self.ixnetwork.Vport.find(Name=desired_vport_name)
+            if len(vports) == 0:
+                raise IxiaPortUnavailableError(
+                    f"vport {desired_vport_name} missing after connect"
+                )
+            l1_config = port_config.l1_config
+            if l1_config is not None and getattr(
+                l1_config, "enable_rs_fec", False
+            ):
+                self.configure_l1_settings(vports[0], l1_config)
+                fec_ports.add(desired_vport_name)
+            all_ports.append(desired_vport_name)
+        deadline = time.time() + timeout_seconds
+        pending = set(all_ports)
+        while pending and time.time() < deadline:
+            for vport in self.ixnetwork.Vport.find():
+                if vport.Name in pending and vport.ConnectionState == "connectedLinkUp":
+                    pending.discard(vport.Name)
+                    via_fec = " with RS-FEC" if vport.Name in fec_ports else ""
+                    self.logger.info(
+                        f"{_GREEN}[IXIA]{_RESET}   {vport.Name} link up{via_fec}"
+                    )
+            if pending:
+                time.sleep(5)
+        if pending:
+            raise IxiaPortUnavailableError(
+                "Ports never linked up after connect "
+                "(link-up gate was skipped for RS-FEC): "
+                + ", ".join(sorted(pending))
+                + f". Hardware port state: {self._hardware_port_states(port_configs)}"
+            )
+
+    def _hardware_port_states(
+        self, port_configs: t.Sequence[ixia_types.PortConfig]
+    ) -> str:
+        """Best-effort owner, busy and link state of each physical port.
+
+        A restpy link-up timeout looks the same whether another IxNetwork
+        session holds the port or the physical link is down; the chassis-side
+        port state tells them apart. Called while building an error message,
+        so it never raises.
+        """
+        try:
+            return self._describe_hardware_ports(port_configs)
+        except Exception as ex:
+            return f"unavailable ({type(ex).__name__}: {ex})"
+
+    def _describe_hardware_ports(
+        self, port_configs: t.Sequence[ixia_types.PortConfig]
+    ) -> str:
+        # pyrefly: ignore [missing-attribute]
+        all_chassis = list(self.ixnetwork.AvailableHardware.Chassis.find())
+        states: t.List[str] = []
+        any_busy = any_down = False
+        for port_config in port_configs:
+            phy = port_config.phy_port_config
+            location = f"{phy.chassis_ip} {phy.slot_number}/{phy.port_number}"
+            chassis = next(
+                (c for c in all_chassis if _same_host(c.Hostname, phy.chassis_ip)),
+                None,
+            )
+            if chassis is None:
+                states.append(f"{location}: chassis not in session")
+                continue
+            try:
+                ports = chassis.Card.find(CardId=phy.slot_number).Port.find(
+                    PortId=phy.port_number
+                )
+                if len(ports) == 0:
+                    states.append(f"{location}: port not found")
+                    continue
+                port = ports[0]
+                busy, link_up = bool(port.IsBusy), bool(port.IsLinkUp)
+                states.append(
+                    f"{location}: owner={port.Owner or 'none'} busy={busy} "
+                    f"link_up={link_up}"
+                )
+            except Exception as ex:
+                states.append(f"{location}: unavailable ({type(ex).__name__}: {ex})")
+                continue
+            any_busy |= busy
+            any_down |= not link_up
+        summary = "; ".join(states)
+        if any_busy:
+            summary += (
+                ". A busy port is usually held by another IxNetwork session or "
+                "a concurrent run; compare its owner and free it before retrying"
+            )
+        elif any_down:
+            summary += ". Link is down; check the physical link and optics"
+        return summary
+
+    def configure_nrz_100g_rs_fec(
+        self, port_configs: t.Sequence[ixia_types.PortConfig]
+    ) -> None:
+        """Bring up 100G NRZ ports whose DUT expects RS-FEC.
+
+        IEEE L1 defaults run 100G NRZ with FEC off. Ports on those defaults
+        that do not link up get RS-FEC (CL91); ports that still stay down are
+        put back on IEEE defaults, so a DUT that runs without FEC, or a port
+        that is down for another reason, ends up exactly where it started.
+        Ports that are already up, run PAM4, or carry test-specific L1 settings
+        are never touched. Best effort: a failure here only logs.
+        """
+        if not self.auto_nrz_100g_rs_fec or self.is_uhd_chassis:
+            return
+        candidates: t.List["Vport"] = []
+        for port_config in port_configs:
+            desired_vport_name = DESIRED_VPORT_NAME.format(
+                port_identifier=self.get_port_identifier(port_config.port_name)
+            )
+            try:
+                vport = self.ixnetwork.Vport.find(Name=desired_vport_name)
+                if self._is_nrz_100g_on_ieee_defaults(vport):
+                    candidates.append(vport)
+            except Exception as ex:
+                self.logger.debug(
+                    f"[IXIA] Skipping 100G NRZ FEC check for {desired_vport_name}: {ex}"
+                )
+        if not candidates:
+            return
+
+        up = self._wait_for_vports_link_up(candidates, _NRZ_100G_FEC_LINK_WAIT_SECONDS)
+        down = [vport for vport in candidates if vport.Name not in up]
+        if not down:
+            return
+        names = ", ".join(vport.Name for vport in down)
+        self.logger.info(
+            f"{_CYAN}[IXIA]{_RESET} 100G NRZ port(s) down on IEEE defaults "
+            f"(FEC off), trying RS-FEC: {names}"
+        )
+        try:
+            for vport in down:
+                self._set_l1_rs_fec(vport, enabled=True)
+            fixed = self._wait_for_vports_link_up(
+                down, _NRZ_100G_FEC_LINK_WAIT_SECONDS
+            )
+            for vport in down:
+                if vport.Name in fixed:
+                    self.logger.info(
+                        f"{_GREEN}[IXIA]{_RESET}   {vport.Name} up with RS-FEC (CL91)"
+                    )
+                else:
+                    self._set_l1_rs_fec(vport, enabled=False)
+                    self.logger.warning(
+                        f"{_YELLOW}[IXIA]{_RESET}   {vport.Name} still down with "
+                        "RS-FEC; restored IEEE L1 defaults"
+                    )
+        except Exception as ex:
+            self.logger.warning(f"[IXIA] 100G NRZ RS-FEC configuration failed: {ex}")
+
+    def _get_l1_speed_settings(self, vport: "Vport") -> t.Optional[t.Any]:
+        """Return the speed-specific L1 settings object of a vport.
+
+        `L1Config.CurrentType` names it, e.g. `aresOneM` -> `L1Config.AresOneM`.
+        The `Fcoe` variant of a type shares the settings object of the base type.
+        """
+        current_type = str(vport.L1Config.CurrentType or "")
+        if not current_type:
+            return None
+        attribute = (current_type[0].upper() + current_type[1:]).replace("Fcoe", "")
+        return getattr(vport.L1Config, attribute, None)
+
+    def _get_resource_group_mode(self, vport: "Vport") -> t.Optional[str]:
+        """Return the resource group mode of the physical port behind a vport."""
+        port_href = str(vport.ConnectedTo or "")
+        if "/port/" not in port_href:
+            return None
+        card = self.session.Session.GetObjectFromHref(port_href.rsplit("/port/", 1)[0])
+        if card is None:
+            return None
+        for aggregation in card.Aggregation.find():
+            if port_href in (aggregation.ActivePorts or []):
+                return aggregation.Mode
+        return card.AggregationMode
+
+    def _is_nrz_100g_on_ieee_defaults(self, vport: "Vport") -> bool:
+        settings = self._get_l1_speed_settings(vport)
+        if settings is None:
+            return False
+        if (
+            settings.Speed != _NRZ_100G_SPEED
+            or not settings.IeeeL1Defaults
+            or settings.EnableRsFec
+        ):
+            return False
+        mode = self._get_resource_group_mode(vport) or ""
+        return "NRZ" in mode or mode in _LEGACY_NRZ_100G_RESOURCE_MODES
+
+    def _set_l1_rs_fec(self, vport: "Vport", enabled: bool) -> None:
+        """Turn RS-FEC (CL91) on, or put the port back on IEEE L1 defaults."""
+        settings = none_throws(self._get_l1_speed_settings(vport))
+        if enabled:
+            settings.IeeeL1Defaults = False
+            settings.EnableRsFec = True
+        else:
+            settings.EnableRsFec = False
+            settings.IeeeL1Defaults = True
+
+    def _wait_for_vports_link_up(
+        self, vports: t.Sequence["Vport"], timeout_seconds: float
+    ) -> t.Set[str]:
+        """Poll until every vport links up or the timeout passes.
+
+        Returns the names of the vports that came up.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        pending = list(vports)
+        up: t.Set[str] = set()
+        while True:
+            for vport in list(pending):
+                if vport.refresh().ConnectionState == _VPORT_LINK_UP_STATE:
+                    up.add(vport.Name)
+                    pending.remove(vport)
+            if not pending or time.monotonic() >= deadline:
+                return up
+            time.sleep(_NRZ_100G_FEC_LINK_POLL_SECONDS)
+
+    def rehydrate_vport_indices(
+        self, port_configs: t.Sequence[ixia_types.PortConfig]
+    ) -> None:
+        """Rebuild the local object index for an existing IXIA topology.
+
+        An ``.ixncfg`` load or explicit ``--ixia-session-id`` restores the
+        IxNetwork object graph, but not this Python process's object index.
+        Resolve configured objects by their deterministic names without
+        mutating the retained session. Missing objects fail closed so a cache
+        hit can fall back to a clean build and a retained-session attach gets
+        an actionable error instead of a later ``KeyError``.
+        """
+
+        def required(obj: t.Any, description: str) -> t.Any:
+            if not obj:
+                raise IxiaSetupError(
+                    f"Cannot rehydrate IXIA session: missing {description}"
+                )
+            return obj
+
+        def network_group_name(
+            network_group_index: int,
+            device_group_identifier: str,
+            address_family: ixia_types.IpAddressFamily,
+        ) -> str:
+            identifier = f"N{network_group_index}_{device_group_identifier}"
+            template = (
+                DESIRED_V4_BGP_PREFIX_NAME
+                if address_family == ixia_types.IpAddressFamily.IPV4
+                else DESIRED_V6_BGP_PREFIX_NAME
+            )
+            return template.format(port_identifier=identifier)
+
+        self.vport_indices = {}
+        self.tag_name_to_device_group_name_list = defaultdict(list)
+        for port_config in port_configs:
+            port_identifier = self.get_port_identifier(port_config.port_name)
+            desired_vport_name = DESIRED_VPORT_NAME.format(
+                port_identifier=port_identifier
+            )
+            required(
+                self.ixnetwork.Vport.find(Name=desired_vport_name),
+                f"vport {desired_vport_name!r}",
+            )
+            desired_topology_name = DESIRED_TOPOLOGY_NAME.format(
+                port_identifier=port_identifier
+            )
+            topology = required(
+                self.ixnetwork.Topology.find(Name=desired_topology_name),
+                f"topology {desired_topology_name!r}",
+            )
+            vport_index = VportIndex(
+                name=desired_vport_name,
+                topology_name=topology.Name,
+            )
+            self.vport_indices[port_identifier] = vport_index
+            created_device_groups: t.Dict[int, "DeviceGroup"] = {}
+
+            for device_group_config in port_config.device_group_configs or ():
+                device_group_identifier = (
+                    f"D{device_group_config.device_group_index}_{port_identifier}"
+                )
+                if device_group_config.tag_name:
+                    device_group_identifier += (
+                        f"_{device_group_config.tag_name.upper()}"
+                    )
+                    self.tag_name_to_device_group_name_list[
+                        device_group_config.tag_name
+                    ].append(device_group_identifier)
+
+                container = topology
+                tag_upper = (device_group_config.tag_name or "").upper()
+                if match := re.search(r"CHAINED_(\d+)", tag_upper):
+                    parent_index = int(match.group(1))
+                    container = required(
+                        created_device_groups.get(parent_index),
+                        f"parent device group index {parent_index} for "
+                        f"{device_group_identifier!r}",
+                    )
+
+                desired_device_group_name = (
+                    device_group_config.device_group_name
+                    or DESIRED_DEVICE_GROUP_NAME.format(
+                        port_identifier=device_group_identifier
+                    )
+                )
+                device_group = required(
+                    container.DeviceGroup.find(Name=desired_device_group_name),
+                    f"device group {desired_device_group_name!r}",
+                )
+                created_device_groups[device_group_config.device_group_index] = (
+                    device_group
+                )
+                device_group_index = DeviceGroupIndex(device_group=device_group)
+                vport_index.device_group_indices[
+                    device_group_config.device_group_index
+                ] = device_group_index
+
+                desired_ethernet_name = DESIRED_ETHERNET_NAME.format(
+                    port_identifier=device_group_identifier
+                )
+                ethernet = required(
+                    device_group.Ethernet.find(Name=desired_ethernet_name),
+                    f"Ethernet stack {desired_ethernet_name!r}",
+                )
+                device_group_index.ethernet = ethernet
+                device_group_index.ipv4 = ethernet.Ipv4.find(
+                    Name=DESIRED_IPV4_NAME.format(
+                        port_identifier=device_group_identifier
+                    )
+                ) or None
+                device_group_index.ipv6 = ethernet.Ipv6.find(
+                    Name=DESIRED_IPV6_NAME.format(
+                        port_identifier=device_group_identifier
+                    )
+                ) or None
+
+                bgp_config_info = device_group_config.bgp_config
+                if not bgp_config_info:
+                    continue
+                for bgp_config in (
+                    bgp_config_info.bgp_v4_config,
+                    bgp_config_info.bgp_v6_config,
+                ):
+                    if not bgp_config:
+                        continue
+                    custom_network_groups = (
+                        bgp_config.custom_network_group_configs or ()
+                    )
+                    if custom_network_groups:
+                        for config in custom_network_groups:
+                            network_group = required(
+                                device_group.NetworkGroup.find(
+                                    Name=config.network_group_name
+                                ),
+                                f"network group {config.network_group_name!r}",
+                            )
+                            device_group_index.network_group_indices[
+                                config.network_group_index
+                            ] = NetworkGroupIndex(network_group=network_group)
+                    else:
+                        for config in bgp_config.bgp_prefix_configs or ():
+                            address_family = (
+                                config.ip_address_family
+                                or bgp_config.ip_address_family
+                            )
+                            desired_name = network_group_name(
+                                config.network_group_index,
+                                device_group_identifier,
+                                address_family,
+                            )
+                            network_group = required(
+                                device_group.NetworkGroup.find(Name=desired_name),
+                                f"network group {desired_name!r}",
+                            )
+                            device_group_index.network_group_indices[
+                                config.network_group_index
+                            ] = NetworkGroupIndex(network_group=network_group)
+
+                    for config in bgp_config.import_bgp_routes_params_list or ():
+                        desired_name = network_group_name(
+                            config.network_group_index,
+                            device_group_identifier,
+                            bgp_config.ip_address_family,
+                        )
+                        network_group = required(
+                            device_group.NetworkGroup.find(Name=desired_name),
+                            f"network group {desired_name!r}",
+                        )
+                        device_group_index.network_group_indices[
+                            config.network_group_index
+                        ] = NetworkGroupIndex(network_group=network_group)
+
+        self.logger.info(
+            "Rehydrated IXIA vport index for existing session: "
+            f"{sorted(self.vport_indices)}"
         )
 
     def create_topology(self, port_identifier: str, vport: "Vport") -> "Topology":
@@ -2194,13 +3351,15 @@ class Ixia:
         return IpAddressResult(ipv4=ipv4_addr, ipv6=ipv6_addr)
 
     @external_api
-    def start_protocols(self) -> None:
-        """Used to start all the protocols synchronously"""
+    def start_protocols(self, sleep_timer: int = 0) -> None:
+        """Start all protocols synchronously, then wait for them to settle."""
 
         self.ixnetwork.StartAllProtocols(Arg1="sync")
         self.logger.info(
             "[GLOBAL] Successfully started all the protocols in the IXIA setup"
         )
+
+        time.sleep(sleep_timer)
 
     @external_api
     def stop_protocols(self, sleep_timer: int = 0) -> None:
@@ -2213,6 +3372,82 @@ class Ixia:
 
         time.sleep(sleep_timer)
 
+    def stop_protocols_and_wait(
+        self,
+        timeout_seconds: int = _PROTOCOL_STATE_SETTLE_TIMEOUT_SECONDS,
+        poll_seconds: int = _PROTOCOL_STATE_POLL_SECONDS,
+    ) -> None:
+        """Stop all protocols and block until the device groups have really stopped.
+
+        Use this, not bare :meth:`stop_protocols`, before writing any property
+        that IxNetwork refuses to change on a started element (AS-path segments,
+        community lists, prefix-pool multipliers, ...).
+
+        ``StopAllProtocols(Arg1="sync")`` returns once the stop is QUEUED, not
+        once it has been applied: IxNetwork reports the outstanding work as
+        "changes are pending to be applied after the following action(s) ...
+        Stopping <element>". A property write issued inside that window is
+        rejected outright with "Changing the property in a started element is
+        not permitted", and the caller sees an error that looks nothing like a
+        race.
+        """
+        self.stop_protocols()
+        self.wait_for_protocols_stopped(
+            timeout_seconds=timeout_seconds, poll_seconds=poll_seconds
+        )
+
+    def wait_for_protocols_stopped(
+        self,
+        timeout_seconds: int = _PROTOCOL_STATE_SETTLE_TIMEOUT_SECONDS,
+        poll_seconds: int = _PROTOCOL_STATE_POLL_SECONDS,
+    ) -> None:
+        """Block until every device group has left the started/transitioning state.
+
+        Polls the authoritative ``DeviceGroup.Status`` rather than sleeping for a
+        guessed duration: it returns as soon as the state actually flips (usually
+        far sooner than a fixed sleep) and still waits when a large topology
+        genuinely takes longer. ``timeout_seconds`` is therefore a bound on the
+        ERROR path -- a healthy stop never reaches it -- not an estimate of how
+        long stopping takes.
+
+        Raises:
+            IxiaOperationTimeoutError: if any device group is still not stopped
+                when the timeout expires. Named elements and their states are
+                included, because "which element is still started" is exactly
+                what the raw IxNetwork rejection does not tell you.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            # `Status` is a REST round-trip and is free to change between reads,
+            # so sample it ONCE per device group: reading it again for the error
+            # message could report a different state than the one that failed
+            # the check.
+            statuses = [
+                (device_group.Name, device_group.Status)
+                for topology in self.ixnetwork.Topology.find()
+                for device_group in topology.DeviceGroup.find()
+            ]
+            pending = [
+                (name, status)
+                for name, status in statuses
+                if status not in _PROTOCOLS_STOPPED_STATES
+            ]
+            if not pending:
+                self.logger.debug(
+                    "[GLOBAL] All device groups have reached a stopped state"
+                )
+                return
+            if time.monotonic() >= deadline:
+                raise IxiaOperationTimeoutError(
+                    f"device groups still not stopped after {timeout_seconds}s, "
+                    f"so a property write would be rejected: {pending}",
+                    deadline_expired=True,
+                )
+            self.logger.info(
+                f"Waiting for {len(pending)} device group(s) to stop: {pending}"
+            )
+            time.sleep(poll_seconds)
+
     def verify_protocols(self) -> None:
         """API to verify the status of the protocols in the topology"""
         if self.skip_ixia_protocol_verification:
@@ -2224,28 +3459,53 @@ class Ixia:
             UhdStatViewAssistant if self.is_uhd_chassis else IxnStatViewAssistant
         )
 
-        protocols_summary = StatViewAssistant(self.ixnetwork, "Protocols Summary")
+        # `CheckCondition` polls `self.Rows` in a loop until the condition holds
+        # or `Timeout` expires, and every `.Rows` read is a chassis CSV snapshot.
+        # Two 300s conditions therefore make this the heaviest snapshot user in
+        # the class, so it has to hold the session snapshot lock like every other
+        # stat-view reader. Nesting is safe — `_snapshot_lock` is an `RLock`.
+        with self.stat_view_snapshot():
+            protocols_summary = StatViewAssistant(self.ixnetwork, "Protocols Summary")
 
-        protocols_summary.CheckCondition(
-            "Sessions Not Started", StatViewAssistant.EQUAL, 0, Timeout=300
-        )
+            protocols_summary.CheckCondition(
+                "Sessions Not Started", StatViewAssistant.EQUAL, 0, Timeout=300
+            )
 
-        protocols_summary.CheckCondition(
-            "Sessions Down", StatViewAssistant.EQUAL, 0, Timeout=300
-        )
+            protocols_summary.CheckCondition(
+                "Sessions Down", StatViewAssistant.EQUAL, 0, Timeout=300
+            )
 
         self.logger.info(
             "[GLOBAL] Successfully verified the operational status of all "
             "the protocols in the IXIA setup!"
         )
 
+    def _apply_changes_with_retry(self) -> None:
+        for attempt in range(1, _APPLY_CHANGES_MAX_ATTEMPTS + 1):
+            try:
+                with self._bounded_apply_lock:
+                    self.assert_session_not_quarantined()
+                    self.ixnetwork.Globals.Topology.ApplyOnTheFly()
+                    self.logger.debug(
+                        "[GLOBAL] Successfully applied changes on the fly"
+                    )
+                return
+            except IxiaSessionQuarantinedError:
+                raise
+            except Exception as error:
+                if attempt == _APPLY_CHANGES_MAX_ATTEMPTS:
+                    raise
+                self.logger.warning(
+                    f"Attempt {attempt}/{_APPLY_CHANGES_MAX_ATTEMPTS} failed for "
+                    f"_apply_changes_with_retry: {error}. Retrying in "
+                    f"{_APPLY_CHANGES_RETRY_DELAY_SECONDS:.2f}s..."
+                )
+                time.sleep(_APPLY_CHANGES_RETRY_DELAY_SECONDS)
+
     @external_api
-    @retryable(num_tries=3, sleep_time=10, debug=True)
     def apply_changes(self, sleep_timer: int = 0) -> None:
         """API to apply the changes made on the fly to the topology"""
-
-        self.ixnetwork.Globals.Topology.ApplyOnTheFly()
-        self.logger.debug("[GLOBAL] Successfully applied changes on the fly")
+        self._apply_changes_with_retry()
 
         time.sleep(sleep_timer)
 
@@ -2300,7 +3560,6 @@ class Ixia:
         self,
         endpoint: ixia_types.Endpoint,
         traffic_type: ixia_types.TrafficType,
-        # pyre-fixme[7]: Expected `t.Union[IxnIpv6, IxnNetworkGroup, IxnVport, UhdIpv6,
         #  UhdNetworkGroup, UhdVport]` but got implicit return value of `None`.
     ) -> t.Union["Ipv6", "NetworkGroup", "Vport", "Ipv4"]:
         port_identifier: str = Ixia.get_port_identifier(endpoint.port_name)
@@ -2471,6 +3730,7 @@ class Ixia:
     def _configure_transmission_control(
         config_element: "ConfigElement",
         transmission_control: ixia_types.TransmissionControl,
+        repeat_burst_count: t.Optional[int] = None,
     ) -> None:
         """Configures the transmission control for the config element
 
@@ -2484,7 +3744,7 @@ class Ixia:
         ]
         if transmission_control.type == ixia_types.TransmissionControlType.CONTINUOUS:
             config_element.TransmissionControl.update(
-                Type=transmission_control_type_raw
+                Type=transmission_control_type_raw,
             )
 
         elif (
@@ -2504,6 +3764,29 @@ class Ixia:
                 Type=transmission_control_type_raw,
                 Duration=transmission_control.frame_count,
             )
+
+        elif (
+            transmission_control.type
+            == ixia_types.TransmissionControlType.BURST_FIXED_DURATION
+        ):
+            burst_params: t.Dict[str, t.Any] = {
+                "Type": transmission_control_type_raw,
+                "Duration": transmission_control.duration,
+                "EnableInterBurstGap": True,
+                "RepeatBurst": (
+                    repeat_burst_count if repeat_burst_count is not None else 1
+                ),
+            }
+            if transmission_control.burst_packet_count is not None:
+                burst_params["BurstPacketCount"] = (
+                    transmission_control.burst_packet_count
+                )
+            if transmission_control.inter_burst_gap_ms is not None:
+                burst_params["InterBurstGap"] = transmission_control.inter_burst_gap_ms
+                burst_params["InterBurstGapUnits"] = "milliseconds"
+            if transmission_control.min_gap_bytes is not None:
+                burst_params["MinGapBytes"] = transmission_control.min_gap_bytes
+            config_element.TransmissionControl.update(**burst_params)
 
     @staticmethod
     def configure_rate_distribution(
@@ -2780,10 +4063,11 @@ class Ixia:
 
         return packet_header_field_obj
 
-    def create_traffic_items(
+    def create_traffic_items(  # noqa: C901
         self,
         traffic_items: t.Sequence[ixia_types.TrafficItem],
         override_traffic_items: bool = False,
+        generate_traffic_items: bool = True,
     ) -> None:
         """API to create traffic item
 
@@ -2817,27 +4101,36 @@ class Ixia:
                 f"[GLOBAL] Attempting to create traffic item {traffic_item_name}"
             )
 
-            traffic_item_obj: "IxiaTrafficItem" = (
-                self.ixnetwork.Traffic.TrafficItem.find(Name=rf"^{traffic_item_name}&")
+            existing_traffic_item_obj: "IxiaTrafficItem" = (
+                self.ixnetwork.Traffic.TrafficItem.find(
+                    Name=rf"^{re.escape(traffic_item_name)}$"
+                )
             )
-            if traffic_item_obj and not override_traffic_items:
+            if existing_traffic_item_obj and not override_traffic_items:
                 self.logger.info(
                     f"[{traffic_item_name}] There is already an existing Traffic "
                     f"item instance {traffic_item_name}. Hence not creating a new one!"
                 )
                 continue
-            else:
-                # [STEP 1]: Creating the base traffic item object
-                traffic_item_obj: "IxiaTrafficItem" = (
-                    self.ixnetwork.Traffic.TrafficItem.add(
-                        Name=traffic_item_name,
-                        TrafficType=ixia_types.TRAFFIC_TYPE_MAP[
-                            traffic_item_info.traffic_type
-                        ],
+            replacement_name = traffic_item_name
+            if existing_traffic_item_obj:
+                while True:
+                    replacement_name = (
+                        f"{traffic_item_name}__taac_replacement_{uuid.uuid4().hex}"
                     )
-                )
-                if traffic_item_info.traffic_type == ixia_types.TrafficType.RAW:
-                    traffic_item_obj.TrafficItemType = "l2L3"
+                    if not self.ixnetwork.Traffic.TrafficItem.find(
+                        Name=rf"^{re.escape(replacement_name)}$"
+                    ):
+                        break
+            # [STEP 1]: Creating the base traffic item object
+            traffic_item_obj = self.ixnetwork.Traffic.TrafficItem.add(
+                Name=replacement_name,
+                TrafficType=ixia_types.TRAFFIC_TYPE_MAP[
+                    traffic_item_info.traffic_type
+                ],
+            )
+            if traffic_item_info.traffic_type == ixia_types.TrafficType.RAW:
+                traffic_item_obj.TrafficItemType = "l2L3"
             self.logger.debug(
                 f"[{traffic_item_name}] Successfully found or created the base "
                 "traffic item object"
@@ -2965,20 +4258,206 @@ class Ixia:
                 "statistics tracking type for this tracking item"
             )
             # [STEP 9]: Regenerate traffic item
-            traffic_item_obj.Generate()
-            self.logger.debug(
-                f"[{traffic_item_name}] Successfully regenerated the traffic item"
+            if generate_traffic_items:
+                traffic_item_obj.Generate()
+                self.logger.debug(
+                    f"[{traffic_item_name}] Successfully regenerated the traffic item"
+                )
+            else:
+                self.logger.info(
+                    f"[{traffic_item_name}] Deferred traffic generation until "
+                    "the first traffic start after DUT setup"
+                )
+            traffic_item_obj.update(
+                Enabled=(traffic_item_info.enabled if generate_traffic_items else False)
             )
-            traffic_item_obj.update(Enabled=traffic_item_info.enabled)
 
             # [STEP 9]: Modify traffic options. This will enable the capture of
             # packet loss duration in ms while fetching the traffic statistics
             self.modify_traffic_options()
 
+            if existing_traffic_item_obj:
+                if generate_traffic_items:
+                    existing_traffic_item_obj.remove()
+                    traffic_item_obj.update(Name=traffic_item_name)
+                    self.logger.info(
+                        f"[{traffic_item_name}] Replaced the existing traffic item"
+                    )
+                else:
+                    pending_replacements = [
+                        replacement
+                        for replacement in getattr(
+                            self, "_deferred_traffic_item_replacements", ()
+                        )
+                        if replacement[0] != traffic_item_name
+                    ]
+                    pending_replacements.append(
+                        (traffic_item_name, replacement_name)
+                    )
+                    self._deferred_traffic_item_replacements = pending_replacements
+                    self._deferred_traffic_item_replacement_swaps_started = getattr(
+                        self,
+                        "_deferred_traffic_item_replacement_swaps_started",
+                        set(),
+                    )
+                    self._deferred_traffic_item_replacement_swaps_started.discard(
+                        (traffic_item_name, replacement_name)
+                    )
+                    self.logger.info(
+                        f"[{traffic_item_name}] Kept the existing traffic item until "
+                        "its deferred replacement is generated"
+                    )
             self.logger.info(
                 "[GLOBAL] Successfully configured all parameters for the "
                 f"traffic item {traffic_item_name}"
             )
+
+    def finalize_deferred_traffic_item_replacements(self) -> None:  # noqa: C901
+        """Install generated replacements with an idempotent per-item retry path."""
+        pending_replacements = list(
+            dict.fromkeys(
+                getattr(self, "_deferred_traffic_item_replacements", ())
+            )
+        )
+        swaps_started = getattr(
+            self,
+            "_deferred_traffic_item_replacement_swaps_started",
+            set(),
+        )
+        self._deferred_traffic_item_replacement_swaps_started = swaps_started
+        resolved_replacements = []
+        for traffic_item_name, replacement_name in pending_replacements:
+            replacement_key = (traffic_item_name, replacement_name)
+            previous_name = f"{replacement_name}__previous"
+            replacement = self.ixnetwork.Traffic.TrafficItem.find(
+                Name=rf"^{re.escape(replacement_name)}$"
+            )
+            previous_item = None
+            previous_item_needs_rename = False
+            installed_replacement = None
+            if replacement_key in swaps_started:
+                previous_item = self.ixnetwork.Traffic.TrafficItem.find(
+                    Name=rf"^{re.escape(previous_name)}$"
+                )
+            if replacement and not previous_item:
+                previous_item = self.ixnetwork.Traffic.TrafficItem.find(
+                    Name=rf"^{re.escape(traffic_item_name)}$"
+                )
+                previous_item_needs_rename = bool(previous_item)
+            elif not replacement and replacement_key in swaps_started:
+                installed_replacement = self.ixnetwork.Traffic.TrafficItem.find(
+                    Name=rf"^{re.escape(traffic_item_name)}$"
+                )
+            if not replacement and not installed_replacement:
+                raise RuntimeError(
+                    f"Deferred replacement {replacement_name} is missing for "
+                    f"traffic item {traffic_item_name}"
+                )
+            if replacement and not previous_item:
+                raise RuntimeError(
+                    f"Original traffic item {traffic_item_name} is missing while "
+                    f"installing deferred replacement {replacement_name}"
+                )
+            resolved_replacements.append(
+                (
+                    traffic_item_name,
+                    replacement_name,
+                    previous_name,
+                    previous_item,
+                    previous_item_needs_rename,
+                    replacement,
+                )
+            )
+
+        failures: list[tuple[str, Exception]] = []
+        for (
+            traffic_item_name,
+            replacement_name,
+            previous_name,
+            previous_item,
+            previous_item_needs_rename,
+            replacement,
+        ) in resolved_replacements:
+            replacement_key = (traffic_item_name, replacement_name)
+            if not replacement:
+                try:
+                    if previous_item:
+                        previous_item.remove()
+                except Exception as exc:
+                    failures.append((traffic_item_name, exc))
+                    continue
+                self._deferred_traffic_item_replacements = [
+                    pending
+                    for pending in self._deferred_traffic_item_replacements
+                    if pending != replacement_key
+                ]
+                swaps_started.discard(replacement_key)
+                self.logger.info(
+                    f"[{traffic_item_name}] Confirmed a deferred replacement "
+                    "installed by the prior attempt"
+                )
+                continue
+            if replacement is None or previous_item is None:
+                raise RuntimeError(
+                    f"Invalid deferred replacement state for {traffic_item_name}"
+                )
+            swaps_started.add(replacement_key)
+            try:
+                if previous_item_needs_rename:
+                    previous_item.update(Name=previous_name)
+                replacement.update(Name=traffic_item_name)
+                previous_item.remove()
+            except Exception as exc:
+                failures.append((traffic_item_name, exc))
+                continue
+            self._deferred_traffic_item_replacements = [
+                pending
+                for pending in self._deferred_traffic_item_replacements
+                if pending != replacement_key
+            ]
+            swaps_started.discard(replacement_key)
+            self.logger.info(
+                f"[{traffic_item_name}] Installed the generated deferred replacement"
+            )
+        if failures:
+            failure_details = "; ".join(
+                f"{name}: {error}" for name, error in failures
+            )
+            remaining_names = ", ".join(
+                name for name, _ in self._deferred_traffic_item_replacements
+            )
+            raise RuntimeError(
+                f"Failed to install deferred replacements: {failure_details}; "
+                f"pending replacements: {remaining_names}"
+            ) from failures[0][1]
+
+    def _requires_post_setup_traffic_preparation(
+        self,
+        traffic_items: t.Sequence[ixia_types.TrafficItem],
+    ) -> bool:
+        routed_items = tuple(
+            any(
+                endpoint.network_group_index is not None
+                for endpoint in (
+                    *traffic_item.source_endpoints,
+                    *traffic_item.dest_endpoints,
+                )
+            )
+            for traffic_item in traffic_items
+        )
+        if any(routed_items) and not all(routed_items):
+            self.logger.warning(
+                "Mixed routed and directly connected IXIA traffic items defer "
+                "preparation for the entire set"
+            )
+        return any(routed_items)
+
+    def _is_deferred_routed_traffic_preparation_enabled(self) -> bool:
+        if TAAC_OSS:
+            return True
+        return justknobs.check(
+            "dne_pit/taac:enable_deferred_routed_traffic_preparation"
+        )
 
     def modify_bgp_capabilities(
         self,
@@ -3038,11 +4517,12 @@ class Ixia:
 
             # fmt: off
             # BgpIpv4Peer does not have the Next Hop Encoding capability
-            elif capability == ixia_types.BgpCapability.NHEncodingCapabilities and (
-                isinstance(bgp_peer_obj, IxnBgpIpv6Peer)
-                or isinstance(bgp_peer_obj, UhdBgpIpv6Peer)
+            elif (
+                capability == ixia_types.BgpCapability.NHEncodingCapabilities
+                and _is_ipv6_bgp_peer(bgp_peer_obj)
             ):
                 bgp_cap_obj_map[capability] = (
+                    # pyrefly: ignore [missing-attribute]
                     bgp_peer_obj.CapabilityNHEncodingCapabilities
                 )  # noqa
             # fmt: on
@@ -3103,15 +4583,259 @@ class Ixia:
             or not bgp_peer_config.bgp_peer_name.endswith(self._DRAIN_PEER_NAME_SUFFIX)
         ):
             return
-        bgp_peer_obj.LocalRouterID.Increment(
-            start_value=self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE,
-            step_value=self._DRAIN_PEER_LOCAL_ROUTER_ID_STEP,
+        local_router_id = bgp_peer_obj.LocalRouterID
+        increment = getattr(local_router_id, "Increment", None)
+        applied = False
+        if increment is not None:
+            increment(
+                start_value=self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE,
+                step_value=self._DRAIN_PEER_LOCAL_ROUTER_ID_STEP,
+            )
+            applied = True
+        else:
+            # BgpIpv4Peer/BgpIpv6Peer expose LocalRouterID as a plain value
+            # list, not a Multivalue pattern: set one stepped value per
+            # current entry, which is the Increment pattern spelled out
+            # for a value list. The generated update() setter does not
+            # accept this field in the loaded restpy version, so write
+            # through _set_attribute, the primitive the generated setters
+            # use; if neither write works, continue with IXIA defaults
+            # rather than failing all of setup for one drain peer. The
+            # stepped values are built inside the guarded block, so a
+            # base/step the address parser rejects soft-fails the same
+            # way; ip_address covers both address families.
+            current = local_router_id if isinstance(local_router_id, list) else []
+            values: list[str] = []
+
+            def _read_values() -> list[str] | None:
+                read = bgp_peer_obj.LocalRouterID
+                if isinstance(read, (list, tuple)):
+                    return [str(v) for v in read]
+                if isinstance(read, str):
+                    return [read]
+                return None
+
+            try:
+                base = ipaddress.ip_address(self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE)
+                step = int(ipaddress.ip_address(self._DRAIN_PEER_LOCAL_ROUTER_ID_STEP))
+                values = [
+                    str(base + index * step)
+                    for index in range(max(len(current), 1))
+                ]
+                wrote = False
+                try:
+                    t.cast(t.Any, bgp_peer_obj).update(LocalRouterID=values)
+                    # update() may ignore an unaccepted field without
+                    # raising: only a read-back proving the values landed
+                    # counts as applied.
+                    wrote = _read_values() == values
+                except TypeError:
+                    wrote = False
+                if not wrote:
+                    getattr(bgp_peer_obj, "_set_attribute")(
+                        "localRouterID", values
+                    )
+                    wrote = _read_values() == values
+                applied = wrote
+            except Exception as e:  # noqa: BLE001 - defaults are the fallback
+                self.logger.warning(
+                    f"[{port_identifier}] Could not set explicit "
+                    f"LocalRouterID {values} on drain peer "
+                    f"{desired_bgp_name}: {e!r}; continuing with IXIA "
+                    "defaults (drain router-id collision risk remains)"
+                )
+        # Only when a write applied: logging success after the soft-fail
+        # warning above would contradict it.
+        if applied:
+            self.logger.info(
+                f"[{port_identifier}] Set explicit LocalRouterID base "
+                f"{self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE} on drain peer "
+                f"{desired_bgp_name} to avoid IXIA default-allocator "
+                f"collision with main pool"
+            )
+
+    def _verify_bgp_tcp_window_readback(
+        self,
+        *,
+        tcp_window_multivalue: t.Any,
+        tcp_window_size_bytes: int,
+        scope_label: str,
+        desired_bgp_name: str,
+        attempts: int = _BGP_TCP_WINDOW_READBACK_ATTEMPTS,
+        retry_seconds: float = _BGP_TCP_WINDOW_READBACK_RETRY_SECONDS,
+    ) -> t.Any:
+        last_observed_value: t.Any | None = None
+        last_readback_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            current_value, readback_error = _read_ixia_single_pattern(
+                tcp_window_multivalue
+            )
+            if readback_error is not None:
+                last_readback_error = readback_error
+            elif current_value is not None:
+                last_observed_value = current_value
+                if _ixia_value_equals(current_value, tcp_window_size_bytes):
+                    return current_value
+            if attempt < attempts and retry_seconds > 0:
+                time.sleep(retry_seconds * 2 ** (attempt - 1))
+
+        if last_observed_value is not None:
+            error_suffix = (
+                f"; last read error={last_readback_error!s}"
+                if last_readback_error is not None
+                else ""
+            )
+            self._raise_bgp_tcp_window_readback_error(
+                f"[{scope_label}] BGP peer {desired_bgp_name!r} TCP window "
+                f"readback mismatch after {attempts} attempt(s): "
+                f"expected={tcp_window_size_bytes}, last observed="
+                f"{last_observed_value!r}{error_suffix}",
+                last_readback_error,
+            )
+
+        readback_detail = (
+            str(last_readback_error)
+            if last_readback_error is not None
+            else "empty Pattern value"
+        )
+        self._raise_bgp_tcp_window_readback_error(
+            f"[{scope_label}] Requested TcpWindowSizeInBytes="
+            f"{tcp_window_size_bytes} on BGP peer {desired_bgp_name!r}, "
+            f"but could not verify the readback after {attempts} attempt(s): "
+            f"{readback_detail}",
+            last_readback_error,
+        )
+
+    @staticmethod
+    def _raise_bgp_tcp_window_readback_error(
+        message: str,
+        cause: Exception | None,
+    ) -> t.NoReturn:
+        if cause is None:
+            raise _BgpPeerTcpWindowOperationError(message)
+        raise _BgpPeerTcpWindowOperationError(message) from cause
+
+    @staticmethod
+    def _get_bgp_peer_tcp_window_multivalue(
+        *,
+        bgp_peer_obj: t.Union["BgpIpv4Peer", "BgpIpv6Peer"],
+        scope_label: str,
+        desired_bgp_name: str,
+    ) -> t.Any:
+        attribute_is_declared = True
+        try:
+            inspect.getattr_static(bgp_peer_obj, "TcpWindowSizeInBytes")
+        except AttributeError:
+            attribute_is_declared = False
+        try:
+            return bgp_peer_obj.TcpWindowSizeInBytes
+        except AttributeError as error:
+            if not attribute_is_declared:
+                raise _BgpPeerTcpWindowUnsupportedError(
+                    f"[{scope_label}] BGP peer {desired_bgp_name!r} does not "
+                    "support TcpWindowSizeInBytes"
+                ) from error
+            raise _BgpPeerTcpWindowOperationError(
+                f"[{scope_label}] Could not read TcpWindowSizeInBytes on BGP "
+                f"peer {desired_bgp_name!r}: {error!s}"
+            ) from error
+        except (
+            IxnIxNetworkError,
+            UhdIxNetworkError,
+            RequestException,
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise _BgpPeerTcpWindowOperationError(
+                f"[{scope_label}] Could not read TcpWindowSizeInBytes on BGP "
+                f"peer {desired_bgp_name!r}: {error!s}"
+            ) from error
+
+    def _set_and_verify_bgp_peer_tcp_window(
+        self,
+        *,
+        bgp_peer_obj: t.Union["BgpIpv4Peer", "BgpIpv6Peer"],
+        tcp_window_size_bytes: int,
+        scope_label: str,
+        desired_bgp_name: str,
+        readback_attempts: int = _BGP_TCP_WINDOW_READBACK_ATTEMPTS,
+        readback_retry_seconds: float = _BGP_TCP_WINDOW_READBACK_RETRY_SECONDS,
+    ) -> None:
+        try:
+            validate_ixia_bgp_tcp_window_size_bytes(tcp_window_size_bytes)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"[{scope_label}] BGP peer {desired_bgp_name!r} has an invalid "
+                f"TcpWindowSizeInBytes value: {error}"
+            ) from error
+        tcp_window_multivalue = self._get_bgp_peer_tcp_window_multivalue(
+            bgp_peer_obj=bgp_peer_obj,
+            scope_label=scope_label,
+            desired_bgp_name=desired_bgp_name,
+        )
+        try:
+            changed = _set_single_pattern_if_changed(
+                tcp_window_multivalue, tcp_window_size_bytes
+            )
+        except (
+            IxnIxNetworkError,
+            UhdIxNetworkError,
+            RequestException,
+            AttributeError,
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise _BgpPeerTcpWindowOperationError(
+                f"[{scope_label}] Could not set TcpWindowSizeInBytes="
+                f"{tcp_window_size_bytes} on BGP peer {desired_bgp_name!r}: "
+                f"{error!s}"
+            ) from error
+        if not changed:
+            self.logger.info(
+                f"[{scope_label}] Preserved TcpWindowSizeInBytes="
+                f"{tcp_window_size_bytes} on BGP peer {desired_bgp_name!r}"
+            )
+            return
+        observed_value = self._verify_bgp_tcp_window_readback(
+            tcp_window_multivalue=tcp_window_multivalue,
+            tcp_window_size_bytes=tcp_window_size_bytes,
+            scope_label=scope_label,
+            desired_bgp_name=desired_bgp_name,
+            attempts=readback_attempts,
+            retry_seconds=readback_retry_seconds,
         )
         self.logger.info(
-            f"[{port_identifier}] Set explicit LocalRouterID base "
-            f"{self._DRAIN_PEER_LOCAL_ROUTER_ID_BASE} on drain peer "
-            f"{desired_bgp_name} to avoid IXIA default-allocator "
-            f"collision with main pool"
+            f"[{scope_label}] Set and verified TcpWindowSizeInBytes="
+            f"{tcp_window_size_bytes} on BGP peer {desired_bgp_name!r}; "
+            f"readback={observed_value!r}"
+        )
+
+    def _apply_bgp_peer_tcp_window(
+        self,
+        *,
+        bgp_peer_obj: t.Union["BgpIpv4Peer", "BgpIpv6Peer"],
+        tcp_window_size_bytes: int | None,
+        scope_label: str,
+        desired_bgp_name: str,
+    ) -> None:
+        """Apply a declared TCP window and preserve IXIA state when unset.
+
+        An unset value preserves IXIA state. The declarative cache hash includes
+        this field, so a changed declaration cannot reuse stale cached state.
+        The imperative mutation API also requires session teardown. A declared
+        value must apply and verify, or topology setup fails.
+        """
+        if tcp_window_size_bytes is None:
+            return
+        self._set_and_verify_bgp_peer_tcp_window(
+            bgp_peer_obj=bgp_peer_obj,
+            tcp_window_size_bytes=tcp_window_size_bytes,
+            scope_label=scope_label,
+            desired_bgp_name=desired_bgp_name,
         )
 
     def create_bgp_peer(
@@ -3141,6 +4865,11 @@ class Ixia:
 
         Returns:
             An object of type either BgpIpv4Peer or BgpIpv6Peer.
+
+        Raises:
+            RuntimeError: If a declared TCP window cannot be set and verified
+                on either a new peer or an existing peer. This fail-closed
+                behavior prevents false slow-peer test coverage.
         """
         if ip_address_family == ixia_types.IpAddressFamily.IPV4:
             desired_bgp_name: str = (
@@ -3156,21 +4885,26 @@ class Ixia:
             )
             bgp_peer_cls = ip_addr_obj.BgpIpv6Peer  # pyre-ignore
 
+        # This module and BgpPeerConfig use the same generated Thrift target.
+        tcp_window_size_bytes = bgp_peer_config.tcp_window_size_bytes
         bgp_peer_obj: t.Union["BgpIpv4Peer", "BgpIpv6Peer"] = bgp_peer_cls.find(
-            # pyre-fixme[61]: `desired_bgp_name` may not be initialized here.
             Name=desired_bgp_name
         )
         if bgp_peer_obj:
             self.logger.info(
                 f"[{port_identifier}] There is already an existing IPv6 "
-                # pyre-fixme[61]: `desired_bgp_name` may not be initialized here.
                 f"instance of the BGP prefix {desired_bgp_name}. Hence "
                 "not creating a new one!"
+            )
+            self._apply_bgp_peer_tcp_window(
+                bgp_peer_obj=bgp_peer_obj,
+                tcp_window_size_bytes=tcp_window_size_bytes,
+                scope_label=port_identifier,
+                desired_bgp_name=desired_bgp_name,
             )
             return bgp_peer_obj
 
         bgp_peer_obj: t.Union["BgpIpv4Peer", "BgpIpv6Peer"] = bgp_peer_cls.add(
-            # pyre-fixme[61]: `desired_bgp_name` may not be initialized here.
             Name=desired_bgp_name
         )
         bgp_peer_obj.DutIp.Increment(
@@ -3224,6 +4958,13 @@ class Ixia:
             bgp_peer_obj.ConfigureKeepaliveTimer.Single(True)
             bgp_peer_obj.KeepaliveTimer.Single(bgp_peer_config.keepalive_timer)
 
+        self._apply_bgp_peer_tcp_window(
+            bgp_peer_obj=bgp_peer_obj,
+            tcp_window_size_bytes=tcp_window_size_bytes,
+            scope_label=port_identifier,
+            desired_bgp_name=desired_bgp_name,
+        )
+
         if bgp_peer_config.capabilities:
             self.modify_bgp_capabilities(bgp_peer_obj, bgp_peer_config.capabilities)
 
@@ -3240,7 +4981,6 @@ class Ixia:
             )
 
         self.logger.info(
-            # pyre-fixme[61]: `desired_bgp_name` may not be initialized here.
             f"[{port_identifier}] Successfully created BGP peer {desired_bgp_name}"
         )
         return bgp_peer_obj
@@ -3400,6 +5140,8 @@ class Ixia:
         session_end_idx: t.Optional[int] = None,
         expected_peer_count: t.Optional[int] = None,
         validate_session_range: bool = False,
+        verify_started: bool = False,
+        verify_up_timeout_seconds: t.Optional[float] = None,
     ) -> None:
         """Start or stop a contiguous range of emulated BGP sessions.
 
@@ -3413,6 +5155,14 @@ class Ixia:
             session_start_idx: First session index (inclusive, 1-based).
             session_end_idx: Last session index (inclusive, 1-based). Defaults
                 per peer to that peer's own ``Count``.
+            verify_started: After a Start, wait until no session in the range is
+                ``notStarted``, re-issuing Start for stragglers, and raise
+                ``IxiaOperationStateError`` naming any that never start.
+            verify_up_timeout_seconds: After a verified Start, wait up to this
+                long for every session in the range to report ``up``, stopping
+                and restarting stragglers, and raise ``IxiaOperationStateError``
+                naming any still not up. Only for callers whose DUT is already
+                configured for the started peers. Requires ``verify_started``.
 
         IXIA ``SessionIndices`` are 1-based; index 0 is not a valid session.
         A range starting at 0 leaves an IxNetwork-internal lock unreleased,
@@ -3434,20 +5184,13 @@ class Ixia:
                 "start_bgp_peers: session_end_idx must be >= session_start_idx, "
                 f"got [{session_start_idx}:{session_end_idx}]"
             )
-        if regex:
-            bgp_peers = self.find_bgp_peers(regex, ignore_case)
-        else:
-            device_group_idx_obj = self.vport_indices[
-                none_throws(vport_idx)
-            ].device_group_indices[none_throws(device_group_idx)]
-            bgp_peers = []
-            for (
-                network_group_index
-            ) in device_group_idx_obj.network_group_indices.values():
-                if network_group_index.ipv4_bgp_peer:
-                    bgp_peers.append(network_group_index.ipv4_bgp_peer)
-                if network_group_index.ipv6_bgp_peer:
-                    bgp_peers.append(network_group_index.ipv6_bgp_peer)
+        if verify_up_timeout_seconds is not None and not verify_started:
+            raise ValueError(
+                "start_bgp_peers: verify_up_timeout_seconds requires verify_started"
+            )
+        bgp_peers = self._select_bgp_peers(
+            regex, ignore_case, vport_idx, device_group_idx
+        )
         matched_names = [str(peer.Name) for peer in bgp_peers]
         self.logger.info(
             f"start_bgp_peers matched {len(bgp_peers)} peer object(s): {matched_names}"
@@ -3458,6 +5201,7 @@ class Ixia:
                 f"{expected_peer_count} peer object(s), got {len(bgp_peers)}: "
                 f"{matched_names}"
             )
+        started_ranges: list[t.Tuple[t.Any, int, int]] = []
         for bgp_peer in bgp_peers:
             # Compute the end index PER PEER. Must be a local -- reassigning
             # session_end_idx would lock it to the first peer's Count and apply
@@ -3481,49 +5225,512 @@ class Ixia:
                     )
             if start:
                 bgp_peer.Start(SessionIndices=f"{session_start_idx}-{peer_end_idx}")
+                started_ranges.append((bgp_peer, session_start_idx, peer_end_idx))
             else:
                 bgp_peer.Stop(SessionIndices=f"{session_start_idx}-{peer_end_idx}")
             self.logger.debug(
                 f"Successfully {'started' if start else 'stopped'} BGP sessions {session_start_idx}-{peer_end_idx} on {bgp_peer.Name}"
             )
+        if verify_started:
+            self._ensure_bgp_sessions_started(started_ranges)
+        if verify_up_timeout_seconds is not None and started_ranges:
+            self._ensure_bgp_sessions_up(started_ranges, verify_up_timeout_seconds)
+
+    def _select_bgp_peers(
+        self,
+        regex: t.Optional[str],
+        ignore_case: bool,
+        vport_idx: t.Optional[str],
+        device_group_idx: t.Optional[int],
+    ) -> list[t.Any]:
+        if regex:
+            return self.find_bgp_peers(regex, ignore_case)
+        device_group_idx_obj = self.vport_indices[
+            none_throws(vport_idx)
+        ].device_group_indices[none_throws(device_group_idx)]
+        bgp_peers = []
+        for network_group_index in device_group_idx_obj.network_group_indices.values():
+            if network_group_index.ipv4_bgp_peer:
+                bgp_peers.append(network_group_index.ipv4_bgp_peer)
+            if network_group_index.ipv6_bgp_peer:
+                bgp_peers.append(network_group_index.ipv6_bgp_peer)
+        return bgp_peers
+
+    def _ensure_bgp_sessions_started(
+        self, started_ranges: t.Sequence[t.Tuple[t.Any, int, int]]
+    ) -> None:
+        pending = self._bgp_sessions_not_started(started_ranges)
+        restarts = 0
+        deadline = time.monotonic() + _BGP_START_SETTLE_SECONDS
+        while pending:
+            if time.monotonic() < deadline:
+                time.sleep(_BGP_START_POLL_SECONDS)
+            elif restarts < _BGP_START_MAX_RESTARTS:
+                restarts += 1
+                for bgp_peer, indices in pending:
+                    self.logger.warning(
+                        f"{len(indices)} BGP session(s) on {bgp_peer.Name} still "
+                        f"notStarted; re-issuing Start (attempt {restarts}): "
+                        f"{_bgp_session_indices_spec(indices)}"
+                    )
+                    bgp_peer.Start(SessionIndices=_bgp_session_indices_spec(indices))
+                deadline = time.monotonic() + _BGP_START_SETTLE_SECONDS
+            else:
+                raise IxiaOperationStateError(
+                    "BGP sessions never left notStarted after "
+                    f"{_BGP_START_MAX_RESTARTS} re-start(s): "
+                    + "; ".join(
+                        self._bgp_start_failure_detail(bgp_peer, indices)
+                        for bgp_peer, indices in pending
+                    )
+                    + f"; Ixia server errors: {self._recent_ixia_server_errors()}"
+                )
+            pending = self._bgp_sessions_not_started(started_ranges)
+
+    def _ensure_bgp_sessions_up(
+        self,
+        started_ranges: t.Sequence[t.Tuple[t.Any, int, int]],
+        timeout_seconds: float,
+    ) -> None:
+        pending = self._bgp_sessions_not_up(started_ranges)
+        restarts = 0
+        deadline = time.monotonic() + timeout_seconds
+        while pending:
+            if time.monotonic() < deadline:
+                time.sleep(_BGP_START_POLL_SECONDS)
+            elif restarts < _BGP_START_MAX_RESTARTS:
+                restarts += 1
+                for bgp_peer, indices in pending:
+                    spec = _bgp_session_indices_spec(indices)
+                    self.logger.warning(
+                        f"{len(indices)} BGP session(s) on {bgp_peer.Name} not up "
+                        f"after {timeout_seconds}s; stopping and restarting "
+                        f"(attempt {restarts}): {spec}"
+                    )
+                    bgp_peer.Stop(SessionIndices=spec)
+                    bgp_peer.Start(SessionIndices=spec)
+                deadline = time.monotonic() + timeout_seconds
+            else:
+                raise IxiaOperationStateError(
+                    f"BGP sessions not up after {_BGP_START_MAX_RESTARTS} "
+                    "restart(s): "
+                    + "; ".join(
+                        self._bgp_start_failure_detail(bgp_peer, indices, "not up")
+                        for bgp_peer, indices in pending
+                    )
+                    + f"; Ixia server errors: {self._recent_ixia_server_errors()}"
+                )
+            pending = self._bgp_sessions_not_up(started_ranges)
+
+    def _recent_ixia_server_errors(self) -> list[str]:
+        try:
+            errors = [
+                error
+                for error in self.ixnetwork.Globals.AppErrors.find().Error.find()
+                if error.ErrorLevel in _IXIA_SERVER_ERROR_LEVELS
+            ]
+        except Exception as error:
+            return [f"unavailable ({type(error).__name__}: {error})"]
+        errors.sort(key=lambda error: str(error.LastModified))
+        return [
+            f"{error.LastModified} [{error.ErrorLevel}] {error.Name}: "
+            f"{error.Description}"
+            for error in errors[-_BGP_START_FAILURE_SERVER_ERRORS:]
+        ]
+
+    @staticmethod
+    def _bgp_sessions_not_started(
+        started_ranges: t.Sequence[t.Tuple[t.Any, int, int]],
+    ) -> list[t.Tuple[t.Any, list[int]]]:
+        return Ixia._bgp_sessions_matching(
+            started_ranges, lambda status: status == "notStarted"
+        )
+
+    @staticmethod
+    def _bgp_sessions_not_up(
+        started_ranges: t.Sequence[t.Tuple[t.Any, int, int]],
+    ) -> list[t.Tuple[t.Any, list[int]]]:
+        return Ixia._bgp_sessions_matching(
+            started_ranges, lambda status: status != _BGP_UP_STATUS
+        )
+
+    @staticmethod
+    def _bgp_sessions_matching(
+        started_ranges: t.Sequence[t.Tuple[t.Any, int, int]],
+        is_pending: t.Callable[[str], bool],
+    ) -> list[t.Tuple[t.Any, list[int]]]:
+        pending = []
+        for bgp_peer, start_idx, end_idx in started_ranges:
+            # restpy serves attributes from the snapshot taken when the peer was
+            # fetched, so without refresh() every poll re-reads pre-Start state.
+            bgp_peer.refresh()
+            statuses = list(bgp_peer.SessionStatus)
+            if end_idx > len(statuses):
+                raise ValueError(
+                    f"start_bgp_peers cannot verify sessions {start_idx}-{end_idx} "
+                    f"on {bgp_peer.Name}: it reports {len(statuses)} session(s)"
+                )
+            indices = [
+                index
+                for index in range(start_idx, end_idx + 1)
+                if is_pending(statuses[index - 1])
+            ]
+            if indices:
+                pending.append((bgp_peer, indices))
+        return pending
+
+    @staticmethod
+    def _bgp_start_failure_detail(
+        bgp_peer: t.Any, indices: t.Sequence[int], state: str = "notStarted"
+    ) -> str:
+        sample = indices[:_BGP_START_FAILURE_SAMPLE_SIZE]
+        try:
+            infos = list(bgp_peer.SessionInfo)
+            info = dict(Counter(infos[index - 1] for index in sample))
+        except Exception as error:
+            info = f"unavailable ({type(error).__name__})"
+        try:
+            active = [str(value).lower() for value in bgp_peer.Active.Values]
+            inactive = [
+                index
+                for index in sample
+                if active[0 if len(active) == 1 else index - 1] == "false"
+            ]
+        except Exception as error:
+            inactive = f"unavailable ({type(error).__name__})"
+        return (
+            f"{bgp_peer.Name}: {len(indices)} {state} "
+            f"[{_bgp_session_indices_spec(sample)}"
+            f"{', ...' if len(indices) > len(sample) else ''}], "
+            f"SessionInfo={info}, inactive={inactive}, "
+            f"ip={Ixia._bgp_ip_layer_detail(bgp_peer, sample)}"
+        )
+
+    @staticmethod
+    def _bgp_ip_layer_detail(bgp_peer: t.Any, sample: t.Sequence[int]) -> str:
+        """Summarize the IP stack beneath `bgp_peer` for the sampled sessions.
+
+        BGP Stop/Start leaves this layer alone, so a session whose gateway MAC
+        never resolved stays down however often BGP restarts.
+        """
+        try:
+            stack = bgp_peer.parent
+            stack.refresh()
+            ip_count, bgp_count = int(stack.Count), int(bgp_peer.Count)
+            if ip_count != bgp_count:
+                return f"unavailable (IP Count {ip_count} != BGP Count {bgp_count})"
+            statuses = list(stack.SessionStatus)
+            infos = list(stack.SessionInfo)
+            macs = list(stack.ResolvedGatewayMac or [])
+            status = dict(Counter(_sampled_session_values(statuses, sample)))
+            info = dict(Counter(_sampled_session_values(infos, sample)))
+            unresolved = [
+                index
+                for index in sample
+                if index > len(macs) or not _is_resolved_gateway_mac(macs[index - 1])
+            ]
+        except Exception as error:
+            return f"unavailable ({type(error).__name__}: {error})"
+        return (
+            f"{{SessionStatus={status}, SessionInfo={info}, "
+            f"unresolved_gateways=[{_bgp_session_indices_spec(unresolved)}]}}"
+        )
 
     @external_api
     def restore_bgp_peer_ranges(
-        self, peer_ranges: t.Sequence[t.Mapping[str, t.Any]]
+        self,
+        peer_ranges: t.Sequence[t.Mapping[str, t.Any]],
+        apply_timeout_seconds: float = 60.0,
+        abort_timeout_seconds: float = 10.0,
     ) -> None:
-        """Best-effort restoration of multiple BGP peer session ranges.
+        """Enable complete peer containers, verify them, then start each range.
 
-        Successful starts are intentionally not undone when another target
-        fails: the desired baseline has every range started, and a subsequent
-        cleanup retry can idempotently reapply the complete target set. A
-        raised ``RuntimeError`` means the environment may be only partially
-        restored and must not be reused until retry or manual recovery
-        succeeds.
+        This cleanup API intentionally restores every session row in each
+        selected peer container to Active before issuing Start. Partial ranges
+        are rejected so rows outside the requested range are never rewritten
+        implicitly.
         """
-        errors = []
-        successful_targets = []
-        for target in peer_ranges:
-            target_label = str(target.get("label", target.get("regex", "<unknown>")))
+        with self.mutation_transaction():
+            plans = self._prepare_bgp_peer_range_restoration(peer_ranges)
             try:
-                self.start_bgp_peers(
-                    start=True,
-                    regex=str(target["regex"]),
-                    session_start_idx=int(target["session_start_idx"]),
-                    session_end_idx=int(target["session_end_idx"]),
-                    expected_peer_count=int(target["expected_peer_count"]),
-                    validate_session_range=True,
+                self._write_bgp_peer_active_baseline(plans)
+                self.apply_changes_bounded(
+                    apply_timeout_seconds,
+                    abort_timeout_seconds=abort_timeout_seconds,
                 )
+                self._verify_bgp_peer_active_baseline(plans)
+            except Exception as error:
+                try:
+                    self._rollback_bgp_peer_active_baseline(
+                        plans,
+                        apply_timeout_seconds=apply_timeout_seconds,
+                        abort_timeout_seconds=abort_timeout_seconds,
+                    )
+                except Exception as rollback_error:
+                    error.add_note(
+                        "BGP peer Active rollback also failed: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                raise
+            self._start_restored_bgp_peer_ranges(plans)
+
+    def _prepare_bgp_peer_range_restoration(
+        self, peer_ranges: t.Sequence[t.Mapping[str, t.Any]]
+    ) -> tuple[_BgpPeerRangeRestoration, ...]:
+        plans = []
+        matched_peer_names: set[str] = set()
+        for target in peer_ranges:
+            label = str(target.get("label", target.get("regex", "<unknown>")))
+            regex = str(target["regex"])
+            start = int(target["session_start_idx"])
+            end = int(target["session_end_idx"])
+            expected_count = int(target["expected_peer_count"])
+            peers = self._resolve_bgp_peer_restore_target(
+                label, regex, expected_count
+            )
+            duplicate_names = matched_peer_names.intersection(
+                str(peer.Name) for peer in peers
+            )
+            if duplicate_names:
+                raise ValueError(
+                    f"BGP peer-range restoration targets overlap: {sorted(duplicate_names)}"
+                )
+            matched_peer_names.update(str(peer.Name) for peer in peers)
+            writes = tuple(
+                self._prepare_bgp_peer_active_write(peer, start, end) for peer in peers
+            )
+            plans.append(
+                _BgpPeerRangeRestoration(
+                    label=label,
+                    regex=regex,
+                    session_start_idx=start,
+                    session_end_idx=end,
+                    expected_peer_count=expected_count,
+                    writes=writes,
+                )
+            )
+        if not plans:
+            raise ValueError("BGP peer-range restoration requires at least one target")
+        return tuple(plans)
+
+    def _resolve_bgp_peer_restore_target(
+        self, label: str, regex: str, expected_count: int
+    ) -> tuple[t.Any, ...]:
+        peers = tuple(self.find_bgp_peers(regex))
+        names = [str(peer.Name) for peer in peers]
+        self.logger.info(
+            f"BGP peer-range restoration target {label} matched {names}"
+        )
+        if expected_count <= 0 or len(peers) != expected_count:
+            raise ValueError(
+                f"BGP peer-range restoration target {label} expected "
+                f"{expected_count} peer object(s), got {len(peers)}: {names}"
+            )
+        if len(set(names)) != len(names):
+            raise ValueError(
+                f"BGP peer-range restoration target {label} has duplicate peer "
+                f"names: {names}"
+            )
+        return peers
+
+    def _prepare_bgp_peer_active_write(
+        self, peer: t.Any, start: int, end: int
+    ) -> _BgpPeerActiveWrite:
+        peer_name = str(peer.Name)
+        try:
+            peer_count = int(peer.Count)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"BGP peer {peer_name} has invalid Count {getattr(peer, 'Count', None)!r}"
+            ) from error
+        if start < 1 or end < start or end > peer_count:
+            raise ValueError(
+                f"BGP peer-range restoration invalid session range {start}-{end} "
+                f"for {peer_name} with Count={peer_count}"
+            )
+        if start != 1 or end != peer_count:
+            raise ValueError(
+                "BGP peer-range restoration requires the complete session "
+                f"range 1-{peer_count} for {peer_name}, got {start}-{end}"
+            )
+        baseline = IxiaValueVector.capture(
+            peer.Active,
+            peer_count,
+            f"{peer_name} peer Active baseline",
+            compact_row_count=peer_count,
+        )
+        # Preserve each captured row's IXIA representation while enabling it;
+        # deriving every row independently avoids projecting row zero's type
+        # across a heterogeneous vector.
+        expected = tuple(
+            self._bgp_peer_active_value(baseline.baseline_value(row))
+            for row in range(peer_count)
+        )
+        write = expected
+        if all(value == expected[0] for value in expected[1:]):
+            write = (expected[0],)
+        return _BgpPeerActiveWrite(peer_name, baseline, expected, write)
+
+    @staticmethod
+    def _bgp_peer_active_value(value: t.Any) -> t.Any:
+        if isinstance(value, bool):
+            return True
+        if isinstance(value, str) and value.lower() in {"true", "false"}:
+            return "true"
+        raise ValueError(f"IXIA peer Active has invalid value {value!r}")
+
+    @staticmethod
+    def _write_bgp_peer_active_baseline(
+        plans: t.Sequence[_BgpPeerRangeRestoration],
+    ) -> None:
+        for plan in plans:
+            for write in plan.writes:
+                if len(write.write_active) == 1:
+                    write.baseline.handle.Single(value=write.write_active[0])
+                else:
+                    write.baseline.write_fixed_count(write.write_active)
+
+    def _verify_bgp_peer_active_baseline(
+        self, plans: t.Sequence[_BgpPeerRangeRestoration]
+    ) -> None:
+        for plan in plans:
+            fresh_by_name = self._fresh_bgp_restore_peers(plan)
+            for write in plan.writes:
+                fresh_active = IxiaValueVector.capture(
+                    fresh_by_name[write.peer_name].Active,
+                    write.baseline.expanded_row_count,
+                    f"{write.peer_name} peer Active readback",
+                    compact_row_count=write.baseline.compact_row_count,
+                )
+                fresh_active.assert_exact_fixed_count_readback(write.expected_active)
+
+    def _rollback_bgp_peer_active_baseline(
+        self,
+        plans: t.Sequence[_BgpPeerRangeRestoration],
+        *,
+        apply_timeout_seconds: float,
+        abort_timeout_seconds: float,
+    ) -> None:
+        failures = self._restore_bgp_peer_active_vectors(plans)
+        try:
+            self.apply_changes_bounded(
+                apply_timeout_seconds,
+                abort_timeout_seconds=abort_timeout_seconds,
+            )
+        except Exception as error:
+            failures.append(f"apply: {type(error).__name__}: {error}")
+        failures.extend(self._bgp_peer_active_rollback_readback_failures(plans))
+        if failures:
+            raise RuntimeError(
+                "BGP peer Active rollback failed: " + "; ".join(failures)
+            )
+
+    @staticmethod
+    def _restore_bgp_peer_active_vectors(
+        plans: t.Sequence[_BgpPeerRangeRestoration],
+    ) -> list[str]:
+        failures = []
+        for plan in plans:
+            for write in plan.writes:
+                try:
+                    write.baseline.restore()
+                except Exception as error:
+                    failures.append(
+                        f"{write.peer_name} write: {type(error).__name__}: {error}"
+                    )
+        return failures
+
+    def _bgp_peer_active_rollback_readback_failures(
+        self, plans: t.Sequence[_BgpPeerRangeRestoration]
+    ) -> list[str]:
+        failures = []
+        for plan in plans:
+            try:
+                fresh_by_name = self._fresh_bgp_restore_peers(plan)
+            except Exception as error:
+                failures.append(
+                    f"{plan.label} resolve: {type(error).__name__}: {error}"
+                )
+                continue
+            for write in plan.writes:
+                try:
+                    fresh = IxiaValueVector.capture(
+                        fresh_by_name[write.peer_name].Active,
+                        write.baseline.expanded_row_count,
+                        f"{write.peer_name} peer Active rollback readback",
+                        compact_row_count=write.baseline.compact_row_count,
+                    )
+                    if (
+                        fresh.values != write.baseline.values
+                        or fresh.pattern != write.baseline.pattern
+                    ):
+                        raise RuntimeError("readback differs from baseline")
+                except Exception as error:
+                    failures.append(
+                        f"{write.peer_name} readback: {type(error).__name__}: {error}"
+                    )
+        return failures
+
+    def _fresh_bgp_restore_peers(
+        self, plan: _BgpPeerRangeRestoration
+    ) -> dict[str, t.Any]:
+        fresh_by_name = {
+            str(peer.Name): peer
+            for peer in self._resolve_bgp_peer_restore_target(
+                plan.label, plan.regex, plan.expected_peer_count
+            )
+        }
+        if set(fresh_by_name) != {write.peer_name for write in plan.writes}:
+            raise RuntimeError(
+                f"BGP peer-range restoration target {plan.label} changed "
+                "after preparation"
+            )
+        for write in plan.writes:
+            observed_count = int(fresh_by_name[write.peer_name].Count)
+            if observed_count != write.baseline.expanded_row_count:
+                raise RuntimeError(
+                    f"BGP peer {write.peer_name} Count changed from "
+                    f"{write.baseline.expanded_row_count} to {observed_count}"
+                )
+        return fresh_by_name
+
+    def _start_restored_bgp_peer_ranges(
+        self, plans: t.Sequence[_BgpPeerRangeRestoration]
+    ) -> None:
+        failures = []
+        successful_targets = []
+        for plan in plans:
+            try:
+                peers = self._fresh_bgp_restore_peers(plan)
             except Exception as error:
                 self.logger.exception(
-                    f"Failed to restore BGP peer range {target_label}"
+                    f"Failed to restore BGP peer range {plan.label}"
                 )
-                errors.append(f"{target_label}: {type(error).__name__}: {error}")
-            else:
-                successful_targets.append(target_label)
-        if errors:
+                failures.append(f"{plan.label}: {type(error).__name__}: {error}")
+                continue
+            target_failed = False
+            for write in plan.writes:
+                try:
+                    peers[write.peer_name].Start(
+                        SessionIndices=(
+                            f"{plan.session_start_idx}-{plan.session_end_idx}"
+                        )
+                    )
+                except Exception as error:
+                    target_failed = True
+                    self.logger.exception(
+                        f"Failed to restore BGP peer range {plan.label}"
+                    )
+                    failures.append(
+                        f"{plan.label}/{write.peer_name}: "
+                        f"{type(error).__name__}: {error}"
+                    )
+            if not target_failed:
+                successful_targets.append(plan.label)
+        if failures:
             raise RuntimeError(
                 "BGP peer-range restoration failed after attempting every target: "
-                f"succeeded={successful_targets!r}; failed=" + "; ".join(errors)
+                f"succeeded={successful_targets!r}; failed=" + "; ".join(failures)
             )
 
     @external_api
@@ -3729,6 +5936,50 @@ class Ixia:
         )
 
     @external_api
+    def start_device_groups(
+        self,
+        device_group_name_regex: str,
+        require_match: bool = True,
+        settle_time_after_start: int = 10,
+    ) -> None:
+        """Start the matched device groups and resolve their next-hops.
+
+        ``toggle_device_groups(enable=True)`` only writes the ``Enabled``
+        multivalue and applies it; the emulated session stays down until it is
+        started. The ARP/NS pass is not optional either -- a freshly started
+        device group does not answer the DUT's neighbor solicitation until it
+        has sent its own, so without it the DUT cannot resolve the next-hops
+        these routes point at and the routes never program.
+
+        Scoped to the matched groups so an already-converged device group on
+        another port is left alone, unlike a global ``StartAllProtocols``.
+
+        Args:
+            device_group_name_regex: Regex matched against device group names.
+            require_match: Raise when the regex selects nothing.
+            settle_time_after_start: Seconds to wait between the start and the
+                ARP/NS pass, so the protocol stack is up before it is asked to
+                transmit.
+        """
+        device_groups = self.find_device_groups(device_group_name_regex)
+        if require_match and not device_groups:
+            raise ValueError(
+                "start_device_groups: regex "
+                f"{device_group_name_regex!r} selected no device groups"
+            )
+        for device_group in device_groups:
+            for network_group in device_group.NetworkGroup.find():
+                network_group.Start()
+            device_group.Start()
+        self.logger.info(
+            "Successfully started device group "
+            f"{[device_group.Name for device_group in device_groups]}"
+        )
+        time.sleep(settle_time_after_start)
+        for device_group in device_groups:
+            self._send_arp_ns_on_device_group(device_group)
+
+    @external_api
     def rename_device_groups(
         self,
         device_group_name_regex: str,
@@ -3799,7 +6050,7 @@ class Ixia:
         for prefix_pool in prefix_pools:
             bgp_ip_route_property: "BgpIPRouteProperty" = (
                 (prefix_pool.BgpIPRouteProperty.find())
-                if isinstance(prefix_pool, Ipv4PrefixPools)
+                if _is_ipv4_prefix_pool(prefix_pool)
                 else prefix_pool.BgpV6IPRouteProperty.find()
             )[0]
             bgp_ip_route_property.EnableFlapping.Single(value=is_flap)
@@ -3881,6 +6132,140 @@ class Ixia:
         traffic_item_obj.Enabled = True
         self.regenerate_traffic_items()
         self.start_traffic()
+
+    def _vport_href_to_device_group_mac(self) -> t.Dict[str, str]:
+        """Map each vport href to the Ethernet MAC of its first device group."""
+        vport_macs: t.Dict[str, str] = {}
+        for topology in self.ixnetwork.Topology.find():
+            mac = None
+            for device_group in topology.DeviceGroup.find():
+                ethernet = device_group.Ethernet.find()
+                values = list(ethernet.Mac.Values) if ethernet else []
+                if values:
+                    mac = values[0]
+                    break
+            vports = list(topology.Vports or [])
+            if mac is None or len(vports) != 1:
+                # One MAC can't be attributed to several ports; leave them out
+                # so their RAW items are skipped rather than mislabelled.
+                continue
+            vport_macs[vports[0]] = mac
+        return vport_macs
+
+    @external_api
+    def sync_raw_traffic_source_macs(
+        self,
+        traffic_item_regex: str = ".*",
+        sync_destination_macs: bool = False,
+    ) -> t.Dict[str, str]:
+        """Rewrite RAW traffic MACs from the live endpoint device groups.
+
+        RAW packet headers are built before IXIA assigns device-group MACs, so
+        they carry a placeholder source MAC. A DUT that validates source MACs
+        on L3 VLAN interfaces drops those frames at ingress. IXIA assigns
+        device-group MACs per session in no stable order, so the MAC has to be
+        read from the live session rather than hardcoded in the config.
+
+        Args:
+            traffic_item_regex: Only RAW traffic items whose name matches are
+                rewritten.
+            sync_destination_macs: Also rewrite the destination MAC to the rx
+                port's device-group MAC. This is for peer-switched traffic;
+                routed traffic should retain the DUT MAC.
+
+        Returns:
+            Map of rewritten traffic item name to the source MAC it now uses.
+        """
+        vport_macs = self._vport_href_to_device_group_mac()
+        pattern = re.compile(traffic_item_regex)
+        synced: t.Dict[str, str] = {}
+        for traffic_item in self.ixnetwork.Traffic.TrafficItem.find():
+            if traffic_item.TrafficType != "raw" or not pattern.search(
+                traffic_item.Name
+            ):
+                continue
+            tx_vports = {
+                source.rsplit("/protocols", 1)[0]
+                for endpoint_set in traffic_item.EndpointSet.find()
+                for source in endpoint_set.Sources or []
+            }
+            source_macs = {
+                vport_macs[vport] for vport in tx_vports if vport in vport_macs
+            }
+            if len(source_macs) != 1:
+                self.logger.warning(
+                    f"[{traffic_item.Name}] Skipping source MAC sync: expected one "
+                    f"device-group MAC for tx vports {sorted(tx_vports)}, found "
+                    f"{sorted(source_macs)}"
+                )
+                continue
+            source_mac = source_macs.pop()
+            destination_mac = None
+            if sync_destination_macs:
+                rx_vports = {
+                    destination.rsplit("/protocols", 1)[0]
+                    for endpoint_set in traffic_item.EndpointSet.find()
+                    for destination in endpoint_set.Destinations or []
+                }
+                destination_macs = {
+                    vport_macs[vport]
+                    for vport in rx_vports
+                    if vport in vport_macs
+                }
+                if len(destination_macs) != 1:
+                    self.logger.warning(
+                        f"[{traffic_item.Name}] Skipping MAC sync: expected one "
+                        f"device-group MAC for rx vports {sorted(rx_vports)}, "
+                        f"found {sorted(destination_macs)}"
+                    )
+                    continue
+                destination_mac = destination_macs.pop()
+            updated = False
+            for config_element in traffic_item.ConfigElement.find():
+                stack = config_element.Stack.find(StackTypeId="^ethernet$")
+                source_field = (
+                    stack.Field.find(DisplayName="^Source MAC Address$")
+                    if stack
+                    else None
+                )
+                destination_field = (
+                    stack.Field.find(DisplayName="^Destination MAC Address$")
+                    if stack and sync_destination_macs
+                    else None
+                )
+                if not source_field or (
+                    sync_destination_macs and not destination_field
+                ):
+                    self.logger.warning(
+                        f"[{traffic_item.Name}] Config element has no Ethernet "
+                        "MAC fields required for sync; leaving it unchanged"
+                    )
+                    continue
+                source_field.update(
+                    ValueType="singleValue", SingleValue=source_mac
+                )
+                if destination_field and destination_mac:
+                    destination_field.update(
+                        ValueType="singleValue", SingleValue=destination_mac
+                    )
+                updated = True
+            if not updated:
+                continue
+            synced[traffic_item.Name] = source_mac
+            self.logger.info(
+                f"[{traffic_item.Name}] Source MAC set to {source_mac}"
+                + (
+                    f", destination MAC set to {destination_mac}"
+                    if destination_mac
+                    else ""
+                )
+            )
+        if synced:
+            traffic_running = self.is_traffic_running()
+            self.regenerate_traffic_items()
+            if not traffic_running:
+                self.apply_traffic()
+        return synced
 
     @external_api
     def configure_bgp_peers_flap(
@@ -4148,7 +6533,7 @@ class Ixia:
                     )
                 if increment_ip:
                     self.logger.debug(
-                        f"Updated increment ip prefix for prefix pool {prefix_pool.Name} to {starting_ip}"
+                        f"Updated increment ip prefix for prefix pool {prefix_pool.Name} to {increment_ip}"
                     )
             if prefix_length:
                 prefix_pool.PrefixLength.Single(prefix_length)
@@ -4259,7 +6644,7 @@ class Ixia:
         for prefix_pool in prefix_pools:
             bgp_ip_route_property: "BgpIPRouteProperty" = (
                 (prefix_pool.BgpIPRouteProperty.find())
-                if isinstance(prefix_pool, Ipv4PrefixPools)
+                if _is_ipv4_prefix_pool(prefix_pool)
                 else prefix_pool.BgpV6IPRouteProperty.find()
             )[0]
             if enable is not None:
@@ -4343,7 +6728,7 @@ class Ixia:
             if enable is not None:
                 bgp_ip_route_property: "BgpIPRouteProperty" = (
                     (prefix_pool.BgpIPRouteProperty.find())
-                    if isinstance(prefix_pool, Ipv4PrefixPools)
+                    if _is_ipv4_prefix_pool(prefix_pool)
                     else prefix_pool.BgpV6IPRouteProperty.find()
                 )[0]
                 # Resolved per pool: assigning back to session_end_idx would
@@ -4370,17 +6755,31 @@ class Ixia:
         self.apply_changes()
 
     def toggle_device_group(self, device_group, sleep_time_between_toggle_s) -> None:
+        """Restart a device group and resolve its neighbors.
+
+        Device-group ``Enabled`` is a staged multivalue. Writing False and
+        True before an apply collapses to the final True value, so the old
+        implementation never actually stopped the running group. This is
+        particularly important after resizing a group: newly-created sessions
+        remain down until the resized configuration is applied and the group
+        is explicitly restarted.
+        """
         device_group.Enabled.Single(False)
+        self.apply_changes()
         self.logger.info(
             f"Waiting {sleep_time_between_toggle_s} seconds for {device_group.Name} to disable"
         )
         time.sleep(sleep_time_between_toggle_s)
-        # enable device group
         device_group.Enabled.Single(True)
+        self.apply_changes()
+        for network_group in device_group.NetworkGroup.find():
+            network_group.Start()
+        device_group.Start()
         self.logger.info(
-            f"Waiting {sleep_time_between_toggle_s} seconds for {device_group.Name} to ena"
+            f"Waiting {sleep_time_between_toggle_s} seconds for {device_group.Name} to enable"
         )
         time.sleep(sleep_time_between_toggle_s)
+        self._send_arp_ns_on_device_group(device_group)
 
     def get_bgp_device_group_name(
         self, all_device_groups: t.List["DeviceGroup"]
@@ -4406,11 +6805,18 @@ class Ixia:
         device_group_regex: t.Optional[str] = None,
         prefix_count: t.Optional[int] = None,
         toggle_all_ipv6_ipv4_only_protocol: bool = False,
+        toggle_matching_device_group: bool = False,
         sleep_time_between_toggle_s: int = 30,
     ) -> None:
         """API to configure IPv6 entries"""
+        matching_device_groups = []
         if device_group_regex:
-            device_groups = self.find_device_groups(device_group_regex)
+            # ignore_case: same trap as configure_ipv4_entries — callers pass
+            # DUT interface names but device groups are named with upper-cased
+            # port identifiers, so a case-sensitive match silently no-ops.
+            device_groups = self.find_device_groups(
+                device_group_regex, ignore_case=True
+            )
             for device_group in device_groups:
                 for ethernet in device_group.Ethernet.find():
                     for ipv6 in ethernet.Ipv6.find():
@@ -4419,9 +6825,20 @@ class Ixia:
                             # Skip updating the ipv6 stack which has bgp sessions in it
                             continue
                         if prefix_count:
-                            f"Updating {device_group.Name} device multiplier to {prefix_count}"
+                            self.logger.info(
+                                f"Updating {device_group.Name} device multiplier to {prefix_count}"
+                            )
                             device_group.update(Multiplier=prefix_count)
+                            matching_device_groups.append(device_group)
+            # Commit the resized topology before restarting it. Otherwise the
+            # toggle targets the old session population and newly-added IPv6
+            # sessions never send NS.
             self.apply_changes()
+            if toggle_matching_device_group:
+                for device_group in matching_device_groups:
+                    self.toggle_device_group(
+                        device_group, sleep_time_between_toggle_s
+                    )
 
         if not toggle_all_ipv6_ipv4_only_protocol:
             return
@@ -4439,10 +6856,16 @@ class Ixia:
         device_group_regex: str,
         prefix_count: t.Optional[int] = None,
         toggle_all_ipv6_ipv4_only_protocol: bool = False,
+        toggle_matching_device_group: bool = True,
         sleep_time_between_toggle_s: int = 30,
     ) -> None:
         """API to configure IPv6 entries"""
-        device_groups = self.find_device_groups(device_group_regex)
+        matching_device_groups = []
+        # ignore_case: callers pass DUT interface names (e.g. "eth1/31/1")
+        # but device groups are named with upper-cased port identifiers
+        # ("DEVICE_GROUP_D1_<DUT>:ETH1/31/1") — a case-sensitive match makes
+        # the whole call a silent no-op.
+        device_groups = self.find_device_groups(device_group_regex, ignore_case=True)
         for device_group in device_groups:
             for ethernet in device_group.Ethernet.find():
                 for ipv4 in ethernet.Ipv4.find():
@@ -4456,14 +6879,19 @@ class Ixia:
                             f"Updating {device_group.Name} device multiplier to {prefix_count}"
                         )
                         device_group.update(Multiplier=prefix_count)
-                        self.toggle_device_group(
-                            device_group, sleep_time_between_toggle_s
-                        )
+                        matching_device_groups.append(device_group)
 
+        # Apply the new population before restarting the group so every newly
+        # created IPv4 session participates in ARP resolution.
         self.apply_changes()
+        if toggle_matching_device_group:
+            for device_group in matching_device_groups:
+                self.toggle_device_group(device_group, sleep_time_between_toggle_s)
         if not toggle_all_ipv6_ipv4_only_protocol:
             return
-        all_device_groups = self.find_device_groups(device_group_regex)
+        all_device_groups = self.find_device_groups(
+            device_group_regex, ignore_case=True
+        )
         bgp_device_group_name = self.get_bgp_device_group_name(all_device_groups)
         for device_group in all_device_groups:
             if device_group.Name not in bgp_device_group_name:
@@ -5010,8 +7438,24 @@ class Ixia:
         # Configure prefix length
         ip_prefix_pool.PrefixLength.Single(config.prefix_length)
 
-        # Create BGP V6 IP Route Property
-        bgp_route_prop = ip_prefix_pool.BgpV6IPRouteProperty.add()
+        # Reuse the BGP V6 IP Route Property if one is already present.
+        #
+        # On IxNetwork >= 26.4.4101.8, `Ipv6PrefixPools.add()` under a
+        # BGP-enabled device group AUTO-CREATES a bgpV6IPRouteProperty. Calling
+        # `.add()` unconditionally then tries to create a second one and the
+        # commit is rejected:
+        #     400 code 5500  Unable to add .../bgpV6IPRouteProperty:L100
+        #         code 10000 Commit operation failed
+        # The call passes no payload, so the failure is invariant to every value
+        # configured here — which is what made it look like a config problem.
+        # Older builds (e.g. 26.0.2601.3) do not auto-create it, so the same
+        # code works there; this find-or-create handles both.
+        existing_route_props = ip_prefix_pool.BgpV6IPRouteProperty.find()
+        bgp_route_prop = (
+            existing_route_props[0]
+            if existing_route_props
+            else ip_prefix_pool.BgpV6IPRouteProperty.add()
+        )
 
         # Configure next hop settings
         bgp_route_prop.NextHopType.Single(config.next_hop_type)
@@ -5694,8 +8138,15 @@ class Ixia:
 
     @staticmethod
     def fetch_ixia_credentials(secret_name: str, secret_group: str) -> t.Optional[str]:
-        """Fetches Ixia credentials. In OSS mode, reads from env/CSV. Internal uses keychain."""
+        """Fetch IXIA credentials through the environment-selected provider."""
         if TAAC_OSS:
+            from taac.utils.meta_internal_bridge_client import (
+                bridge_enabled,
+                fetch_ixia_password,
+            )
+
+            if bridge_enabled():
+                return fetch_ixia_password(secret_name, secret_group)
             from taac.utils.oss_ixia_utils import (
                 get_oss_ixia_password,
             )
@@ -5703,11 +8154,11 @@ class Ixia:
             _username, password = get_oss_ixia_password()
             return password
 
-        from taac.internal.internal_utils import (
+        from taac.internal.ixia_credentials import (
             fetch_ixia_password_internal,
         )
 
-        return fetch_ixia_password_internal()
+        return fetch_ixia_password_internal(secret_name, secret_group)
 
     def configure_l1_settings(
         self,
@@ -5724,27 +8175,57 @@ class Ixia:
         else:
             port_identifier = vport.Name
         if l1_config.enable_fcoe:
+            # pyrefly: ignore [missing-attribute]
             if "Fcoe" not in vport.L1Config.CurrentType:
+                # pyrefly: ignore [missing-attribute]
                 new_current_type = vport.L1Config.CurrentType + "Fcoe"
+                # pyrefly: ignore [missing-attribute]
                 vport.L1Config.CurrentType = new_current_type
                 self.logger.debug(
                     f"Successfully configured L1Config CurrentType for {port_identifier} as {new_current_type}"
                 )
             if l1_config.flow_control_config:
                 fcoe = getattr(
+                    # pyrefly: ignore [missing-attribute]
                     vport.L1Config,
                     (
+                        # pyrefly: ignore [missing-attribute]
                         vport.L1Config.CurrentType[0].upper()
-                        + vport.L1Config.CurrentType[1:]
+                        + vport.L1Config.CurrentType[1:]  # pyrefly: ignore [missing-attribute]
                     ).replace("Fcoe", ""),
                 ).Fcoe
                 self.apply_flow_control_config(fcoe, l1_config.flow_control_config)
         else:
+            # pyrefly: ignore [missing-attribute]
             if "Fcoe" in vport.L1Config.CurrentType:
+                # pyrefly: ignore [missing-attribute]
                 new_current_type = vport.L1Config.CurrentType.replace("Fcoe", "")
+                # pyrefly: ignore [missing-attribute]
                 vport.L1Config.CurrentType = new_current_type
                 self.logger.debug(
                     f"Successfully configured L1Config CurrentType for {port_identifier} as {new_current_type}"
+                )
+        # getattr: enable_rs_fec rolls out via a configerator thrift change and
+        # the fbcode-generated types lag the mirror sync; stay green on both.
+        # NOTE: this only drives the FEC knobs on the vport's current L1
+        # family. It cannot change the family itself: on some modes the
+        # chassis re-asserts the connect-time personality (e.g. the FCoE
+        # variant on 100G-R4 NRZ), and post-connect switches do not stick.
+        if getattr(l1_config, "enable_rs_fec", False):
+            # pyrefly: ignore [missing-attribute]
+            current_type = vport.L1Config.CurrentType
+            family_attr = current_type.replace("Fcoe", "")
+            family_attr = family_attr[0].upper() + family_attr[1:]
+            # pyrefly: ignore [missing-attribute]
+            l1_family = getattr(vport.L1Config, family_attr, None)
+            if l1_family is not None and hasattr(l1_family, "EnableRsFec"):
+                l1_family.update(
+                    IeeeL1Defaults=False,
+                    EnableRsFec=True,
+                    RsFecForceOn=True,
+                )
+                self.logger.debug(
+                    f"Successfully configured RS-FEC for {port_identifier} as {family_attr}"
                 )
 
     def start_and_verify_protocols(self) -> None:
@@ -5767,6 +8248,12 @@ class Ixia:
     def _send_arp_ns_on_device_group(self, device_group: "DeviceGroup") -> None:
         """Send ARP/NS on a device group and its children recursively."""
         dg_name = device_group.Name
+        enabled_values = tuple(
+            _normalize_ixia_boolean(value) for value in device_group.Enabled.Values
+        )
+        if enabled_values and all(value is False for value in enabled_values):
+            self.logger.debug(f"[{dg_name}] Skipping ARP/NS for disabled device group")
+            return
         for ethernet in device_group.Ethernet.find():
             for ipv4 in ethernet.Ipv4.find():
                 try:
@@ -5783,6 +8270,211 @@ class Ixia:
         # Recurse into child device groups
         for child_dg in device_group.DeviceGroup.find():
             self._send_arp_ns_on_device_group(child_dg)
+
+    @external_api
+    def refresh_and_verify_gateway_resolution(
+        self,
+        device_group_names: t.Sequence[str],
+        timeout_seconds: float = _GATEWAY_RESOLUTION_TIMEOUT_SECONDS,
+    ) -> None:
+        """Re-send ARP/NS on the named device groups and require every gateway MAC.
+
+        `start_and_verify_protocols` sends ARP/NS once, right after
+        StartAllProtocols, when some sessions may not have started yet and the
+        DUT may not own the gateway addresses. Call this after the DUT owns
+        them. IXIA refuses ARP/NS on a session that has not started, so this
+        first waits up to `timeout_seconds` for every IP session to leave
+        notStarted, as re-enabled device groups need. ARP/NS is then sent once
+        per stack and never re-sent. Raises `IxiaOperationStateError` naming
+        the sessions that never started, or whose gateway MAC is still
+        unresolved `timeout_seconds` after ARP/NS.
+        """
+        gateway_stacks = self._gateway_stacks(device_group_names)
+        stale = self._wait_for_started_ip_sessions(gateway_stacks, timeout_seconds)
+        if stale:
+            self.logger.warning(
+                "Gateway MACs unresolved before ARP/NS refresh: "
+                + "; ".join(
+                    f"{gateway_stack.device_group_name} {gateway_stack.family} "
+                    f"{len(indices)}/{count} "
+                    f"[{_bgp_session_indices_spec(indices)}]"
+                    for gateway_stack, count, indices in stale
+                )
+            )
+        for gateway_stack in gateway_stacks:
+            self._send_gateway_resolution_request(gateway_stack)
+        deadline = time.monotonic() + timeout_seconds
+        unresolved = self._unresolved_gateways(gateway_stacks)
+        while unresolved:
+            if time.monotonic() >= deadline:
+                raise IxiaOperationStateError(
+                    f"Gateway MACs unresolved {timeout_seconds}s after ARP/NS: "
+                    + "; ".join(
+                        self._gateway_resolution_failure_detail(
+                            gateway_stack, count, indices
+                        )
+                        for gateway_stack, count, indices in unresolved
+                    )
+                    + f"; Ixia server errors: {self._recent_ixia_server_errors()}"
+                )
+            time.sleep(_GATEWAY_RESOLUTION_POLL_SECONDS)
+            unresolved = self._unresolved_gateways(gateway_stacks)
+        self.logger.info(
+            f"Resolved every gateway MAC on {', '.join(device_group_names)} "
+            f"({len(gateway_stacks)} IP stack(s))"
+        )
+
+    def _gateway_stacks(
+        self, device_group_names: t.Sequence[str]
+    ) -> list[_GatewayStack]:
+        if not device_group_names:
+            raise ValueError("device_group_names must name at least one device group")
+        device_groups_by_name: dict[str, list[t.Any]] = defaultdict(list)
+        for device_group in self.find_device_groups():
+            device_groups_by_name[str(device_group.Name)].append(device_group)
+        gateway_stacks = []
+        for name in device_group_names:
+            matches = device_groups_by_name.get(name, [])
+            if len(matches) != 1:
+                raise IxiaOperationStateError(
+                    f"Expected one device group named {name}, found {len(matches)}"
+                )
+            stacks = [
+                _GatewayStack(name, family, stack)
+                for ethernet in matches[0].Ethernet.find()
+                for family, family_stacks in (
+                    ("IPv4", ethernet.Ipv4.find()),
+                    ("IPv6", ethernet.Ipv6.find()),
+                )
+                for stack in family_stacks
+            ]
+            if not stacks:
+                raise IxiaOperationStateError(
+                    f"Device group {name} has no IPv4 or IPv6 stack"
+                )
+            gateway_stacks.extend(stacks)
+        return gateway_stacks
+
+    def _send_gateway_resolution_request(self, gateway_stack: _GatewayStack) -> None:
+        if gateway_stack.family == "IPv4":
+            gateway_stack.stack.SendArp()
+            request = "ARP"
+        else:
+            gateway_stack.stack.SendNs()
+            request = "NS"
+        self.logger.info(
+            f"[{gateway_stack.device_group_name}] Re-sent {request} on "
+            f"{gateway_stack.family} stack"
+        )
+
+    @staticmethod
+    def _unresolved_gateways(
+        gateway_stacks: t.Sequence[_GatewayStack],
+    ) -> list[t.Tuple[_GatewayStack, int, list[int]]]:
+        unresolved = []
+        for gateway_stack in gateway_stacks:
+            stack = gateway_stack.stack
+            # restpy serves attributes from the snapshot taken by find().
+            stack.refresh()
+            count = int(stack.Count)
+            indices = Ixia._unresolved_gateway_indices(stack, count)
+            if indices:
+                unresolved.append((gateway_stack, count, indices))
+        return unresolved
+
+    @staticmethod
+    def _unresolved_gateway_indices(stack: t.Any, count: int) -> list[int]:
+        macs = list(stack.ResolvedGatewayMac or [])
+        return [
+            index
+            for index in range(1, count + 1)
+            if index > len(macs) or not _is_resolved_gateway_mac(macs[index - 1])
+        ]
+
+    def _wait_for_started_ip_sessions(
+        self,
+        gateway_stacks: t.Sequence[_GatewayStack],
+        timeout_seconds: float,
+    ) -> list[t.Tuple[_GatewayStack, int, list[int]]]:
+        """Wait until no IP session of the stacks is notStarted.
+
+        Returns the gateways that are unresolved once every session has
+        started. Raises `IxiaOperationStateError` naming the sessions still
+        notStarted after `timeout_seconds`.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        waiting_logged = False
+        while True:
+            not_started = []
+            unresolved = []
+            for gateway_stack in gateway_stacks:
+                stack = gateway_stack.stack
+                # restpy serves attributes from the snapshot taken by find().
+                stack.refresh()
+                count = int(stack.Count)
+                statuses = _sampled_session_values(
+                    list(stack.SessionStatus or []), range(1, count + 1)
+                )
+                pending = [
+                    index
+                    for index, status in enumerate(statuses, start=1)
+                    if status == "notStarted"
+                ]
+                if pending:
+                    not_started.append((gateway_stack, count, pending))
+                indices = self._unresolved_gateway_indices(stack, count)
+                if indices:
+                    unresolved.append((gateway_stack, count, indices))
+            if not not_started:
+                return unresolved
+            summary = "; ".join(
+                f"{waiting.device_group_name} {waiting.family} "
+                f"{len(waiting_indices)}/{total} notStarted "
+                f"[{_bgp_session_indices_spec(waiting_indices[:_GATEWAY_RESOLUTION_FAILURE_SAMPLE_SIZE])}"
+                f"{', ...' if len(waiting_indices) > _GATEWAY_RESOLUTION_FAILURE_SAMPLE_SIZE else ''}]"
+                for waiting, total, waiting_indices in not_started
+            )
+            if time.monotonic() >= deadline:
+                raise IxiaOperationStateError(
+                    f"IP sessions not started {timeout_seconds}s into the "
+                    f"gateway check: {summary}; Ixia server errors: "
+                    f"{self._recent_ixia_server_errors()}"
+                )
+            if not waiting_logged:
+                self.logger.info(
+                    f"Waiting for IP sessions to start before ARP/NS: {summary}"
+                )
+                waiting_logged = True
+            time.sleep(_GATEWAY_RESOLUTION_POLL_SECONDS)
+
+    @staticmethod
+    def _gateway_resolution_failure_detail(
+        gateway_stack: _GatewayStack, count: int, indices: t.Sequence[int]
+    ) -> str:
+        stack = gateway_stack.stack
+        sample = indices[:_GATEWAY_RESOLUTION_FAILURE_SAMPLE_SIZE]
+
+        def sampled(read: t.Callable[[], t.Any]) -> list[str] | str:
+            try:
+                return _sampled_session_values(list(read()), sample)
+            except Exception as error:
+                return f"unavailable ({type(error).__name__}: {error})"
+
+        def counted(read: t.Callable[[], t.Any]) -> dict[str, int] | str:
+            values = sampled(read)
+            return values if isinstance(values, str) else dict(Counter(values))
+
+        return (
+            f"{gateway_stack.device_group_name} {gateway_stack.family}: "
+            f"{len(indices)}/{count} unresolved "
+            f"[{_bgp_session_indices_spec(sample)}"
+            f"{', ...' if len(indices) > len(sample) else ''}], "
+            f"Address={sampled(lambda: stack.Address.Values)}, "
+            f"GatewayIp={sampled(lambda: stack.GatewayIp.Values)}, "
+            f"ResolvedGatewayMac={sampled(lambda: stack.ResolvedGatewayMac)}, "
+            f"SessionStatus={counted(lambda: stack.SessionStatus)}, "
+            f"SessionInfo={counted(lambda: stack.SessionInfo)}"
+        )
 
     def apply_flow_control_config(
         self, fcoe: "Fcoe", flow_control_config: ixia_types.FlowControlConfig
@@ -5986,6 +8678,130 @@ class Ixia:
         )
         return device_groups
 
+    def _remove_orphaned_session(
+        self, orphan_id
+    ) -> t.Tuple[bool, t.Optional[Exception]]:
+        """Best-effort ``Sessions.remove()`` of ``orphan_id``, verified server-side.
+
+        ``Sessions.remove()`` has a failure mode that makes a naive
+        retry-on-the-same-object a FALSE SUCCESS: on a non-transient server
+        error it clears the local object's property list first and then raises
+        a plain string (surfacing as TypeError), so a second ``remove()``
+        iterates an empty list, issues no HTTP call, and returns cleanly.
+        Therefore re-find the session by id on a fresh handle each attempt, and
+        trust only the server's word (absence from ``find``) as success.
+
+        Returns ``(destroyed, last_exception)``.
+        """
+        last_exc = None
+        for attempt in (1, 2):
+            try:
+                stale = self.session.TestPlatform.Sessions.find(Id=orphan_id)
+                if len(stale) == 0:
+                    return True, last_exc
+                stale.remove()
+            except Exception as exc:
+                last_exc = exc
+            try:
+                if len(self.session.TestPlatform.Sessions.find(Id=orphan_id)) == 0:
+                    return True, last_exc
+            except Exception as exc:
+                last_exc = exc
+            if attempt == 1:
+                self.logger.warning(
+                    f"{_YELLOW}[IXIA]{_RESET} Session {orphan_id} still present "
+                    f"after remove attempt"
+                    + (f" ({type(last_exc).__name__})" if last_exc else "")
+                    + " — retrying in 5s"
+                )
+                time.sleep(5)
+        return False, last_exc
+
+    def _tombstone_orphaned_session(self, orphan_id) -> t.Optional[str]:
+        """Rename an undestroyable session so it self-identifies in the session list.
+
+        The rename is a platform-metadata PATCH (linux API server only —
+        elsewhere the setter just warns), so verify by reading the name back
+        rather than trusting the setter. Returns the applied name, or ``None``
+        if the rename failed or is unsupported.
+        """
+        tombstone = (
+            f"STALE-ORPHANED-{self.session_name or 'unnamed'}-{int(time.time())}"
+        )
+        try:
+            test_platform = self.session.TestPlatform
+            if test_platform.Platform != "linux":
+                return None
+            stale = test_platform.Sessions.find(Id=orphan_id)
+            if not len(stale):
+                return None
+            stale.Name = tombstone
+            if test_platform.Sessions.find(Id=orphan_id).Name == tombstone:
+                return tombstone
+        except Exception:
+            return None
+        return None
+
+    def _destroy_orphaned_session(self, orphan_id) -> None:
+        """Destroy the session a previous failed setup attempt left behind.
+
+        Orphaned "Active" sessions cost API-server memory and count against the
+        API server's concurrent-session cap; enough of them and NEW session
+        creation starts 5xx-ing, which feeds the very retry path that calls
+        this — so a destroy failure must never be silent.
+        """
+        # `session_id` can come from the constructor while `session` is still
+        # None: there is then no handle to reach the API server with, and this
+        # object never created a session of its own to orphan.
+        if self.session is None:
+            return
+        # Use warning level so messages pass through suppress_console_logs
+        self.logger.warning(
+            f"{_YELLOW}[IXIA]{_RESET} Destroying session "
+            f"{_YELLOW}{orphan_id}{_RESET} from previous failed attempt "
+            f"before retry"
+        )
+        destroyed, last_exc = self._remove_orphaned_session(orphan_id)
+        if destroyed:
+            return
+        tombstone = self._tombstone_orphaned_session(orphan_id)
+        self.logger.error(
+            f"[IXIA] Could not destroy session {orphan_id} from the previous "
+            f"failed attempt"
+            + (
+                f" (last error {type(last_exc).__name__}: {last_exc})"
+                if last_exc
+                else ""
+            )
+            + ". It is now ORPHANED on the API server"
+            + (
+                f" (tombstone-renamed to {tombstone!r})"
+                if tombstone
+                else " (tombstone rename also failed/unsupported)"
+            )
+            + f" — clean up manually via /api/v1/sessions/{orphan_id}."
+        )
+
+    def _start_protocols_with_retained_session_recovery(self) -> None:
+        try:
+            self.start_and_verify_protocols()
+        except Exception as exc:
+            # An interrupted mutation can leave a retained IxNetwork session
+            # with unapplied changes. Starting protocols then fails with this
+            # explicit CPF response even though the topology is otherwise
+            # reusable. Commit that pending state once and retry; preserve all
+            # other setup errors unchanged.
+            if not self.is_existing_session or "Apply Changes is required" not in str(
+                exc
+            ):
+                raise
+            self.logger.warning(
+                "[IXIA] Retained session has pending changes; applying them "
+                "before retrying protocol startup"
+            )
+            self.apply_changes()
+            self.start_and_verify_protocols()
+
     @timeit
     @retryable(num_tries=3, sleep_time=30, print_ex=True)
     def _create_basic_setup(
@@ -5999,6 +8815,15 @@ class Ixia:
         """
 
         setup_start = time.time()
+        configured_traffic_items = (
+            self.ixia_config.traffic_items if self.ixia_config else ()
+        )
+        self._deferred_traffic_item_replacements = []
+        self._deferred_traffic_item_replacement_swaps_started = set()
+        self._defer_traffic_preparation = (
+            self._is_deferred_routed_traffic_preparation_enabled()
+            and self._requires_post_setup_traffic_preparation(configured_traffic_items)
+        )
         # Use warning level so messages pass through suppress_console_logs
         _log = self.logger.warning
 
@@ -6016,16 +8841,7 @@ class Ixia:
         # still be committing server-side when NewConfig() wipes the SDM
         # registry, leading to NullReferenceException in IxNetwork.
         if self.session_id and not self.is_existing_session:
-            _log(
-                f"{_YELLOW}[IXIA]{_RESET} Destroying session "
-                f"{_YELLOW}{self.session_id}{_RESET} from previous failed "
-                f"attempt before retry"
-            )
-            try:
-                if self.session:
-                    self.session.Session.remove()
-            except Exception:
-                pass
+            self._destroy_orphaned_session(self.session_id)
             self.session_id = None
             self.vport_indices = {}
             self.tag_name_to_device_group_name_list = defaultdict(list)
@@ -6037,6 +8853,7 @@ class Ixia:
         _log(f"{_CYAN}{_BOLD}[1/7] Connecting to IXIA chassis...{_RESET}")
         _step_start = time.time()
         self.connect()
+        self.configure_tx_rx_sync()
         _log(f"{_GREEN}[IXIA]{_RESET} Connected in {time.time() - _step_start:.0f}s")
 
         # if we connected to existing session, and didn't clean it up
@@ -6059,6 +8876,7 @@ class Ixia:
             _step_start = time.time()
             # pyrefly: ignore [bad-argument-type]
             self.assign_ports(port_configs)
+            self.configure_nrz_100g_rs_fec(port_configs or ())
             _log(
                 f"{_GREEN}[IXIA]{_RESET} Ports assigned in {time.time() - _step_start:.0f}s"
             )
@@ -6070,7 +8888,7 @@ class Ixia:
                 f"({len(port_configs)} port(s))...{_RESET}"
             )
             _step_start = time.time()
-            # pyrefly: ignore [not-iterable, bad-argument-type]
+            # pyrefly: ignore [bad-argument-type]
             self._build_topologies_and_device_groups(port_configs, _log)
             _log(
                 f"{_GREEN}[IXIA]{_RESET} Topologies & device groups created in "
@@ -6090,9 +8908,18 @@ class Ixia:
                 f"{_GREEN}[IXIA]{_RESET} Chassis configured in {time.time() - _step_start:.0f}s"
             )
         else:
+            try:
+                port_configs = none_throws(self.ixia_config).port_configs
+                self.rehydrate_vport_indices(port_configs)
+            except Exception as exc:
+                raise IxiaSetupError(
+                    f"Retained IXIA session {self.session_id} does not match "
+                    f"the requested topology: {exc}"
+                ) from exc
             _log(
                 f"{_DIM}[IXIA] Steps 2-4 skipped — "
-                f"reusing existing session ID {self.session_id}{_RESET}"
+                f"reusing existing session ID {self.session_id}; local topology "
+                f"index rehydrated{_RESET}"
             )
 
         # ── Step 5: Verify & start protocols ─────────────────────
@@ -6104,7 +8931,7 @@ class Ixia:
             f"{time.time() - _step_start:.0f}s"
         )
         _step_start = time.time()
-        self.start_and_verify_protocols()
+        self._start_protocols_with_retained_session_recovery()
         _log(
             f"{_GREEN}[IXIA]{_RESET} Protocols started and verified in "
             f"{time.time() - _step_start:.0f}s"
@@ -6123,32 +8950,56 @@ class Ixia:
             num_items = len(traffic_items)
             _log(f"{_CYAN}{_BOLD}[6/7] Creating {num_items} traffic item(s)...{_RESET}")
             _step_start = time.time()
-            self.create_traffic_items(traffic_items)
+            self.create_traffic_items(
+                traffic_items,
+                override_traffic_items=self.override_traffic_items,
+                generate_traffic_items=not self._defer_traffic_preparation,
+            )
             _log(
                 f"{_GREEN}[IXIA]{_RESET} {num_items} traffic item(s) created in "
                 f"{time.time() - _step_start:.0f}s"
             )
 
             # ── Step 7: Trial traffic ────────────────────────────
-            _log(
-                f"{_CYAN}{_BOLD}[7/7] Trial traffic for ARP/NDP resolution "
-                f"({trial_traffic_interval_s}s)...{_RESET}"
-            )
-            _step_start = time.time()
-            self.start_traffic()
-            _log(f"{_DIM}[IXIA] Waiting {trial_traffic_interval_s}s...{_RESET}")
-            time.sleep(trial_traffic_interval_s)
-            self.stop_traffic()
-            _log(
-                f"{_GREEN}[IXIA]{_RESET} Trial traffic complete in "
-                f"{time.time() - _step_start:.0f}s"
-            )
+            if self._defer_traffic_preparation:
+                _log(
+                    f"{_DIM}[IXIA] Step 7 deferred — routed traffic will be "
+                    "generated and applied after post-IXIA DUT setup"
+                    f"{_RESET}"
+                )
+            else:
+                _log(
+                    f"{_CYAN}{_BOLD}[7/7] Trial traffic for ARP/NDP resolution "
+                    f"({trial_traffic_interval_s}s)...{_RESET}"
+                )
+                _step_start = time.time()
+                self.start_traffic()
+                _log(f"{_DIM}[IXIA] Waiting {trial_traffic_interval_s}s...{_RESET}")
+                time.sleep(trial_traffic_interval_s)
+                self.stop_traffic()
+                _log(
+                    f"{_GREEN}[IXIA]{_RESET} Trial traffic complete in "
+                    f"{time.time() - _step_start:.0f}s"
+                )
         else:
             _log(f"{_DIM}[IXIA] Steps 6-7 skipped — no traffic items to create{_RESET}")
 
         total_elapsed = time.time() - setup_start
         _log(
             f"\n{_GREEN}{_BOLD}[IXIA] Setup complete in {total_elapsed:.0f}s{_RESET}\n"
+        )
+
+    def configure_tx_rx_sync(self) -> None:
+        """Set the traffic clock policy immediately after session connect.
+
+        This deliberately runs before ports, topologies, TrafficItem Generate,
+        and Traffic.Apply. Single-chassis sessions without a physical primary
+        clock can opt out; the legacy default remains enabled.
+        """
+        self.ixnetwork.Traffic.UseTxRxSync = self.use_tx_rx_sync
+        self.logger.info(
+            f"[IXIA] Inter-chassis Tx/Rx synchronization "
+            f"{'enabled' if self.use_tx_rx_sync else 'disabled'}"
         )
 
     def _build_topologies_and_device_groups(
@@ -6586,6 +9437,41 @@ class Ixia:
             bgp_peer.Stop(SessionIndices=f"1-{bgp_peer.Count}")
             bgp_peer.Start(SessionIndices=f"1-{bgp_peer.Count}")
 
+    def get_bgp_session_addresses(self, regex: str) -> t.List[str]:
+        """IXIA-side session addresses of every BGP peer whose name matches ``regex``."""
+        return [
+            str(ip_address(address))
+            for bgp_peer in self.find_bgp_peers(regex)
+            for address in bgp_peer.parent.Address.Values
+        ]
+
+    def restart_bgp_sessions(
+        self, regex: str, peer_addresses: t.Collection[str]
+    ) -> t.Dict[str, t.List[int]]:
+        """Stop then start only the sessions at ``peer_addresses``.
+
+        ``restart_bgp_peers`` bounces every session on a peer object; this
+        restarts just the listed indices so established siblings on the same
+        object keep their uptime. Returns the 1-based indices restarted per peer
+        name; addresses no matching peer emulates are ignored.
+        """
+        wanted = {ip_address(address) for address in peer_addresses}
+        restarted: t.Dict[str, t.List[int]] = {}
+        for bgp_peer in self.find_bgp_peers(regex):
+            indices = [
+                index
+                for index, address in enumerate(bgp_peer.parent.Address.Values, 1)
+                if ip_address(address) in wanted
+            ]
+            if not indices:
+                continue
+            session_indices = _bgp_session_indices_spec(indices)
+            bgp_peer.Stop(SessionIndices=session_indices)
+            bgp_peer.Start(SessionIndices=session_indices)
+            restarted[bgp_peer.Name] = indices
+        self.logger.info(f"Restarted BGP sessions {restarted} matching {regex!r}")
+        return restarted
+
     def find_ipv6s(
         self, regex: t.Optional[str] = None, ignore_case: bool = False
     ) -> t.List["Ipv6"]:
@@ -6768,34 +9654,98 @@ class Ixia:
         # daisy-chain configuration is meaningless. The existing
         # fall-through below would try to add primary_chassis_ip as
         # a chassis, which hangs forever in "polling" state when
-        # primary_chassis_ip is just the API server.
+        # primary_chassis_ip is just the API server. An explicit
+        # ixia_primary_chassis is a real chassis, so it always gets chained.
         chassis_ips_in_use = {
             port_config.phy_port_config.chassis_ip
             for port_config in none_throws(self.ixia_config).port_configs
         }
-        if len(chassis_ips_in_use) <= 1:
+        if not self.ixia_primary_chassis and len(chassis_ips_in_use) <= 1:
             return
-        primary_chassis_ip = ipaddress.ip_address(self.primary_chassis_ip)
+        primary_chassis_address = none_throws(
+            self.ixia_primary_chassis or self.primary_chassis_ip
+        )
+        if not string_is_ip(primary_chassis_address):
+            primary_chassis_address = get_ipv6_for_host(
+                primary_chassis_address
+            ) or socket.gethostbyname(primary_chassis_address)  # @nolint PATTERNLINT(python-dns-deps)
+        primary_chassis_ip = ipaddress.ip_address(primary_chassis_address)
+        physical_chassis_ips = {
+            ipaddress.ip_address(address) for address in chassis_ips_in_use
+        }
+        # RestPy creates fresh wrappers on iteration; compare remote identities,
+        # and keep the cable clock primary independent of the REST API endpoint.
+        all_chassis = list(self.ixnetwork.AvailableHardware.Chassis.find())
+        def find_clock_primary(chassis_records, allow_missing: bool = False):
+            candidates = [
+                chassis
+                for chassis in chassis_records
+                if ipaddress.ip_address(chassis.Hostname)
+                in physical_chassis_ips | {primary_chassis_ip}
+            ]
+            primary_flags = [getattr(chassis, "IsPrimary", None) for chassis in candidates]
+            if not any(isinstance(flag, bool) for flag in primary_flags):
+                return None
+            clock_primaries = [
+                chassis
+                for chassis, flag in zip(candidates, primary_flags)
+                if flag is True
+            ]
+            # An explicit clock chassis without test ports may not have been
+            # connected yet. Bootstrap it without forcing port ownership, then
+            # validate the refreshed cable flags before changing clock settings.
+            if (
+                allow_missing
+                and primary_chassis_ip not in physical_chassis_ips
+                and all(flag is False for flag in primary_flags)
+                and not any(
+                    ipaddress.ip_address(chassis.Hostname) == primary_chassis_ip
+                    for chassis in candidates
+                )
+            ):
+                return None
+            if not all(isinstance(flag, bool) for flag in primary_flags) or len(
+                clock_primaries
+            ) != 1:
+                raise ValueError("Unable to identify a unique physical clock primary")
+            return clock_primaries[0]
+
+        if self.ixia_primary_chassis:
+            clock_primary = None
+        else:
+            clock_primary = find_clock_primary(all_chassis, allow_missing=True)
+        if clock_primary is not None:
+            primary_chassis_address = clock_primary.Hostname
+            primary_chassis_ip = ipaddress.ip_address(primary_chassis_address)
         vport = None
-        if not any(
-            ipaddress.ip_address(port_config.phy_port_config.chassis_ip)
-            == primary_chassis_ip
-            for port_config in none_throws(self.ixia_config).port_configs
+        if self.ixia_primary_chassis and not any(
+            ipaddress.ip_address(chassis.Hostname) == primary_chassis_ip
+            for chassis in all_chassis
         ):
+            self._add_chassis(primary_chassis_address)
+            all_chassis = list(self.ixnetwork.AvailableHardware.Chassis.find())
+        elif not self.ixia_primary_chassis and primary_chassis_ip not in physical_chassis_ips:
             self.logger.info(
                 "Unable to locate any ports from the Ixia configuration that are associated "
                 "with the primary chassis."
             )
-            portmap_assistant = self.session.PortMapAssistant()
-            # attempt to connect to at least one vport on the primary chassis
-            vport = portmap_assistant.Map(
-                IpAddress=self.primary_chassis_ip,
-                CardId=1,
-                PortId=100,  # an arbitrary port id
-                Name="DO_NOT_USE",
-            )
-            portmap_assistant.Connect(ForceOwnership=False)
-        all_chassis = self.ixnetwork.AvailableHardware.Chassis.find()
+            if self.ixia_primary_chassis:
+                self._add_chassis(primary_chassis_address)
+            else:
+                portmap_assistant = self.session.PortMapAssistant()
+                # attempt to connect to at least one vport on the primary chassis
+                vport = portmap_assistant.Map(
+                    IpAddress=primary_chassis_address,
+                    CardId=1,
+                    PortId=100,  # an arbitrary port id
+                    Name="DO_NOT_USE",
+                )
+                portmap_assistant.Connect(ForceOwnership=False)
+            all_chassis = list(self.ixnetwork.AvailableHardware.Chassis.find())
+            clock_primary = find_clock_primary(all_chassis)
+            if clock_primary is not None:
+                primary_chassis_address = clock_primary.Hostname
+                primary_chassis_ip = ipaddress.ip_address(primary_chassis_address)
         primary_chassis = next(
             (
                 chassis
@@ -6804,25 +9754,47 @@ class Ixia:
             ),
             None,
         )
+        # restpy builds a new object per iteration, so compare by address.
         secondary_chassis = [
-            chassis for chassis in all_chassis if chassis != primary_chassis
+            chassis
+            for chassis in all_chassis
+            if ipaddress.ip_address(chassis.Hostname) in physical_chassis_ips
+            and ipaddress.ip_address(chassis.Hostname) != primary_chassis_ip
         ]
         if not primary_chassis:
-            raise ValueError(f"Primary chassis {self.primary_chassis_ip} is not found")
+            raise ValueError(f"Primary chassis {primary_chassis_address} is not found")
+        primary_chassis.PrimaryChassis = ""
         primary_chassis.SequenceId = 1
         primary_chassis.ChainTopology = "daisy"
-        t.sequence_id = 2
-        for chassis in secondary_chassis:
-            chassis.MasterChassis = primary_chassis.Hostname
-            chassis.SequenceId = t.sequence_id
-            t.sequence_id += 1
+        for sequence_id, chassis in enumerate(secondary_chassis, start=2):
+            chassis.PrimaryChassis = primary_chassis.Hostname
+            chassis.SequenceId = sequence_id
         if vport:
             vport.remove()
+        self.logger.info(
+            f"[IXIA] Chassis chain: primary={primary_chassis.Hostname}, "
+            f"secondaries={[chassis.Hostname for chassis in secondary_chassis]}"
+        )
+
+    def _add_chassis(self, chassis_address: str, timeout_s: int = 120) -> None:
+        ixnetwork = t.cast("IxnIxnetwork", self.ixnetwork)
+        chassis = ixnetwork.AvailableHardware.Chassis.add(Hostname=chassis_address)
+        deadline = time.monotonic() + timeout_s
+        with self.request_deadline(timeout_s, phase="explicit_primary_chassis_ready"):
+            while chassis.refresh().State != "ready":
+                if time.monotonic() >= deadline:
+                    raise IxiaSetupError(
+                        f"Chassis {chassis_address} did not become ready within {timeout_s}s (state={chassis.State})"
+                    )
+                time.sleep(min(3, max(0, deadline - time.monotonic())))
 
     @external_api
     @require_traffic_item
     def enable_traffic(
-        self, regexes: t.Optional[t.List[str]] = None, enable: bool = True
+        self,
+        regexes: t.Optional[t.List[str]] = None,
+        enable: bool = True,
+        apply_changes: bool = True,
     ) -> None:
         """
         Enable or disable traffic items that match the given regexes.
@@ -6831,6 +9803,7 @@ class Ixia:
         Args:
             regexes (List[str], t.optional): Regexes of traffic items to enable/disable. Defaults to None.
             enable (bool, t.optional): Whether to enable or disable traffic items. Defaults to True.
+            apply_changes: Whether to apply the traffic configuration immediately.
         """
         all_traffic_items = self.ixnetwork.Traffic.TrafficItem.find()
         name_to_traffic_item = {item.Name: item for item in all_traffic_items}
@@ -6865,7 +9838,8 @@ class Ixia:
         self.logger.info(
             f"Successfully {action} traffic item(s) {[traffic_item.Name for traffic_item in traffic_items]}"
         )
-        self.apply_traffic()
+        if apply_changes:
+            self.apply_traffic()
 
     def configure_line_rate(
         self,
@@ -6933,7 +9907,7 @@ class Ixia:
         for prefix_pool in prefix_pools:
             bgp_ip_route_property: "BgpIPRouteProperty" = (
                 (prefix_pool.BgpIPRouteProperty.find())
-                if isinstance(prefix_pool, Ipv4PrefixPools)
+                if _is_ipv4_prefix_pool(prefix_pool)
                 else prefix_pool.BgpV6IPRouteProperty.find()
             )[0]
 
@@ -7021,6 +9995,331 @@ class Ixia:
             f"Successfully updated multipliers for device groups in topology for {hostname}:{interface}"
         )
 
+    @staticmethod
+    def _partitioned_prefix_geometry(
+        *,
+        starting_prefix: str,
+        prefix_length: int,
+        peer_count: int,
+        total_prefix_count: int,
+    ) -> t.Tuple[int, str, t.Tuple[str, ...], t.Tuple[str, ...]]:
+        """Return per-peer count, IXIA stride, starts, and lasts."""
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (peer_count, total_prefix_count)
+        ):
+            raise ValueError(
+                "peer_count and total_prefix_count must be positive integers"
+            )
+        if total_prefix_count % peer_count:
+            raise ValueError(
+                f"total_prefix_count={total_prefix_count} must be divisible by "
+                f"peer_count={peer_count}"
+            )
+
+        start = ipaddress.ip_address(starting_prefix)
+        if (
+            isinstance(prefix_length, bool)
+            or not isinstance(prefix_length, int)
+            or not 0 <= prefix_length <= start.max_prefixlen
+        ):
+            raise ValueError(
+                f"prefix_length={prefix_length} is invalid for {starting_prefix}"
+            )
+        network = ipaddress.ip_network(f"{start}/{prefix_length}", strict=False)
+        if start != network.network_address:
+            raise ValueError(
+                f"starting_prefix={starting_prefix} is not /{prefix_length} aligned"
+            )
+
+        prefixes_per_peer = total_prefix_count // peer_count
+        prefix_span = 1 << (start.max_prefixlen - prefix_length)
+        peer_stride = prefixes_per_peer * prefix_span
+        last_address = int(start) + total_prefix_count * prefix_span - 1
+        if last_address > (1 << start.max_prefixlen) - 1:
+            raise ValueError(
+                f"{total_prefix_count} /{prefix_length} prefixes starting at "
+                f"{starting_prefix} exceed the address family"
+            )
+
+        address_type = type(start)
+        starts = tuple(
+            str(address_type(int(start) + peer_index * peer_stride))
+            for peer_index in range(peer_count)
+        )
+        lasts = tuple(
+            str(
+                address_type(
+                    int(start)
+                    + peer_index * peer_stride
+                    + (prefixes_per_peer - 1) * prefix_span
+                )
+            )
+            for peer_index in range(peer_count)
+        )
+        return prefixes_per_peer, str(address_type(peer_stride)), starts, lasts
+
+    def _find_partitioned_bgp_prefix_target(
+        self,
+        *,
+        hostname: str,
+        interface: str,
+        prefix_pool_regex: str,
+        ipv6: bool,
+    ) -> t.Tuple[t.Any, t.Any, t.Any]:
+        """Resolve exactly one prefix pool and its owning groups."""
+        try:
+            pattern = re.compile(prefix_pool_regex)
+        except re.error as error:
+            raise ValueError(
+                f"invalid prefix_pool_regex={prefix_pool_regex!r}: {error}"
+            ) from error
+
+        matches = []
+        for device_group in self.get_device_groups_by_port_and_interface(
+            hostname, interface
+        ):
+            for network_group in device_group.NetworkGroup.find():
+                pools = (
+                    network_group.Ipv6PrefixPools.find()
+                    if ipv6
+                    else network_group.Ipv4PrefixPools.find()
+                )
+                matches.extend(
+                    (device_group, network_group, pool)
+                    for pool in pools
+                    if pattern.fullmatch(str(pool.Name))
+                )
+
+        names = [
+            f"{device_group.Name}/{network_group.Name}/{pool.Name}"
+            for device_group, network_group, pool in matches
+        ]
+        self.logger.info(
+            f"Partitioned BGP prefix target matches for {hostname}:{interface}: "
+            f"{names}"
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                f"prefix_pool_regex={prefix_pool_regex!r} matched {len(matches)} "
+                f"pools on {hostname}:{interface}; expected exactly one: {names}"
+            )
+        return matches[0]
+
+    @staticmethod
+    def _partitioned_bgp_multivalue_values(
+        field: t.Any,
+        *,
+        label: str,
+    ) -> t.Tuple[t.Any, ...]:
+        raw_values = getattr(field, "Values", field)
+        if raw_values is None:
+            raise ValueError(f"{label} returned no values")
+        if isinstance(raw_values, (str, bytes)):
+            return (raw_values,)
+        try:
+            return tuple(raw_values)
+        except TypeError as error:
+            raise ValueError(f"{label} must be an iterable of values") from error
+
+    @staticmethod
+    def _read_partitioned_bgp_prefix_geometry(
+        target: t.Tuple[t.Any, t.Any, t.Any],
+    ) -> t.Dict[str, t.Any]:
+        device_group, network_group, pool = target
+        for obj in (device_group, network_group, pool):
+            refresh = getattr(obj, "refresh", None)
+            if callable(refresh):
+                refresh()
+        return {
+            "device_group_name": str(device_group.Name),
+            "device_group_multiplier": int(device_group.Multiplier),
+            "network_group_name": str(network_group.Name),
+            "network_group_multiplier": int(network_group.Multiplier or 1),
+            "prefix_pool_name": str(pool.Name),
+            "prefix_pool_count": int(pool.Count),
+            "prefixes_per_peer": int(pool.NumberOfAddresses),
+            "starts": tuple(
+                str(ipaddress.ip_address(str(value)))
+                for value in Ixia._partitioned_bgp_multivalue_values(
+                    pool.NetworkAddress,
+                    label=f"{pool.Name} NetworkAddress",
+                )
+            ),
+            "lasts": tuple(
+                str(ipaddress.ip_address(str(value)))
+                for value in Ixia._partitioned_bgp_multivalue_values(
+                    pool.LastNetworkAddress,
+                    label=f"{pool.Name} LastNetworkAddress",
+                )
+            ),
+            "prefix_lengths": tuple(
+                int(value)
+                for value in Ixia._partitioned_bgp_multivalue_values(
+                    pool.PrefixLength,
+                    label=f"{pool.Name} PrefixLength",
+                )
+            ),
+        }
+
+    @staticmethod
+    def _assert_partitioned_bgp_prefix_geometry(
+        observed: t.Mapping[str, t.Any],
+        *,
+        peer_count: int,
+        prefixes_per_peer: int,
+        starts: t.Tuple[str, ...],
+        lasts: t.Tuple[str, ...],
+        prefix_length: int,
+    ) -> None:
+        expected = {
+            "device_group_multiplier": peer_count,
+            "network_group_multiplier": 1,
+            "prefix_pool_count": peer_count,
+            "prefixes_per_peer": prefixes_per_peer,
+            "starts": starts,
+            "lasts": lasts,
+        }
+        mismatches: dict[str, tuple[object, object]] = {
+            key: (value, observed.get(key))
+            for key, value in expected.items()
+            if observed.get(key) != value
+        }
+        prefix_lengths = tuple(observed.get("prefix_lengths", ()))
+        if not prefix_lengths or any(value != prefix_length for value in prefix_lengths):
+            mismatches["prefix_lengths"] = (
+                (prefix_length,),
+                prefix_lengths,
+            )
+        if mismatches:
+            raise ValueError(
+                "partitioned BGP prefix geometry readback mismatch: "
+                f"{mismatches}"
+            )
+
+    @external_api
+    def configure_partitioned_bgp_prefixes_by_port(
+        self,
+        *,
+        hostname: str,
+        interface: str,
+        peer_count: int,
+        total_prefix_count: int,
+        prefix_pool_regex: str,
+        starting_prefix: str,
+        prefix_length: int,
+        restart_protocols: bool = True,
+    ) -> t.Dict[str, t.Any]:
+        """Install one disjoint, equal prefix partition per BGP peer.
+
+        Protocols are stopped before any non-on-the-fly property changes. The
+        device-group multiplier, per-peer prefix count, and per-peer start
+        stride are staged together, applied once, and verified through a fresh
+        lookup before protocols may restart.
+        """
+        (
+            prefixes_per_peer,
+            prefix_step,
+            expected_starts,
+            expected_lasts,
+        ) = self._partitioned_prefix_geometry(
+            starting_prefix=starting_prefix,
+            prefix_length=prefix_length,
+            peer_count=peer_count,
+            total_prefix_count=total_prefix_count,
+        )
+        ipv6 = ipaddress.ip_address(starting_prefix).version == 6
+
+        with self.mutation_transaction():
+            self.stop_protocols_and_wait()
+            target = self._find_partitioned_bgp_prefix_target(
+                hostname=hostname,
+                interface=interface,
+                prefix_pool_regex=prefix_pool_regex,
+                ipv6=ipv6,
+            )
+            device_group, network_group, pool = target
+            baseline = self._read_partitioned_bgp_prefix_geometry(target)
+            network_address_snapshot = IxiaPatternSnapshot.capture(
+                pool.NetworkAddress,
+                f"{pool.Name} NetworkAddress",
+            )
+            if int(network_group.Multiplier or 1) != 1:
+                raise ValueError(
+                    f"{network_group.Name} must use compact multiplier=1; got "
+                    f"{network_group.Multiplier}"
+                )
+
+            try:
+                device_group.Multiplier = peer_count
+                pool.NumberOfAddresses = prefixes_per_peer
+                pool.NetworkAddress.Increment(
+                    start_value=str(ipaddress.ip_address(starting_prefix)),
+                    step_value=prefix_step,
+                )
+                self.apply_changes()
+                fresh_target = self._find_partitioned_bgp_prefix_target(
+                    hostname=hostname,
+                    interface=interface,
+                    prefix_pool_regex=prefix_pool_regex,
+                    ipv6=ipv6,
+                )
+                observed = self._read_partitioned_bgp_prefix_geometry(fresh_target)
+                self._assert_partitioned_bgp_prefix_geometry(
+                    observed,
+                    peer_count=peer_count,
+                    prefixes_per_peer=prefixes_per_peer,
+                    starts=expected_starts,
+                    lasts=expected_lasts,
+                    prefix_length=prefix_length,
+                )
+            except Exception as error:
+                try:
+                    rollback_target = self._find_partitioned_bgp_prefix_target(
+                        hostname=hostname,
+                        interface=interface,
+                        prefix_pool_regex=prefix_pool_regex,
+                        ipv6=ipv6,
+                    )
+                    rollback_device_group, _rollback_network_group, rollback_pool = (
+                        rollback_target
+                    )
+                    rollback_device_group.Multiplier = baseline[
+                        "device_group_multiplier"
+                    ]
+                    rollback_pool.NumberOfAddresses = baseline["prefixes_per_peer"]
+                    network_address_snapshot.restore(rollback_pool.NetworkAddress)
+                    self.apply_changes()
+                    restored = self._read_partitioned_bgp_prefix_geometry(
+                        self._find_partitioned_bgp_prefix_target(
+                            hostname=hostname,
+                            interface=interface,
+                            prefix_pool_regex=prefix_pool_regex,
+                            ipv6=ipv6,
+                        )
+                    )
+                    if restored != baseline:
+                        raise ValueError(
+                            f"rollback readback mismatch: expected={baseline}, "
+                            f"observed={restored}"
+                        )
+                except Exception as rollback_error:
+                    error.add_note(
+                        "partitioned BGP prefix rollback also failed: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                    raise error from rollback_error
+                raise
+
+            if restart_protocols:
+                self.start_protocols()
+
+        return {
+            **observed,
+            "total_prefix_count": total_prefix_count,
+            "prefix_step": prefix_step,
+        }
+
     @external_api
     def update_prefix_counts_by_port(
         self,
@@ -7028,6 +10327,7 @@ class Ixia:
         interface: str,
         prefix_count: int,
         network_group_multiplier: t.Optional[int] = None,
+        protocols_already_stopped: bool = False,
     ) -> None:
         """
         Update the prefix counts and optionally the network group multiplier for the specified port.
@@ -7037,6 +10337,8 @@ class Ixia:
             interface: Interface name
             prefix_count: New prefix count value to set
             network_group_multiplier: Optional multiplier to set for network groups
+            protocols_already_stopped: Skip the internal stop/start cycle when
+                the caller owns a larger stopped-protocol configuration window.
         """
         device_groups = self.get_device_groups_by_port_and_interface(
             hostname, interface
@@ -7062,23 +10364,30 @@ class Ixia:
                     # protocols synchronously, apply the multiplier, then restart
                     # (StartAllProtocols honors Enabled, so disabled groups stay
                     # down).
+                    action = (
+                        "protocols already stopped by caller"
+                        if protocols_already_stopped
+                        else "stopping all protocols"
+                    )
                     self.logger.info(
                         f"Multiplier change {network_group.Multiplier} -> "
                         f"{network_group_multiplier} for {network_group.Name}; "
-                        "stopping all protocols"
+                        f"{action}"
                     )
                     # StopAllProtocols can return before the protocol state fully
                     # settles; wait so the network group has actually left the
                     # started state before the (non-on-the-fly) multiplier PATCH.
-                    self.stop_protocols(sleep_timer=30)
+                    if not protocols_already_stopped:
+                        self.stop_protocols_and_wait()
                     self.logger.info(
                         f"Setting multiplier to {network_group_multiplier} for network group {network_group.Name}"
                     )
                     network_group.Multiplier = network_group_multiplier
-                    self.logger.info(
-                        f"Multiplier set for {network_group.Name}; starting all protocols"
-                    )
-                    self.start_protocols()
+                    if not protocols_already_stopped:
+                        self.logger.info(
+                            f"Multiplier set for {network_group.Name}; starting all protocols"
+                        )
+                        self.start_protocols()
 
                 # Update IPv6 prefix pools
                 for ipv6_prefix_pool in network_group.Ipv6PrefixPools.find():
@@ -7189,6 +10498,18 @@ class Ixia:
             f"Successfully configured same prefixes across all peers for {hostname}:{interface}"
         )
 
+    @contextmanager
+    def stat_view_snapshot(self, timeout_seconds: float = 600) -> t.Iterator[None]:
+        if not self._snapshot_lock.acquire(timeout=timeout_seconds):
+            raise IxiaOperationTimeoutError(
+                f"Timed out after {timeout_seconds}s waiting for IXIA statistics "
+                "snapshot lock"
+            )
+        try:
+            yield
+        finally:
+            self._snapshot_lock.release()
+
     @retryable(num_tries=20, sleep_time=10, debug=True)
     def get_bgp_update_statistics(
         self,
@@ -7211,68 +10532,51 @@ class Ixia:
             List[Dict[str, Any]]: List of dictionaries containing BGP update statistics
                                  filtered by port if specified
         """
-        try:
-            # Define the views we want to collect statistics from
-            views = ["BGP Peer Per Port", "BGP+ Peer Per Port"]
-            combined_stats = []
+        return self._get_bgp_update_statistics(
+            port=port,
+            hostname=hostname,
+            interface=interface,
+            require_all_views=False,
+        )
 
-            # Select the appropriate StatViewAssistant class based on chassis type
+    @retryable(num_tries=3, sleep_time=2, debug=True)
+    def get_bgp_update_statistics_strict(
+        self,
+        port: t.Optional[str] = None,
+        hostname: t.Optional[str] = None,
+        interface: t.Optional[str] = None,
+    ) -> t.List[t.Dict[str, t.Any]]:
+        return self._get_bgp_update_statistics(
+            port=port,
+            hostname=hostname,
+            interface=interface,
+            require_all_views=True,
+        )
+
+    def _get_bgp_update_statistics(
+        self,
+        *,
+        port: t.Optional[str],
+        hostname: t.Optional[str],
+        interface: t.Optional[str],
+        require_all_views: bool,
+    ) -> t.List[t.Dict[str, t.Any]]:
+        try:
+            views = ["BGP Peer Per Port", "BGP+ Peer Per Port"]
             StatViewAssistant = (
                 UhdStatViewAssistant if self.is_uhd_chassis else IxnStatViewAssistant
             )
-
-            # Collect statistics from both views
-            for view_name in views:
-                self.logger.info(
-                    f"Getting BGP update statistics from view: {view_name}"
+            with self.stat_view_snapshot():
+                combined_stats = self._read_bgp_update_views(
+                    views,
+                    StatViewAssistant,
+                    require_all_views=require_all_views,
                 )
-
-                try:
-                    # Get the BGP protocol statistics view
-                    stats_view = StatViewAssistant(self.ixnetwork, view_name)
-
-                    # Check a condition to ensure the view is ready
-                    # This will wait until the view is fully populated
-                    try:
-                        stats_view.CheckCondition(
-                            "Port Name",
-                            StatViewAssistant.NOT_EQUAL,
-                            "DUMMY_VALUE_THAT_WONT_MATCH",
-                        )
-                    except Exception as e:
-                        # This exception is expected and just ensures the view is ready
-                        self.logger.debug(
-                            f"CheckCondition exception (expected): {str(e)}"
-                        )
-
-                    # Get the statistics from this view
-                    view_stats = []
-                    for row in stats_view.Rows:
-                        stat_entry = {}
-                        # Copy all columns to the stat entry
-                        for column_name in row.Columns:
-                            stat_entry[column_name] = row[column_name]
-                        # Add the view name to identify which view this came from
-                        stat_entry["View"] = view_name
-                        view_stats.append(stat_entry)
-
-                    self.logger.info(
-                        f"Retrieved {len(view_stats)} entries from {view_name}"
-                    )
-                    combined_stats.extend(view_stats)
-
-                except Exception as e:
-                    # If one view fails, log the error but continue with the other view
-                    self.logger.warning(
-                        f"Error getting statistics from {view_name}: {str(e)}"
-                    )
 
             # Filter statistics by port if specified
             filtered_stats = combined_stats
             if port:
-                filtered_stats = [
-                    stat for stat in combined_stats if port in stat.get("Port", "")
-                ]
+                filtered_stats = _filter_bgp_stats_by_port(combined_stats, port)
                 self.logger.info(
                     f"Filtered statistics for port {port}: {len(filtered_stats)} entries"
                 )
@@ -7280,12 +10584,13 @@ class Ixia:
             elif hostname and interface:
                 # Construct port identifier
                 port_id = self.get_port_identifier(f"{hostname}:{interface}")
-                filtered_stats = [
-                    stat for stat in combined_stats if port_id in stat.get("Port", "")
-                ]
+                filtered_stats = _filter_bgp_stats_by_port(combined_stats, port_id)
                 self.logger.info(
                     f"Filtered statistics for {hostname}:{interface} (port ID: {port_id}): {len(filtered_stats)} entries"
                 )
+
+            if require_all_views:
+                self._validate_complete_bgp_update_statistics(filtered_stats, views)
 
             self.logger.info(
                 f"Retrieved a total of {len(filtered_stats)} BGP statistics entries from all views"
@@ -7296,14 +10601,97 @@ class Ixia:
                 filter_desc = port if port else f"{hostname}:{interface}"
                 self.logger.warning(
                     f"No BGP statistics found for {filter_desc} in any view. "
-                    f"Available ports: {{stat.get('Port', '') for stat in combined_stats if 'Port' in stat}}"
+                    "Available ports: "
+                    f"{sorted({str(stat.get('Port Name', stat.get('Port', ''))) for stat in combined_stats})}"
                 )
 
             return filtered_stats
 
         except Exception as e:
             self.logger.error(f"Error getting BGP update statistics: {str(e)}")
+            if require_all_views:
+                raise
             return []
+
+    def _read_bgp_update_views(
+        self,
+        views: t.Sequence[str],
+        stat_view_assistant: t.Any,
+        *,
+        require_all_views: bool,
+    ) -> t.List[t.Dict[str, t.Any]]:
+        combined_stats: t.List[t.Dict[str, t.Any]] = []
+        view_errors: t.Dict[str, str] = {}
+        for view_name in views:
+            self.logger.info(f"Getting BGP update statistics from view: {view_name}")
+            try:
+                stats_view = stat_view_assistant(self.ixnetwork, view_name)
+                try:
+                    stats_view.CheckCondition(
+                        "Port Name",
+                        stat_view_assistant.NOT_EQUAL,
+                        "DUMMY_VALUE_THAT_WONT_MATCH",
+                    )
+                except Exception as error:
+                    if require_all_views and "Snapshot DefaultSnapshotSettings" in str(
+                        error
+                    ):
+                        raise
+                    self.logger.debug(
+                        f"CheckCondition exception (expected): {str(error)}"
+                    )
+
+                view_stats = []
+                for row in stats_view.Rows:
+                    stat_entry = {
+                        column_name: row[column_name] for column_name in row.Columns
+                    }
+                    stat_entry["View"] = view_name
+                    view_stats.append(stat_entry)
+                self.logger.info(
+                    f"Retrieved {len(view_stats)} entries from {view_name}"
+                )
+                combined_stats.extend(view_stats)
+            except Exception as error:
+                view_errors[view_name] = f"{type(error).__name__}: {error}"
+                self.logger.warning(
+                    f"Error getting statistics from {view_name}: {str(error)}"
+                )
+
+        if require_all_views and view_errors:
+            raise RuntimeError(
+                f"Incomplete IXIA BGP statistics snapshot: {view_errors}"
+            )
+        return combined_stats
+
+    @staticmethod
+    def _validate_complete_bgp_update_statistics(
+        stats: t.Sequence[t.Mapping[str, t.Any]],
+        views: t.Sequence[str],
+    ) -> None:
+        required_counters = (
+            "Updates Tx",
+            "Routes Advertised",
+            "Routes Withdrawn",
+        )
+        failures: t.Dict[str, t.Any] = {}
+        for view_name in views:
+            rows = [row for row in stats if row.get("View") == view_name]
+            if not rows:
+                failures[view_name] = "missing rows"
+                continue
+            missing = {
+                counter
+                for counter in required_counters
+                if any(
+                    row.get(counter) is None or str(row.get(counter, "")).strip() == ""
+                    for row in rows
+                )
+            }
+            if missing:
+                failures[view_name] = {"missing_counters": sorted(missing)}
+        if failures:
+            raise RuntimeError(f"Incomplete IXIA BGP statistics snapshot: {failures}")
 
     def _build_bgp_peer_ip_mapping(self) -> t.Dict[str, t.Dict[str, str]]:
         """Build ``{peer_key -> {Remote IP, Local IP}}`` by walking the
@@ -7634,7 +11022,7 @@ class Ixia:
 
             # Stop protocols before making changes
             self.logger.info("Stopping protocols before configuring BGP attributes")
-            self.stop_protocols()
+            self.stop_protocols_and_wait()
 
             # Find device groups for the specified interface
             device_groups = self.get_device_groups_by_port_and_interface(
@@ -7808,7 +11196,7 @@ class Ixia:
             self.logger.info(
                 "Stopping protocols before reverting route storm attributes"
             )
-            self.stop_protocols(sleep_timer=30)
+            self.stop_protocols_and_wait()
 
             # Find device groups for the specified interface
             device_groups = self.get_device_groups_by_port_and_interface(
@@ -7908,6 +11296,7 @@ class Ixia:
         restart_protocols: bool = True,
         device_group_regex: str = ".*",
         stop_protocols: bool = True,
+        fail_closed: bool = False,
     ) -> bool:
         """
         Configure AS path distribution from a constant pool across BGP routes.
@@ -7955,7 +11344,7 @@ class Ixia:
             # Stop protocols before making changes (opt-in to avoid chassis-wide cascade)
             if stop_protocols:
                 self.logger.info("Stopping protocols before configuring AS path pool")
-                self.stop_protocols()
+                self.stop_protocols_and_wait()
             else:
                 self.logger.info(
                     "Skipping stop_protocols (caller opted out — config write "
@@ -8006,7 +11395,9 @@ class Ixia:
                         bgp_route_properties = ip_prefix_pool.BgpIPRouteProperty.find()
                         if bgp_route_properties:
                             self._configure_as_path_pool_on_route_property(
-                                bgp_route_properties[0], as_path_pool
+                                bgp_route_properties[0],
+                                as_path_pool,
+                                fail_closed=fail_closed,
                             )
                         else:
                             self.logger.warning(
@@ -8020,7 +11411,9 @@ class Ixia:
                         )
                         if bgp_route_properties:
                             self._configure_as_path_pool_on_route_property(
-                                bgp_route_properties[0], as_path_pool
+                                bgp_route_properties[0],
+                                as_path_pool,
+                                fail_closed=fail_closed,
                             )
                         else:
                             self.logger.warning(
@@ -8053,7 +11446,7 @@ class Ixia:
 
     @staticmethod
     def _build_as_path_position_values(
-        as_path_pool: t.List[str],
+        as_path_pool: t.Sequence[t.Tuple[int, ...]],
         max_as_path_length: int,
     ) -> t.List[t.List[int]]:
         """Build per-position AS number value lists from an AS path pool.
@@ -8064,16 +11457,12 @@ class Ixia:
         Returns:
             List of value lists, one per AS number position.
         """
-        position_values = []
-        for asn_position in range(max_as_path_length):
-            as_values_at_position = []
-            for as_path_str in as_path_pool:
-                as_numbers = [int(asn) for asn in as_path_str.split()]
-                if asn_position < len(as_numbers):
-                    as_values_at_position.append(as_numbers[asn_position])
-                else:
-                    as_values_at_position.append(0)
-            position_values.append(as_values_at_position)
+        position_values: t.List[t.List[int]] = [[] for _ in range(max_as_path_length)]
+        for as_path in as_path_pool:
+            for asn_position, values in enumerate(position_values):
+                values.append(
+                    as_path[asn_position] if asn_position < len(as_path) else 0
+                )
         return position_values
 
     def _apply_as_positions_concurrently(
@@ -8083,20 +11472,28 @@ class Ixia:
     ) -> None:
         """Apply AS number position values concurrently via ThreadPoolExecutor.
 
+        Every position must describe the same number of route rows.
         Failed positions are automatically retried sequentially.
         """
         from concurrent.futures import as_completed, ThreadPoolExecutor
 
-        max_workers = 10
         num_positions = len(position_values)
-        self.logger.info(
-            f"Configuring {num_positions} AS positions concurrently "
-            f"(max_workers={max_workers})..."
-        )
 
         def set_position(pos: int) -> None:
             bgp_as_number_list[pos].AsNumber.ValueList(position_values[pos])
             bgp_as_number_list[pos].EnableASNumber.Single(True)
+
+        route_row_count = self._as_position_route_row_count(position_values)
+        if self._apply_large_as_positions_in_batches(
+            bgp_as_number_list, position_values, route_row_count
+        ):
+            return
+
+        max_workers = 10
+        self.logger.info(
+            f"Configuring {num_positions} AS positions concurrently "
+            f"(max_workers={max_workers})..."
+        )
 
         errors = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -8133,10 +11530,111 @@ class Ixia:
                 f"{retry_failures[:5]}"
             )
 
+    @staticmethod
+    def _as_position_route_row_count(
+        position_values: t.Sequence[t.Sequence[int]],
+    ) -> int:
+        route_row_counts = {len(values) for values in position_values}
+        if len(route_row_counts) > 1:
+            raise ValueError(
+                "AS position value lists must have equal route-row counts, got "
+                f"{sorted(route_row_counts)}"
+            )
+        return next(iter(route_row_counts), 0)
+
+    def _apply_large_as_positions_in_batches(
+        self,
+        bgp_as_number_list: t.Sequence[t.Any],
+        position_values: t.Sequence[t.Sequence[int]],
+        route_row_count: int,
+    ) -> bool:
+        num_positions = len(position_values)
+        if num_positions < 128 or route_row_count < 10_000:
+            return False
+        batch_size = 16
+        slots = list(bgp_as_number_list[:num_positions])
+        xpaths = self._resolve_resource_xpaths(slots)
+        self.logger.info(
+            "Configuring %d AS positions in ResourceManager batches of %d "
+            "across %d route rows",
+            num_positions,
+            batch_size,
+            route_row_count,
+        )
+        for start in range(0, num_positions, batch_size):
+            stop = min(start + batch_size, num_positions)
+            batch_started = time.monotonic()
+            payload = []
+            for position in range(start, stop):
+                source = xpaths[position]
+                payload.extend(
+                    (
+                        {
+                            "xpath": (
+                                f"/multivalue[@source = '{source} asNumber']/valueList"
+                            ),
+                            "values": list(position_values[position]),
+                        },
+                        {
+                            "xpath": (
+                                f"/multivalue[@source = '{source} enableASNumber']"
+                                "/singleValue"
+                            ),
+                            "value": True,
+                        },
+                    )
+                )
+            errors = self.ixnetwork.ResourceManager.ImportConfig(
+                json.dumps(payload, separators=(",", ":")), False
+            )
+            if errors:
+                raise RuntimeError(
+                    "IXIA AS-position batch import failed for positions "
+                    f"[{start}, {stop}): {self._bounded_rollback_error(errors)}"
+                )
+            self.logger.info(
+                "Configured AS positions [%d, %d) in %.2fs",
+                start,
+                stop,
+                time.monotonic() - batch_started,
+            )
+        return True
+
+    def _resolve_resource_xpaths(self, resources: t.Sequence[t.Any]) -> t.List[str]:
+        if not resources:
+            return []
+        root_href = str(self.ixnetwork.href)
+        ixnetwork_end = root_href.index("ixnetwork") + len("ixnetwork")
+        responses = self.ixnetwork._connection._execute(
+            f"{root_href[:ixnetwork_end]}/operations/select?xpath=true",
+            {
+                "selects": [
+                    {
+                        "from": resource.href,
+                        "properties": ["href"],
+                        "children": [],
+                        "inlines": [],
+                    }
+                    for resource in resources
+                ]
+            },
+        )
+        if len(responses) != len(resources):
+            raise RuntimeError(
+                "IXIA XPath resolution returned "
+                f"{len(responses)} result(s) for {len(resources)} resource(s)"
+            )
+        xpaths = [response.get("xpath") for response in responses]
+        if any(not xpath for xpath in xpaths):
+            raise RuntimeError("IXIA XPath resolution returned an empty XPath")
+        return t.cast(t.List[str], xpaths)
+
     def _configure_as_path_pool_on_route_property(
         self,
         bgp_route_prop: t.Union["BgpIPRouteProperty", "BgpV6IPRouteProperty"],
         as_path_pool: t.List[str],
+        *,
+        fail_closed: bool = False,
     ) -> None:
         """
         Configure AS path pool on a BGP route property to distribute AS paths across routes.
@@ -8148,10 +11646,19 @@ class Ixia:
         Args:
             bgp_route_prop: BGP route property object (BgpIPRouteProperty or BgpV6IPRouteProperty)
             as_path_pool: List of AS path strings
+            fail_closed: Propagate instead of warning. Mirrors
+                ``_configure_extended_community_pool_on_route_property``. Callers
+                whose test is INVALID without the pool must pass True: swallowing
+                here still lets ``configure_as_path_pool`` return True, so the
+                caller logs success while the DUT receives IXIA's default AS
+                path -- a silently different workload from the one requested,
+                with no failure anywhere to say so.
         """
         try:
             self._program_as_path_pool_on_route_property(bgp_route_prop, as_path_pool)
         except Exception as e:
+            if fail_closed:
+                raise
             self.logger.warning(f"Error configuring AS path pool: {str(e)}")
 
     def _program_as_path_pool_on_route_property(
@@ -8168,20 +11675,46 @@ class Ixia:
         bgp_route_prop.NoOfASPathSegmentsPerRouteRange = 1
         bgp_as_path_segment_list = bgp_route_prop.BgpAsPathSegmentList.find()
         if not bgp_as_path_segment_list:
+            # On a freshly-loaded topology the segment list that
+            # EnableAsPathSegments.Single(True) requests does not exist until the
+            # pending change is committed, so this first find() returns empty and
+            # the entire pool is skipped. Commit once and retry rather than give
+            # up. Costs nothing on the normal path -- it only runs where we would
+            # otherwise have raised.
+            self.logger.info(
+                "AS path segment list not materialized yet; committing pending "
+                "changes and retrying"
+            )
+            self.apply_changes()
+            bgp_as_path_segment_list = bgp_route_prop.BgpAsPathSegmentList.find()
+        if not bgp_as_path_segment_list:
             raise ValueError("No BGP AS path segment list found")
 
         bgp_as_path_segment = bgp_as_path_segment_list[0]
         bgp_as_path_segment.SegmentType.Single("asseq")
-        max_as_path_length = max(len(as_path.split()) for as_path in as_path_pool)
+        parsed_paths = [
+            tuple(int(asn) for asn in as_path.split()) for as_path in as_path_pool
+        ]
+        max_as_path_length = max(len(as_path) for as_path in parsed_paths)
         bgp_as_path_segment.NumberOfAsNumberInSegment = max_as_path_length
         self.logger.info(f"Maximum AS path length in pool: {max_as_path_length}")
 
         bgp_as_number_list = bgp_as_path_segment.BgpAsNumberList.find()
         if not bgp_as_number_list:
+            # Same materialization race as the segment list above, one level
+            # down: NumberOfAsNumberInSegment has to be committed before the
+            # per-position rows exist.
+            self.logger.info(
+                "AS number list not materialized yet; committing pending "
+                "changes and retrying"
+            )
+            self.apply_changes()
+            bgp_as_number_list = bgp_as_path_segment.BgpAsNumberList.find()
+        if not bgp_as_number_list:
             raise ValueError("No BGP AS number list found")
 
         position_values = self._build_as_path_position_values(
-            as_path_pool, max_as_path_length
+            parsed_paths, max_as_path_length
         )
         self._apply_as_positions_concurrently(bgp_as_number_list, position_values)
         self.logger.info("Successfully configured AS path distribution")
@@ -8199,6 +11732,294 @@ class Ixia:
     ) -> None:
         """Configure AS paths on an already-resolved BGP route property."""
         self._program_as_path_pool_on_route_property(bgp_route_prop, as_path_pool)
+
+    def configure_as_path_segment_pools_on_route_property(
+        self,
+        bgp_route_prop: t.Union["BgpIPRouteProperty", "BgpV6IPRouteProperty"],
+        segment_pools: t.Sequence[t.Tuple[str, t.Sequence[str]]],
+    ) -> None:
+        """Configure multiple AS-path segment pools on one route property."""
+        normalized = self._normalize_as_path_segment_pools(segment_pools)
+        prepared_segments, original_segment_count = self._prepare_as_path_segments(
+            bgp_route_prop, normalized
+        )
+        try:
+            snapshots = self._capture_as_path_segment_values(
+                bgp_route_prop, prepared_segments, original_segment_count
+            )
+        except Exception as error:
+            try:
+                self._restore_as_path_segment_structure(
+                    bgp_route_prop, prepared_segments, original_segment_count
+                )
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "AS path segment snapshot failed "
+                    f"({self._bounded_rollback_error(error)}); rollback also failed "
+                    f"({self._bounded_rollback_error(rollback_error)})"
+                ) from error
+            raise
+        try:
+            bgp_route_prop.EnableAsPathSegments.Single(True)
+            for (segment_type, _width, position_values), (
+                segment,
+                slots,
+                _original_width,
+            ) in zip(normalized, prepared_segments):
+                segment.SegmentType.Single(segment_type)
+                self._apply_as_positions_concurrently(slots, position_values)
+        except Exception as error:
+            try:
+                self._rollback_as_path_segment_programming(
+                    bgp_route_prop,
+                    prepared_segments,
+                    original_segment_count,
+                    snapshots,
+                )
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "AS path segment programming failed "
+                    f"({self._bounded_rollback_error(error)}); rollback also failed "
+                    f"({self._bounded_rollback_error(rollback_error)})"
+                ) from error
+            raise
+
+    def _normalize_as_path_segment_pools(
+        self,
+        segment_pools: t.Sequence[t.Tuple[str, t.Sequence[str]]],
+    ) -> t.List[t.Tuple[str, int, t.List[t.List[int]]]]:
+        if not segment_pools:
+            raise ValueError("AS path segment pools must not be empty")
+        normalized: t.List[t.Tuple[str, int, t.List[t.List[int]]]] = []
+        row_count: t.Optional[int] = None
+        for segment_type, paths in segment_pools:
+            ixia_type = str(segment_type).lower()
+            if ixia_type not in {"asseq", "asset"}:
+                raise ValueError(f"unsupported AS path segment type {segment_type!r}")
+            path_values = list(paths)
+            parsed_paths = [
+                tuple(int(asn) for asn in path.split()) for path in path_values
+            ]
+            if not path_values or any(not path for path in parsed_paths):
+                raise ValueError(f"{ixia_type} AS path pool must not be empty")
+            if row_count is None:
+                row_count = len(path_values)
+            elif len(path_values) != row_count:
+                raise ValueError("AS path segment pools must have equal row counts")
+            widths = {len(path) for path in parsed_paths}
+            if len(widths) != 1:
+                raise ValueError(
+                    f"{ixia_type} AS path pool must have one fixed positive width"
+                )
+            width = next(iter(widths))
+            position_values = self._build_as_path_position_values(parsed_paths, width)
+            normalized.append((ixia_type, width, position_values))
+        return normalized
+
+    def _prepare_as_path_segments(
+        self,
+        bgp_route_prop: t.Union["BgpIPRouteProperty", "BgpV6IPRouteProperty"],
+        normalized: t.Sequence[t.Tuple[str, int, t.List[t.List[int]]]],
+    ) -> t.Tuple[t.List[t.Tuple[t.Any, t.Sequence[t.Any], int]], int]:
+        original_segment_count = int(bgp_route_prop.NoOfASPathSegmentsPerRouteRange)
+        prepared_segments: t.List[t.Tuple[t.Any, t.Sequence[t.Any], int]] = []
+        original_widths: t.List[t.Tuple[t.Any, int]] = []
+        try:
+            bgp_route_prop.NoOfASPathSegmentsPerRouteRange = len(normalized)
+            segments = bgp_route_prop.BgpAsPathSegmentList.find()
+            if len(segments) < len(normalized):
+                raise ValueError(
+                    f"AS path segment list has {len(segments)} entries, "
+                    f"expected at least {len(normalized)}"
+                )
+            for index, (_segment_type, width, _values) in enumerate(normalized):
+                segment = segments[index]
+                original_width = int(segment.NumberOfAsNumberInSegment)
+                original_widths.append((segment, original_width))
+                segment.NumberOfAsNumberInSegment = width
+                slots = segment.BgpAsNumberList.find()
+                prepared_segments.append((segment, slots, original_width))
+                if len(slots) < width:
+                    raise ValueError(
+                        f"AS path segment {index} has {len(slots)} slots, "
+                        f"expected at least {width}"
+                    )
+        except Exception as error:
+            try:
+                self._restore_as_path_segment_structure(
+                    bgp_route_prop,
+                    tuple(
+                        (segment, (), original_width)
+                        for segment, original_width in original_widths
+                    ),
+                    original_segment_count,
+                )
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "AS path segment preparation failed "
+                    f"({self._bounded_rollback_error(error)}); rollback also failed "
+                    f"({self._bounded_rollback_error(rollback_error)})"
+                ) from error
+            raise
+        return prepared_segments, original_segment_count
+
+    def _capture_as_path_segment_values(
+        self,
+        bgp_route_prop: t.Union["BgpIPRouteProperty", "BgpV6IPRouteProperty"],
+        prepared_segments: t.Sequence[t.Tuple[t.Any, t.Sequence[t.Any], int]],
+        original_segment_count: int,
+    ) -> t.List[t.Tuple[str, t.Any, t.Tuple[t.Any, ...]]]:
+        handles = [("route.enable", bgp_route_prop.EnableAsPathSegments)]
+        for segment_index, (segment, slots, original_width) in enumerate(
+            prepared_segments[:original_segment_count]
+        ):
+            handles.append((f"segment[{segment_index}].type", segment.SegmentType))
+            for slot_index, slot in enumerate(slots[:original_width]):
+                handles.extend(
+                    (
+                        (
+                            f"segment[{segment_index}].slot[{slot_index}].asn",
+                            slot.AsNumber,
+                        ),
+                        (
+                            f"segment[{segment_index}].slot[{slot_index}].enable",
+                            slot.EnableASNumber,
+                        ),
+                    )
+                )
+        return [(label, handle, tuple(handle.Values)) for label, handle in handles]
+
+    def _restore_ixia_values(self, handle: t.Any, values: t.Sequence[t.Any]) -> None:
+        if not values:
+            raise ValueError("cannot restore an empty IXIA multivalue snapshot")
+        if len(values) == 1:
+            handle.Single(values[0])
+        else:
+            handle.ValueList(list(values))
+
+    @staticmethod
+    def _bounded_rollback_error(error: Exception, limit: int = 256) -> str:
+        rendered = repr(error)
+        return rendered if len(rendered) <= limit else f"{rendered[: limit - 3]}..."
+
+    def _restore_as_path_segment_structure(
+        self,
+        bgp_route_prop: t.Union["BgpIPRouteProperty", "BgpV6IPRouteProperty"],
+        prepared_segments: t.Sequence[t.Tuple[t.Any, t.Sequence[t.Any], int]],
+        original_segment_count: int,
+    ) -> None:
+        failed_count = 0
+        failed_sample = []
+        for segment_index, (segment, _slots, original_width) in enumerate(
+            prepared_segments
+        ):
+            try:
+                segment.NumberOfAsNumberInSegment = original_width
+            except Exception as error:
+                failed_count += 1
+                if len(failed_sample) < 10:
+                    failed_sample.append(
+                        f"segment[{segment_index}].width: "
+                        f"{self._bounded_rollback_error(error)}"
+                    )
+        try:
+            bgp_route_prop.NoOfASPathSegmentsPerRouteRange = original_segment_count
+        except Exception as error:
+            failed_count += 1
+            if len(failed_sample) < 10:
+                failed_sample.append(
+                    f"route.segment_count: {self._bounded_rollback_error(error)}"
+                )
+        if failed_count:
+            raise RuntimeError(
+                "AS path segment structural rollback errors: "
+                f"failed_count={failed_count}, failed_sample={failed_sample}"
+            )
+
+    def _rollback_as_path_segment_programming(
+        self,
+        bgp_route_prop: t.Union["BgpIPRouteProperty", "BgpV6IPRouteProperty"],
+        prepared_segments: t.Sequence[t.Tuple[t.Any, t.Sequence[t.Any], int]],
+        original_segment_count: int,
+        snapshots: t.Sequence[t.Tuple[str, t.Any, t.Tuple[t.Any, ...]]],
+    ) -> None:
+        failed_count = 0
+        failed_sample = []
+        restored_count = 0
+        restored_sample = []
+        for label, handle, values in reversed(snapshots):
+            try:
+                self._restore_ixia_values(handle, values)
+            except Exception as error:
+                failed_count += 1
+                if len(failed_sample) < 10:
+                    failed_sample.append(
+                        f"{label}: {self._bounded_rollback_error(error)}"
+                    )
+            else:
+                restored_count += 1
+                if len(restored_sample) < 5:
+                    restored_sample.append(label)
+        try:
+            self._restore_as_path_segment_structure(
+                bgp_route_prop, prepared_segments, original_segment_count
+            )
+        except Exception as error:
+            failed_count += 1
+            if len(failed_sample) < 10:
+                failed_sample.append(
+                    f"structure: {self._bounded_rollback_error(error)}"
+                )
+        if failed_count:
+            raise RuntimeError(
+                "AS path segment rollback errors: "
+                f"failed_count={failed_count}, failed_sample={failed_sample}, "
+                f"restored_count={restored_count}, "
+                f"restored_sample={restored_sample}"
+            )
+
+    def _write_tcp_window_on_device_group(
+        self,
+        device_group: t.Any,
+        tcp_window_size_bytes: int,
+    ) -> _BgpPeerTcpWindowWriteResult:
+        matched_peers = 0
+        unsupported_peers = 0
+        verified_peers = 0
+        for ethernet in device_group.Ethernet.find():
+            peer_sets = (
+                (
+                    "v6",
+                    (
+                        peer
+                        for ipv6 in ethernet.Ipv6.find()
+                        for peer in ipv6.BgpIpv6Peer.find()
+                    ),
+                ),
+                (
+                    "v4",
+                    (
+                        peer
+                        for ipv4 in ethernet.Ipv4.find()
+                        for peer in ipv4.BgpIpv4Peer.find()
+                    ),
+                ),
+            )
+            for ip_family, peers in peer_sets:
+                result = self._write_tcp_window_on_peers(
+                    peers=peers,
+                    dg_name=device_group.Name,
+                    ip_family=ip_family,
+                    tcp_window_size_bytes=tcp_window_size_bytes,
+                )
+                matched_peers += result.matched
+                unsupported_peers += result.unsupported
+                verified_peers += result.verified
+        return _BgpPeerTcpWindowWriteResult(
+            matched=matched_peers,
+            unsupported=unsupported_peers,
+            verified=verified_peers,
+        )
 
     @external_api
     def configure_bgp_peer_tcp_window_size(
@@ -8222,6 +12043,16 @@ class Ixia:
         ``stop_protocols()`` nor ``apply_changes()`` and is safe to run mid-
         storm; callers issue ``apply_changes`` themselves.
 
+        This API changes live state outside the declarative cache key. It
+        requires normal IXIA session teardown so the changed value cannot leak
+        into a later test. The current backpressure test also disables IXIA
+        caching.
+
+        The operation is not atomic. If one peer fails after another peer is
+        verified, the verified value remains applied. Retry the operation after
+        a transient failure. Rebuild or restore the IXIA session when abandoning
+        the operation.
+
         Args:
             device_group_regex: Regex matching DGs whose peers should be
                 throttled (e.g. r"^DEVICE_GROUP_IPV6_EBGP_SLOW$").
@@ -8229,56 +12060,104 @@ class Ixia:
                 force flow-control on every UPDATE.
 
         Returns:
-            Number of peers on which the write succeeded.
+            Number of peers whose requested window was verified.
 
         Raises:
-            RuntimeError: If ``device_group_regex`` matched at least one DG
-                but the write did not succeed on any peer (framework failure
-                or malformed IxNetwork tree). Silently returning 0 would let
-                the downstream storm phase proceed unthrottled and produce
-                trivially-passing fast/slow-asymmetry gates.
+            RuntimeError: If the requested value is invalid, the regex matches
+                no DG, a matched DG has no BGP peers, any matched peer lacks
+                TCP-window support, or any supported peer does not verify the
+                value. A partial write would leave an intended peer unthrottled.
         """
+        try:
+            validate_ixia_bgp_tcp_window_size_bytes(tcp_window_size_bytes)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "[configure_bgp_peer_tcp_window_size] invalid "
+                f"TcpWindowSizeInBytes value: {error}"
+            ) from error
+        if not self.teardown_session:
+            raise RuntimeError(
+                "[configure_bgp_peer_tcp_window_size] requires IXIA session "
+                "teardown because it changes live state outside the "
+                "declarative cache; set teardown_session=True"
+            )
         device_groups = self.find_device_groups(regex=device_group_regex)
         if not device_groups:
-            self.logger.warning(
+            raise RuntimeError(
                 f"[configure_bgp_peer_tcp_window_size] no DGs match "
                 f"regex={device_group_regex!r}"
             )
-            return 0
-        touched = 0
+        matched_peers = 0
+        unsupported_peers = 0
+        verified_peers = 0
         for dg in device_groups:
-            for ethernet in dg.Ethernet.find():
-                touched += self._write_tcp_window_on_peers(
-                    peers=(
-                        peer
-                        for ipv6 in ethernet.Ipv6.find()
-                        for peer in ipv6.BgpIpv6Peer.find()
-                    ),
-                    dg_name=dg.Name,
-                    ip_family="v6",
-                    tcp_window_size_bytes=tcp_window_size_bytes,
-                )
-                touched += self._write_tcp_window_on_peers(
-                    peers=(
-                        peer
-                        for ipv4 in ethernet.Ipv4.find()
-                        for peer in ipv4.BgpIpv4Peer.find()
-                    ),
-                    dg_name=dg.Name,
-                    ip_family="v4",
-                    tcp_window_size_bytes=tcp_window_size_bytes,
-                )
-        if touched == 0:
+            result = self._write_tcp_window_on_device_group(dg, tcp_window_size_bytes)
+            matched_peers += result.matched
+            unsupported_peers += result.unsupported
+            verified_peers += result.verified
+        self._assert_bgp_peer_tcp_window_outcome(
+            device_group_regex=device_group_regex,
+            device_group_count=len(device_groups),
+            tcp_window_size_bytes=tcp_window_size_bytes,
+            matched_peers=matched_peers,
+            unsupported_peers=unsupported_peers,
+            verified_peers=verified_peers,
+        )
+        return verified_peers
+
+    def _assert_bgp_peer_tcp_window_outcome(
+        self,
+        *,
+        device_group_regex: str,
+        device_group_count: int,
+        tcp_window_size_bytes: int,
+        matched_peers: int,
+        unsupported_peers: int,
+        verified_peers: int,
+    ) -> None:
+        supported_peers = matched_peers - unsupported_peers
+        if matched_peers == 0:
             raise RuntimeError(
                 f"[configure_bgp_peer_tcp_window_size] regex="
-                f"{device_group_regex!r} matched {len(device_groups)} DG(s) "
-                f"but no peer accepted the TcpWindowSizeInBytes="
-                f"{tcp_window_size_bytes} write -- either the IxNetwork tree "
-                f"has no BgpIpv6Peer/BgpIpv4Peer children under the matched "
-                f"DGs, or every write raised. Downstream fast/slow-asymmetry "
-                f"gates would trivially pass without throttling."
+                f"{device_group_regex!r} matched {device_group_count} DG(s), "
+                "but their IxNetwork trees contain no BGP peers"
             )
-        return touched
+        if supported_peers == 0:
+            raise RuntimeError(
+                f"[configure_bgp_peer_tcp_window_size] regex="
+                f"{device_group_regex!r} matched {device_group_count} DG(s), "
+                "but none of their BGP peers support TcpWindowSizeInBytes. "
+                "The downstream fast/slow-asymmetry gates require at least "
+                "one throttled peer."
+            )
+        unverified_supported_peers = supported_peers - verified_peers
+        if unsupported_peers:
+            unverified_detail = (
+                f" and {unverified_supported_peers} supported peer(s) did not verify"
+                if unverified_supported_peers
+                else ""
+            )
+            raise RuntimeError(
+                f"[configure_bgp_peer_tcp_window_size] regex="
+                f"{device_group_regex!r} matched {matched_peers} BGP peer(s), "
+                f"but {unsupported_peers} peer(s) do not support "
+                f"TcpWindowSizeInBytes{unverified_detail}. Every matched peer "
+                "must be throttled. "
+                "Successful peer writes remain applied; retry this operation "
+                "or rebuild or restore the IXIA session."
+            )
+        if verified_peers != supported_peers:
+            raise RuntimeError(
+                f"[configure_bgp_peer_tcp_window_size] regex="
+                f"{device_group_regex!r} matched {device_group_count} DG(s) "
+                f"and {supported_peers} supported peer(s), but only "
+                f"{verified_peers} peer(s) accepted and verified "
+                "TcpWindowSizeInBytes="
+                f"{tcp_window_size_bytes}. Downstream fast/slow-asymmetry "
+                "gates require every supported matched peer to be throttled. "
+                "Successful peer writes remain applied; retry this operation "
+                "or rebuild or restore the IXIA session."
+            )
 
     def _write_tcp_window_on_peers(
         self,
@@ -8287,27 +12166,52 @@ class Ixia:
         dg_name: str,
         ip_family: str,
         tcp_window_size_bytes: int,
-    ) -> int:
-        """Write ``TcpWindowSizeInBytes`` on each peer, logging (but tolerating)
-        per-peer failures. Returns the number of successful writes.
+    ) -> _BgpPeerTcpWindowWriteResult:
+        """Set and verify ``TcpWindowSizeInBytes`` on each peer.
+
+        Return labeled matched, unsupported, and verified peer counts.
         """
-        touched = 0
+        matched = 0
+        unsupported = 0
+        verified = 0
         for peer in peers:
+            matched += 1
+            peer_name = "<unnamed>"
             try:
-                peer.TcpWindowSizeInBytes.Single(tcp_window_size_bytes)
-                touched += 1
-                self.logger.info(
-                    f"[configure_bgp_peer_tcp_window_size] set "
-                    f"TcpWindowSizeInBytes={tcp_window_size_bytes} on "
-                    f"DG={dg_name!r} {ip_family} Peer={peer.Name!r}"
+                peer_name = str(getattr(peer, "Name", peer_name))
+                self._set_and_verify_bgp_peer_tcp_window(
+                    bgp_peer_obj=peer,
+                    tcp_window_size_bytes=tcp_window_size_bytes,
+                    scope_label=f"DG={dg_name!r} {ip_family}",
+                    desired_bgp_name=peer_name,
+                    readback_attempts=_BGP_TCP_WINDOW_IMPERATIVE_READBACK_ATTEMPTS,
+                    readback_retry_seconds=(
+                        _BGP_TCP_WINDOW_IMPERATIVE_READBACK_RETRY_SECONDS
+                    ),
                 )
-            except AttributeError as inner:
+                verified += 1
+            except _BgpPeerTcpWindowUnsupportedError as error:
+                unsupported += 1
                 self.logger.warning(
-                    f"[configure_bgp_peer_tcp_window_size] "
-                    f"TcpWindowSizeInBytes not present on DG={dg_name!r} "
-                    f"{ip_family} Peer={peer.Name!r}: {inner!s}"
+                    "[configure_bgp_peer_tcp_window_size] skipped unsupported "
+                    f"DG={dg_name!r} {ip_family} Peer={peer_name!r}: {error!s}"
                 )
-        return touched
+            except (
+                _BgpPeerTcpWindowOperationError,
+                IxnIxNetworkError,
+                UhdIxNetworkError,
+                RequestException,
+            ) as error:
+                self.logger.warning(
+                    "[configure_bgp_peer_tcp_window_size] could not set and "
+                    f"verify TcpWindowSizeInBytes={tcp_window_size_bytes} on "
+                    f"DG={dg_name!r} {ip_family} Peer={peer_name!r}: {error!s}"
+                )
+        return _BgpPeerTcpWindowWriteResult(
+            matched=matched,
+            unsupported=unsupported,
+            verified=verified,
+        )
 
     @external_api
     def configure_community_pool(
@@ -8375,7 +12279,7 @@ class Ixia:
             # Stop protocols before making changes (opt-in to avoid chassis-wide cascade)
             if stop_protocols:
                 self.logger.info("Stopping protocols before configuring community pool")
-                self.stop_protocols()
+                self.stop_protocols_and_wait()
             else:
                 self.logger.info(
                     "Skipping stop_protocols (caller opted out — config write "
@@ -8692,6 +12596,7 @@ class Ixia:
         restart_protocols: bool = True,
         device_group_regex: str = ".*",
         stop_protocols: bool = True,
+        fail_closed: bool = False,
     ) -> bool:
         """
         Configure diverse extended community combinations for each prefix using Ixia API.
@@ -8751,7 +12656,7 @@ class Ixia:
                 self.logger.info(
                     "Stopping protocols before configuring extended community pool"
                 )
-                self.stop_protocols()
+                self.stop_protocols_and_wait()
             else:
                 self.logger.info(
                     "Skipping stop_protocols (caller opted out — config write "
@@ -8804,6 +12709,7 @@ class Ixia:
                             self._configure_extended_community_pool_on_route_property(
                                 bgp_route_properties[0],
                                 extended_community_combinations,
+                                fail_closed=fail_closed,
                             )
                         else:
                             self.logger.warning(
@@ -8819,6 +12725,7 @@ class Ixia:
                             self._configure_extended_community_pool_on_route_property(
                                 bgp_route_properties[0],
                                 extended_community_combinations,
+                                fail_closed=fail_closed,
                             )
                         else:
                             self.logger.warning(
@@ -8952,7 +12859,18 @@ class Ixia:
         try:
             bgp_route_prop.EnableExtendedCommunity.Single(True)
             bgp_route_prop.NoOfExternalCommunities = position_count
-            return bgp_route_prop.BgpExtendedCommunitiesList.find()
+            positions = bgp_route_prop.BgpExtendedCommunitiesList.find()
+            if not positions:
+                # Same materialization race as the AS-path segment list: the
+                # rows EnableExtendedCommunity requests do not exist until the
+                # pending change is committed.
+                self.logger.info(
+                    "Extended-community list not materialized yet; committing "
+                    "pending changes and retrying"
+                )
+                self.apply_changes()
+                positions = bgp_route_prop.BgpExtendedCommunitiesList.find()
+            return positions
         except Exception:
             self.logger.exception(
                 "Failed to initialize %d extended-community position(s) "
@@ -9023,6 +12941,47 @@ class Ixia:
             assigned2_values,
         )
 
+    def _write_multivalue(
+        self,
+        field: t.Any,
+        values: t.Sequence[t.Any],
+        label: str,
+    ) -> None:
+        """Write a per-route field, collapsing a constant column to ``Single()``.
+
+        A ``ValueList`` uploads one entry per route. When every entry is the same
+        value that payload carries no information: an extended community whose
+        AS number is fixed still ships that AS number once per row. IxNetwork's
+        ``Single()`` expresses the identical configuration as one scalar.
+
+        This is not a micro-optimisation. An extended community decomposes into
+        SIX per-route Multivalues, and for a pool of the form ``<asn>:<n>`` with
+        a two-byte ASN, FIVE of them are constant -- including both string
+        fields, which dominate the payload. Collapsing them turns tens of
+        megabytes of REST body into five scalars.
+
+        Falls back to ``ValueList`` whenever the column genuinely varies, so the
+        configuration produced is identical either way.
+        """
+        if not values:
+            raise ValueError(f"{label}: refusing to write an empty value list")
+
+        first = values[0]
+        if all(value == first for value in values):
+            self.logger.info(
+                f"  {label}: constant {first!r} across {len(values):,} row(s) "
+                "-> Single()"
+            )
+            field.Single(first)
+            return
+
+        distinct = len(set(values))
+        self.logger.info(
+            f"  {label}: {distinct:,} distinct value(s) across {len(values):,} "
+            "row(s) -> ValueList()"
+        )
+        field.ValueList(list(values))
+
     def _write_extended_community_position(
         self,
         position: t.Any,
@@ -9047,12 +13006,20 @@ class Ixia:
             assigned2_values,
         ) = values
         try:
-            position.Type.ValueList(types)
-            position.SubType.ValueList(subtypes)
-            position.AsNumber2Bytes.ValueList(as2_values)
-            position.AssignedNumber4Bytes.ValueList(assigned4_values)
-            position.AsNumber4Bytes.ValueList(as4_values)
-            position.AssignedNumber2Bytes.ValueList(assigned2_values)
+            self._write_multivalue(position.Type, types, "Type")
+            self._write_multivalue(position.SubType, subtypes, "SubType")
+            self._write_multivalue(
+                position.AsNumber2Bytes, as2_values, "AsNumber2Bytes"
+            )
+            self._write_multivalue(
+                position.AssignedNumber4Bytes, assigned4_values, "AssignedNumber4Bytes"
+            )
+            self._write_multivalue(
+                position.AsNumber4Bytes, as4_values, "AsNumber4Bytes"
+            )
+            self._write_multivalue(
+                position.AssignedNumber2Bytes, assigned2_values, "AssignedNumber2Bytes"
+            )
         except Exception:
             self.logger.exception(
                 "Failed to configure extended-community position %d of %d "
@@ -9280,17 +13247,99 @@ class Ixia:
                 as_numbers, last_two_octets = self._split_community_values(
                     community_list
                 )
-                community_obj.Type.Single(
-                    ixia_types.BGP_COMMUNITY_TYPE_MAP[
-                        config.bgp_community_type or ixia_types.BgpCommunityType.MANUAL
-                    ]
-                )
                 if config.attribute == ixia_types.BgpAttribute.COMMUNITIES:
+                    community_obj.Type.Single(
+                        ixia_types.BGP_COMMUNITY_TYPE_MAP[
+                            config.bgp_community_type
+                            or ixia_types.BgpCommunityType.MANUAL
+                        ]
+                    )
                     community_obj.AsNumber.ValueList(as_numbers)
                     community_obj.LastTwoOctets.ValueList(last_two_octets)
                 else:
-                    community_obj.AsNumber4Bytes.ValueList(as_numbers)
-                    community_obj.AssignedNumber4Bytes.ValueList(last_two_octets)
+                    type_value, as_field, assigned_field = (
+                        self._extended_community_fields(
+                            community_list, as_numbers, last_two_octets
+                        )
+                    )
+                    community_obj.Type.Single(type_value)
+                    getattr(community_obj, as_field).ValueList(as_numbers)
+                    getattr(community_obj, assigned_field).ValueList(
+                        last_two_octets
+                    )
+
+    def _extended_community_fields(
+        self,
+        community_list: list[str],
+        as_numbers: list[str],
+        last_two_octets: list[str],
+    ) -> tuple[str, str, str]:
+        """(Type, AS field, assigned field) for an extended-community row list.
+
+        The standard-community map does not apply here: the extended
+        object's ``Type`` only accepts administrator forms. A 2-octet
+        administrator takes ``AsNumber2Bytes``/``AssignedNumber4Bytes``;
+        a 4-octet administrator takes ``AsNumber4Bytes``/
+        ``AssignedNumber2Bytes``. Only the route-target prefix is
+        recognised; anything else fails loudly.
+
+        One row list maps to one community object, and one object
+        carries one ``Type``, so the choice is per list, not per
+        value: a list whose AS numbers are all 2-octet takes the
+        2-octet form, and any list containing a 4-octet AS takes
+        the 4-octet form, whose 4-byte AS field holds every value
+        in the list. Splitting a mixed list across two objects
+        would change the community count the caller stated. The
+        assigned numbers must fit the assigned field of the chosen
+        form: a list with a 4-octet AS and an assigned number over
+        65535 has no single form that holds both, so it fails
+        loudly here instead of overflowing the 2-byte field.
+        """
+        for community in community_list:
+            parts = community.split(":")
+            if len(parts) == 3 and parts[0] != "rt":
+                raise ValueError(
+                    f"extended community {community!r} has unsupported "
+                    "prefix (only 'rt:' is recognised)"
+                )
+        widths: list[int] = []
+        for asn in as_numbers:
+            try:
+                widths.append(int(asn))
+            except ValueError:
+                raise ValueError(
+                    f"extended community AS {asn!r} is not a decimal number"
+                ) from None
+        assigned: list[int] = []
+        for value in last_two_octets:
+            try:
+                assigned.append(int(value))
+            except ValueError:
+                raise ValueError(
+                    f"extended community assigned number {value!r} "
+                    "is not a decimal number"
+                ) from None
+        if all(width <= 65535 for width in widths):
+            if any(value > 0xFFFFFFFF for value in assigned):
+                raise ValueError(
+                    "extended community assigned number does not fit in "
+                    "AssignedNumber4Bytes (4-byte field)"
+                )
+            return (
+                "administratoras2octet",
+                "AsNumber2Bytes",
+                "AssignedNumber4Bytes",
+            )
+        if any(value > 65535 for value in assigned):
+            raise ValueError(
+                "extended community assigned number does not fit in "
+                "AssignedNumber2Bytes (2-byte field)"
+            )
+        return (
+            "administratoras4octet",
+            "AsNumber4Bytes",
+            "AssignedNumber2Bytes",
+        )
 
     def _parse_communities_file(self, file_content: str) -> list[list[str]]:
         """Parse a communities file into a list of community lists."""
@@ -9310,11 +13359,26 @@ class Ixia:
     def _split_community_values(
         self, community_list: list[str]
     ) -> tuple[list[str], list[str]]:
-        """Split community values into AS numbers and last two octets."""
+        """Split community values into AS numbers and last two octets.
+
+        Standard form is ``<as>:<number>``. Extended route-target form
+        is ``rt:<as>:<number>``; the type prefix is dropped and the
+        remaining two parts are used as-is. Anything else fails loudly
+        here rather than silently mis-assigning an AS number.
+        """
         as_numbers = []
         last_two_octets = []
         for community in community_list:
-            as_number, last_two_octet = community.split(":")
+            parts = community.split(":")
+            if len(parts) == 2:
+                as_number, last_two_octet = parts
+            elif len(parts) == 3 and parts[0] == "rt":
+                _prefix, as_number, last_two_octet = parts
+            else:
+                raise ValueError(
+                    f"community {community!r} is not '<as>:<number>' "
+                    "or 'rt:<as>:<number>'"
+                )
             as_numbers.append(as_number)
             last_two_octets.append(last_two_octet)
         return as_numbers, last_two_octets
@@ -9387,7 +13451,7 @@ class Ixia:
         ipv6_prefix_pool_to_network_group_map, ipv4_prefix_pool_to_network_group_map = (
             self.map_prefix_pools_to_network_groups()
         )
-        if isinstance(prefix_pool_obj, Ipv4PrefixPools):
+        if _is_ipv4_prefix_pool(prefix_pool_obj):
             return ipv4_prefix_pool_to_network_group_map[prefix_pool_obj.Name]
         else:
             return ipv6_prefix_pool_to_network_group_map[prefix_pool_obj.Name]
@@ -9428,7 +13492,7 @@ class Ixia:
         ipv6_prefix_pool_to_device_group_map, ipv4_prefix_pool_to_device_group_map = (
             self.map_prefix_pools_to_device_groups()
         )
-        if isinstance(prefix_pool_obj, Ipv4PrefixPools):
+        if _is_ipv4_prefix_pool(prefix_pool_obj):
             return ipv4_prefix_pool_to_device_group_map[prefix_pool_obj.Name]
         else:
             return ipv6_prefix_pool_to_device_group_map[prefix_pool_obj.Name]
@@ -9437,7 +13501,7 @@ class Ixia:
         self, prefix_pool_obj: t.Union["Ipv4PrefixPools", "Ipv6PrefixPools"]
     ) -> t.Union["BgpIpv4Peer", "BgpIpv6Peer"]:
         device_group_obj = self.map_prefix_pool_to_device_group(prefix_pool_obj)
-        if isinstance(prefix_pool_obj, Ipv4PrefixPools):
+        if _is_ipv4_prefix_pool(prefix_pool_obj):
             return device_group_obj.Ethernet.find().Ipv4.find().BgpIpv4Peer.find()
         else:
             return device_group_obj.Ethernet.find().Ipv6.find().BgpIpv6Peer.find()
@@ -9517,6 +13581,42 @@ class Ixia:
             field_name,
             dscp_values,
         )
+        if (
+            ip_address_family == ixia_types.IpAddressFamily.IPV4
+            and qos_config.ecn_capability != ixia_types.EcnCapability.ECN_NON_CAPABLE
+        ):
+            self._configure_ipv4_ecn(
+                config_element, qos_config.phb_type, qos_config.ecn_capability
+            )
+
+    def _configure_ipv4_ecn(
+        self,
+        config_element: "ConfigElement",
+        phb_type: ixia_types.PHBTypes,
+        ecn_capability: ixia_types.EcnCapability,
+    ) -> None:
+        """Set the IPv4 ECN bits, which the PHB field above leaves at 0 (Not-ECT).
+
+        IPv6 carries ECN in the raw Traffic Class value; IPv4 keeps it in the
+        PHB's 2-bit ``unused`` sibling. Without it an ECN-capable IPv4 stream is
+        sent Not-ECT, so a queue with ECN marking plus WRED early-drops only the
+        IPv4 packets.
+        """
+        phb = _IPV4_PHB_FIELD[phb_type]
+        stack = config_element.Stack.find(
+            DisplayName=self._get_ip_address_family_str(ixia_types.IpAddressFamily.IPV4)
+        )
+        # By FieldTypeId: every PHB (and the ToS form) has a field named "Unused".
+        ecn_field = stack.Field.find(
+            FieldTypeId=rf"^ipv4\.header\.priority\.ds\.phb\.{phb}\.unused$"
+        )
+        values = [2] if ecn_capability == ixia_types.EcnCapability.ECN_CAPABLE else [2, 0]
+        if len(values) == 1:
+            ecn_field.ValueType = "singleValue"
+            ecn_field.SingleValue = values[0]
+        else:
+            ecn_field.ValueType = "valueList"
+            ecn_field.ValueList = values
 
     def configure_dscp(
         self,
@@ -9560,6 +13660,7 @@ class Ixia:
         line_rate_type: t.Optional[ixia_types.RateType],
         frame_size_setting: t.Optional[ixia_types.FrameSize],
         qos_config: t.Optional[ixia_types.QoSConfig],
+        transmission_control: t.Optional[ixia_types.TransmissionControl] = None,
     ) -> None:
         traffic_item_obj = self.ixnetwork.Traffic.TrafficItem.find(
             Name=traffic_item_name
@@ -9592,7 +13693,205 @@ class Ixia:
                     qos_config,
                     none_throws(ip_address_family),
                 )
+            if transmission_control:
+                self._configure_transmission_control(
+                    config_element, transmission_control
+                )
         traffic_item_obj.Generate()
+
+    @external_api
+    def set_transmission_control(
+        self,
+        traffic_item_regex: str,
+        transmission_type: str,
+        duration: int = 300,
+        inter_burst_gap_ms: t.Optional[float] = None,
+        burst_packet_count: t.Optional[int] = None,
+        min_gap_bytes: t.Optional[int] = None,
+        repeat_burst_count: t.Optional[int] = None,
+        transmit_mode: t.Optional[str] = None,
+    ) -> None:
+        """Set transmission control mode on matching traffic items.
+
+        Allows switching between continuous and burst modes mid-playbook
+        via INVOKE_IXIA_API_STEP.
+
+        Raises:
+            ValueError: on an unknown ``transmission_type``, or if burst
+                parameters are supplied for a non-burst mode. Accepting them
+                silently would leave the traffic item running the previous
+                pattern with no failure signal.
+        """
+        import re
+
+        tc = self._build_runtime_transmission_control(
+            transmission_type=transmission_type,
+            duration=duration,
+            inter_burst_gap_ms=inter_burst_gap_ms,
+            burst_packet_count=burst_packet_count,
+            min_gap_bytes=min_gap_bytes,
+            repeat_burst_count=repeat_burst_count,
+            transmit_mode=transmit_mode,
+        )
+
+        # Stop traffic before modifying transmission control to avoid
+        # "stateless traffic item has been unapplied" errors from IXIA.
+        # The IXIA server rejects dynamic TransmissionControl updates on
+        # traffic items that are in unapplied state (e.g. after a
+        # stop/start cycle without regeneration).
+        was_running = self.is_traffic_running()
+        if was_running:
+            self.stop_traffic()
+
+        pattern = re.compile(traffic_item_regex)
+        matched = 0
+        if transmit_mode is not None:
+            for vport in self.ixnetwork.Vport.find():
+                vport.update(TxMode=transmit_mode)
+        for ti in self.ixnetwork.Traffic.TrafficItem.find():
+            if pattern.search(ti.Name):
+                matched += 1
+                if transmit_mode is not None:
+                    ti.update(TransmitMode=transmit_mode)
+                for ce in ti.ConfigElement.find():
+                    self._configure_transmission_control(
+                        ce, tc, repeat_burst_count=repeat_burst_count
+                    )
+                ti.Generate()
+                self.logger.info(
+                    f"Set transmission control to '{transmission_type}' "
+                    f"on traffic item '{ti.Name}'"
+                )
+
+        # A regex that matches nothing would otherwise leave every traffic item
+        # on its previous pattern and still report success.
+        if not matched:
+            raise ValueError(
+                f"No traffic item matched '{traffic_item_regex}'; transmission "
+                f"control was not changed."
+            )
+
+        if was_running:
+            self.apply_traffic()
+            self.start_traffic()
+
+    @staticmethod
+    def _build_runtime_transmission_control(
+        *,
+        transmission_type: str,
+        duration: int,
+        inter_burst_gap_ms: t.Optional[float],
+        burst_packet_count: t.Optional[int],
+        min_gap_bytes: t.Optional[int],
+        repeat_burst_count: t.Optional[int],
+        transmit_mode: t.Optional[str],
+    ) -> ixia_types.TransmissionControl:
+        type_map = {v: k for k, v in ixia_types.TRANS_CONTROL_TYPE_MAP.items()}
+        if transmission_type not in type_map:
+            raise ValueError(
+                f"Unknown transmission type '{transmission_type}'. "
+                f"Valid: {list(type_map.keys())}"
+            )
+        resolved_type = type_map[transmission_type]
+        burst_args = {
+            "inter_burst_gap_ms": inter_burst_gap_ms,
+            "burst_packet_count": burst_packet_count,
+            "min_gap_bytes": min_gap_bytes,
+            "repeat_burst_count": repeat_burst_count,
+        }
+        supplied_burst_args = sorted(k for k, v in burst_args.items() if v is not None)
+        if (
+            supplied_burst_args
+            and resolved_type != ixia_types.TransmissionControlType.BURST_FIXED_DURATION
+        ):
+            raise ValueError(
+                f"{supplied_burst_args} only apply to 'burstFixedDuration'; "
+                f"got '{transmission_type}'."
+            )
+        if (
+            resolved_type == ixia_types.TransmissionControlType.BURST_FIXED_DURATION
+            and burst_packet_count is None
+        ):
+            raise ValueError(
+                "burstFixedDuration needs an explicit burst_packet_count; "
+                "without it IXIA keeps whatever burst size was configured last."
+            )
+        if repeat_burst_count is not None and repeat_burst_count < 1:
+            raise ValueError("repeat_burst_count must be at least 1")
+        valid_transmit_modes = set(ixia_types.TRANSMIT_MODE_MAP.values())
+        if transmit_mode is not None and transmit_mode not in valid_transmit_modes:
+            raise ValueError(
+                f"Unknown transmit mode {transmit_mode!r}. "
+                f"Valid: {sorted(valid_transmit_modes)}"
+            )
+        if repeat_burst_count is not None and transmit_mode != "sequential":
+            raise ValueError(
+                "repeat_burst_count requires transmit_mode='sequential'; "
+                "IXIA ignores RepeatBurst in interleaved mode."
+            )
+        return ixia_types.TransmissionControl(
+            type=resolved_type,
+            duration=duration,
+            burst_packet_count=burst_packet_count,
+            inter_burst_gap_ms=inter_burst_gap_ms,
+            min_gap_bytes=min_gap_bytes,
+        )
+
+    @external_api
+    def start_traffic_items(self, traffic_item_regex: str) -> None:
+        """Start matching traffic items without interrupting running traffic."""
+        pattern = re.compile(traffic_item_regex)
+        traffic_items = [
+            item
+            for item in self.ixnetwork.Traffic.TrafficItem.find()
+            if pattern.search(item.Name)
+        ]
+        if not traffic_items:
+            raise ValueError(
+                f"No traffic item matched '{traffic_item_regex}'; no traffic started."
+            )
+
+        for traffic_item in traffic_items:
+            traffic_item.StartStatelessTrafficBlocking()
+        self.logger.info(
+            f"Started traffic item(s) {[item.Name for item in traffic_items]}"
+        )
+
+    @external_api
+    def repeat_traffic_item_bursts(
+        self,
+        traffic_item_regex: str,
+        number_of_bursts: int,
+        inter_burst_gap_ms: float,
+    ) -> None:
+        """Retrigger one-shot burst items without interrupting other traffic."""
+        if number_of_bursts < 1:
+            raise ValueError("number_of_bursts must be at least 1")
+        if inter_burst_gap_ms < 0:
+            raise ValueError("inter_burst_gap_ms must be non-negative")
+
+        pattern = re.compile(traffic_item_regex)
+        traffic_items = [
+            item
+            for item in self.ixnetwork.Traffic.TrafficItem.find()
+            if pattern.search(item.Name)
+        ]
+        if not traffic_items:
+            raise ValueError(
+                f"No traffic item matched '{traffic_item_regex}'; no bursts ran."
+            )
+
+        gap_seconds = inter_burst_gap_ms / 1000
+        for iteration in range(number_of_bursts):
+            if iteration:
+                time.sleep(gap_seconds)
+            for traffic_item in traffic_items:
+                traffic_item.StopStatelessTrafficBlocking()
+                traffic_item.StartStatelessTrafficBlocking()
+            self.logger.info(
+                f"Started burst {iteration + 1}/{number_of_bursts} for "
+                f"traffic item(s) {[item.Name for item in traffic_items]}"
+            )
 
     @staticmethod
     def _validate_control_buffer_percent(control_buffer_percent: int) -> None:

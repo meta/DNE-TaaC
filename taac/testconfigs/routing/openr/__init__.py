@@ -1,0 +1,85 @@
+# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+
+# pyre-unsafe
+"""
+Open/R Scale Testing — TAAC TestConfigs
+========================================
+
+This package contains TAAC TestConfig factories, lifecycle binding modules,
+and supporting utilities for Open/R scale testing in the DNE PIT lab.
+
+These TestConfigs automate what were previously manual processes: driving a
+port-channel sub-interface plan or the scale_test_server injector against a DUT
+and asserting the resulting Open/R state against baselines — producing a
+deterministic pass/fail result suitable for CI/CD gating.
+
+Test Cases
+----------
+- Test 1 (OPENR_PORTCHANNEL_SUBIF_SCALE_TEST_CONFIG): create N dot1q routed
+  sub-interfaces on the port-channel between DUT and helper and verify Open/R
+  establishes an adjacency on each. N defaults to 1024 (2x the 512 adjacencies
+  a leaf must support); the dot1q ceiling is 4094.
+- Test 2 (OPENR_SCALE_KVSTORE_INJECTION_TEST_CONFIG): run the pre-staged
+  scale_test_server on the helper to inject a synthetic BBF fabric into the
+  DUT's KvStore, and assert the DUT holds the full injected key population.
+- Test 3 (OPENR_SCALE_KVSTORE_MERGE_TEST_CONFIG): isolate both stores, inject
+  two deterministic fabrics, and validate exact merge semantics in sequence.
+- Test 4 (OPENR_SCALE_PHYSICAL_LINK_FLAP_TEST_CONFIG): temporarily split the
+  second physical member into Port-Channel1911 and validate one down/up cycle
+  while Scale Tester remains active through Port-Channel1910.
+- NW-5 (OPENR_SCALE_IPV4_IPV6_PREFIX_INJECTION_TEST_CONFIG): inject equal
+  deterministic IPv4 and IPv6 prefix populations and validate exact KvStore
+  state by family.
+- OPENR_UPDATE_LOSS: freeze FibAgent through asymmetric metric rebuilds on a
+  test-scoped second port-channel and fail when Decision moves on but Fib or
+  EOS keeps stale values (S696505 regression coverage).
+
+All tests must run with ``--skip-testbed-isolation``: they depend on the
+pre-existing Port-Channel1910 interconnect, which testbed isolation shuts.
+
+Lab Environment
+---------------
+- DUT: Jericho2-based chassis (EOS 4.36)
+- Helper / peer: Second EB-class device
+- Results: Published to internal Scuba dataset
+
+References
+----------
+- Requirements & Design: https://docs.google.com/document/d/1F1pkyhYx2sVxJxADitWBZVVpRIs-LoYFM87zkeHYb_8/edit?usp=sharing
+"""
+
+from taac.testconfigs.routing.openr.openr_fibagent_pause_test_config import (
+    OPENR_FIBAGENT_PAUSE,
+)
+from taac.testconfigs.routing.openr.openr_portchannel_subif_test_config import (
+    OPENR_PORTCHANNEL_SUBIF_SCALE_TEST_CONFIG,
+)
+from taac.testconfigs.routing.openr.openr_scale_dut_cold_boot_test_config import (
+    OPENR_SCALE_DUT_COLD_BOOT,
+)
+from taac.testconfigs.routing.openr.openr_scale_ipv4_ipv6_prefix_injection_test_config import (
+    OPENR_SCALE_IPV4_IPV6_PREFIX_INJECTION_TEST_CONFIG,
+)
+from taac.testconfigs.routing.openr.openr_scale_kvstore_merge_test_config import (
+    OPENR_SCALE_KVSTORE_MERGE_TEST_CONFIG,
+)
+from taac.testconfigs.routing.openr.openr_scale_physical_link_flap_test_config import (
+    OPENR_SCALE_PHYSICAL_LINK_FLAP_TEST_CONFIG,
+)
+from taac.testconfigs.routing.openr.openr_scale_test_config import (
+    OPENR_SCALE_KVSTORE_INJECTION_TEST_CONFIG,
+)
+from taac.testconfigs.routing.openr.openr_update_loss_test_config import (
+    OPENR_UPDATE_LOSS,
+)
+
+__all__ = [
+    "OPENR_FIBAGENT_PAUSE",
+    "OPENR_PORTCHANNEL_SUBIF_SCALE_TEST_CONFIG",
+    "OPENR_SCALE_DUT_COLD_BOOT",
+    "OPENR_SCALE_IPV4_IPV6_PREFIX_INJECTION_TEST_CONFIG",
+    "OPENR_SCALE_KVSTORE_INJECTION_TEST_CONFIG",
+    "OPENR_SCALE_KVSTORE_MERGE_TEST_CONFIG",
+    "OPENR_SCALE_PHYSICAL_LINK_FLAP_TEST_CONFIG",
+    "OPENR_UPDATE_LOSS",
+]

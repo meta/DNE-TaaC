@@ -11,9 +11,15 @@
 # Imported at module scope in taac/libs/taac_runner.py.
 tabulate>=0.9.0
 
+# Imported at module scope by taac/libs/investigation_report.py, which is a
+# dependency of taac/libs/taac_runner.py.
+pydantic>=2.0.0
+
 # IXIA traffic-generator client library. Imported at module scope in
 # taac/ixia/taac_ixia.py (from ixnetwork_restpy.assistants.statistics...).
-ixnetwork-restpy>=1.0.0
+# <1.11: taac/ixia/ixia.py imports hash-suffixed generated modules whose
+# names changed in 1.11.0; bumping past it requires updating those imports.
+ixnetwork-restpy>=1.0.0,<1.11
 
 # Pyre's public typing helpers (JSON alias, none_throws). Imported at
 # module scope in taac/utils/json_thrift_utils.py (from pyre_extensions
@@ -22,6 +28,9 @@ pyre-extensions>=0.0.30
 
 # SSH / CLI automation used at module scope in taac/driver/fboss_switch.py.
 pexpect>=4.8.0
+
+# FBOSS state-read retry policy in taac/driver/fboss_switch.py.
+tenacity>=9.1.2,<10
 
 # LRU cache decorators used in taac/driver/memoize_on_app_overload.py
 # (from cachetools import LRUCache).
@@ -40,3 +49,13 @@ paramiko>=2.12.0,<4
 # OTG/snappi traffic-generator client. Imported in taac/ixia/otg_traffic_gen.py
 # for the ixia-c (containerlab) backend.
 snappi>=1.0.0
+
+# Investigation report schema models. Imported at module scope in
+# taac/libs/investigation_report.py (from pydantic import BaseModel, Field),
+# reached via taac/libs/taac_runner.py; without it pytest collection fails.
+pydantic>=2.0
+
+# Asyncio test helpers (later.unittest.TestCase adds task-leak detection).
+# Imported at module scope by the qual_bgp_update_group tc7_cases tests;
+# without it pytest aborts the whole run with a collection error.
+later>=20.10.1

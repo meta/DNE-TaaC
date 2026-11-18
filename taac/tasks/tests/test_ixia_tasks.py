@@ -12,11 +12,41 @@ from ixnetwork_restpy.errors import BadRequestError
 from later.unittest import TestCase
 from taac.tasks.ixia_tasks import (
     _resolve_prefix_slots,
+    _retry_ixia_busy_operation,
     IxiaEnableDisableBgpPrefixes,
 )
 
 _PREFIX_COUNT = 50000
 _PEERS = 2
+_EBB_PEERS = 140
+_EBB_PREFIXES_PER_PEER = 850
+
+
+def _ebb_peer_prefix_exclusion_blocks() -> list[dict[str, t.Any]]:
+    return [
+        {
+            "prefix_start_index": segment_start + group * prefix_count,
+            "prefix_count": prefix_count,
+            "peer_indices": [90 + group * 2, 91 + group * 2],
+        }
+        for segment_start, prefix_count in ((0, 30), (750, 4))
+        for group in range(25)
+    ]
+
+
+def _ebb_750_baseline_active_values() -> list[bool]:
+    values = [False] * (_EBB_PEERS * _EBB_PREFIXES_PER_PEER)
+    for peer_index in range(_EBB_PEERS):
+        peer_start = peer_index * _EBB_PREFIXES_PER_PEER
+        values[peer_start : peer_start + 750] = [True] * 750
+    for block in _ebb_peer_prefix_exclusion_blocks():
+        for peer_index in block["peer_indices"]:
+            block_start = (
+                peer_index * _EBB_PREFIXES_PER_PEER + block["prefix_start_index"]
+            )
+            block_end = block_start + block["prefix_count"]
+            values[block_start:block_end] = [False] * block["prefix_count"]
+    return values
 
 
 def _pool(number_of_addresses: int) -> SimpleNamespace:
@@ -52,6 +82,14 @@ class ResolvePrefixSlotsTest(unittest.TestCase):
         slots, end_idx = _resolve_prefix_slots(_pool(_PREFIX_COUNT), 1, total, 0, None)
         self.assertEqual(end_idx, _PREFIX_COUNT)
         self.assertEqual(len(slots), total)
+
+    def test_zero_end_index_is_not_treated_as_none(self) -> None:
+        slots, end_idx = _resolve_prefix_slots(
+            _pool(1), _PREFIX_COUNT, _PEERS * _PREFIX_COUNT, 0, 0
+        )
+
+        self.assertEqual(0, end_idx)
+        self.assertEqual([], slots)
 
     def test_flat_sub_range_applies_per_peer(self) -> None:
         total = _PEERS * _PREFIX_COUNT
@@ -377,6 +415,64 @@ class IxiaEnableDisableBgpPrefixesTest(TestCase):
         self.assertEqual(3, task._build_prefix_mutation_plan.call_count)
         self.assertEqual([30.0, 30.0], [call.args[0] for call in sleep.call_args_list])
 
+    def test_nested_busy_operations_share_one_retry_deadline(self) -> None:
+        busy = BadRequestError(
+            '"getValues" exec not allowed currently since an operation '
+            "(Collecting Diagnostics) is in progress.",
+            400,
+        )
+        clock = 0.0
+
+        def monotonic() -> float:
+            return clock
+
+        def advance(delay: float) -> None:
+            nonlocal clock
+            clock += delay
+
+        class NestedOperations:
+            def __init__(self) -> None:
+                self.logger = MagicMock()
+                self.first_attempts = 0
+
+            @_retry_ixia_busy_operation
+            def first(self) -> None:
+                self.first_attempts += 1
+                if self.first_attempts == 1:
+                    raise busy
+
+            @_retry_ixia_busy_operation
+            def second(self) -> None:
+                raise busy
+
+            @_retry_ixia_busy_operation
+            def run(self) -> None:
+                self.first()
+                self.second()
+
+        operations = NestedOperations()
+        with (
+            patch(
+                "neteng.test_infra.dne.taac.tasks.ixia_tasks."
+                "_IXIA_BUSY_OPERATION_RETRY_TIMEOUT_SECONDS",
+                60.0,
+            ),
+            patch(
+                "neteng.test_infra.dne.taac.tasks.ixia_tasks.time.monotonic",
+                side_effect=monotonic,
+            ),
+            patch(
+                "neteng.test_infra.dne.taac.tasks.ixia_tasks.time.sleep",
+                side_effect=advance,
+            ) as sleep,
+            self.assertRaises(BadRequestError),
+        ):
+            operations.run()
+
+        self.assertEqual(60.0, clock)
+        self.assertEqual([30.0, 30.0], [call.args[0] for call in sleep.call_args_list])
+        self.assertFalse(hasattr(operations, "_ixia_busy_operation_retry_deadline"))
+
     def test_expected_count_zero_matches_fails_before_mutation(self) -> None:
         task, ixia = self._task([])
 
@@ -414,6 +510,484 @@ class IxiaEnableDisableBgpPrefixesTest(TestCase):
             )
 
         ixia.apply_changes.assert_not_called()
+
+    def test_expected_pool_name_drift_fails_before_mutation(self) -> None:
+        pool = FakeIpv4PrefixPool("WRONG_POOL")
+        task, ixia = self._task([pool])
+
+        with self.assertRaisesRegex(ValueError, "prefix pool match mismatch"):
+            task.configure_bgp_prefixes_active_state(
+                True,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                prefix_start_index=0,
+                prefix_end_index=20,
+                expected_prefix_pool_names=("PREFIX_POOL_IPV4_EBGP",),
+                strict_range=True,
+                verify_readback=True,
+            )
+
+        ixia.apply_changes.assert_not_called()
+
+    def test_strict_flat_slice_returns_verified_evidence(self) -> None:
+        pool = FakeIpv4PrefixPool("PREFIX_POOL_IPV4_EBGP", count=1700)
+        task, ixia = self._task([pool], network_group_multiplier=850)
+
+        with patch(
+            "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+            FakeIpv4PrefixPool,
+        ):
+            evidence = task.configure_bgp_prefixes_active_state(
+                True,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                prefix_start_index=750,
+                prefix_end_index=850,
+                expected_prefix_pool_names=("PREFIX_POOL_IPV4_EBGP",),
+                strict_range=True,
+                verify_readback=True,
+            )
+
+        self.assertFalse(pool.route_property.Active.Values[749])
+        self.assertTrue(all(pool.route_property.Active.Values[750:850]))
+        self.assertTrue(all(pool.route_property.Active.Values[1600:1700]))
+        self.assertEqual(200, evidence["pools"][0]["selected_row_count"])
+        self.assertTrue(evidence["pools"][0]["readback_verified"])
+        self.assertNotIn(
+            "excluded_selected_row_count",
+            evidence["pools"][0],
+        )
+        ixia.apply_changes.assert_called_once_with()
+
+    def test_empty_exclusion_list_uses_standard_evidence_schema(self) -> None:
+        pool = FakeIpv4PrefixPool("PREFIX_POOL_IPV4_EBGP")
+        task, ixia = self._task([pool])
+
+        with patch(
+            "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+            FakeIpv4PrefixPool,
+        ):
+            evidence = task.configure_bgp_prefixes_active_state(
+                True,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                prefix_start_index=0,
+                prefix_end_index=10,
+                expected_prefix_pool_count=1,
+                expected_prefix_pool_names=("PREFIX_POOL_IPV4_EBGP",),
+                verify_readback=True,
+                peer_prefix_exclusion_blocks=[],
+            )
+
+        self.assertNotIn(
+            "excluded_selected_row_count",
+            evidence["pools"][0],
+        )
+        ixia.apply_changes.assert_called_once_with()
+
+    def test_runtime_enable_skips_start_when_all_rows_are_excluded(self) -> None:
+        pool = FakeIpv4PrefixPool("PREFIX_POOL_IPV4_EBGP")
+        task, ixia = self._task([pool])
+
+        with patch(
+            "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+            FakeIpv4PrefixPool,
+        ):
+            evidence = task.configure_bgp_prefixes_active_state(
+                True,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                prefix_start_index=0,
+                prefix_end_index=20,
+                expected_prefix_pool_count=1,
+                expected_prefix_pool_names=("PREFIX_POOL_IPV4_EBGP",),
+                runtime_route_operation=True,
+                peer_prefix_exclusion_blocks=[
+                    {
+                        "prefix_start_index": 0,
+                        "prefix_count": 20,
+                        "peer_indices": [0],
+                    }
+                ],
+            )
+
+        pool.route_property.Stop.assert_called_once_with(
+            SessionIndices=list(range(1, 21))
+        )
+        pool.route_property.Start.assert_not_called()
+        self.assertFalse(any(pool.route_property.Active.Values))
+        self.assertEqual(20, evidence["pools"][0]["excluded_selected_row_count"])
+        self.assertEqual(2, ixia.apply_changes.call_count)
+
+    def test_sparse_exclusions_survive_750_850_enable_disable_round_trip(
+        self,
+    ) -> None:
+        pool = FakeIpv4PrefixPool(
+            "PREFIX_POOL_IPV4_EBGP",
+            count=_EBB_PEERS * _EBB_PREFIXES_PER_PEER,
+        )
+        baseline_values = _ebb_750_baseline_active_values()
+        pool.route_property.Active.Values = list(baseline_values)
+        task, _ = self._task([pool], network_group_multiplier=_EBB_PREFIXES_PER_PEER)
+        kwargs = {
+            "prefix_start_index": 750,
+            "prefix_end_index": 850,
+            "expected_prefix_pool_names": ("PREFIX_POOL_IPV4_EBGP",),
+            "strict_range": True,
+            "verify_readback": True,
+            "runtime_route_operation": True,
+            "peer_prefix_exclusion_blocks": _ebb_peer_prefix_exclusion_blocks(),
+        }
+
+        with patch(
+            "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+            FakeIpv4PrefixPool,
+        ):
+            enable_evidence = task.configure_bgp_prefixes_active_state(
+                True,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                **kwargs,
+            )
+            enabled_values = list(pool.route_property.Active.Values)
+            disable_evidence = task.configure_bgp_prefixes_active_state(
+                False,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                **kwargs,
+            )
+
+        per_peer_active_counts = [
+            sum(
+                enabled_values[
+                    peer_index * _EBB_PREFIXES_PER_PEER : (peer_index + 1)
+                    * _EBB_PREFIXES_PER_PEER
+                ]
+            )
+            for peer_index in range(_EBB_PEERS)
+        ]
+        self.assertEqual([816] * 50 + [850] * 90, sorted(per_peer_active_counts))
+        self.assertEqual(
+            200,
+            enable_evidence["pools"][0]["excluded_selected_row_count"],
+        )
+        self.assertEqual(
+            200,
+            disable_evidence["pools"][0]["excluded_selected_row_count"],
+        )
+        self.assertEqual(baseline_values, pool.route_property.Active.Values)
+
+        stopped_rows = pool.route_property.Stop.call_args_list[0].kwargs[
+            "SessionIndices"
+        ]
+        started_rows = pool.route_property.Start.call_args.kwargs["SessionIndices"]
+        first_excluded_tail_row = 90 * _EBB_PREFIXES_PER_PEER + 750 + 1
+        first_included_tail_row = 90 * _EBB_PREFIXES_PER_PEER + 754 + 1
+        self.assertEqual(_EBB_PEERS * 100, len(stopped_rows))
+        self.assertEqual(_EBB_PEERS * 100 - 200, len(started_rows))
+        self.assertNotIn(first_excluded_tail_row, started_rows)
+        self.assertIn(first_included_tail_row, started_rows)
+
+    def test_exclusion_blocks_validate_serialized_shape_before_lookup(self) -> None:
+        invalid_blocks = (
+            (
+                [{"prefix_start_index": 0, "prefix_count": 1}],
+                "contain exactly",
+            ),
+            (
+                [
+                    {
+                        "prefix_start_index": -1,
+                        "prefix_count": 1,
+                        "peer_indices": [0],
+                    }
+                ],
+                "non-negative integer",
+            ),
+            (
+                [
+                    {
+                        "prefix_start_index": 0,
+                        "prefix_count": 0,
+                        "peer_indices": [0],
+                    }
+                ],
+                "positive integer prefix_count",
+            ),
+            (
+                [
+                    {
+                        "prefix_start_index": 0,
+                        "prefix_count": 1,
+                        "peer_indices": [],
+                    }
+                ],
+                "nonempty sequence",
+            ),
+            (
+                [
+                    {
+                        "prefix_start_index": 0,
+                        "prefix_count": 1,
+                        "peer_indices": [0, 0],
+                    }
+                ],
+                "unique non-negative integers",
+            ),
+        )
+        for blocks, error_pattern in invalid_blocks:
+            with self.subTest(blocks=blocks):
+                task, ixia = self._task([])
+                with self.assertRaisesRegex(ValueError, error_pattern):
+                    task.configure_bgp_prefixes_active_state(
+                        True,
+                        "runtime",
+                        peer_prefix_exclusion_blocks=blocks,
+                    )
+                ixia.get_prefix_pools_by_regexes.assert_not_called()
+
+    def test_exclusion_blocks_validate_flat_pool_geometry(self) -> None:
+        cases = (
+            (
+                "prefix range",
+                FakeIpv4PrefixPool("RUNTIME", count=40),
+                20,
+                [
+                    {
+                        "prefix_start_index": 19,
+                        "prefix_count": 2,
+                        "peer_indices": [0],
+                    }
+                ],
+            ),
+            (
+                "peer index 2",
+                FakeIpv4PrefixPool("RUNTIME", count=40),
+                20,
+                [
+                    {
+                        "prefix_start_index": 0,
+                        "prefix_count": 1,
+                        "peer_indices": [2],
+                    }
+                ],
+            ),
+            (
+                "overlap",
+                FakeIpv4PrefixPool("RUNTIME", count=40),
+                20,
+                [
+                    {
+                        "prefix_start_index": 0,
+                        "prefix_count": 2,
+                        "peer_indices": [0],
+                    },
+                    {
+                        "prefix_start_index": 1,
+                        "prefix_count": 1,
+                        "peer_indices": [0],
+                    },
+                ],
+            ),
+            (
+                "positive multiple",
+                FakeIpv4PrefixPool("RUNTIME", count=41),
+                20,
+                [
+                    {
+                        "prefix_start_index": 0,
+                        "prefix_count": 1,
+                        "peer_indices": [0],
+                    }
+                ],
+            ),
+            (
+                "flat IXIA prefix-pool geometry",
+                FakeIpv4PrefixPool(
+                    "RUNTIME",
+                    number_of_addresses=20,
+                    compact_peer_count=2,
+                ),
+                1,
+                [
+                    {
+                        "prefix_start_index": 0,
+                        "prefix_count": 1,
+                        "peer_indices": [0],
+                    }
+                ],
+            ),
+        )
+        for error_pattern, pool, multiplier, blocks in cases:
+            with self.subTest(error_pattern=error_pattern):
+                task, ixia = self._task([pool], network_group_multiplier=multiplier)
+                with (
+                    patch(
+                        "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+                        FakeIpv4PrefixPool,
+                    ),
+                    self.assertRaisesRegex(ValueError, error_pattern),
+                ):
+                    task.configure_bgp_prefixes_active_state(
+                        True,
+                        "^RUNTIME$",
+                        expected_prefix_pool_count=1,
+                        peer_prefix_exclusion_blocks=blocks,
+                    )
+                ixia.apply_changes.assert_not_called()
+
+    def test_strict_flat_range_rejects_overrun_and_empty_selection(self) -> None:
+        pool = FakeIpv4PrefixPool("PREFIX_POOL_IPV4_EBGP", count=20)
+        task, ixia = self._task([pool], network_group_multiplier=20)
+
+        with (
+            patch(
+                "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+                FakeIpv4PrefixPool,
+            ),
+            self.assertRaisesRegex(ValueError, "exceeds 20 prefixes per peer"),
+        ):
+            task.configure_bgp_prefixes_active_state(
+                True,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                20,
+                21,
+                expected_prefix_pool_names=("PREFIX_POOL_IPV4_EBGP",),
+                strict_range=True,
+                verify_readback=True,
+            )
+        with (
+            patch(
+                "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+                FakeIpv4PrefixPool,
+            ),
+            self.assertRaisesRegex(ValueError, "selected no IXIA rows"),
+        ):
+            task.configure_bgp_prefixes_active_state(
+                True,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                20,
+                None,
+                expected_prefix_pool_names=("PREFIX_POOL_IPV4_EBGP",),
+                strict_range=True,
+                verify_readback=True,
+            )
+
+        ixia.apply_changes.assert_not_called()
+
+    def test_strict_compact_slice_resizes_between_logical_capacities(self) -> None:
+        pool = FakeIpv4PrefixPool(
+            "PREFIX_POOL_IPV4_EBGP",
+            number_of_addresses=850,
+            compact_peer_count=2,
+        )
+        pool.route_property.Active.Values = [True, True]
+        task, _ = self._task([pool], network_group_multiplier=1)
+
+        with patch(
+            "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+            FakeIpv4PrefixPool,
+        ):
+            withdraw_evidence = task.configure_bgp_prefixes_active_state(
+                False,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                750,
+                850,
+                expected_prefix_pool_names=("PREFIX_POOL_IPV4_EBGP",),
+                strict_range=True,
+                verify_readback=True,
+            )
+            advertise_evidence = task.configure_bgp_prefixes_active_state(
+                True,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                750,
+                850,
+                expected_prefix_pool_names=("PREFIX_POOL_IPV4_EBGP",),
+                strict_range=True,
+                verify_readback=True,
+            )
+
+        self.assertEqual(850, pool.NumberOfAddresses)
+        self.assertEqual([True, True], pool.route_property.Active.Values)
+        self.assertEqual(750, withdraw_evidence["pools"][0]["prefixes_per_peer"])
+        self.assertEqual(850, advertise_evidence["pools"][0]["prefixes_per_peer"])
+        self.assertEqual(
+            750,
+            withdraw_evidence["pools"][0]["logical_prefix_capacity_after_operation"],
+        )
+        self.assertEqual(
+            850,
+            advertise_evidence["pools"][0]["logical_prefix_capacity_after_operation"],
+        )
+        self.assertTrue(withdraw_evidence["pools"][0]["readback_verified"])
+
+    def test_strict_compact_slice_skips_steady_state_reapply(self) -> None:
+        pool = FakeIpv4PrefixPool(
+            "PREFIX_POOL_IPV4_EBGP",
+            number_of_addresses=850,
+            compact_peer_count=2,
+        )
+        pool.route_property.Active.Values = [True, True]
+        task, ixia = self._task([pool], network_group_multiplier=1)
+
+        with patch(
+            "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+            FakeIpv4PrefixPool,
+        ):
+            evidence = task.configure_bgp_prefixes_active_state(
+                True,
+                "^PREFIX_POOL_IPV4_EBGP$",
+                750,
+                850,
+                expected_prefix_pool_names=("PREFIX_POOL_IPV4_EBGP",),
+                strict_range=True,
+                verify_readback=True,
+            )
+
+        ixia.apply_changes.assert_not_called()
+        self.assertEqual(850, evidence["pools"][0]["prefixes_per_peer"])
+        self.assertTrue(evidence["pools"][0]["readback_verified"])
+
+    def test_cleanup_failure_latches_terminal_error(self) -> None:
+        pool = FakeIpv4PrefixPool("RUNTIME_20")
+        task, ixia = self._task([pool])
+        pool.route_property.Active.ValueList.side_effect = RuntimeError(
+            "setter and cleanup failed"
+        )
+
+        with (
+            patch(
+                "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+                FakeIpv4PrefixPool,
+            ),
+            self.assertRaisesRegex(ValueError, "fail-closed withdrawal failed"),
+        ):
+            task.configure_bgp_prefixes_active_state(
+                True,
+                "^RUNTIME_20$",
+                expected_prefix_pool_count=1,
+            )
+        write_count = pool.route_property.Active.ValueList.call_count
+        lookup_count = ixia.get_prefix_pools_by_regexes.call_count
+
+        with self.assertRaisesRegex(
+            ValueError, "Create a new IxiaEnableDisableBgpPrefixes instance"
+        ):
+            task.configure_bgp_prefixes_active_state(
+                True,
+                "^RUNTIME_20$",
+                expected_prefix_pool_count=1,
+            )
+
+        self.assertEqual(write_count, pool.route_property.Active.ValueList.call_count)
+        self.assertEqual(lookup_count, ixia.get_prefix_pools_by_regexes.call_count)
+
+        recovered_pool = FakeIpv4PrefixPool("RUNTIME_20")
+        replacement, _ = self._task([recovered_pool])
+        with patch(
+            "neteng.test_infra.dne.taac.tasks.ixia_tasks.Ipv4PrefixPools",
+            FakeIpv4PrefixPool,
+        ):
+            replacement.configure_bgp_prefixes_active_state(
+                True,
+                "^RUNTIME_20$",
+                expected_prefix_pool_count=1,
+            )
+        self.assertEqual([True] * 20, recovered_pool.route_property.Active.Values)
 
     def test_invalid_expected_count_fails_before_lookup(self) -> None:
         for invalid_count in (0, -1, True, 1.0, "1"):
@@ -566,7 +1140,7 @@ class IxiaEnableDisableBgpPrefixesTest(TestCase):
             )
 
         self.assertEqual(
-            ["stop", "active", "apply", "start"],
+            ["stop", "active", "apply", "start", "apply"],
             [event for event, _ in events],
         )
         self.assertEqual(tuple(range(1, 141)), events[0][1])
@@ -632,7 +1206,7 @@ class IxiaEnableDisableBgpPrefixesTest(TestCase):
 
         self.assertEqual(2, pool.route_property.Stop.call_count)
         self.assertFalse(any(pool.route_property.Active.Values))
-        self.assertEqual(2, ixia.apply_changes.call_count)
+        self.assertEqual(3, ixia.apply_changes.call_count)
 
     def test_safe_active_restore_skips_verify_when_apply_fails(self) -> None:
         pool = FakeIpv4PrefixPool("SHARED_RUNTIME")
@@ -842,6 +1416,85 @@ class IxiaEnableDisableBgpPrefixesTest(TestCase):
             True, "runtime", 0, 20, 1
         )
 
+    async def test_run_records_strict_toggle_evidence(self) -> None:
+        task, _ = self._task([])
+        evidence = {"pools": [{"name": "PREFIX_POOL_IPV4_EBGP"}]}
+        exclusion_blocks = [
+            {
+                "prefix_start_index": 750,
+                "prefix_count": 4,
+                "peer_indices": [90, 91],
+            }
+        ]
+        task.configure_bgp_prefixes_active_state = MagicMock(return_value=evidence)
+
+        await task.run(
+            {
+                "enable": True,
+                "prefix_pool_regex": "^PREFIX_POOL_IPV4_EBGP$",
+                "prefix_start_index": 750,
+                "prefix_end_index": 850,
+                "expected_prefix_pool_names": ["PREFIX_POOL_IPV4_EBGP"],
+                "strict_range": True,
+                "verify_readback": True,
+                "peer_prefix_exclusion_blocks": exclusion_blocks,
+            }
+        )
+
+        task.configure_bgp_prefixes_active_state.assert_called_once_with(
+            True,
+            "^PREFIX_POOL_IPV4_EBGP$",
+            750,
+            850,
+            None,
+            expected_prefix_pool_names=["PREFIX_POOL_IPV4_EBGP"],
+            strict_range=True,
+            verify_readback=True,
+            peer_prefix_exclusion_blocks=exclusion_blocks,
+        )
+        self.assertEqual(evidence, task._data["prefix_toggle"])
+
+    async def test_run_retains_cross_instance_phase_evidence(self) -> None:
+        shared_data: dict[str, t.Any] = {}
+        first, ixia = self._task([])
+        second = IxiaEnableDisableBgpPrefixes(
+            ixia=t.cast(t.Any, ixia), shared_data=shared_data
+        )
+        first = IxiaEnableDisableBgpPrefixes(
+            ixia=t.cast(t.Any, ixia), shared_data=shared_data
+        )
+        first.configure_bgp_prefixes_active_state = MagicMock(
+            return_value={"pools": [{"name": "PREFIX_POOL_IPV4_EBGP"}]}
+        )
+        second.configure_bgp_prefixes_active_state = MagicMock(
+            return_value={"pools": [{"name": "PREFIX_POOL_IPV6_EBGP"}]}
+        )
+
+        await first.run(
+            {
+                "enable": False,
+                "prefix_pool_regex": "^PREFIX_POOL_IPV4_EBGP$",
+                "evidence_label": "setup_withdraw:PREFIX_POOL_IPV4_EBGP",
+            }
+        )
+        await second.run(
+            {
+                "enable": True,
+                "prefix_pool_regex": "^PREFIX_POOL_IPV6_EBGP$",
+                "evidence_label": "stage_advertise:PREFIX_POOL_IPV6_EBGP",
+            }
+        )
+
+        history = second._data["prefix_toggle_history"]
+        self.assertEqual(2, len(history))
+        self.assertEqual(
+            [
+                "setup_withdraw:PREFIX_POOL_IPV4_EBGP",
+                "stage_advertise:PREFIX_POOL_IPV6_EBGP",
+            ],
+            [record["label"] for record in history],
+        )
+
     async def test_worker_path_serializes_restpy_across_task_instances(self) -> None:
         first_started = threading.Event()
         release_first = threading.Event()
@@ -890,6 +1543,7 @@ class IxiaEnableDisableBgpPrefixesTest(TestCase):
         target = "neteng.test_infra.dne.taac.tasks.ixia_tasks.asyncio.to_thread"
 
         with patch(target, new=AsyncMock()) as to_thread:
+            to_thread.return_value = {"pools": []}
             await task.run(
                 {
                     "enable": False,

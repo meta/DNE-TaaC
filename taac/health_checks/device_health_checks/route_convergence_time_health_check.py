@@ -4,6 +4,7 @@
 import asyncio
 import re
 import shlex
+import time
 import typing as t
 from dataclasses import dataclass
 from datetime import datetime
@@ -110,6 +111,18 @@ class RouteConvergenceTimeHealthCheck(
         iterations = int(check_params.get("iterations", 5))
         time_threshold = int(check_params.get("time_threshold", 35))
         wait_time_seconds = int(check_params.get("wait_time_seconds", 60))
+        expected_route_count_param = check_params.get("expected_route_count")
+        expected_route_count = (
+            int(expected_route_count_param)
+            if expected_route_count_param is not None
+            else None
+        )
+        observation_timeout_seconds = float(
+            check_params.get("observation_timeout_seconds", 15)
+        )
+        observation_poll_interval_seconds = float(
+            check_params.get("observation_poll_interval_seconds", 1)
+        )
         network_group_regex = check_params.get("network_group_regex")
         log_file = check_params.get("log_file", "/var/facebook/logs/wedge_agent.log")
         archive_dir = check_params.get(
@@ -160,6 +173,9 @@ class RouteConvergenceTimeHealthCheck(
                     archive_dir=archive_dir,
                     start_time_file=start_time_file,
                     iteration=iteration,
+                    expected_route_count=expected_route_count,
+                    observation_timeout_seconds=observation_timeout_seconds,
+                    observation_poll_interval_seconds=observation_poll_interval_seconds,
                 )
 
                 all_results.append(
@@ -174,8 +190,14 @@ class RouteConvergenceTimeHealthCheck(
                 )
 
                 if not result["passed"]:
-                    failed_operations.append(
-                        f"Iter{iteration}-{operation_type}: {result.get('message', 'Failed')}"
+                    failure = (
+                        f"Iter{iteration}-{operation_type}: "
+                        f"{result.get('message', 'Failed')}"
+                    )
+                    failed_operations.append(failure)
+                    self.logger.error(
+                        f"[Iter {iteration}] {operation_type} FAILED: "
+                        f"{result.get('message', 'Failed')}"
                     )
 
         # Build summary
@@ -224,6 +246,9 @@ class RouteConvergenceTimeHealthCheck(
         start_time_file: str,
         iteration: int,
         archive_dir: str = "/var/facebook/logs/fboss/archive",
+        expected_route_count: int | None = None,
+        observation_timeout_seconds: float = 0,
+        observation_poll_interval_seconds: float = 1,
     ) -> t.Dict[str, t.Any]:
         """
         Run a single ADD or DELETE operation.
@@ -283,14 +308,17 @@ class RouteConvergenceTimeHealthCheck(
             f"[Iter {iteration}] Analyzing logs for {operation_type} operation"
         )
 
-        log_files = await self._find_log_files(start_stamp, log_file, archive_dir)
-
         try:
-            metrics = await self._get_route_convergence_metrics(
-                log_files=log_files,
+            metrics = await self._observe_route_convergence_metrics(
+                start_stamp=start_stamp,
+                log_file=log_file,
+                archive_dir=archive_dir,
                 operation_type=operation_type,
                 start_time_str=start_time_str,
                 time_threshold=time_threshold,
+                expected_route_count=expected_route_count,
+                observation_timeout_seconds=observation_timeout_seconds,
+                observation_poll_interval_seconds=observation_poll_interval_seconds,
             )
         except Exception as ex:
             return {
@@ -309,6 +337,21 @@ class RouteConvergenceTimeHealthCheck(
             metrics.total_routes_added
             if operation_type == "ADD"
             else metrics.total_routes_deleted
+        )
+
+        if expected_route_count is not None and route_count < expected_route_count:
+            return {
+                "passed": False,
+                "time": metrics.total_state_update_time_sec,
+                "routes": route_count,
+                "message": (
+                    f"Incomplete {operation_type}: observed "
+                    f"{route_count}/{expected_route_count} routes"
+                ),
+            }
+
+        metrics.total_state_update_time_sec = self._elapsed_seconds(
+            start_time_str, metrics.last_batch_time
         )
 
         if metrics.total_state_update_time_sec > time_threshold:
@@ -330,6 +373,54 @@ class RouteConvergenceTimeHealthCheck(
             "routes": route_count,
             "message": f"{operation_type} completed in {metrics.total_state_update_time_sec:.3f}s",
         }
+
+    async def _observe_route_convergence_metrics(
+        self,
+        start_stamp: str | None,
+        log_file: str,
+        archive_dir: str,
+        operation_type: str,
+        start_time_str: str,
+        time_threshold: int,
+        expected_route_count: int | None,
+        observation_timeout_seconds: float,
+        observation_poll_interval_seconds: float,
+    ) -> RouteConvergenceMetrics | None:
+        deadline = time.monotonic() + observation_timeout_seconds
+        latest_metrics = None
+
+        while True:
+            log_files = await self._find_log_files(start_stamp, log_file, archive_dir)
+            latest_metrics = await self._get_route_convergence_metrics(
+                log_files=log_files,
+                operation_type=operation_type,
+                start_time_str=start_time_str,
+                time_threshold=time_threshold,
+                start_stamp=start_stamp,
+            )
+            route_count = self._route_count(latest_metrics, operation_type)
+            if latest_metrics is not None and (
+                expected_route_count is None or route_count >= expected_route_count
+            ):
+                return latest_metrics
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return latest_metrics
+
+            await asyncio.sleep(min(observation_poll_interval_seconds, remaining))
+
+    @staticmethod
+    def _route_count(
+        metrics: RouteConvergenceMetrics | None, operation_type: str
+    ) -> int:
+        if metrics is None:
+            return 0
+        return (
+            metrics.total_routes_added
+            if operation_type == "ADD"
+            else metrics.total_routes_deleted
+        )
 
     async def _capture_start_time(
         self, start_time_file: str
@@ -384,10 +475,11 @@ class RouteConvergenceTimeHealthCheck(
             # Already in time format, extract HH:MM:SS part
             parts = start_time.split(":")
             if len(parts) >= 3:
-                # Handle HH:MM:SS.microseconds format
+                # Preserve fractional seconds so pre-toggle events in the same
+                # wall-clock second cannot enter the measurement window.
                 hour = parts[0]
                 minute = parts[1]
-                second = parts[2].split(".")[0]
+                second = parts[2]
                 return f"{hour}:{minute}:{second}"
             elif len(parts) == 2:
                 return f"{parts[0]}:{parts[1]}:00"
@@ -421,6 +513,7 @@ class RouteConvergenceTimeHealthCheck(
         operation_type: str,
         start_time_str: t.Optional[str],
         time_threshold: int,
+        start_stamp: t.Optional[str] = None,
     ) -> t.Optional[RouteConvergenceMetrics]:
         """
         Parse the given log files and calculate route convergence metrics.
@@ -445,14 +538,27 @@ class RouteConvergenceTimeHealthCheck(
         aggregated: t.Optional[RouteConvergenceMetrics] = None
 
         for log_file in log_files:
+            # The driver selects a file stream for Classic/NSPAWN and a
+            # service journal for native NetOS. FBOSS messages retain their
+            # glog timestamps, so the AWK parser remains common.
+            # pyrefly: ignore [missing-attribute]
+            log_source_command = await self.driver.async_get_log_source_command(
+                log_file, start_time=start_stamp
+            )
             # Build the AWK command based on operation type
             if operation_type == "ADD":
                 cmd = self._build_add_awk_command(
-                    log_file, start_time_str, time_threshold
+                    log_file,
+                    start_time_str,
+                    time_threshold,
+                    log_source_command=log_source_command,
                 )
             else:
                 cmd = self._build_delete_awk_command(
-                    log_file, start_time_str, time_threshold
+                    log_file,
+                    start_time_str,
+                    time_threshold,
+                    log_source_command=log_source_command,
                 )
 
             # pyrefly: ignore [missing-attribute]
@@ -473,11 +579,17 @@ class RouteConvergenceTimeHealthCheck(
 
         return aggregated
 
+    @staticmethod
+    def _default_log_source_command(log_file: str) -> str:
+        decompressor = "zstdcat" if log_file.endswith(".zst") else "zcat -f"
+        return f"{decompressor} {shlex.quote(log_file)}"
+
     def _build_add_awk_command(
         self,
         log_file: str,
         start_time_str: t.Optional[str],
         time_threshold: int,
+        log_source_command: t.Optional[str] = None,
     ) -> str:
         """
         Build AWK command for ADD operation analysis.
@@ -487,7 +599,10 @@ class RouteConvergenceTimeHealthCheck(
         """
         start_time = start_time_str or "00:00:00"
 
-        return f"""zcat -f {shlex.quote(log_file)} | awk -v start="{start_time}" -v threshold="{time_threshold}" '
+        source_command = log_source_command or self._default_log_source_command(
+            log_file
+        )
+        return f"""{source_command} | awk -v start="{start_time}" -v threshold="{time_threshold}" '
 function time_to_sec(t) {{
     split(t, a, ":");
     split(a[3], b, ".");
@@ -532,6 +647,7 @@ END {{
         log_file: str,
         start_time_str: t.Optional[str],
         time_threshold: int,
+        log_source_command: t.Optional[str] = None,
     ) -> str:
         """
         Build AWK command for DELETE operation analysis.
@@ -541,7 +657,10 @@ END {{
         """
         start_time = start_time_str or "00:00:00"
 
-        return f"""zcat -f {shlex.quote(log_file)} | awk -v start="{start_time}" -v threshold="{time_threshold}" '
+        source_command = log_source_command or self._default_log_source_command(
+            log_file
+        )
+        return f"""{source_command} | awk -v start="{start_time}" -v threshold="{time_threshold}" '
 function time_to_sec(t) {{
     split(t, a, ":");
     split(a[3], b, ".");
@@ -655,7 +774,7 @@ END {{
             try:
                 # pyrefly: ignore [missing-attribute]
                 out = await self.driver.async_run_cmd_on_shell(
-                    f"ls -1 {shlex.quote(archive_dir)}/wedge_agent.log-*.gz 2>/dev/null"
+                    f"ls -1 {shlex.quote(archive_dir)}/wedge_agent.log-* 2>/dev/null"
                 )
             except Exception as e:
                 self.logger.warning(f"Failed to list archive logs: {e}")
@@ -665,7 +784,7 @@ END {{
                 path = line.strip()
                 # Match only wedge_agent.log-<12 digits>.gz; this excludes
                 # wedge_agent_snapshots.log* by construction.
-                match = re.search(r"wedge_agent\.log-(\d{12})\.gz$", path)
+                match = re.search(r"wedge_agent\.log-(\d{12})\.(?:gz|zst)$", path)
                 if match and match.group(1) >= start_stamp:
                     archives.append((match.group(1), path))
 
@@ -678,6 +797,11 @@ END {{
         """Convert an 'HH:MM:SS[.ffffff]' timestamp to seconds."""
         hour, minute, rest = ts.split(":")
         return int(hour) * 3600 + int(minute) * 60 + float(rest)
+
+    @classmethod
+    def _elapsed_seconds(cls, start: str, end: str) -> float:
+        elapsed = cls._hhmmss_to_sec(end) - cls._hhmmss_to_sec(start)
+        return elapsed + 86400 if elapsed < 0 else elapsed
 
     def _merge_metrics(
         self,

@@ -3,6 +3,8 @@
 # pyre-unsafe
 """Unit tests for LogParsingHealthCheck (FBOSS `_run` path)."""
 
+import calendar
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,7 +14,11 @@ from taac.health_checks.device_health_checks import (
     log_parsing_health_check as log_parsing_health_check_module,
 )
 from taac.health_checks.device_health_checks.log_parsing_health_check import (
+    find_resource_accountant_rejections,
     LogParsingHealthCheck,
+)
+from taac.health_checks.healthcheck_definitions import (
+    create_resource_accountant_activation_check,
 )
 from taac.health_check.health_check import types as hc_types
 
@@ -36,6 +42,14 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
         self.health_check.driver = AsyncMock()
         self.health_check.driver.async_read_file = AsyncMock(
             return_value=_SAMPLE_COOP_CONFIG
+        )
+        self.health_check.driver.async_read_log_file = AsyncMock(
+            return_value=_SAMPLE_COOP_CONFIG
+        )
+        # `date +%z` on the device; the UTC default keeps windows built with
+        # calendar.timegm aligned with the log stamps.
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            return_value="+0000\n"
         )
         self.device = MagicMock(spec=TestDevice)
         self.device.name = "test-host"
@@ -75,6 +89,27 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(exclude, result.message)
         self.assertNotIn("Found", result.message)
 
+    async def test_tail_lines_bounds_remote_log_output(self):
+        result = await self.health_check._run(
+            self.device,
+            self.input,
+            {
+                "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+                "exclude_regex": "never-match",
+                "start_time": 100,
+                "end_time": 200,
+                "tail_lines": 500,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.health_check.driver.async_read_log_file.assert_awaited_once_with(
+            "/var/facebook/logs/fboss/wedge_agent.log",
+            start_time=100,
+            end_time=200,
+            tail_lines=500,
+        )
+
     async def test_exclude_regex_match_returns_fail(self):
         """exclude_regex with at least one match returns FAIL with the lines."""
         check_params = {
@@ -84,6 +119,167 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
         result = await self.health_check._run(self.device, self.input, check_params)
         self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
         self.assertIn("matching criteria", result.message)
+
+    async def test_resource_accountant_mode_accepts_canonical_in_window_event(self):
+        start_time = calendar.timegm((2026, 9, 20, 10, 0, 0, 0, 0, 0))
+        content = (
+            "E0920 10:01:02.123456 1234 ResourceAccountant.cpp:1026] "
+            "Total NDP entries in new switchState: 4101 exceeds the limit: 4100 "
+            "for switchId: 0\n"
+        )
+        self.health_check.driver.async_read_log_file.return_value = content
+        result = await self.health_check._run(
+            self.device,
+            self.input,
+            {
+                "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+                "include_regex": "ResourceAccountant",
+                "resource_accountant_activation": True,
+                "start_time": start_time,
+                "end_time": start_time + 120,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn("NDP", result.message)
+        self.health_check.driver.async_read_log_file.assert_awaited_once_with(
+            "/var/facebook/logs/fboss/wedge_agent.log",
+            start_time=start_time,
+            end_time=start_time + 120,
+            grep_pattern=log_parsing_health_check_module._RESOURCE_ACCOUNTANT_GREP_PATTERN,
+            tail_lines=200,
+            utc_offset_seconds=0,
+        )
+        self.health_check.driver.async_read_file.assert_not_awaited()
+
+    async def test_resource_accountant_mode_reads_window_in_device_local_time(
+        self,
+    ):
+        # Regression: Overcommit_ECMP_ONLY_Groups on ssw002.s002.f01.qzd1
+        # (America/Los_Angeles). The device rejected the overcommit at 05:21:46
+        # PST, inside the 05:16:53-05:28:46 PST window, but reading the glog
+        # stamp as UTC put it eight hours early and the check failed.
+        start_time = 1793539013
+        end_time = 1793539726
+        content = (
+            "Nov  1 05:21:46 ssw002.s002.f01.qzd1.tfbnw.net "
+            "fboss_sw_agent[573954]: E1101 05:21:46.686595 574442 "
+            "ValidateStateUpdate.cpp:356] State updated rejected by resource "
+            "accountant.\n"
+        )
+        self.health_check.driver.async_run_cmd_on_shell.return_value = "-0800\n"
+        self.health_check.driver.async_read_log_file.return_value = content
+
+        result = await self.health_check._run(
+            self.device,
+            self.input,
+            {
+                "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+                "resource_accountant_activation": True,
+                "start_time": start_time,
+                "end_time": end_time,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.health_check.driver.async_run_cmd_on_shell.assert_awaited_once_with(
+            "date +%z"
+        )
+        self.health_check.driver.async_read_log_file.assert_awaited_once_with(
+            "/var/facebook/logs/fboss/wedge_agent.log",
+            start_time=start_time,
+            end_time=end_time,
+            grep_pattern=log_parsing_health_check_module._RESOURCE_ACCOUNTANT_GREP_PATTERN,
+            tail_lines=200,
+            utc_offset_seconds=-8 * 3600,
+        )
+        self.assertEqual(
+            [],
+            find_resource_accountant_rejections(content, start_time, end_time),
+        )
+
+    def test_resource_accountant_accepts_netos_syslog_prefixed_event(self) -> None:
+        start_time = calendar.timegm((2026, 9, 20, 23, 20, 0, 0, 0, 0))
+        content = (
+            "Sep 20 23:20:25 fsw003.p003.f01.qzd1.tfbnw.net "
+            "fboss_sw_agent[50780]: E0920 23:20:25.062138 51089 "
+            "ResourceAccountant.cpp:1041] Total ARP entries in new switchState: "
+            "1281 exceeds the limit: 1280 for switchId: 0\n"
+        )
+
+        self.assertEqual(
+            [content.rstrip()],
+            find_resource_accountant_rejections(
+                content,
+                start_time=start_time,
+                end_time=start_time + 60,
+            ),
+        )
+
+    async def test_resource_accountant_mode_rejects_historical_event(self):
+        start_time = calendar.timegm((2026, 9, 20, 10, 0, 0, 0, 0, 0))
+        self.health_check.driver.async_read_file.return_value = (
+            "E0920 09:59:59.123456 1234 ResourceAccountant.cpp:1026] "
+            "Total NDP entries in new switchState: 4101 exceeds the limit: 4100 "
+            "for switchId: 0\n"
+        )
+        self.health_check.driver.async_read_log_file.return_value = (
+            self.health_check.driver.async_read_file.return_value
+        )
+        result = await self.health_check._run(
+            self.device,
+            self.input,
+            {
+                "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+                "include_regex": "ResourceAccountant",
+                "resource_accountant_activation": True,
+                "start_time": start_time,
+                "end_time": start_time + 120,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("No ResourceAccountant rejection", result.message)
+
+    async def test_resource_accountant_mode_rejects_name_only_false_positive(self):
+        start_time = calendar.timegm((2026, 9, 20, 10, 0, 0, 0, 0, 0))
+        content = (
+            "I0920 10:01:02.123456 1234 ResourceAccountant.cpp:70] "
+            "ResourceAccountant initialized\n"
+        )
+        self.health_check.driver.async_read_file.return_value = content
+        self.health_check.driver.async_read_log_file.return_value = content
+        result = await self.health_check._run(
+            self.device,
+            self.input,
+            {
+                "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+                "include_regex": "ResourceAccountant",
+                "resource_accountant_activation": True,
+                "start_time": start_time,
+                "end_time": start_time + 120,
+            },
+        )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("No ResourceAccountant rejection", result.message)
+
+    def test_resource_accountant_factory_uses_requested_time_anchor_and_retries(self):
+        check = create_resource_accountant_activation_check(
+            start_time_jq_var="post_disruption_start_time",
+            retry_count=4,
+            retry_delay_seconds=3,
+        )
+
+        self.assertEqual(hc_types.CheckName.LOG_PARSING_CHECK, check.name)
+        self.assertEqual(
+            {"start_time": ".post_disruption_start_time"},
+            check.check_params.jq_params,
+        )
+        params = json.loads(check.check_params.json_params)
+        self.assertTrue(params["resource_accountant_activation"])
+        self.assertEqual(4, params["retry_count"])
+        self.assertEqual(3, params["retry_delay_seconds"])
 
     async def test_both_regexes_provided_raises(self):
         """Providing both include_regex and exclude_regex is an assertion error."""
@@ -103,7 +299,7 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
 
     def _arista_params(self, **overrides):
         params = {
-            "agent_name": "Bgp",
+            "agent_name": "Bgpcpp",
             "exclude_regex": "Memory Limit Reached",
         }
         params.update(overrides)
@@ -132,7 +328,7 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
         archived_logs.assert_awaited_once_with(
             self.health_check.driver,
-            "Bgp",
+            "Bgpcpp",
             "26775",
             start_time=100,
             end_time=200,
@@ -163,7 +359,7 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("exclude regex", result.message)
         archived_logs.assert_awaited_once_with(
             self.health_check.driver,
-            "Bgp",
+            "Bgpcpp",
             "26775",
             start_time=100,
             end_time=200,
@@ -231,7 +427,7 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(hc_types.HealthCheckStatus.ERROR, result.status)
-        self.assertIn("No live or archived Bgp logs", result.message)
+        self.assertIn("No live or archived Bgpcpp logs", result.message)
 
     async def test_arista_rejects_inverted_time_window(self):
         get_pid = AsyncMock(return_value="26775")
@@ -249,3 +445,287 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hc_types.HealthCheckStatus.ERROR, result.status)
         self.assertIn("must not be earlier", result.message)
         get_pid.assert_not_awaited()
+
+    async def test_arista_system_log_recovery_is_context_not_failure(self) -> None:
+        recovery = (
+            "[ERROR] switch: %SAND-3-L3_HOST_RESOURCE_NORMAL: "
+            "All host entries are programmed in hardware"
+        )
+        with patch.object(
+            log_parsing_health_check_module.arista_utils,
+            "check_eos_system_logs",
+            new=AsyncMock(return_value=[recovery]),
+        ):
+            result = await self.health_check._run_arista(
+                self.device,
+                self.input,
+                {"check_system_logs": True},
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn("recovery context", result.message)
+        self.assertIn("L3_HOST_RESOURCE_NORMAL", result.message)
+
+    async def test_arista_other_resource_full_fails_with_recovery_context(
+        self,
+    ) -> None:
+        issue = (
+            "[ERROR] switch: %SAND-3-L3_HOST_RESOURCE_FULL: "
+            "Hardware resources are insufficient"
+        )
+        recovery = (
+            "[ERROR] switch: %SAND-3-L3_HOST_RESOURCE_NORMAL: "
+            "All host entries are programmed in hardware"
+        )
+        with patch.object(
+            log_parsing_health_check_module.arista_utils,
+            "check_eos_system_logs",
+            new=AsyncMock(return_value=[issue, recovery]),
+        ):
+            result = await self.health_check._run_arista(
+                self.device,
+                self.input,
+                {"check_system_logs": True},
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("L3_HOST_RESOURCE_FULL", result.message)
+        self.assertIn("recovery context", result.message)
+
+    async def test_arista_allowed_recovered_resource_full_passes(self) -> None:
+        issue = (
+            "[ERROR] switch: %SAND-3-FEC_RESOURCE_FULL: "
+            "Not all FECs are programmed in hardware"
+        )
+        repeated_issue = (
+            "[ERROR] switch: %SAND-3-FEC_RESOURCE_FULL: "
+            "FEC programming remains constrained"
+        )
+        recovery = (
+            "[ERROR] switch: %ROUTING-3-FEC_RESOURCE_NORMAL: "
+            "All FECs are programmed in hardware"
+        )
+        for configured_mnemonic in (
+            "FEC_RESOURCE",
+            "FEC_RESOURCE_FULL",
+            "fec_resource_normal",
+        ):
+            with (
+                self.subTest(configured_mnemonic=configured_mnemonic),
+                patch.object(
+                    log_parsing_health_check_module.arista_utils,
+                    "check_eos_system_logs",
+                    new=AsyncMock(return_value=[issue, repeated_issue, recovery]),
+                ),
+                patch.object(
+                    log_parsing_health_check_module.arista_utils,
+                    "classify_eos_system_log_entries",
+                    wraps=(
+                        log_parsing_health_check_module.arista_utils.classify_eos_system_log_entries
+                    ),
+                ) as classify_logs,
+            ):
+                result = await self.health_check._run_arista(
+                    self.device,
+                    self.input,
+                    {
+                        "check_system_logs": True,
+                        "allowed_recovered_resource_mnemonics": [configured_mnemonic],
+                    },
+                )
+
+            self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+            self.assertIn("allowed recovered resource issues", result.message)
+            self.assertIn("FEC_RESOURCE_FULL", result.message)
+            classify_logs.assert_called_once_with([issue, repeated_issue, recovery])
+
+    async def test_arista_recovered_resource_does_not_mask_same_line_issue(
+        self,
+    ) -> None:
+        mixed_issue = (
+            "[ERROR] switch: %SYS-3-CONTROL_PLANE_FAILURE: unrelated alarm; "
+            "%SAND-3-FEC_RESOURCE_FULL: FEC programming is constrained"
+        )
+        recovery = (
+            "[ERROR] switch: %ROUTING-3-FEC_RESOURCE_NORMAL: "
+            "All FECs are programmed in hardware"
+        )
+        with patch.object(
+            log_parsing_health_check_module.arista_utils,
+            "check_eos_system_logs",
+            new=AsyncMock(return_value=[mixed_issue, recovery]),
+        ):
+            result = await self.health_check._run_arista(
+                self.device,
+                self.input,
+                {
+                    "check_system_logs": True,
+                    "allowed_recovered_resource_mnemonics": ["FEC_RESOURCE"],
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("CONTROL_PLANE_FAILURE", result.message)
+
+    async def test_arista_unrelated_primary_recovery_mnemonic_does_not_recover(
+        self,
+    ) -> None:
+        issue = (
+            "[ERROR] switch: %SAND-3-FEC_RESOURCE_FULL: "
+            "Not all FECs are programmed in hardware"
+        )
+        unrelated_recovery = (
+            "[ERROR] switch: %SAND-3-L3_HOST_RESOURCE_NORMAL: "
+            "diagnostic context mentions FEC_RESOURCE_NORMAL:"
+        )
+        with patch.object(
+            log_parsing_health_check_module.arista_utils,
+            "check_eos_system_logs",
+            new=AsyncMock(return_value=[issue, unrelated_recovery]),
+        ):
+            result = await self.health_check._run_arista(
+                self.device,
+                self.input,
+                {
+                    "check_system_logs": True,
+                    "allowed_recovered_resource_mnemonics": ["FEC_RESOURCE"],
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("FEC_RESOURCE_FULL", result.message)
+
+    async def test_arista_invalid_index_evidence_fails_without_duplicates(
+        self,
+    ) -> None:
+        issue = "[ERROR] switch: %SYS-3-CONTROL_PLANE_FAILURE: unrelated alarm"
+        classification = (
+            log_parsing_health_check_module.arista_utils.EosSystemLogClassification(
+                issues=(issue,),
+                excluded=(),
+                issues_with_indexes=((0, issue), (0, issue)),
+            )
+        )
+        with (
+            patch.object(
+                log_parsing_health_check_module.arista_utils,
+                "check_eos_system_logs",
+                new=AsyncMock(return_value=[issue]),
+            ),
+            patch.object(
+                log_parsing_health_check_module.arista_utils,
+                "classify_eos_system_log_entries",
+                return_value=classification,
+            ),
+        ):
+            result = await self.health_check._run_arista(
+                self.device,
+                self.input,
+                {
+                    "check_system_logs": True,
+                    "allowed_recovered_resource_mnemonics": ["FEC_RESOURCE"],
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("Found 1 system log issues", result.message)
+        self.logger.warning.assert_any_call(
+            "Bypassing allowed recovered EOS resource tolerance because "
+            "indexed issue evidence does not align with classified issues "
+            "(%d indexed entries for %d issues)",
+            2,
+            1,
+        )
+
+    async def test_arista_allowed_unrecovered_resource_full_fails(self) -> None:
+        issue = (
+            "[ERROR] switch: %SAND-3-FEC_RESOURCE_FULL: "
+            "Not all FECs are programmed in hardware"
+        )
+        with patch.object(
+            log_parsing_health_check_module.arista_utils,
+            "check_eos_system_logs",
+            new=AsyncMock(return_value=[issue]),
+        ):
+            result = await self.health_check._run_arista(
+                self.device,
+                self.input,
+                {
+                    "check_system_logs": True,
+                    "allowed_recovered_resource_mnemonics": ["FEC_RESOURCE"],
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("FEC_RESOURCE_FULL", result.message)
+
+    async def test_arista_allowed_resource_must_finish_recovered(self) -> None:
+        recovery = (
+            "[ERROR] switch: %ROUTING-3-FEC_RESOURCE_NORMAL: "
+            "All FECs are programmed in hardware"
+        )
+        issue = (
+            "[ERROR] switch: %SAND-3-FEC_RESOURCE_FULL: "
+            "Not all FECs are programmed in hardware"
+        )
+        with patch.object(
+            log_parsing_health_check_module.arista_utils,
+            "check_eos_system_logs",
+            new=AsyncMock(return_value=[issue, recovery, issue]),
+        ):
+            result = await self.health_check._run_arista(
+                self.device,
+                self.input,
+                {
+                    "check_system_logs": True,
+                    "allowed_recovered_resource_mnemonics": ["FEC_RESOURCE"],
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("FEC_RESOURCE_FULL", result.message)
+
+    def test_arista_classification_preserves_duplicate_issue_indexes(self) -> None:
+        issue = (
+            "[ERROR] switch: %SAND-3-FEC_RESOURCE_FULL: "
+            "Not all FECs are programmed in hardware"
+        )
+        recovery = (
+            "[ERROR] switch: %ROUTING-3-FEC_RESOURCE_NORMAL: "
+            "All FECs are programmed in hardware"
+        )
+
+        classification = log_parsing_health_check_module.arista_utils.classify_eos_system_log_entries(
+            [issue, recovery, issue]
+        )
+
+        self.assertEqual((issue, issue), classification.issues)
+        self.assertEqual(((0, issue), (2, issue)), classification.issues_with_indexes)
+
+    async def test_arista_allowed_recovery_does_not_match_longer_mnemonic(
+        self,
+    ) -> None:
+        issue = (
+            "[ERROR] switch: %SAND-3-ROUTING_FEC_RESOURCE_FULL: "
+            "Not all routing FECs are programmed in hardware"
+        )
+        recovery = (
+            "[ERROR] switch: %ROUTING-3-FEC_RESOURCE_NORMAL: "
+            "All FECs are programmed in hardware"
+        )
+        with patch.object(
+            log_parsing_health_check_module.arista_utils,
+            "check_eos_system_logs",
+            new=AsyncMock(return_value=[issue, recovery]),
+        ):
+            result = await self.health_check._run_arista(
+                self.device,
+                self.input,
+                {
+                    "check_system_logs": True,
+                    "allowed_recovered_resource_mnemonics": ["FEC_RESOURCE"],
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("ROUTING_FEC_RESOURCE_FULL", result.message)

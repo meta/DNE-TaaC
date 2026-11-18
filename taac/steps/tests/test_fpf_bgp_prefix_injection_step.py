@@ -65,6 +65,7 @@ class TestFpfBgpPrefixInjectionStep(unittest.IsolatedAsyncioTestCase):
             "count": 4,
             "increment_step": "0:0:1::",
             "community_list": "gtsw",
+            "batch_size": 100,
         }
 
         input_data = taac_types.BaseInput()
@@ -78,6 +79,7 @@ class TestFpfBgpPrefixInjectionStep(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_args[0][0], mock_driver_instance)
         self.assertEqual(len(call_args[0][1]), 4)
         self.assertEqual(len(call_args[0][2]), len(COMMUNITY_PRESETS["gtsw"]))
+        self.assertEqual(call_args.kwargs["batch_size"], 100)
 
     @patch(
         "neteng.test_infra.dne.taac.steps.fpf_bgp_prefix_injection_step.FbossSwitchInternal"
@@ -126,6 +128,7 @@ class TestFpfBgpPrefixInjectionStep(unittest.IsolatedAsyncioTestCase):
             "count": 16,
             "community_list": "gtsw",
             "withdraw_only": True,
+            "batch_size": 50,
         }
 
         input_data = taac_types.BaseInput()
@@ -136,6 +139,7 @@ class TestFpfBgpPrefixInjectionStep(unittest.IsolatedAsyncioTestCase):
         call_args = mock_withdraw.call_args
         self.assertEqual(call_args[0][0], mock_driver_instance)
         self.assertEqual(len(call_args[0][1]), 16)
+        self.assertEqual(call_args.kwargs["batch_size"], 50)
 
     @patch(
         "neteng.test_infra.dne.taac.steps.fpf_bgp_prefix_injection_step.FbossSwitchInternal"
@@ -162,6 +166,29 @@ class TestFpfBgpPrefixInjectionStep(unittest.IsolatedAsyncioTestCase):
         mock_inject.assert_called_once()
         communities = mock_inject.call_args[0][2]
         self.assertEqual(len(communities), len(COMMUNITY_PRESETS["stsw"]))
+
+    @patch(
+        "neteng.test_infra.dne.taac.steps.fpf_bgp_prefix_injection_step.FbossSwitchInternal"
+    )
+    @patch(
+        "neteng.test_infra.dne.taac.steps.fpf_bgp_prefix_injection_step.inject_prefixes",
+        new_callable=AsyncMock,
+    )
+    async def test_extra_community_is_appended_to_valid_preset(
+        self, mock_inject, mock_driver_cls
+    ):
+        mock_driver_cls.return_value = MagicMock()
+        params = {
+            "devices": ["stsw001.s001.l202.mwg2"],
+            "prefix_base": "5000:dd::/64",
+            "count": 1,
+            "community_list": "stsw",
+            "extra_communities": ["65446:10"],
+        }
+        await self.step_instance.setUp(taac_types.BaseInput(), params)
+        await self.step_instance.run(taac_types.BaseInput(), params)
+        communities = mock_inject.call_args[0][2]
+        self.assertEqual(len(communities), len(COMMUNITY_PRESETS["stsw"]) + 1)
 
     @patch(
         "neteng.test_infra.dne.taac.steps.fpf_bgp_prefix_injection_step.FbossSwitchInternal"

@@ -9,7 +9,7 @@ or Kodiak3 chassis back into themselves via fiber jumpers (a "snake"
 topology). Each ``SnakeConfig`` declares one source/destination port pair
 on the same DUT plus point-to-point IPv6 addressing; the framework
 generates IXIA traffic across the loop and runs PTP + a suite of snake
-playbooks (link toggles, FSDB restart/crash, etc.) plus the standard
+playbooks (link toggles, service disruptions, stress cases, etc.) plus the standard
 ``gen_common_hcs`` health-check set.
 
 Each module-level constant (``MINIPACK3_STANDALONE_*``,
@@ -25,7 +25,10 @@ import typing as t
 
 from ixia.ixia import types as ixia_types
 from taac.health_checks.healthcheck_definitions import (
+    create_device_core_dumps_check,
     create_ixia_packet_loss_check,
+    create_port_state_check,
+    create_systemctl_active_state_check,
 )
 from taac.playbooks.playbook_definitions import (
     gen_common_hcs,
@@ -34,6 +37,42 @@ from taac.playbooks.playbook_definitions import (
 )
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
+
+
+BENCHMARK_TRAFFIC_ITEM_PREFIX = "SNAKE_BENCHMARK_"
+
+# Preamble + SFD (8B) and minimum inter-frame gap (12B) per Ethernet frame.
+_ETHERNET_L1_OVERHEAD_BYTES = 20
+
+# Benchmark items keep BasicTrafficItemConfig's default bidirectional=True, and the
+# IXIA "Traffic Item Statistics" row sums Tx/Rx over both directions.
+_BENCHMARK_TRAFFIC_DIRECTIONS = 2
+
+
+def gen_benchmark_min_rate_gbps(
+    link_speed_gbps: int,
+    line_rate: int,
+    packet_size: int,
+    min_rate_percent: int,
+) -> int:
+    """Minimum Tx/Rx rate (Gbps) a FIXED-size benchmark item must sustain.
+
+    IXIA applies ``line_rate`` at L1 (frame plus preamble and inter-frame gap),
+    while ``IXIA_TRAFFIC_RATE_CHECK`` reads the L2 ``Tx/Rx Rate (Mbps)`` columns,
+    which exclude that overhead and sum both directions of the bidirectional
+    item. The expected rate is therefore
+    ``2 * link_speed * line_rate * size / (size + 20)``; the threshold is
+    ``min_rate_percent`` of it, floored to whole Gbps (the check's unit). Losing
+    either direction drops the item below the threshold.
+    """
+    expected_l2_gbps = (
+        _BENCHMARK_TRAFFIC_DIRECTIONS
+        * link_speed_gbps
+        * (line_rate / 100.0)
+        * packet_size
+        / (packet_size + _ETHERNET_L1_OVERHEAD_BYTES)
+    )
+    return int(expected_l2_gbps * min_rate_percent / 100.0)
 
 
 def gen_basic_traffic_item_configs(
@@ -111,7 +150,7 @@ def gen_benchmark_traffic_item_configs(
     traffic_item_configs: t.List[taac_types.BasicTrafficItemConfig] = []
     name_by_packet_size: t.Dict[int, str] = {}
     for packet_size in packet_sizes:
-        traffic_item_name = f"SNAKE_BENCHMARK_{packet_size}B"
+        traffic_item_name = f"{BENCHMARK_TRAFFIC_ITEM_PREFIX}{packet_size}B"
         name_by_packet_size[packet_size] = traffic_item_name
         traffic_item_configs.extend(
             gen_basic_traffic_item_configs(
@@ -140,6 +179,17 @@ def gen_snake_test_config(
     frame_size_settings: t.Optional[ixia_types.FrameSize] = None,
     playbooks_to_skip: t.Optional[t.List[str]] = None,
     include_link_flap_longevity: bool = False,
+    link_flap_longevity_iterations: int = 33,
+    link_flap_longevity_disable_delay_s: int = 30,
+    link_flap_longevity_enable_delay_s: int = 20,
+    link_flap_longevity_soak_s: int = 3600,
+    link_flap_longevity_interface_slice: t.Optional[str] = None,
+    include_rapid_a_end_flap_stress: bool = False,
+    rapid_a_end_flap_duration_s: int = 3600,
+    rapid_a_end_flap_interval_s: int = 6,
+    rapid_a_end_flap_rest_s: int = 120,
+    rapid_a_end_flap_longevity_s: int = 300,
+    include_split_agent_warmboot: bool = False,
     manual_test_interfaces: t.Optional[t.List[str]] = None,
     ixia_ports: t.Optional[t.List[str]] = None,
     precheck_packet_loss_clear_stats: bool = False,
@@ -147,18 +197,41 @@ def gen_snake_test_config(
     include_benchmark: bool = False,
     benchmark_packet_sizes: t.Optional[t.List[int]] = None,
     benchmark_line_rate: int = 100,
+    benchmark_link_speed_gbps: t.Optional[int] = None,
+    benchmark_min_rate_percent: int = 98,
+    benchmark_allowed_loss_packet_sizes: t.Optional[t.Set[int]] = None,
     use_ipv6_ping: bool = True,
+    additional_dut_hostnames: t.Optional[t.List[str]] = None,
+    playbooks_to_include: t.Optional[t.List[str]] = None,
+    primary_endpoint_is_dut: bool = True,
+    use_cross_device_half_interface_toggle: bool = False,
+    postcheck_port_state_retry_count: t.Optional[int] = None,
+    postcheck_port_state_retry_delay_seconds: float = 10.0,
+    qsfp_service_restart_use_recovery_window: bool = False,
+    rapid_a_end_flap_neighbor_hostnames: t.Optional[t.List[str]] = None,
+    flap_recovery_check_retry_count: t.Optional[int] = None,
+    flap_recovery_check_retry_delay_seconds: float = 10.0,
+    half_toggle_check_retry_count: t.Optional[int] = None,
+    half_toggle_check_retry_delay_seconds: float = 2.0,
+    include_ptp: bool = True,
+    skip_ixia_protocol_verification: bool = False,
+    ixia_protocol_verification_timeout: int = 90,
+    default_ixia_l1_config: t.Optional[ixia_types.L1Config] = None,
+    postcheck_systemctl_services: t.Optional[t.List[hc_types.Service]] = None,
+    postcheck_systemctl_min_active_seconds: t.Optional[int] = None,
 ) -> taac_types.TestConfig:
-    """Build a single-DUT snake/loopback ``TestConfig``.
+    """Build a snake/loopback ``TestConfig``.
 
     Generates IXIA traffic items + per-loop PTP unicast (two-step)
     configs from the supplied ``snake_configs``, then composes the full
-    snake playbook suite via ``gen_snake_playbooks`` (with common
-    health checks shared between prechecks and postchecks).
+    snake playbook suite via ``gen_snake_playbooks`` (with common link and
+    traffic checks shared between prechecks and postchecks, plus post-only
+    core-dump validation).
 
     Args:
         name: Name registered in ``TestConfig.name``.
-        hostname: Single DUT hostname (e.g. ``"fboss150.99.snc1"``).
+        hostname: Primary IXIA-connected DUT hostname (e.g.
+            ``"fboss150.99.snc1"``).
         basset_pool: Basset reservation pool (typically
             ``"dne.standalone"``).
         snake_configs: Source/destination loop pairs on the DUT plus
@@ -189,11 +262,79 @@ def gen_snake_test_config(
                 (default 10).
             playbooks_to_skip: Test-case names to drop from the
                 generated playbook list.
+            additional_dut_hostnames: Optional DUTs that share the
+                primary DUT's IXIA traffic path without owning IXIA ports.
+            playbooks_to_include: Optional exact allowlist of generated
+                playbook names. When set, only these playbooks are retained.
+            primary_endpoint_is_dut: Whether the IXIA-connected primary
+                endpoint is also a DUT. Set False when it only supplies IXIA
+                connectivity for an additional DUT's test case.
+            use_cross_device_half_interface_toggle: Replace the loopback-circuit
+                half-toggle playbook with per-DUT interface slicing suitable for
+                a cross-device snake.
+            postcheck_port_state_retry_count: Optional number of post-test port
+                state retries. Prechecks remain single-shot.
+            postcheck_port_state_retry_delay_seconds: Fixed delay between
+                post-test port-state retries.
+            half_toggle_check_retry_count: Optional number of retries for the
+                half-interface-toggle LLDP and port-state checks that run
+                after interfaces are re-enabled. None keeps them single-shot.
+            half_toggle_check_retry_delay_seconds: Fixed delay between those
+                retries.
+            qsfp_service_restart_use_recovery_window: Clear IXIA counters after
+                QSFP service recovery so its postcheck measures a fresh
+                ``packet_loss_sleep_time`` recovery window instead of the
+                service-restart disruption interval.
+            rapid_a_end_flap_neighbor_hostnames: Optional explicit peer devices
+                used to select DUT-local endpoints in a cross-device snake.
             include_link_flap_longevity: When True, include the long
                 link-flap longevity playbook variant.
+            link_flap_longevity_iterations / _disable_delay_s /
+                _enable_delay_s / _soak_s / _interface_slice: Tuning
+                knobs for that playbook (33 cycles over all interfaces,
+                1-hour soak). ``_interface_slice`` is a positional slice
+                expression (e.g. ``":3"`` = first 3 interfaces) to flap a
+                subset; ``None`` flaps all. ``_disable_delay_s`` /
+                ``_enable_delay_s`` also set the per-interface spacing of
+                every interface-disruptive playbook in the suite (thrift
+                toggle, qsfp_util disable / low-power, qsfp reset), not
+                just the link-flap longevity one. ``_enable_delay_s``
+                defaults to 10s; ZR optics need ~5 minutes to relock, so
+                the ZR4 800G configs pass 300.
+            include_rapid_a_end_flap_stress: When True, include the
+                ``test_snake_rapid_a_end_flap_stress`` playbook -- a rapid
+                optical (wedge_qsfp_util tx_disable/tx_enable) flap of every
+                snake circuit's A-end, run continuously for
+                ``rapid_a_end_flap_duration_s`` with
+                ``rapid_a_end_flap_interval_s`` between flaps, then a
+                ``rapid_a_end_flap_rest_s`` rest, a stats clear, a mid-test
+                validation, and a ``rapid_a_end_flap_longevity_s`` soak.
+                Defaults: 1h continuous / 6s gap / 2m rest / 5m soak.
+            include_split_agent_warmboot: When True, include
+                ``test_snake_sw_agent_warmboot`` and
+                ``test_snake_hw_agent_warmboot``, which restart
+                ``fboss_sw_agent`` and ``fboss_hw_agent@0`` separately. Only
+                for platforms that run a split agent.
             manual_test_interfaces: Optional explicit interface list
                 forwarded to ``gen_snake_playbooks`` for tests that
                 need an operator-pinned target set.
+            include_ptp: Whether to create per-loop IXIA PTP master/slave
+                stacks. Defaults to True to preserve existing snake configs.
+            benchmark_link_speed_gbps: Snake port speed. When set (with
+                ``include_benchmark``), each benchmark playbook's traffic-rate
+                check requires its item to sustain ``benchmark_min_rate_percent``
+                of the expected L2 rate (see ``gen_benchmark_min_rate_gbps``).
+                When ``None`` the rate check has no thresholds.
+            benchmark_min_rate_percent: Percent of the expected L2 rate a
+                benchmark item must sustain (default 98).
+            skip_ixia_protocol_verification: Skip IXIA's protocol-summary gate.
+                The traffic precheck still verifies end-to-end forwarding.
+            ixia_protocol_verification_timeout: Settle time used when protocol
+                verification is skipped.
+            postcheck_systemctl_services: When set, every playbook postchecks
+                that these units are active, retried like the port-state check.
+            postcheck_systemctl_min_active_seconds: Minimum time each of those
+                units must have been active, so a crash loop FAILs.
 
     Returns:
         A ``TestConfig`` ready to slot into ``SNAKE_TEST_CONFIGS``.
@@ -213,9 +354,12 @@ def gen_snake_test_config(
     )
 
     # Benchmark sweep: one extra FIXED-frame-size traffic item per packet size.
-    # They are configured but not started by the standard playbooks -- each
-    # benchmark playbook selects its own via `traffic_items_to_start`.
+    # Each benchmark playbook selects its own item via `traffic_items_to_start`;
+    # the standard playbooks set none and fall back to the TestConfig-level regex
+    # below, which keeps the benchmark items disabled while they run.
     benchmark_name_by_packet_size = None
+    benchmark_min_rate_gbps_by_packet_size = None
+    traffic_items_to_start = None
     if include_benchmark:
         benchmark_traffic_item_configs, benchmark_name_by_packet_size = (
             gen_benchmark_traffic_item_configs(
@@ -227,6 +371,20 @@ def gen_snake_test_config(
         basic_traffic_item_configs = (
             basic_traffic_item_configs + benchmark_traffic_item_configs
         )
+        # The runner uses playbook.traffic_items_to_start or this value, and None
+        # enables every traffic item. Matched with re.match, so this selects every
+        # item whose name does not start with the benchmark prefix.
+        traffic_items_to_start = [f"(?!{BENCHMARK_TRAFFIC_ITEM_PREFIX})"]
+        if benchmark_link_speed_gbps is not None:
+            benchmark_min_rate_gbps_by_packet_size = {
+                packet_size: gen_benchmark_min_rate_gbps(
+                    benchmark_link_speed_gbps,
+                    benchmark_line_rate,
+                    packet_size,
+                    benchmark_min_rate_percent,
+                )
+                for packet_size in benchmark_name_by_packet_size
+            }
 
     common_hcs = gen_common_hcs(skip_lldp_check)
 
@@ -254,6 +412,19 @@ def gen_snake_test_config(
 
     common_prechecks = common_hcs
     common_postchecks = common_hcs
+    if postcheck_port_state_retry_count is not None:
+        common_postchecks = [
+            (
+                create_port_state_check(
+                    retry_count=postcheck_port_state_retry_count,
+                    retry_delay_seconds=postcheck_port_state_retry_delay_seconds,
+                    retry_delay_multiplier=1.0,
+                )
+                if hc.name == hc_types.CheckName.PORT_STATE_CHECK
+                else hc
+            )
+            for hc in common_hcs
+        ]
     if precheck_packet_loss_clear_stats or packet_loss_sleep_time != 10:
         common_prechecks = _override_packet_loss(
             common_hcs, clear_traffic_stats=precheck_packet_loss_clear_stats
@@ -261,62 +432,137 @@ def gen_snake_test_config(
     if packet_loss_sleep_time != 10:
         # post-check: keep clear_traffic_stats=False, only adjust the drain window
         common_postchecks = _override_packet_loss(common_hcs, clear_traffic_stats=False)
+    if postcheck_systemctl_services:
+        common_postchecks = common_postchecks + [
+            create_systemctl_active_state_check(
+                services=postcheck_systemctl_services,
+                retry_count=postcheck_port_state_retry_count or 6,
+                retry_delay_seconds=postcheck_port_state_retry_delay_seconds,
+                retry_delay_multiplier=1.0,
+                min_active_seconds=postcheck_systemctl_min_active_seconds,
+            )
+        ]
 
-    ptp_configs = [
-        ixia_types.PTPConfig(
-            server_endpoint=ixia_types.PTPEndpoint(
-                name=snake_config.source,
-                device_group_index=0,
-            ),
-            client_endpoints=[
-                ixia_types.PTPEndpoint(
-                    name=snake_config.destination,
+    common_postchecks = [*common_postchecks, create_device_core_dumps_check()]
+
+    qsfp_service_restart_postchecks = None
+    if qsfp_service_restart_use_recovery_window:
+        qsfp_service_restart_postchecks = _override_packet_loss(
+            common_postchecks, clear_traffic_stats=True
+        )
+
+    ptp_configs = (
+        [
+            ixia_types.PTPConfig(
+                server_endpoint=ixia_types.PTPEndpoint(
+                    name=snake_config.source,
                     device_group_index=0,
                 ),
-            ],
-            communication_mode=ixia_types.PTPCommunicationMode.UNICAST,
-            step_mode=ixia_types.PTPStepMode.TWO_STEP,
-        )
-        for snake_config in snake_configs
-    ]
+                client_endpoints=[
+                    ixia_types.PTPEndpoint(
+                        name=snake_config.destination,
+                        device_group_index=0,
+                    ),
+                ],
+                communication_mode=ixia_types.PTPCommunicationMode.UNICAST,
+                step_mode=ixia_types.PTPStepMode.TWO_STEP,
+            )
+            for snake_config in snake_configs
+        ]
+        if include_ptp
+        else []
+    )
+
+    playbooks = gen_snake_playbooks(
+        "{dut}" if additional_dut_hostnames else hostname,
+        iteration,
+        playbooks_to_skip,
+        include_link_flap_longevity,
+        link_flap_longevity_iterations=link_flap_longevity_iterations,
+        link_flap_longevity_disable_delay_s=link_flap_longevity_disable_delay_s,
+        link_flap_longevity_enable_delay_s=link_flap_longevity_enable_delay_s,
+        link_flap_longevity_soak_s=link_flap_longevity_soak_s,
+        link_flap_longevity_interface_slice=link_flap_longevity_interface_slice,
+        include_rapid_a_end_flap_stress=include_rapid_a_end_flap_stress,
+        rapid_a_end_flap_duration_s=rapid_a_end_flap_duration_s,
+        rapid_a_end_flap_interval_s=rapid_a_end_flap_interval_s,
+        rapid_a_end_flap_rest_s=rapid_a_end_flap_rest_s,
+        rapid_a_end_flap_longevity_s=rapid_a_end_flap_longevity_s,
+        common_prechecks=common_prechecks,
+        common_postchecks=common_postchecks,
+        manual_test_interfaces=manual_test_interfaces,
+        benchmark_traffic_item_name_by_packet_size=benchmark_name_by_packet_size,
+        benchmark_min_rate_gbps_by_packet_size=benchmark_min_rate_gbps_by_packet_size,
+        benchmark_allowed_loss_packet_sizes=benchmark_allowed_loss_packet_sizes,
+        use_ipv6_ping=use_ipv6_ping,
+        use_cross_device_half_interface_toggle=use_cross_device_half_interface_toggle,
+        qsfp_service_restart_postchecks=qsfp_service_restart_postchecks,
+        rapid_a_end_flap_neighbor_hostnames=rapid_a_end_flap_neighbor_hostnames,
+        flap_recovery_check_retry_count=flap_recovery_check_retry_count,
+        flap_recovery_check_retry_delay_seconds=(
+            flap_recovery_check_retry_delay_seconds
+        ),
+        half_toggle_check_retry_count=half_toggle_check_retry_count,
+        half_toggle_check_retry_delay_seconds=half_toggle_check_retry_delay_seconds,
+        skip_lldp_check=skip_lldp_check,
+        include_split_agent_warmboot=include_split_agent_warmboot,
+    )
+    if playbooks_to_include is not None:
+        included_playbooks = set(playbooks_to_include)
+        known_playbooks = {playbook.name for playbook in playbooks}
+        unknown_playbooks = included_playbooks - known_playbooks
+        if unknown_playbooks:
+            raise ValueError(
+                "Unknown snake playbooks in playbooks_to_include: "
+                f"{sorted(unknown_playbooks)}"
+            )
+        playbooks = [
+            playbook for playbook in playbooks if playbook.name in included_playbooks
+        ]
 
     test_config = taac_types.TestConfig(
         name=name,
         basset_pool=basset_pool,
+        skip_ixia_protocol_verification=skip_ixia_protocol_verification,
+        ixia_protocol_verification_timeout=ixia_protocol_verification_timeout,
         snake_configs=snake_configs,
         basic_traffic_item_configs=basic_traffic_item_configs,
+        traffic_items_to_start=traffic_items_to_start,
         ptp_configs=ptp_configs,
         endpoints=[
             taac_types.Endpoint(
                 name=hostname,
-                dut=True,
+                dut=primary_endpoint_is_dut,
                 ixia_needed=True,
                 direct_ixia_connections=direct_ixia_connections or [],
                 ixia_ports=ixia_ports,
             ),
+            *[
+                taac_types.Endpoint(
+                    name=dut_hostname,
+                    dut=True,
+                    ixia_needed=False,
+                )
+                for dut_hostname in (additional_dut_hostnames or [])
+            ],
         ],
         # Deprecated - define at playbook level
         # postchecks=common_hcs,
         # Deprecated - define at playbook level
         # prechecks=common_hcs,
-        playbooks=gen_snake_playbooks(
-            hostname,
-            iteration,
-            playbooks_to_skip,
-            include_link_flap_longevity,
-            common_prechecks=common_prechecks,
-            common_postchecks=common_postchecks,
-            manual_test_interfaces=manual_test_interfaces,
-            benchmark_traffic_item_name_by_packet_size=benchmark_name_by_packet_size,
-            use_ipv6_ping=use_ipv6_ping,
-        ),
-        # Opt out of the two-tier IXIA topology cache (default-on per D107780401).
+        playbooks=playbooks,
+        # Explicitly retain the cache-free IXIA setup path.
         # Snake tests do single-DUT loopback bring-up that exercises
         # `create_basic_setup` itself (per-loop SnakeConfig + PTP unicast
         # endpoints) -- caching the post-setup ixncfg would obscure regressions
         # in that very code path. Every snake run pays the cold cost on
         # purpose so any drift in topology assembly surfaces immediately.
         ixia_config_cache=taac_types.IxiaConfigCache(enabled=False),
+        default_basic_port_config=(
+            taac_types.BasicPortConfig(l1_config=default_ixia_l1_config)
+            if default_ixia_l1_config is not None
+            else None
+        ),
     )
     return test_config
 
@@ -465,12 +711,9 @@ MINIPACK3_STANDALONE_TEST_CONFIG_ZR4_800G = gen_snake_test_config(
         type=ixia_types.FrameSizeType.CUSTOM_IMIX,
         imix_weight={94: 1, 96: 18, 192: 3, 512: 1, 1200: 1, 4600: 76, 9000: 76},
     ),
-    playbooks_to_skip=[
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
-    ],
     iteration=10,
     include_link_flap_longevity=True,
+    link_flap_longevity_enable_delay_s=300,
 )
 
 KODIAK3_STANDALONE_TEST_CONFIG_100G = gen_snake_test_config(
@@ -596,10 +839,6 @@ KODIAK3_STANDALONE_TEST_CONFIG_ZR4_800G = gen_snake_test_config(
         type=ixia_types.FrameSizeType.CUSTOM_IMIX,
         imix_weight={94: 1, 96: 18, 192: 3, 512: 1, 1200: 1, 4600: 76, 9000: 76},
     ),
-    playbooks_to_skip=[
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
-    ],
     iteration=10,
     include_link_flap_longevity=True,
 )
@@ -647,6 +886,22 @@ MINIPACK3_STANDALONE_TEST_CONFIG_FBOSS159_800G_DR4_GEARBOX = gen_snake_test_conf
     ),
     # Use only the two clean IXIA endpoints; ignore the dangling eth1/1/5, eth1/64/5 taps.
     ixia_ports=["eth1/1/1", "eth1/64/1"],
+    # Bypass IXIA LLDP asset discovery (IXIA LLDP is not a meaningful signal for this
+    # snake NPI, and it drops after any ixnetworkweb restart on this hand-brought-up box).
+    # Pin the tap->chassis/port mapping explicitly so setup never depends on IXIA LLDP;
+    # the snake device-to-device circuits are unaffected. ixia16.netcastle.ash6.
+    direct_ixia_connections=[
+        taac_types.DirectIxiaConnection(
+            interface="eth1/1/1",
+            ixia_chassis_ip="2401:db00:2066:304b::3004",
+            ixia_port="1/21",
+        ),
+        taac_types.DirectIxiaConnection(
+            interface="eth1/64/1",
+            ixia_chassis_ip="2401:db00:2066:304b::3004",
+            ixia_port="1/23",
+        ),
+    ],
     # LLDP_CHECK enabled: D109171150 (eth1/34<->eth1/35 lane-swap) has LANDED, so the
     # check's expected neighbor (read from the landed static topology) now matches the
     # real swapped cabling. LLDP is validated, not skipped.
@@ -665,25 +920,40 @@ MINIPACK3_STANDALONE_TEST_CONFIG_FBOSS159_800G_DR4_GEARBOX = gen_snake_test_conf
     #    port every 5s for 10 min and FAILS on any flap -- surfacing the spontaneous
     #    ~60s gearbox link flaps (T283020514) instead of riding through them.
     #  * remaining longevity (1m/1h/72h): out of scope for this run.
-    #  * fsdb restart/crash: fsdb is not deployed on this manually brought-up box (no
-    #    fsdb.service), so they time out on fsdb-thrift -- an environment gap, not a bug.
     #  * transceiver/fiber removal: require physical optic/fiber manipulation at the rack.
-    #  * system reboots (bmc/userver): run separately/last (heavy; box is hand-deployed).
+    # The three system-reboot playbooks (bmc_full / bmc_microserver / microserver) are
+    # now ENABLED. They were skipped out of concern that this hand-brought-up box (no
+    # COOP to re-provision it) would not come back cleanly, but all three passed on
+    # 2026-08-16 with 0.0% packet loss: wedge_agent and qsfp_service are systemd-enabled
+    # and the agent config + packages live on disk, so the snake restores itself on boot
+    # (agent config sha unchanged across all three reboots, 193/193 links back up).
     playbooks_to_skip=[
         "test_one_min_longevity",
         "test_one_hour_longevity",
         "test_72hr_longevity",
-        "test_snake_system_reboot_bmc_full",
-        "test_snake_system_reboot_bmc_microserver",
-        "test_snake_system_reboot_microserver",
         "test_snake_transceiver_removal",
         "test_snake_fiber_removal",
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
     ],
     # iteration=1 for the first full Phase 3/4 sweep (validate each disruption once);
     # bump later once a clean single-iteration sweep is confirmed.
     iteration=1,
+    # test_snake_link_flap_with_longevity: full production timeline. The small first-pass
+    # (1 cycle / first 3 interfaces / 2m recovery / 2m soak) passed cleanly with 0 packet
+    # loss on 2026-08-12, so this now runs the real test at the playbook defaults: 33 flap
+    # cycles over ALL interfaces (30s disable / 10s enable per-interface spacing),
+    # then a 1-hour longevity soak.
+    include_link_flap_longevity=True,
+    # test_snake_rapid_a_end_flap_stress: rapid OPTICAL flap (wedge_qsfp_util
+    # tx_disable/tx_enable) of every snake circuit's A-end, continuously for 1 hour
+    # of wall time with a 6s hold between flaps, then a 2-minute rest, a device+IXIA
+    # stats clear, a mid-test validation (all links UP + LLDP), and a 5-minute
+    # longevity soak measured clean. Complements the admin-disable (thrift) link-flap
+    # test with an optical-laser stress on one end per circuit (gearbox sibling-lane
+    # safe). Values are the playbook defaults (3600s / 6s / 120s / 300s).
+    # The flap COUNT is not 3600/6: each flap also pays two wedge_qsfp_util
+    # invocations across all A-ends, measured at ~18.7s/flap on this box's 94
+    # A-ends, so expect roughly 190 flaps in the hour rather than 600.
+    include_rapid_a_end_flap_stress=True,
 )
 
 
@@ -698,18 +968,27 @@ ICEPACK_STANDALONE_TEST_CONFIG_FR4_800G = gen_snake_test_config(
             destination_ip="5000:1::2/64",
         ),
     ],
+    direct_ixia_connections=[
+        taac_types.DirectIxiaConnection(
+            interface="eth1/1/1",
+            ixia_chassis_ip="2401:db00:2066:31fb::3025",
+            ixia_port="1/7",
+        ),
+        taac_types.DirectIxiaConnection(
+            interface="eth1/64/5",
+            ixia_chassis_ip="2401:db00:2066:31fb::3025",
+            ixia_port="1/8",
+        ),
+    ],
     hostname="fboss335776657.ash6",
     line_rate=99,
     frame_size_settings=ixia_types.FrameSize(
         type=ixia_types.FrameSizeType.CUSTOM_IMIX,
         imix_weight={94: 1, 96: 18, 192: 3, 512: 1, 1200: 1, 4600: 76, 9000: 76},
     ),
-    playbooks_to_skip=[
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
-    ],
     iteration=10,
     include_link_flap_longevity=True,
+    link_flap_longevity_enable_delay_s=300,
 )
 
 
@@ -725,19 +1004,160 @@ ICEPACK_STANDALONE_TEST_CONFIG_FR4_400G = gen_snake_test_config(
         ),
     ],
     hostname="fboss336803613.ash6",
-    line_rate=99,
+    line_rate=49,
     frame_size_settings=ixia_types.FrameSize(
         type=ixia_types.FrameSizeType.CUSTOM_IMIX,
         imix_weight={94: 1, 96: 18, 192: 3, 512: 1, 1200: 1, 4600: 76, 9000: 76},
     ),
-    playbooks_to_skip=[
-        "test_snake_fsdb_restart",
-        "test_snake_fsdb_crash",
-    ],
     iteration=10,
     include_link_flap_longevity=True,
 )
 
+
+ICEPACK_MP3_CROSS_DEVICE_SNAKE_TEST_CONFIG = gen_snake_test_config(
+    name="ICEPACK_MP3_CROSS_DEVICE_SNAKE_TEST_CONFIG",
+    basset_pool="dne.standalone",
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source="fboss336024506.ash6:eth1/1/1",
+            destination="fboss336024506.ash6:eth1/64/5",
+            source_ip="5000:1::1/64",
+            destination_ip="5000:1::2/64",
+        ),
+    ],
+    hostname="fboss336024506.ash6",
+    precheck_packet_loss_clear_stats=True,
+    skip_lldp_check=True,
+    direct_ixia_connections=[
+        taac_types.DirectIxiaConnection(
+            interface="eth1/1/1",
+            ixia_chassis_ip="2401:db00:2066:3223::3027",
+            ixia_port="1/49",
+        ),
+        taac_types.DirectIxiaConnection(
+            interface="eth1/64/5",
+            ixia_chassis_ip="2401:db00:2066:3223::3027",
+            ixia_port="1/53",
+        ),
+    ],
+    ixia_ports=["eth1/1/1", "eth1/64/5"],
+    playbooks_to_skip=[
+        "test_snake_half_interface_toggle_with_thrift_api",
+        "test_snake_interface_toggle_with_qsfp_util_low_power",
+    ],
+    iteration=1,
+)
+
+
+ICEPACK_MP3_CROSS_DEVICE_ICEPACK_THRIFT_FLAP_TEST_CONFIG = gen_snake_test_config(
+    name="ICEPACK_MP3_CROSS_DEVICE_ICEPACK_THRIFT_FLAP_TEST_CONFIG",
+    basset_pool="dne.standalone",
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source="fboss336024506.ash6:eth1/1/1",
+            destination="fboss336024506.ash6:eth1/64/5",
+            source_ip="5000:1::1/64",
+            destination_ip="5000:1::2/64",
+        ),
+    ],
+    hostname="fboss336024506.ash6",
+    precheck_packet_loss_clear_stats=True,
+    skip_lldp_check=True,
+    direct_ixia_connections=[
+        taac_types.DirectIxiaConnection(
+            interface="eth1/1/1",
+            ixia_chassis_ip="2401:db00:2066:3223::3027",
+            ixia_port="1/49",
+        ),
+        taac_types.DirectIxiaConnection(
+            interface="eth1/64/5",
+            ixia_chassis_ip="2401:db00:2066:3223::3027",
+            ixia_port="1/53",
+        ),
+    ],
+    ixia_ports=["eth1/1/1", "eth1/64/5"],
+    playbooks_to_include=[
+        "test_snake_interface_toggle_with_thrift_api",
+        "test_snake_half_interface_toggle_with_thrift_api",
+        "test_snake_interface_toggle_with_qsfp_util_disable",
+        "test_snake_interface_toggle_with_qsfp_util_low_power",
+        "test_snake_interface_reset_with_qsfp_reset",
+        "test_snake_agent_warmboot",
+        "test_snake_qsfp_service_restart",
+        "test_snake_agent_coldboot",
+        "test_snake_agent_crash",
+        "test_snake_qsfp_service_crash",
+        "test_snake_system_reboot_bmc_full",
+        "test_snake_system_reboot_bmc_microserver",
+        "test_snake_system_reboot_microserver",
+        "test_snake_link_flap_with_longevity",
+        "test_snake_rapid_a_end_flap_stress",
+    ],
+    use_cross_device_half_interface_toggle=True,
+    postcheck_port_state_retry_count=6,
+    qsfp_service_restart_use_recovery_window=True,
+    include_link_flap_longevity=True,
+    include_rapid_a_end_flap_stress=True,
+    rapid_a_end_flap_neighbor_hostnames=["fboss334824744.ash6"],
+    flap_recovery_check_retry_count=6,
+    iteration=1,
+)
+
+
+ICEPACK_MP3_CROSS_DEVICE_MP3_THRIFT_FLAP_TEST_CONFIG = gen_snake_test_config(
+    name="ICEPACK_MP3_CROSS_DEVICE_MP3_THRIFT_FLAP_TEST_CONFIG",
+    basset_pool="dne.standalone",
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source="fboss336024506.ash6:eth1/1/1",
+            destination="fboss336024506.ash6:eth1/64/5",
+            source_ip="5000:1::1/64",
+            destination_ip="5000:1::2/64",
+        ),
+    ],
+    hostname="fboss336024506.ash6",
+    additional_dut_hostnames=["fboss334824744.ash6"],
+    primary_endpoint_is_dut=False,
+    precheck_packet_loss_clear_stats=True,
+    skip_lldp_check=True,
+    direct_ixia_connections=[
+        taac_types.DirectIxiaConnection(
+            interface="eth1/1/1",
+            ixia_chassis_ip="2401:db00:2066:3223::3027",
+            ixia_port="1/49",
+        ),
+        taac_types.DirectIxiaConnection(
+            interface="eth1/64/5",
+            ixia_chassis_ip="2401:db00:2066:3223::3027",
+            ixia_port="1/53",
+        ),
+    ],
+    ixia_ports=["eth1/1/1", "eth1/64/5"],
+    playbooks_to_include=[
+        "test_snake_interface_toggle_with_thrift_api",
+        "test_snake_half_interface_toggle_with_thrift_api",
+        "test_snake_interface_toggle_with_qsfp_util_disable",
+        "test_snake_interface_toggle_with_qsfp_util_low_power",
+        "test_snake_interface_reset_with_qsfp_reset",
+        "test_snake_agent_warmboot",
+        "test_snake_qsfp_service_restart",
+        "test_snake_agent_coldboot",
+        "test_snake_agent_crash",
+        "test_snake_qsfp_service_crash",
+        "test_snake_system_reboot_bmc_full",
+        "test_snake_system_reboot_bmc_microserver",
+        "test_snake_system_reboot_microserver",
+        "test_snake_link_flap_with_longevity",
+        "test_snake_rapid_a_end_flap_stress",
+    ],
+    use_cross_device_half_interface_toggle=True,
+    postcheck_port_state_retry_count=6,
+    include_link_flap_longevity=True,
+    include_rapid_a_end_flap_stress=True,
+    rapid_a_end_flap_neighbor_hostnames=["fboss336024506.ash6"],
+    flap_recovery_check_retry_count=6,
+    iteration=1,
+)
 
 # Throughput benchmark: the 10-point packet-size sweep at 100% line rate, 12
 # mins per size (~2h). Kept as its own TestConfig rather than folded into
@@ -762,6 +1182,42 @@ MINIPACK3_STANDALONE_BENCHMARK_TEST_CONFIG = gen_snake_test_config(
     ],
 )
 
+
+WEDGE800BACT_STANDALONE_TEST_CONFIG_200G = gen_snake_test_config(
+    name="WEDGE800BACT_STANDALONE_TEST_CONFIG_200G",
+    basset_pool="dne.standalone",
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source="fboss338826578.ash6:eth1/1/1",
+            destination="fboss338826578.ash6:eth1/32/5",
+            source_ip="5000:1::1/64",
+            destination_ip="5000:1::2/64",
+        ),
+    ],
+    direct_ixia_connections=[
+        taac_types.DirectIxiaConnection(
+            interface="eth1/1/1",
+            ixia_chassis_ip="2401:db00:2066:3091::3002",
+            ixia_port="1/135",
+        ),
+        taac_types.DirectIxiaConnection(
+            interface="eth1/32/5",
+            ixia_chassis_ip="2401:db00:2066:3091::3002",
+            ixia_port="1/136",
+        ),
+    ],
+    hostname="fboss338826578.ash6",
+    line_rate=99,
+    traffic_item_name="W800_BACT_200G_SNAKE",
+    include_benchmark=True,
+    include_link_flap_longevity=True,
+    include_rapid_a_end_flap_stress=True,
+    playbooks_to_skip=[
+        "test_snake_fsdb_restart",
+        "test_snake_fsdb_crash",
+    ],
+)
+
 SNAKE_TEST_CONFIGS = [
     MINIPACK3_STANDALONE_TEST_CONFIG_FBOSS159_800G_DR4_GEARBOX,
     MINIPACK3_STANDALONE_TEST_CONFIG,
@@ -778,6 +1234,10 @@ SNAKE_TEST_CONFIGS = [
     KODIAK3_STANDALONE_TEST_CONFIG_400G_200G,
     KODIAK3_STANDALONE_TEST_CONFIG_200G,
     KODIAK3_STANDALONE_TEST_CONFIG_ZR4_800G,
+    ICEPACK_MP3_CROSS_DEVICE_SNAKE_TEST_CONFIG,
+    ICEPACK_MP3_CROSS_DEVICE_ICEPACK_THRIFT_FLAP_TEST_CONFIG,
+    ICEPACK_MP3_CROSS_DEVICE_MP3_THRIFT_FLAP_TEST_CONFIG,
     ICEPACK_STANDALONE_TEST_CONFIG_FR4_400G,
     ICEPACK_STANDALONE_TEST_CONFIG_FR4_800G,
+    WEDGE800BACT_STANDALONE_TEST_CONFIG_200G,
 ]

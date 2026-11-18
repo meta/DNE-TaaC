@@ -4,12 +4,37 @@ import ipaddress
 import math
 import os
 import random
+import re
 import socket
 import time
 import typing as t
 
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
+# systemd ``Result`` values that mean the unit's last run terminated abnormally.
+# Kept in sync with ``SystemdStateCollector.UNCLEAN_SYSTEMD_RESULTS``; duplicated
+# here so this module doesn't need to import from ``taac.libs.collectors``.
+_UNCLEAN_JOURNAL_RESULTS: t.FrozenSet[str] = frozenset(
+    {"core-dump", "signal", "watchdog", "timeout", "oom-kill"}
+)
+
+# Matches systemd's ``Failed with result '<reason>'`` message across the
+# ``--output=short-iso`` and default output formats:
+#   2026-08-04T02:15:32-0700 dut1 systemd[1]: fboss_sw_agent.service: Failed with result 'signal'.
+#   Aug 04 02:15:32 dut1 systemd[1]: fboss_sw_agent.service: Failed with result 'signal'.
+#
+# Requires the ``systemd[<pid>]:`` process prefix so a monitored daemon's own
+# stdout can't false-match. Without this anchor a log line like
+# ``... dut1 bgpd[123]: peer log: sys.service: Failed with result 'core-dump'``
+# would be attributed to a phantom ``sys`` unit. Unit names are captured up to
+# ``.service:`` so instance units (``fboss_hw_agent@0.service``) parse.
+_JOURNAL_FAILED_LINE = re.compile(
+    r"systemd\[\d+\]:\s+"
+    r"(?P<svc>[A-Za-z0-9_.@\-]+?)\.service:\s+"
+    r"Failed with result '(?P<reason>[^']+)'"
+)
+
+from taac.driver.driver_constants import DEFAULT_THRIFT_TIMEOUT
 from taac.health_checks.constants import (
     CORE_DUMP_IGNORE_WORDS,
     EOS_CORE_DUMP_PATH,
@@ -19,43 +44,80 @@ from taac.health_checks.constants import (
 )
 from taac.libs.collectors.registry import get_test_case_start_time
 from taac.utils.driver_factory import async_get_device_driver
+from taac.utils.fboss_ports import fboss_thrift_port
 from taac.utils.oss_taac_lib_utils import (
     ConsoleFileLogger,
     get_root_logger,
     none_throws,
 )
+from taac.utils.upper_bound_gate import evaluate_upper_bound_gates
 
 LOGGER: ConsoleFileLogger = get_root_logger()
 
-FBOSS_FB303_PORT: int = 5909
+# fb303 counters are served by the agent's own ThriftServer, so the migrated
+# port serves them too. 5931 (hwagent) is outside the blocked VNC range.
+FBOSS_FB303_PORT: int = fboss_thrift_port(5909)
 FBOSS_MNPU_FB303_PORT: int = 5931
 
 
-async def get_fb303_client(host: str):
-    """Get fb303 client.
-    In OSS mode, raises NotImplementedError since fb303 requires Meta-internal thrift.
+def normalize_device_name(device_name: str) -> str:
+    normalized = device_name.rstrip(".").casefold()
+    for suffix in (".facebook.com", ".tfbnw.net"):
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)]
+    return normalized
+
+
+def is_same_device(left: str, right: str) -> bool:
+    return normalize_device_name(left) == normalize_device_name(right)
+
+
+# fb303 counter reads are bulk: an agent exports tens of thousands of counters
+# and getCounters() returns all of them. fbthrift's default client timeout is far
+# too short for that, so give the OSS client the same headroom every other TAAC
+# thrift client gets.
+FB303_READ_TIMEOUT_SECONDS: float = float(DEFAULT_THRIFT_TIMEOUT)
+
+
+async def _resolve_fb303_port(host: str) -> int:
+    """Pick the fb303 monitoring port for ``host``.
+
+    A monolithic box exports the swagent's counters on :5909; a multi-switch
+    (DNX) box exports them on :5931.
     """
-    if TAAC_OSS:
-        # TODO: Implement fb303 client with direct TCP thrift connection
-        # for OSS. Use host:5909 (or 5931 for MNPU) with standard thrift transport.
-        raise NotImplementedError(
-            "fb303 client requires Meta-internal get_direct_client. "
-            "Not yet available in OSS mode."
-        )
-
-    from fb303.clients import FacebookService
-    from libfb.py.asyncio.thrift import ClientType, get_direct_client
-
     driver = await async_get_device_driver(host)
     # pyre-fixme[16]: `AbstractSwitch` has no attribute `async_is_multi_switch`.
     is_multi_switch = await driver.async_is_multi_switch()
-    port = FBOSS_MNPU_FB303_PORT if is_multi_switch else FBOSS_FB303_PORT
-    return get_direct_client(
-        FacebookService,
-        host=host,
-        port=port,
-        client_type=ClientType.THRIFT_ROCKET_CLIENT_TYPE,
-    )
+    return FBOSS_MNPU_FB303_PORT if is_multi_switch else FBOSS_FB303_PORT
+
+
+async def get_fb303_client(host: str):
+    """Get an fb303 client as an async context manager.
+
+    OSS uses a direct fbthrift connection to the agent's fb303 monitoring port,
+    the same way OSSClientFactory reaches FbossCtrl/TBgpService. fb303 itself is
+    not Meta-internal -- ``common/fb303/if/fb303.thrift`` ships in
+    fboss-thrift-defs and generates ``fb303.thrift_clients.FacebookService`` --
+    only the Meta ``get_direct_client`` transport was, which is why this used to
+    raise NotImplementedError and take every per-queue / buffer / PFC / DSF
+    health check down with it.
+    """
+    port = await _resolve_fb303_port(host)
+
+    if TAAC_OSS:
+        from fb303.thrift_clients import FacebookService
+        from thrift.python.client import get_client
+
+        return get_client(
+            FacebookService,
+            host=host,
+            port=port,
+            timeout=FB303_READ_TIMEOUT_SECONDS,
+        )
+
+    from taac.utils.fb303_counter_utils import make_fb303_client
+
+    return make_fb303_client(host, port)
 
 
 def ip_ntop(addr):
@@ -180,6 +242,20 @@ async def async_find_critical_core_dumps(
         return critical_core_dumps
 
 
+def is_fboss_core_dump_from_process(
+    core_file: str, process_names: t.Collection[str]
+) -> bool:
+    """Match an FBOSS packaged core path to an explicitly named process."""
+    parts = core_file.strip("/").split("/")
+    if len(parts) < 2 or parts[-1] not in ("core", "metadata"):
+        return False
+    return any(
+        re.fullmatch(rf"{re.escape(process)}_\d+_{re.escape(process)}_\d+", parts[-2])
+        is not None
+        for process in process_names
+    )
+
+
 async def async_is_critical_core_dump(
     core_dump_filename: str,
     critical_core_dump_keywords: t.Optional[t.List[str]] = None,
@@ -204,6 +280,79 @@ def format_timestamp(timestamp: t.Union[int, float, str]) -> str:
         Human-readable timestamp string in format "YYYY-MM-DD HH:MM:SS"
     """
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(timestamp)))
+
+
+async def async_query_journalctl_unclean_exits(
+    driver: t.Any,
+    services: t.Sequence[str],
+    window_start: float,
+    window_end: float,
+) -> t.Dict[str, t.List[t.Tuple[str, str]]]:
+    """Return ``{service: [(timestamp, reason), ...]}`` for units where
+    journalctl reports a ``Failed with result '<reason>'`` message between
+    ``window_start`` and ``window_end`` (unix timestamps). ``reason`` is one
+    of core-dump / signal / watchdog / timeout / oom-kill — matches
+    ``SystemdStateCollector.UNCLEAN_SYSTEMD_RESULTS``.
+
+    Complements the collector's periodic ``Result`` sampling: an unclean exit
+    that completes and is auto-restarted between two poll intervals slips
+    through the sampler but persists in the journal. This is a one-shot
+    postcheck SSH read, not a poll — cheap enough to run alongside every
+    ``UncleanExitHealthCheck``.
+
+    On SSH error, empty output, or no matches, returns ``{}``. Callers should
+    treat this as an additional signal on top of the collector's samples, not
+    a replacement.
+    """
+    if not services:
+        return {}
+    try:
+        resolved_services = [
+            await driver.async_get_systemctl_service_name(service)
+            for service in services
+        ]
+        resolved_to_logical: t.Dict[str, t.List[str]] = {}
+        for logical, resolved in zip(services, resolved_services, strict=True):
+            resolved_to_logical.setdefault(
+                resolved.removesuffix(".service"), []
+            ).append(logical)
+        unit_args = " ".join(f"-u {service}.service" for service in resolved_to_logical)
+        # journalctl ``--since=@<epoch>`` / ``--until=@<epoch>`` are numeric
+        # timestamps. ``--until`` is inclusive to the second; add 1 so a Failed
+        # message logged AT window_end still lands inside the query.
+        cmd = (
+            f"journalctl {unit_args} "
+            f"--since=@{int(window_start)} --until=@{int(window_end) + 1} "
+            f"--no-pager --output=short-iso"
+        )
+        output = await driver.async_run_cmd_on_shell(cmd) or ""
+    except Exception:
+        return {}
+    result: t.Dict[str, t.List[t.Tuple[str, str]]] = {}
+    for line in output.splitlines():
+        m = _JOURNAL_FAILED_LINE.search(line)
+        if not m:
+            continue
+        reason = m.group("reason")
+        if reason not in _UNCLEAN_JOURNAL_RESULTS:
+            continue
+        resolved_service = m.group("svc")
+        # Belt-and-suspenders on top of the ``systemd[<pid>]:`` regex
+        # anchor: if a match somehow leaks through for a unit that isn't
+        # in the caller's requested set (a related instance unit systemd
+        # pulled in by ``Wants=``, an accidentally-broad regex match on a
+        # future systemd version), don't attribute it to the check.
+        if resolved_service not in resolved_to_logical:
+            continue
+        # The line typically starts with an ISO timestamp; grab the first
+        # whitespace-separated token as the timestamp string. If the line is
+        # exotic (e.g. no timestamp), fall back to the whole line so nothing
+        # is silently dropped.
+        first_tok = line.split(" ", 1)[0] if line else ""
+        timestamp = first_tok or line
+        for service in resolved_to_logical[resolved_service]:
+            result.setdefault(service, []).append((timestamp, reason))
+    return result
 
 
 def collector_window_start(
@@ -489,7 +638,11 @@ def evaluate_rss_delta_from_baseline(
         )
 
     growth_pct = (current_rss_bytes - baseline_rss_bytes) / baseline_rss_bytes * 100.0
-    passed = growth_pct <= max_growth_pct
+    gate_result = evaluate_upper_bound_gates(
+        values={"rss_growth_pct": growth_pct},
+        thresholds={"rss_growth_pct": max_growth_pct},
+    )
+    passed = gate_result.passed
     message = (
         f"RSS delta-from-baseline: baseline={int(baseline_rss_bytes)} bytes, "
         f"current={int(current_rss_bytes)} bytes, growth={growth_pct:.2f}% "

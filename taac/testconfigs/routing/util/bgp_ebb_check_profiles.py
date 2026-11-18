@@ -41,6 +41,12 @@ import dataclasses
 import enum
 import typing as t
 
+from taac.abstractions.compatibility.legacy_ebb_binding import (
+    IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+    IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+    IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+    IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+)
 from taac.health_checks.healthcheck_definitions import (
     create_bgp_convergence_check,
     create_bgp_rib_fib_consistency_check,
@@ -50,18 +56,76 @@ from taac.health_checks.healthcheck_definitions import (
     create_bgp_tcpdump_check,
     create_core_dumps_snapshot_check,
     create_cpu_percentile_observe_check,
+    create_hardware_capacity_check,
+    create_next_hop_count_check,
     create_rss_delta_observe_check,
 )
 from taac.health_checks.retry_policy import get_retry_kwargs
 from taac.testconfigs.routing.util.bgp_ebb_health_checks import (
+    BgpMonScope,
     create_standard_postchecks,
     create_standard_prechecks,
     create_standard_snapshot_checks,
+    DEFAULT_BGP_MON_SCOPE,
 )
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config.types import PointInTimeHealthCheck, SnapshotHealthCheck
 
+# SC9 asserts on the eBGP population and nothing else: the 128 eBGP peers per
+# AFI are what advertise the 5,000 prefixes, and the ECMP sets under test are
+# built entirely from them. The topology's iBGP "mimic" groups carry
+# ``bgp_prefix_configs=[]`` -- they advertise NOTHING and contribute no path to
+# any ECMP set -- so a shortfall there cannot affect a single SC9 assertion.
+#
+# Scoping them out is therefore correct, not convenient. It is also necessary:
+# on the first bag013 run 22 of the 128 IPv6 iBGP peers sat in IDLE from before
+# the prechecks through every retry (all 256 eBGP were Established), which fails
+# the run on a population the test does not measure. Those 22 are a real open
+# question about the lab topology and are tracked separately; they are not an
+# SC9 result, and SC9 should not be the thing that reports them.
+#
+# The constants are bare prefixes, so the masks are applied here.
+#
+# The v6 mask is /80, NOT /64. eBGP and iBGP differ only in the FIFTH hextet
+# ("...:11:8::" vs "...:11:9::"), which sits beyond a /64 boundary --
+# `is_parent_prefix` calls `ip_network(prefix, strict=False)`, so
+# "2401:db00:e50d:11:9::/64" silently normalises to "2401:db00:e50d:11::/64"
+# and swallows the eBGP range as well. That is not theoretical: with /64 the
+# first clean bag013 run reported "All 133 BGP sessions are established" --
+# 128 eBGP v4 plus 5 others, with all 128 eBGP v6 sessions quietly out of
+# scope. /80 covers exactly the five hextets that distinguish the two.
+#
+# The v4 mask is /23, NOT /24, because the peer range ROLLS OVER. iBGP v4
+# starts at 10.164.28.11 and steps by 2 for 128 peers, so the last five land at
+# 10.164.29.1 .. .9 -- past the /24 boundary. A /24 leaves exactly those five in
+# scope, which is the other half of the 133 the first clean run reported:
+# 128 eBGP v4 (correctly in scope) + 5 iBGP v4 stragglers (wrongly in scope).
+# /23 covers 10.164.28.0-10.164.29.255 and still excludes eBGP, which lives in
+# 10.163.28.0/23. The v6 peers do not roll over -- they run ::11 to ::10f,
+# entirely inside the fifth hextet -- so /80 is exact there.
+#
+# Net effect of the two masks: exactly the 256 eBGP sessions stay in scope.
+#
+# Both chassis are listed because SC9 runs on bag013 (ixia) and nrqeb009
+# (ixia03), and the profile is built without knowing which one it is bound to.
+# With only the ixia masks, nrqeb009 kept its 256 ixia03 iBGP mimic sessions in
+# scope and the drain failed its baseline with "512, expected 256". The ixia03
+# ranges have the same shape, so the same /80 and /23 masks apply, and neither
+# chassis' masks overlap the other's eBGP range.
+IBGP_MIMIC_PARENTS: t.List[str] = [
+    f"{IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1}::/80",
+    f"{IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1}.0/23",
+    f"{IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1}::/80",
+    f"{IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1}.0/23",
+]
+
+# 128 eBGP peers per AFI, both AFIs -- the population the masks above leave in
+# scope. Shared with the playbook's drain stage so the session count the drain
+# asserts and the count the postcheck asserts cannot drift apart.
+SC9_EBGP_SESSION_COUNT = 256
+
 _LIFECYCLE_CONVERGENCE_HARD_TIMEOUT_SECONDS = 1200
+_SOAK_READINESS_STABILITY_WINDOW_SECONDS = 30.0
 RUNTIME_UPDATE_EXACT_PEER_GROUP_NAMES = ("EB-FA-V6", "EB-FA-V4")
 
 
@@ -79,8 +143,8 @@ class CheckProfile(enum.Enum):
     # BGP route/session oscillation & multipath churn: convergence OFF; which
     # snapshot sub-checks to skip varies by sub-shape (carried in the context).
     OSCILLATION = "oscillation"
-    # FA/plane drain-undrain: convergence OFF, iBGP-PNH precheck off, snapshot
-    # skips flap only (uptime still checked).
+    # FA/plane drain-undrain: convergence OFF; PNH readiness opts in with a
+    # resolved range; snapshot skips flap only (uptime still checked).
     DRAIN_UNDRAIN = "drain_undrain"
     # CICD-EBB-11 route storm: convergence OFF, expected established-session count
     # enforced, and a context-selected snapshot shape. The custom steps own
@@ -90,10 +154,14 @@ class CheckProfile(enum.Enum):
     # OFF, standard snapshot, plus a BGP tcpdump check whose message-types and
     # last-mod-time window come from the context.
     IGP_INSTABILITY = "igp_instability"
-    # No-precheck stress (nexthop-group-count threshold / longevity soak): NO
-    # prechecks, standard postchecks (convergence toggled by context), and a
-    # snapshot that skips flap + uptime (sessions churn during the workload).
+    # No-precheck longevity stress: standard postchecks and a snapshot that
+    # skips flap + uptime (sessions churn during the workload).
     SOAK_NO_PRECHECK = "soak_no_precheck"
+    # CICD-EBB-16: block route oscillation until required sessions, ingress EOR,
+    # accepted routes, and all three route-programming views are ready. The
+    # postcheck tolerates setup-era EOR expiry because readiness is established
+    # before the workload begins.
+    SOAK_READINESS_GATED = "soak_readiness_gated"
     # Route-registry prefix-list runtime update: standard prechecks plus a
     # route-count verification add-on, postchecks with convergence ON but EOR
     # expiry tolerated (a runtime prefix-list update is not a restart).
@@ -102,6 +170,7 @@ class CheckProfile(enum.Enum):
     # Minimal-shape (accept the context for a uniform API, but ignore it):
     # bag012 perf-scaling, bounded-ECMP-sets (case9).
     PERF_SCALING_BOUNDED_ECMP = "perf_scaling_bounded_ecmp"
+    SC9_BOUNDED_ECMP = "sc9_bounded_ecmp"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,9 +183,10 @@ class CpuCharacterizationConfig:
     results table); set it to gate on the raw ``gate_percentile``.
     """
 
-    summary_jq_var: str = "cpu_percentile_summary"
+    summary_jq_var: str
     gate_percentile: float = 95.0
     gate_threshold_pct: t.Optional[float] = None
+    gate_thresholds_pct: tuple[tuple[int, float], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,8 +199,23 @@ class RssDeltaConfig:
     set it to gate on steady-state RSS growth over the in-run baseline.
     """
 
-    summary_jq_var: str = "rss_delta_summary"
+    summary_jq_var: str
     max_growth_pct: t.Optional[float] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class CharacterizationGates:
+    """Blocking CPU percentile and RSS growth criteria for one playbook.
+
+    Collection remains independently controlled by ``CharacterizationConfig``.
+    An empty instance preserves observe-only reporting.
+    """
+
+    cpu_thresholds_pct: tuple[tuple[int, float], ...] = ()
+    rss_max_growth_pct: t.Optional[float] = None
+
+
+NO_CHARACTERIZATION_GATES = CharacterizationGates()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -153,20 +238,34 @@ class ProfileContext:
     postcheck_thresholds: t.Optional[t.Any] = None
     # Default matches the standard-shape playbook entry points (8.0), which are
     # the only profiles that thread this into create_standard_prechecks. NOT
-    # create_standard_prechecks' own 4.0 default — drain/churn want the factory
-    # 4.0 and get it by not passing cpu_baseline at all, so this default is only
+    # create_standard_prechecks' own 5.0 default: drain/churn want the factory
+    # 5.0 and get it by not passing cpu_baseline at all, so this default is only
     # ever read by the 8.0 consumers. Keeping it 8.0 means a direct
     # get_profile_checks(DAEMON_RESTART, ProfileContext()) matches the playbook.
     cpu_baseline: float = 8.0
+    check_cpu_load_average: bool = True
     check_ibgp_pnh: bool = False
+    ibgp_pnh_start_ipv4s: t.Optional[tuple[str, ...]] = None
+    ibgp_pnh_start_ipv6s: t.Optional[tuple[str, ...]] = None
+    # Count and stride of the resolved Open/R injection, carried beside the
+    # starts so readiness describes the whole injected range. Left None by a
+    # caller with no plan, which serializes the pre-existing payload.
+    ibgp_pnh_count: t.Optional[int] = None
+    ibgp_pnh_step: t.Optional[int] = None
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None
-    exclude_bgp_mon: bool = True
+    # Whether to exclude BGP-MON peers from the session checks, and which
+    # chassis' BGP-MON prefix to exclude. The default keeps the ixia11 prefix;
+    # a config driving the secondary chassis must set ``parent_network``, or
+    # its BGP-MON sessions are counted instead of excluded and every
+    # session-count check is off by the BGP-MON peer count. Held as one value
+    # so a profile cannot thread the exclusion but forget the chassis.
+    bgp_mon: BgpMonScope = DEFAULT_BGP_MON_SCOPE
     # Cold-start tolerates an expired EOR timer by default.
     fail_on_eor_expired: bool = False
     # Oscillation: expected established session count at precheck, and which
     # snapshot sub-checks to skip (sessions intentionally flap during the test).
-    expected_established_sessions: int = 0
+    expected_established_sessions: int | None = None
     snapshot_skip_flap: bool = False
     snapshot_skip_uptime: bool = False
     # CICD-EBB-10 restores an exact baseline before requiring the full session
@@ -179,15 +278,21 @@ class ProfileContext:
     tcpdump_expected_message_types: t.Optional[t.List[str]] = None
     tcpdump_unexpected_message_types: t.Optional[t.List[str]] = None
     tcpdump_expected_last_mod_time: t.Optional[int] = None
-    # No-precheck soak: whether the convergence postcheck runs (the only policy
-    # difference between the nexthop-threshold and longevity shapes), and an
-    # optional convergence threshold threaded only when set (so the factory keeps
-    # the single source of truth for the default).
+    # Soak profiles: whether the convergence postcheck runs and an optional
+    # convergence threshold threaded only when set (so the factory keeps the
+    # single source of truth for the default).
     check_bgp_convergence: bool = True
     convergence_threshold: t.Optional[int] = None
-    # Runtime-update: expected baseline eBGP route count for the route-count
-    # verification precheck add-on (the only per-call variable in its params).
+    # Expected baseline eBGP route count for readiness and runtime-update
+    # route-count verification prechecks.
     route_count_expected: t.Optional[int] = None
+    # Exact bound-topology eBGP peer-group names used by route-count checks.
+    # The default preserves direct callers; full-scale factories override it
+    # from their BoundTopology automation contract.
+    exact_ebgp_peer_group_names: tuple[str, ...] = RUNTIME_UPDATE_EXACT_PEER_GROUP_NAMES
+    route_count_histogram_by_afi: t.Optional[t.Mapping[str, t.Mapping[int, int]]] = None
+    # EBB-16 requires the aggregate EOR milestone only with Update Group.
+    enable_update_group: bool = True
     # Opt-in observe-only characterization postchecks (results land in the
     # POST-HEALTH CHECK RESULTS table). CPU needs the stage START/STOP collector;
     # RSS is self-soaking (postcheck only). None => not added.
@@ -203,6 +308,27 @@ class ProfileChecks(t.NamedTuple):
     snapshot_checks: t.List[SnapshotHealthCheck]
 
 
+def _route_count_expectation(ctx: ProfileContext) -> t.Dict[str, t.Any]:
+    if (
+        ctx.route_count_expected is not None
+        and ctx.route_count_histogram_by_afi is not None
+    ):
+        raise ValueError(
+            "route_count_expected and route_count_histogram_by_afi are mutually "
+            "exclusive"
+        )
+    if ctx.route_count_histogram_by_afi is not None:
+        return {
+            "expected_count_histogram_by_afi": {
+                afi: dict(histogram)
+                for afi, histogram in ctx.route_count_histogram_by_afi.items()
+            }
+        }
+    if ctx.route_count_expected is not None:
+        return {"expected_count": ctx.route_count_expected}
+    return {}
+
+
 def _daemon_restart(ctx: ProfileContext) -> ProfileChecks:
     """BGP/agent daemon restart: convergence ON, restart-aware postcheck, strict
     EOR (inherits create_standard_postchecks default fail_on_eor_expired=True),
@@ -216,7 +342,11 @@ def _daemon_restart(ctx: ProfileContext) -> ProfileChecks:
             expected_established_sessions=(ctx.expected_established_sessions or 0),
             cpu_baseline=ctx.cpu_baseline,
             check_ibgp_pnh=ctx.check_ibgp_pnh,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
+            bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
             postcheck_thresholds=ctx.postcheck_thresholds,
@@ -226,27 +356,39 @@ def _daemon_restart(ctx: ProfileContext) -> ProfileChecks:
             expected_established_session_count=(
                 ctx.expected_established_sessions or None
             ),
-            expected_restarted_services=["Bgp"],
+            expected_restarted_services=["Bgpcpp"],
             restart_start_time_jq_var="daemon_restart_time",
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
         snapshot_checks=create_standard_snapshot_checks(
             skip_flap_check=True,
             skip_uptime_check=True,
             expected_peer_identity=ctx.expected_peer_identity,
             parent_prefixes_to_ignore=ctx.parent_prefixes_to_ignore,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
     )
 
 
-def _append_characterization_postchecks(
-    postchecks: t.List[PointInTimeHealthCheck], ctx: ProfileContext
+def _characterization_postchecks(
+    ctx: ProfileContext,
 ) -> t.List[PointInTimeHealthCheck]:
-    """Append the opt-in observe-only characterization postchecks (RSS delta,
-    CPU percentile) when configured on the context. Both land in the results
-    table; observe-only unless their config carries a threshold.
+    """Build the opt-in observe-only characterization postchecks (RSS delta,
+    CPU percentile) configured on the context. Both land in the results table;
+    observe-only unless their config carries a threshold.
+
+    Returns a new list rather than appending to a caller-supplied one, so
+    correctness does not depend on every profile builder handing back a freshly
+    constructed postcheck list. Empty when neither config is set.
+
+    Args:
+        ctx: Per-invocation context carrying the optional characterization
+            configs.
+
+    Returns:
+        Zero, one, or two postchecks, in RSS-then-CPU order.
     """
+    postchecks: t.List[PointInTimeHealthCheck] = []
     if ctx.rss_delta is not None:
         postchecks.append(
             create_rss_delta_observe_check(
@@ -260,6 +402,11 @@ def _append_characterization_postchecks(
                 summary_jq_var=ctx.cpu_characterization.summary_jq_var,
                 gate_percentile=ctx.cpu_characterization.gate_percentile,
                 gate_threshold_pct=ctx.cpu_characterization.gate_threshold_pct,
+                gate_thresholds_pct=(
+                    dict(ctx.cpu_characterization.gate_thresholds_pct)
+                    if ctx.cpu_characterization.gate_thresholds_pct
+                    else None
+                ),
             )
         )
     return postchecks
@@ -276,27 +423,28 @@ def _cold_start(ctx: ProfileContext) -> ProfileChecks:
             precheck_thresholds=ctx.precheck_thresholds,
             cpu_baseline=ctx.cpu_baseline,
             check_ibgp_pnh=ctx.check_ibgp_pnh,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
+            bgp_mon=ctx.bgp_mon,
         ),
-        postchecks=_append_characterization_postchecks(
-            create_standard_postchecks(
-                postcheck_thresholds=ctx.postcheck_thresholds,
-                convergence_hard_timeout_seconds=(
-                    _LIFECYCLE_CONVERGENCE_HARD_TIMEOUT_SECONDS
-                ),
-                fail_on_eor_expired=ctx.fail_on_eor_expired,
-                expected_established_session_count=(
-                    ctx.expected_established_sessions or None
-                ),
-                expected_restarted_services=["Bgp"],
-                restart_start_time_jq_var="daemon_restart_time",
-                exclude_bgp_mon=ctx.exclude_bgp_mon,
+        postchecks=create_standard_postchecks(
+            postcheck_thresholds=ctx.postcheck_thresholds,
+            convergence_hard_timeout_seconds=(
+                _LIFECYCLE_CONVERGENCE_HARD_TIMEOUT_SECONDS
             ),
-            ctx,
+            fail_on_eor_expired=ctx.fail_on_eor_expired,
+            expected_established_session_count=(
+                ctx.expected_established_sessions or None
+            ),
+            expected_restarted_services=["Bgpcpp"],
+            restart_start_time_jq_var="daemon_restart_time",
+            bgp_mon=ctx.bgp_mon,
         ),
         snapshot_checks=create_standard_snapshot_checks(
             expected_peer_identity=ctx.expected_peer_identity,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
     )
 
@@ -314,43 +462,61 @@ def _oscillation(ctx: ProfileContext) -> ProfileChecks:
             expected_established_sessions=ctx.expected_established_sessions,
             cpu_baseline=ctx.cpu_baseline,
             check_ibgp_pnh=ctx.check_ibgp_pnh,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
+            bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
             postcheck_thresholds=ctx.postcheck_thresholds,
             check_bgp_convergence=False,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
         snapshot_checks=create_standard_snapshot_checks(
             skip_flap_check=ctx.snapshot_skip_flap,
             skip_uptime_check=ctx.snapshot_skip_uptime,
             expected_peer_identity=ctx.expected_peer_identity,
             parent_prefixes_to_ignore=ctx.parent_prefixes_to_ignore,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
     )
 
 
 def _drain_undrain(ctx: ProfileContext) -> ProfileChecks:
-    """FA/plane drain-undrain: standard prechecks with the iBGP-PNH check OFF
-    (drain tests don't assert PNH metric), postchecks with convergence OFF, and
-    a snapshot that skips only the flap check (uptime is still validated).
+    """Drain profiles retain legacy checks unless a PNH range is explicitly supplied.
+
+    Postchecks keep convergence off; snapshots skip only flap checks.
     """
     return ProfileChecks(
         prechecks=create_standard_prechecks(
             peergroup_ibgp_v6=ctx.peergroup_ibgp_v6,
             peergroup_ibgp_v4=ctx.peergroup_ibgp_v4,
+            precheck_thresholds=ctx.precheck_thresholds,
             expected_established_sessions=ctx.expected_established_sessions,
-            check_ibgp_pnh=False,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            check_ibgp_pnh=ctx.check_ibgp_pnh
+            and any(
+                value is not None
+                for value in (
+                    ctx.ibgp_pnh_start_ipv4s,
+                    ctx.ibgp_pnh_start_ipv6s,
+                    ctx.ibgp_pnh_count,
+                    ctx.ibgp_pnh_step,
+                )
+            ),
+            ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
+            bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
             check_bgp_convergence=False,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
         snapshot_checks=create_standard_snapshot_checks(
             skip_flap_check=True,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
     )
 
@@ -367,20 +533,26 @@ def _churn_storm(ctx: ProfileContext) -> ProfileChecks:
         prechecks=create_standard_prechecks(
             peergroup_ibgp_v6=ctx.peergroup_ibgp_v6,
             peergroup_ibgp_v4=ctx.peergroup_ibgp_v4,
+            precheck_thresholds=ctx.precheck_thresholds,
             expected_established_sessions=ctx.expected_established_sessions,
+            check_cpu_load_average=ctx.check_cpu_load_average,
             check_ibgp_pnh=ctx.check_ibgp_pnh,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
+            bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
             check_bgp_convergence=False,
             expected_established_session_count=ctx.expected_established_sessions,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
         snapshot_checks=(
             create_standard_snapshot_checks(
                 expected_peer_identity=ctx.expected_peer_identity,
                 parent_prefixes_to_ignore=ctx.parent_prefixes_to_ignore,
-                exclude_bgp_mon=ctx.exclude_bgp_mon,
+                bgp_mon=ctx.bgp_mon,
             )
             if ctx.full_session_snapshot
             else [create_core_dumps_snapshot_check()]
@@ -397,7 +569,7 @@ def _igp_instability(ctx: ProfileContext) -> ProfileChecks:
     postchecks = create_standard_postchecks(
         postcheck_thresholds=ctx.postcheck_thresholds,
         check_bgp_convergence=False,
-        exclude_bgp_mon=ctx.exclude_bgp_mon,
+        bgp_mon=ctx.bgp_mon,
     )
     if (
         ctx.tcpdump_expected_message_types is not None
@@ -418,18 +590,22 @@ def _igp_instability(ctx: ProfileContext) -> ProfileChecks:
             expected_established_sessions=ctx.expected_established_sessions,
             cpu_baseline=ctx.cpu_baseline,
             check_ibgp_pnh=ctx.check_ibgp_pnh,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
+            bgp_mon=ctx.bgp_mon,
         ),
         postchecks=postchecks,
         snapshot_checks=create_standard_snapshot_checks(
             expected_peer_identity=ctx.expected_peer_identity,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
     )
 
 
 def _soak_no_precheck(ctx: ProfileContext) -> ProfileChecks:
-    """No-precheck stress (nexthop-group-count threshold / longevity soak): NO
+    """No-precheck stress (longevity soak): NO
     prechecks, standard postchecks with the convergence check toggled by the
     context (and an optional threaded threshold), and a snapshot that skips flap
     + uptime since sessions intentionally churn during the long workload.
@@ -437,7 +613,7 @@ def _soak_no_precheck(ctx: ProfileContext) -> ProfileChecks:
     postcheck_kwargs: t.Dict[str, t.Any] = {
         "postcheck_thresholds": ctx.postcheck_thresholds,
         "check_bgp_convergence": ctx.check_bgp_convergence,
-        "exclude_bgp_mon": ctx.exclude_bgp_mon,
+        "bgp_mon": ctx.bgp_mon,
     }
     if ctx.convergence_threshold is not None:
         postcheck_kwargs["convergence_threshold"] = ctx.convergence_threshold
@@ -448,7 +624,82 @@ def _soak_no_precheck(ctx: ProfileContext) -> ProfileChecks:
         snapshot_checks=create_standard_snapshot_checks(
             skip_flap_check=True,
             skip_uptime_check=True,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
+        ),
+    )
+
+
+def _soak_readiness_gated(ctx: ProfileContext) -> ProfileChecks:
+    """CICD-EBB-16 readiness gate before route oscillation.
+
+    Require the exact non-monitor session count, a continuously observable
+    mode-specific initialization milestone, the expected per-peer-group
+    accepted-route count, and consistent BGP RIB, FibAgent, and hardware views.
+    Update Group uses ALL_EOR_RECEIVED. Non-Update Group uses INITIALIZED
+    because it is the guaranteed terminal startup milestone for that mode.
+    """
+    if (
+        ctx.expected_established_sessions is None
+        or ctx.expected_established_sessions <= 0
+    ):
+        raise ValueError("SOAK_READINESS_GATED requires expected_established_sessions")
+    if ctx.route_count_expected is None and ctx.route_count_histogram_by_afi is None:
+        raise ValueError("SOAK_READINESS_GATED requires a route-count expectation")
+
+    convergence_threshold = ctx.convergence_threshold or 600
+    if ctx.enable_update_group:
+        readiness_end_event = "4"  # ALL_EOR_RECEIVED
+        readiness_check_id = "startup_all_eor_received"
+    else:
+        readiness_end_event = "9"  # INITIALIZED
+        readiness_check_id = "startup_bgp_initialized"
+    return ProfileChecks(
+        prechecks=[
+            create_bgp_session_establish_check(
+                expected_established_sessions_static=(
+                    ctx.expected_established_sessions
+                ),
+                parent_prefixes_to_ignore=ctx.bgp_mon.ignore_prefixes(),
+                check_id="startup_bgp_session_verification",
+                **get_retry_kwargs(hc_types.CheckName.BGP_SESSION_ESTABLISH_CHECK),
+            ),
+            create_bgp_convergence_check(
+                convergence_threshold=convergence_threshold,
+                hard_timeout_seconds=convergence_threshold,
+                stability_window_seconds=_SOAK_READINESS_STABILITY_WINDOW_SECONDS,
+                fail_on_eor_expired=False,
+                validate_sequence=False,
+                extra_json_params={
+                    "start_event": "3",  # PEER_INFO_LOADED
+                    "end_event": readiness_end_event,
+                },
+                check_id=readiness_check_id,
+            ),
+            create_bgp_route_count_verification_check(
+                json_params={
+                    "exact_peer_group_names": [*ctx.exact_ebgp_peer_group_names],
+                    "direction": "received",
+                    **_route_count_expectation(ctx),
+                    "policy_type": "post_policy",
+                },
+                check_id="startup_bgp_route_count_verification",
+            ),
+            create_bgp_rib_fib_consistency_check(
+                check_id="rib_fib_consistency_precheck",
+                **get_retry_kwargs(hc_types.CheckName.BGP_RIB_FIB_CONSISTENCY_CHECK),
+            ),
+        ],
+        postchecks=create_standard_postchecks(
+            postcheck_thresholds=ctx.postcheck_thresholds,
+            convergence_threshold=convergence_threshold,
+            fail_on_eor_expired=False,
+            expected_established_session_count=ctx.expected_established_sessions,
+            bgp_mon=ctx.bgp_mon,
+        ),
+        snapshot_checks=create_standard_snapshot_checks(
+            skip_flap_check=True,
+            skip_uptime_check=True,
+            bgp_mon=ctx.bgp_mon,
         ),
     )
 
@@ -465,18 +716,22 @@ def _runtime_update(ctx: ProfileContext) -> ProfileChecks:
             peergroup_ibgp_v4=ctx.peergroup_ibgp_v4,
             precheck_thresholds=ctx.precheck_thresholds,
             cpu_baseline=ctx.cpu_baseline,
-            expected_established_sessions=ctx.expected_established_sessions,
+            expected_established_sessions=(ctx.expected_established_sessions or None),
             check_ibgp_pnh=ctx.check_ibgp_pnh,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
+            bgp_mon=ctx.bgp_mon,
         )
         + [
             create_bgp_route_count_verification_check(
                 json_params={
                     "exact_peer_group_names": [
-                        *RUNTIME_UPDATE_EXACT_PEER_GROUP_NAMES,
+                        *ctx.exact_ebgp_peer_group_names,
                     ],
                     "direction": "received",
-                    "expected_count": ctx.route_count_expected,
+                    **_route_count_expectation(ctx),
                     "policy_type": "post_policy",
                 },
                 check_id="startup_bgp_session_verification",
@@ -485,10 +740,11 @@ def _runtime_update(ctx: ProfileContext) -> ProfileChecks:
         postchecks=create_standard_postchecks(
             postcheck_thresholds=ctx.postcheck_thresholds,
             fail_on_eor_expired=False,
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            expected_established_session_count=ctx.expected_established_sessions,
+            bgp_mon=ctx.bgp_mon,
         ),
         snapshot_checks=create_standard_snapshot_checks(
-            exclude_bgp_mon=ctx.exclude_bgp_mon,
+            bgp_mon=ctx.bgp_mon,
         ),
     )
 
@@ -532,6 +788,100 @@ def _perf_scaling_bounded_ecmp(ctx: ProfileContext) -> ProfileChecks:
     )
 
 
+def _sc9_bounded_ecmp(ctx: ProfileContext) -> ProfileChecks:
+    """Profile for the SC9 bounded-ECMP-sets characteristic on bag013.
+
+    SC9 asserts that 5,000 routes learned from 128 eBGP peers install as ONE
+    ECMP set per AFI, that a simultaneous drain does not push the programmed
+    set count past what the hardware can hold, and that the structure collapses
+    back afterwards.
+
+    Only the claims that can be recorded as Requirement Coverage live here.
+    ``_VALIDATION_PHASES`` admits precheck / workload / postcheck / snapshot
+    only, so a periodic-task verdict can never be counted as coverage -- the
+    nexthop-group poll therefore carries the transient series and the
+    instrument-liveness guards, while the coverage-bearing assertions are the
+    postchecks below.
+
+    Deliberately additive: ``PERF_SCALING_BOUNDED_ECMP`` is left byte-identical
+    so the retained bounded-ECMP TestConfig is unaffected.
+    """
+    return ProfileChecks(
+        prechecks=[
+            # Check instantaneous hardware headroom before the drain. Do not
+            # gate the boot-lifetime ECMP high watermark here: Conveyor runs
+            # SC9 after the full-scale workloads on the same boot, so that
+            # counter legitimately includes predecessor activity. Stage A
+            # captures SC9's own baseline for the Stage C delta comparison.
+            create_hardware_capacity_check(
+                check_id="sc9_precheck_hw_capacity_baseline",
+                check_watermarks=False,
+            ),
+        ],
+        postchecks=[
+            # Scoped to the eBGP population -- see IBGP_MIMIC_PARENTS. The
+            # drain withdraws routes without tearing down sessions, so an eBGP
+            # peer that is not Established at postcheck IS a real finding.
+            create_bgp_session_establish_check(
+                check_id="sc9_postcheck_ebgp_sessions_established",
+                parent_prefixes_to_ignore=IBGP_MIMIC_PARENTS,
+                # The COUNT, not just the scope. Without it this passes on any
+                # number of in-scope sessions INCLUDING ZERO -- so the very bug
+                # the masks above fix (a mask that accidentally excludes the
+                # population under test) would sail through this check rather
+                # than be caught by it. 128 eBGP peers per AFI, both AFIs.
+                expected_established_sessions=SC9_EBGP_SESSION_COUNT,
+                **get_retry_kwargs(hc_types.CheckName.BGP_SESSION_ESTABLISH_CHECK),
+            ),
+            create_bgp_rib_fib_consistency_check(
+                **get_retry_kwargs(hc_types.CheckName.BGP_RIB_FIB_CONSISTENCY_CHECK),
+            ),
+            create_bgp_convergence_check(
+                convergence_threshold=ctx.convergence_threshold or 600,
+                # Unlike PERF_SCALING_BOUNDED_ECMP this does NOT fail on an
+                # expired EOR timer. SC9 drains peers on purpose, so peers that
+                # never re-send EOR are the stimulus, not a defect; failing on
+                # it reports the workload as a fault. This matches the fleet
+                # standard (BGP_STANDARD_POSTCHECKS).
+                fail_on_eor_expired=False,
+                check_id="sc9_postcheck_convergence",
+                **get_retry_kwargs(hc_types.CheckName.BGP_CONVERGENCE_CHECK),
+            ),
+            # RECOVERY, at RIB level: every prefix discovered at baseline must
+            # be back at its baseline multipath width. peers_stopped_delta=0
+            # because the drain is a route withdrawal followed by a restore --
+            # no peer is left administratively down at postcheck time.
+            create_next_hop_count_check(
+                check_id="sc9_postcheck_multipath_width_restored",
+                use_discovered_prefixes=True,
+                use_discovered_width=True,
+                peers_stopped_delta=0,
+            ),
+            # Check instantaneous hardware headroom after the drain. The
+            # boot-lifetime watermark remains excluded for the same reason as
+            # the precheck; the Stage C delta comparison owns SC9-attributable
+            # watermark growth.
+            create_hardware_capacity_check(
+                check_id="sc9_postcheck_hw_capacity",
+                check_watermarks=False,
+            ),
+        ],
+        snapshot_checks=[
+            create_core_dumps_snapshot_check(),
+            # The drain withdraws routes; it does not tear down sessions, so a
+            # flap here is a real finding rather than expected churn. Unlike
+            # PERF_SCALING_BOUNDED_ECMP the flap and uptime checks stay ON.
+            # Scoped the SAME way as the postcheck above. Leaving it unscoped
+            # would let the iBGP mimic population -- which this profile argues
+            # at length is outside SC9's subject -- fail the run through the
+            # back door on a flap or a drop the test does not assert on.
+            create_bgp_session_snapshot_check(
+                parent_prefixes_to_ignore=IBGP_MIMIC_PARENTS,
+            ),
+        ],
+    )
+
+
 # Explicit profile -> builder mapping (no decorator/registration side effects, per
 # the lazy-import guidance). Builders are referenced, not called, at import time.
 _PROFILE_BUILDERS: t.Dict[CheckProfile, t.Callable[[ProfileContext], ProfileChecks]] = {
@@ -542,8 +892,10 @@ _PROFILE_BUILDERS: t.Dict[CheckProfile, t.Callable[[ProfileContext], ProfileChec
     CheckProfile.CHURN_STORM: _churn_storm,
     CheckProfile.IGP_INSTABILITY: _igp_instability,
     CheckProfile.SOAK_NO_PRECHECK: _soak_no_precheck,
+    CheckProfile.SOAK_READINESS_GATED: _soak_readiness_gated,
     CheckProfile.RUNTIME_UPDATE: _runtime_update,
     CheckProfile.PERF_SCALING_BOUNDED_ECMP: _perf_scaling_bounded_ecmp,
+    CheckProfile.SC9_BOUNDED_ECMP: _sc9_bounded_ecmp,
 }
 
 
@@ -559,4 +911,18 @@ def get_profile_checks(profile: CheckProfile, ctx: ProfileContext) -> ProfileChe
     builder = _PROFILE_BUILDERS.get(profile)
     if builder is None:
         raise ValueError(f"Unknown CheckProfile: {profile}")
-    return builder(ctx)
+    checks = builder(ctx)
+    # Characterization reporting is profile-independent. Any playbook that
+    # brackets a span (see create_characterization_bracket_stages) sets these
+    # configs on the context, and the matching postcheck is added here rather
+    # than in each of the 20+ profile builders. Without it the bracket would
+    # collect a measurement and stash it into a jq var that nothing reads.
+    # No-op when neither config is set, which is every playbook that has not
+    # opted in.
+    characterization = _characterization_postchecks(ctx)
+    if not characterization:
+        return checks
+    # Rebuild rather than append: a builder is free to return a shared or
+    # cached list, and mutating it would leak these postchecks into every later
+    # caller of that profile.
+    return checks._replace(postchecks=[*checks.postchecks, *characterization])

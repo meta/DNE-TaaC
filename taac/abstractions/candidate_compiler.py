@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from taac.abstractions.artifacts import CompiledTaacArtifacts
@@ -15,12 +15,18 @@ from taac.abstractions.compilation.basic_port_composition import (
 from taac.abstractions.compilation.dut import (
     DutEndpointBaseRenderResult,
     DutHostOsRenderResult,
+    DutLifecycleRenderResult,
 )
 from taac.abstractions.compilation.endpoint_composition import (
     EndpointCompositionRequest,
     EndpointCompositionResult,
 )
+from taac.abstractions.compilation.lifecycle import LifecyclePlan
+from taac.abstractions.compilation.lifecycle_materialization import (
+    validate_lifecycle_task_materialization,
+)
 from taac.abstractions.compilation.model import (
+    DutPlan,
     TopologyCompilationPlan,
 )
 from taac.abstractions.compilation.planner import PlanningResult
@@ -29,6 +35,8 @@ from taac.abstractions.compilation.protocols import (
     DutCapabilityPreflight,
     DutEndpointBaseRenderer,
     DutHostOsRenderer,
+    DutLifecycleRenderer,
+    DutLifecycleTaskMaterializer,
     EndpointComposer,
     TrafficGeneratorEndpointRenderer,
     TrafficGeneratorPortBaseRenderer,
@@ -50,6 +58,9 @@ from taac.abstractions.compilation.traffic_generator import (
     TrafficGeneratorPortDeviceGroupRenderResult,
     TrafficGeneratorRenderRequest,
     TrafficGeneratorRenderResult,
+)
+from taac.abstractions.native_artifact_assembler import (
+    NativeArtifactAssemblyRequest,
 )
 from taac.abstractions.topology.model import BoundTopology
 
@@ -77,6 +88,13 @@ class ArtifactAdapter(Protocol):
         bound: BoundTopology,
         plan: TopologyCompilationPlan,
     ) -> AdaptedArtifacts: ...
+
+
+class ArtifactAssembler(Protocol):
+    def assemble(
+        self,
+        request: NativeArtifactAssemblyRequest,
+    ) -> CompiledTaacArtifacts: ...
 
 
 @dataclass(frozen=True)
@@ -118,6 +136,8 @@ class CandidateCompilation:
     artifacts: CompiledTaacArtifacts
     dut_endpoint_base_shadow: DutEndpointBaseRenderResult[object] | None = None
     dut_host_os_shadow: DutHostOsRenderResult[object] | None = None
+    dut_lifecycle_shadow: DutLifecycleRenderResult[object] | None = None
+    dut_lifecycle_task_shadow: DutLifecycleRenderResult[object] | None = None
     traffic_generator_endpoint_shadow: TrafficGeneratorEndpointRenderResult | None = (
         None
     )
@@ -130,6 +150,8 @@ class CandidateCompilation:
     basic_port_composition_shadow: BasicPortCompositionResult[object] | None = None
     endpoint_composition_shadow: EndpointCompositionResult[object] | None = None
     traffic_generator_shadow: TrafficGeneratorRenderResult | None = None
+    native_artifact_shadow: CompiledTaacArtifacts | None = None
+    lifecycle: LifecyclePlan = field(default_factory=LifecyclePlan)
 
 
 def _traffic_generator_request(
@@ -152,13 +174,103 @@ def _require_traffic_generator_request(
     return request
 
 
+def _materialize_dut_lifecycle(
+    materializer: DutLifecycleTaskMaterializer | None,
+    plan: DutPlan,
+    lifecycle: LifecyclePlan,
+    intents: DutLifecycleRenderResult[object] | None,
+) -> DutLifecycleRenderResult[object] | None:
+    if materializer is None:
+        return None
+    if intents is None:
+        raise RuntimeError("DUT lifecycle intent was not rendered")
+    tasks = materializer.materialize(plan, lifecycle, intents)
+    validate_lifecycle_task_materialization(
+        plan,
+        lifecycle,
+        intents,
+        tasks,
+    )
+    return tasks
+
+
+def _assemble_native_artifacts(
+    assembler: ArtifactAssembler | None,
+    planning: PlanningResult,
+    endpoint_composition: EndpointCompositionResult[object] | None,
+    host_os: DutHostOsRenderResult[object] | None,
+    dut_lifecycle: DutLifecycleRenderResult[object] | None,
+    basic_ports: BasicPortCompositionResult[object] | None,
+    traffic_generator: TrafficGeneratorRenderResult | None,
+) -> CompiledTaacArtifacts | None:
+    if assembler is None:
+        return None
+    if (
+        endpoint_composition is None
+        or host_os is None
+        or dut_lifecycle is None
+        or basic_ports is None
+        or traffic_generator is None
+    ):
+        raise RuntimeError("artifact assembler dependencies were not rendered")
+    return assembler.assemble(
+        NativeArtifactAssemblyRequest(
+            plan=planning.plan,
+            lifecycle=planning.lifecycle,
+            endpoints=endpoint_composition,
+            host_os=host_os,
+            dut_lifecycle=dut_lifecycle,
+            basic_ports=basic_ports,
+            traffic_generator=traffic_generator,
+        )
+    )
+
+
+def _adapt_artifacts(
+    adapter: ArtifactAdapter | None,
+    bound: BoundTopology,
+    plan: TopologyCompilationPlan,
+) -> AdaptedArtifacts | None:
+    return adapter.render(bound, plan) if adapter is not None else None
+
+
+def _renderer_reports(
+    adapted: AdaptedArtifacts | None,
+) -> tuple[RendererReport, ...]:
+    if adapted is not None:
+        return adapted.renderer_reports
+    return tuple(
+        RendererReport(
+            lane=lane,
+            disposition=RendererDisposition.NATIVE,
+        )
+        for lane in _REQUIRED_RENDERER_LANES
+    )
+
+
+def _select_artifacts(
+    native_authoritative: bool,
+    native: CompiledTaacArtifacts | None,
+    adapted: AdaptedArtifacts | None,
+) -> CompiledTaacArtifacts:
+    if native_authoritative:
+        if native is None:
+            raise RuntimeError("native artifact authority emitted no artifact")
+        return native
+    if adapted is None:
+        raise RuntimeError("delegated artifact authority emitted no artifact")
+    return adapted.artifacts
+
+
 @dataclass(frozen=True)
 class CandidateTopologyCompiler:
     planner: CandidatePlanner
     dut_capability_preflight: DutCapabilityPreflight
-    artifact_adapter: ArtifactAdapter
+    artifact_adapter: ArtifactAdapter | None
     dut_endpoint_base_renderer: DutEndpointBaseRenderer[object] | None = None
     dut_host_os_renderer: DutHostOsRenderer[object] | None = None
+    dut_lifecycle_renderer: DutLifecycleRenderer[object] | None = None
+    dut_lifecycle_task_materializer: DutLifecycleTaskMaterializer | None = None
     traffic_generator_endpoint_renderer: TrafficGeneratorEndpointRenderer | None = None
     traffic_generator_port_base_renderer: (
         TrafficGeneratorPortBaseRenderer[object] | None
@@ -169,8 +281,26 @@ class CandidateTopologyCompiler:
     basic_port_composer: BasicPortComposer | None = None
     endpoint_composer: EndpointComposer | None = None
     traffic_generator_renderer: TrafficGeneratorRenderer | None = None
+    artifact_assembler: ArtifactAssembler | None = None
+    native_artifacts_authoritative: bool = False
 
     def __post_init__(self) -> None:
+        if self.native_artifacts_authoritative:
+            if self.artifact_adapter is not None:
+                raise ValueError(
+                    "native artifact authority must not mix a delegated adapter"
+                )
+            if self.artifact_assembler is None:
+                raise ValueError("native artifact authority requires an assembler")
+        elif self.artifact_adapter is None:
+            raise ValueError("delegated artifact authority requires an adapter")
+        if (
+            self.dut_lifecycle_task_materializer is not None
+            and self.dut_lifecycle_renderer is None
+        ):
+            raise ValueError(
+                "DUT lifecycle task materializer requires lifecycle renderer"
+            )
         if self.endpoint_composer is not None and (
             self.dut_endpoint_base_renderer is None
             or self.traffic_generator_endpoint_renderer is None
@@ -186,6 +316,17 @@ class CandidateTopologyCompiler:
             raise ValueError(
                 "basic-port composer requires port-base and device-group renderers"
             )
+        if self.artifact_assembler is not None and (
+            self.dut_host_os_renderer is None
+            or self.dut_lifecycle_task_materializer is None
+            or self.endpoint_composer is None
+            or self.basic_port_composer is None
+            or self.traffic_generator_renderer is None
+        ):
+            raise ValueError(
+                "artifact assembler requires host-OS, materialized lifecycle, "
+                "endpoint, basic-port, and traffic-generator outputs"
+            )
 
     def analyze(self, bound: BoundTopology) -> PlanningResult:
         return self.planner.plan(bound)
@@ -195,7 +336,7 @@ class CandidateTopologyCompiler:
         resource_ids = planning.plan.iter_resource_ids()
         planning.report.assert_renderable(resource_ids)
         self.dut_capability_preflight.validate(planning.plan.dut)
-        adapted = self.artifact_adapter.render(bound, planning.plan)
+        adapted = _adapt_artifacts(self.artifact_adapter, bound, planning.plan)
         traffic_generator_request = _traffic_generator_request(
             planning,
             self.traffic_generator_endpoint_renderer,
@@ -213,6 +354,22 @@ class CandidateTopologyCompiler:
         if self.dut_host_os_renderer is not None:
             dut_host_os_shadow = self.dut_host_os_renderer.render(planning.plan.dut)
             dut_host_os_shadow.validate(planning.plan.dut)
+        dut_lifecycle_shadow = None
+        if self.dut_lifecycle_renderer is not None:
+            dut_lifecycle_shadow = self.dut_lifecycle_renderer.render(
+                planning.plan.dut,
+                planning.lifecycle,
+            )
+            dut_lifecycle_shadow.validate(
+                planning.plan.dut,
+                planning.lifecycle,
+            )
+        dut_lifecycle_task_shadow = _materialize_dut_lifecycle(
+            self.dut_lifecycle_task_materializer,
+            planning.plan.dut,
+            planning.lifecycle,
+            dut_lifecycle_shadow,
+        )
         traffic_generator_endpoint_request = None
         traffic_generator_endpoint_shadow = None
         if self.traffic_generator_endpoint_renderer is not None:
@@ -308,17 +465,33 @@ class CandidateTopologyCompiler:
                 traffic_generator_request
             )
             traffic_generator_shadow.validate(traffic_generator_request)
-        report = planning.report.with_renderer_reports(*adapted.renderer_reports)
+        native_artifact_shadow = _assemble_native_artifacts(
+            self.artifact_assembler,
+            planning,
+            endpoint_composition_shadow,
+            dut_host_os_shadow,
+            dut_lifecycle_task_shadow,
+            basic_port_composition_shadow,
+            traffic_generator_shadow,
+        )
+        report = planning.report.with_renderer_reports(*_renderer_reports(adapted))
         report.assert_renderable(
             resource_ids,
             _REQUIRED_RENDERER_LANES,
         )
+        artifacts = _select_artifacts(
+            self.native_artifacts_authoritative,
+            native_artifact_shadow,
+            adapted,
+        )
         return CandidateCompilation(
             plan=planning.plan,
             report=report,
-            artifacts=adapted.artifacts,
+            artifacts=artifacts,
             dut_endpoint_base_shadow=dut_endpoint_base_shadow,
             dut_host_os_shadow=dut_host_os_shadow,
+            dut_lifecycle_shadow=dut_lifecycle_shadow,
+            dut_lifecycle_task_shadow=dut_lifecycle_task_shadow,
             traffic_generator_endpoint_shadow=traffic_generator_endpoint_shadow,
             traffic_generator_port_base_shadow=traffic_generator_port_base_shadow,
             traffic_generator_port_device_group_shadow=(
@@ -327,6 +500,8 @@ class CandidateTopologyCompiler:
             basic_port_composition_shadow=basic_port_composition_shadow,
             endpoint_composition_shadow=endpoint_composition_shadow,
             traffic_generator_shadow=traffic_generator_shadow,
+            native_artifact_shadow=native_artifact_shadow,
+            lifecycle=planning.lifecycle,
         )
 
     def compile(self, bound: BoundTopology) -> CompiledTaacArtifacts:

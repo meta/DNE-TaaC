@@ -11,20 +11,28 @@ It's useful for validating that route filter policies (prefix-lists) are
 working correctly on specific peer groups like EB-FA.
 """
 
+import asyncio
+import ipaddress
 import typing as t
+from collections import Counter
+from collections.abc import Mapping
 
 from taac.constants import TestDevice
 from taac.health_checks.abstract_health_check import (
     AbstractDeviceHealthCheck,
 )
+from taac.health_checks.common_utils import declares_bgpcpp
 from taac.utils.bgp_route_count_utils import (
     filter_bgp_sessions,
+    get_route_count_histogram_by_afi_for_peers,
     get_route_counts_for_peers,
-    select_peer_addresses_by_exact_peer_group,
+    normalize_expected_count_histogram_by_afi,
+    select_peer_addresses_by_exact_config_peer_group,
     validate_all_peer_route_counts,
     validate_direction,
     validate_policy_type,
 )
+from taac.utils.health_check_utils import ip_ntop
 from taac.health_check.health_check import types as hc_types
 
 
@@ -53,10 +61,20 @@ class BgpRouteCountVerificationHealthCheck(
         descriptions_to_ignore: t.Sequence[str],
         descriptions_to_check: t.Sequence[str],
         exact_peer_group_names: t.Sequence[str],
+        peer_addresses_to_check: t.Sequence[str],
     ) -> None:
-        if exact_peer_group_names and (descriptions_to_ignore or descriptions_to_check):
+        selector_count = sum(
+            bool(selector)
+            for selector in (
+                descriptions_to_ignore or descriptions_to_check,
+                exact_peer_group_names,
+                peer_addresses_to_check,
+            )
+        )
+        if selector_count > 1:
             raise ValueError(
-                "description filters and exact_peer_group_names are mutually exclusive"
+                "description filters, exact_peer_group_names, and "
+                "peer_addresses_to_check are mutually exclusive"
             )
 
     async def _run(
@@ -75,6 +93,7 @@ class BgpRouteCountVerificationHealthCheck(
                 - descriptions_to_ignore: List of description substrings to ignore peers by (optional)
                 - descriptions_to_check: List of description substrings to check peers by (optional)
                 - exact_peer_group_names: Exact BGP peer-group names to check (optional)
+                - peer_addresses_to_check: Exact BGP peer addresses to check (optional)
                 - direction: "received" or "advertised" (optional, defaults to "received")
                 - policy_type: "pre_policy" or "post_policy" (optional, defaults to "pre_policy")
                     - pre_policy: Uses getPrefilterReceivedNetworks/getPrefilterAdvertisedNetworks
@@ -82,21 +101,53 @@ class BgpRouteCountVerificationHealthCheck(
                     - post_policy: Uses getPostfilterReceivedNetworks/getPostfilterAdvertisedNetworks
                       APIs to get route counts after policy filtering
                 - expected_count: Expected number of routes per peer (optional)
+                - expected_count_histogram_by_afi: Exact route-count distribution
+                  for each selected address family (optional)
                 - min_count: Minimum expected routes per peer (optional)
                 - max_count: Maximum expected routes per peer (optional)
+                - rib_prefix_ranges: Parent networks selecting bgpcpp Loc-RIB
+                  entries for absolute AddPath verification (optional)
+                - expected_rib_prefix_count: Exact selected RIB-entry count;
+                  required with rib_prefix_ranges
+                - expected_rib_path_count: Exact sum of every path list in the
+                  selected TRibEntry.paths maps; required with rib_prefix_ranges
+                - retry_count / retry_delay_seconds: Optional convergence retry
+                  controls for absolute RIB verification
 
         Returns:
             HealthCheckResult: Result of the health check
         """
         hostname = obj.name
 
+        expected_rib_prefix_count = check_params.get("expected_rib_prefix_count")
+        expected_rib_path_count = check_params.get("expected_rib_path_count")
+        rib_prefix_ranges = check_params.get("rib_prefix_ranges")
+        if any(
+            value is not None
+            for value in (
+                expected_rib_prefix_count,
+                expected_rib_path_count,
+                rib_prefix_ranges,
+            )
+        ):
+            return await self._verify_rib_prefix_and_path_counts(
+                hostname=hostname,
+                expected_prefix_count=expected_rib_prefix_count,
+                expected_path_count=expected_rib_path_count,
+                prefix_ranges=rib_prefix_ranges,
+                retry_count=check_params.get("retry_count", 0),
+                retry_delay_seconds=check_params.get("retry_delay_seconds", 5),
+            )
+
         # Extract parameters
         descriptions_to_ignore = check_params.get("descriptions_to_ignore", [])
         descriptions_to_check = check_params.get("descriptions_to_check", [])
         exact_peer_group_names = check_params.get("exact_peer_group_names", [])
+        requested_peer_addresses = check_params.get("peer_addresses_to_check", [])
         direction = check_params.get("direction", "received")
         policy_type = check_params.get("policy_type", "pre_policy")
         expected_count = check_params.get("expected_count")
+        expected_count_histogram_by_afi = None
         min_count = check_params.get("min_count")
         max_count = check_params.get("max_count")
 
@@ -105,9 +156,20 @@ class BgpRouteCountVerificationHealthCheck(
                 descriptions_to_ignore,
                 descriptions_to_check,
                 exact_peer_group_names,
+                requested_peer_addresses,
             )
             validate_direction(direction)
             validate_policy_type(policy_type)
+            expected_count_histogram_by_afi = normalize_expected_count_histogram_by_afi(
+                check_params.get("expected_count_histogram_by_afi")
+            )
+            if expected_count_histogram_by_afi is not None and any(
+                value is not None for value in (expected_count, min_count, max_count)
+            ):
+                raise ValueError(
+                    "expected_count_histogram_by_afi is mutually exclusive with "
+                    "expected_count, min_count, and max_count"
+                )
         except ValueError as e:
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.FAIL,
@@ -133,9 +195,13 @@ class BgpRouteCountVerificationHealthCheck(
         )
 
         try:
-            peer_addresses_to_check = await self._resolve_peer_group_addresses(
-                hostname,
-                exact_peer_group_names,
+            peer_addresses_to_check = (
+                set(requested_peer_addresses)
+                if requested_peer_addresses
+                else await self._resolve_peer_group_addresses(
+                    hostname,
+                    exact_peer_group_names,
+                )
             )
 
             # Get all BGP sessions
@@ -152,7 +218,13 @@ class BgpRouteCountVerificationHealthCheck(
                 descriptions_to_check=descriptions_to_check,
                 peer_addresses_to_check=peer_addresses_to_check,
             )
-            if peer_addresses_to_check is not None and not peers_to_check:
+            missing_peer_addresses = set(requested_peer_addresses) - set(peers_to_check)
+            if requested_peer_addresses and missing_peer_addresses:
+                raise RuntimeError(
+                    "Exact peer selection did not resolve to established sessions: "
+                    f"missing={sorted(missing_peer_addresses)}"
+                )
+            if exact_peer_group_names and not peers_to_check:
                 raise RuntimeError(
                     "No established peers matched the selected exact peer groups"
                 )
@@ -161,33 +233,68 @@ class BgpRouteCountVerificationHealthCheck(
                 f"Checking {len(peers_to_check)} peers after filtering on {hostname}"
             )
 
-            # Get route counts for all peers concurrently
-            peer_route_counts = await get_route_counts_for_peers(
-                peers=peers_to_check,
-                direction=direction,
-                policy_type=policy_type,
-                driver=self.driver,
-            )
-
-            # Validate counts for each peer
-            results = validate_all_peer_route_counts(
-                peer_route_counts=peer_route_counts,
-                expected_count=expected_count,
-                min_count=min_count,
-                max_count=max_count,
-                direction=direction,
-                policy_type=policy_type,
-            )
-
-            # Collect all errors
-            validation_errors = []
-            for result in results:
-                validation_errors.extend(result.errors)
+            validation_errors: list[str] = []
+            if expected_count_histogram_by_afi is not None:
+                try:
+                    # The transport peer address is not the route AFI in
+                    # MP-BGP.  Use negotiated-family counters from detailed
+                    # neighbor state so crossed and dual-stack sessions are
+                    # attributed to their actual NLRI families.
+                    # pyrefly: ignore [missing-attribute]
+                    bgp_helper = await self.driver.bgp()
+                    actual_histogram = await get_route_count_histogram_by_afi_for_peers(
+                        peers=peers_to_check,
+                        afis=expected_count_histogram_by_afi,
+                        direction=direction,
+                        policy_type=policy_type,
+                        bgp_helper=bgp_helper,
+                    )
+                except Exception as error:
+                    return hc_types.HealthCheckResult(
+                        status=hc_types.HealthCheckStatus.ERROR,
+                        message=(
+                            "Could not collect authoritative route-count histogram "
+                            f"by AFI on {hostname} ({direction}, {policy_type}): "
+                            f"{type(error).__name__}: {error}"
+                        ),
+                    )
+                if actual_histogram != expected_count_histogram_by_afi:
+                    validation_errors.append(
+                        "Expected route-count histogram by AFI "
+                        f"{expected_count_histogram_by_afi}, got "
+                        f"{actual_histogram} ({direction}, {policy_type})"
+                    )
+            else:
+                # Scalar verification preserves the existing per-peer network
+                # query path and its legacy failure semantics.
+                peer_route_counts = await get_route_counts_for_peers(
+                    peers=peers_to_check,
+                    direction=direction,
+                    policy_type=policy_type,
+                    driver=self.driver,
+                )
+                results = validate_all_peer_route_counts(
+                    peer_route_counts=peer_route_counts,
+                    expected_count=expected_count,
+                    min_count=min_count,
+                    max_count=max_count,
+                    direction=direction,
+                    policy_type=policy_type,
+                )
+                for result in results:
+                    validation_errors.extend(result.errors)
 
             # Build result message
             if not validation_errors:
                 # All peers passed validation
-                if expected_count is None and min_count is None and max_count is None:
+                if expected_count_histogram_by_afi is not None:
+                    message = (
+                        f"BGP route count verification PASSED on {hostname}: "
+                        "exact per-AFI histogram "
+                        f"{expected_count_histogram_by_afi} "
+                        f"({direction}, {policy_type})"
+                    )
+                elif expected_count is None and min_count is None and max_count is None:
                     message = f"BGP route count verification on {hostname} ({direction}, {policy_type})"
                 else:
                     criteria = []
@@ -231,6 +338,120 @@ class BgpRouteCountVerificationHealthCheck(
                 message=f"Failed to verify BGP route counts on {hostname}: {str(e)}",
             )
 
+    async def _verify_rib_prefix_and_path_counts(
+        self,
+        hostname: str,
+        expected_prefix_count: t.Any,
+        expected_path_count: t.Any,
+        prefix_ranges: t.Any,
+        retry_count: t.Any,
+        retry_delay_seconds: t.Any,
+    ) -> hc_types.HealthCheckResult:
+        """Assert absolute prefix and AddPath cardinality in the bgpcpp RIB.
+
+        ``TRibEntry.paths`` is a map of path groups to lists of ``TBgpPath``.
+        Counting only RIB-entry keys verifies prefixes but silently misses path
+        scale, so this mode deliberately sums every list in every selected
+        entry. Prefix ranges scope the assertion to the routes injected by the
+        test and exclude unrelated production routes.
+        """
+        try:
+            expected_prefix_count = int(expected_prefix_count)
+            expected_path_count = int(expected_path_count)
+            if expected_prefix_count < 0 or expected_path_count < 0:
+                raise ValueError("expected RIB counts must be non-negative")
+            if not isinstance(prefix_ranges, list) or not prefix_ranges:
+                raise ValueError("rib_prefix_ranges must be a non-empty list")
+            networks = [ipaddress.ip_network(value) for value in prefix_ranges]
+            retry_count = int(retry_count)
+            retry_delay_seconds = float(retry_delay_seconds)
+            if retry_count < 0 or retry_delay_seconds < 0:
+                raise ValueError("retry values must be non-negative")
+        except (TypeError, ValueError) as error:
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.FAIL,
+                message=f"Invalid BGP RIB count parameters on {hostname}: {error}",
+            )
+
+        last_error: Exception | None = None
+        actual_prefix_count = 0
+        actual_path_count = 0
+        for attempt in range(retry_count + 1):
+            try:
+                # pyrefly: ignore [missing-attribute]
+                rib_entries = await self.driver.async_get_bgp_rib_entries()
+                selected_entries = []
+                for entry in rib_entries:
+                    prefix = ipaddress.ip_network(
+                        f"{ip_ntop(entry.prefix.prefix_bin)}/{entry.prefix.num_bits}",
+                        strict=False,
+                    )
+                    if any(
+                        (
+                            isinstance(prefix, ipaddress.IPv4Network)
+                            and isinstance(network, ipaddress.IPv4Network)
+                            and prefix.subnet_of(network)
+                        )
+                        or (
+                            isinstance(prefix, ipaddress.IPv6Network)
+                            and isinstance(network, ipaddress.IPv6Network)
+                            and prefix.subnet_of(network)
+                        )
+                        for network in networks
+                    ):
+                        selected_entries.append(entry)
+
+                actual_prefix_count = len(selected_entries)
+                actual_path_count = 0
+                for entry in selected_entries:
+                    paths_by_group = entry.paths or {}
+                    if not isinstance(paths_by_group, Mapping):
+                        raise TypeError(
+                            "TRibEntry.paths must be a map of path-group lists"
+                        )
+                    actual_path_count += sum(
+                        len(paths or []) for paths in paths_by_group.values()
+                    )
+                last_error = None
+            except Exception as error:
+                last_error = error
+
+            if (
+                last_error is None
+                and actual_prefix_count == expected_prefix_count
+                and actual_path_count == expected_path_count
+            ):
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.PASS,
+                    message=(
+                        f"BGP RIB path-scale verification PASSED on {hostname}: "
+                        f"{actual_prefix_count} prefixes, {actual_path_count} paths "
+                        f"within {prefix_ranges}"
+                    ),
+                )
+            if attempt < retry_count:
+                await asyncio.sleep(retry_delay_seconds)
+
+        if last_error is not None:
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.ERROR,
+                message=(
+                    "Could not collect authoritative bgpcpp RIB path counts on "
+                    f"{hostname}: {type(last_error).__name__}: {last_error}"
+                ),
+            )
+
+        return hc_types.HealthCheckResult(
+            status=hc_types.HealthCheckStatus.FAIL,
+            message=(
+                f"BGP RIB path-scale verification FAILED on {hostname}: "
+                f"ranges={prefix_ranges}, expected_prefixes={expected_prefix_count}, "
+                f"actual_prefixes={actual_prefix_count}, "
+                f"expected_paths={expected_path_count}, "
+                f"actual_paths={actual_path_count}"
+            ),
+        )
+
     async def _resolve_peer_group_addresses(
         self,
         hostname: str,
@@ -240,9 +461,10 @@ class BgpRouteCountVerificationHealthCheck(
             return None
 
         # pyrefly: ignore [missing-attribute]
-        update_groups = await self.driver.async_get_update_group_info()
-        selected, observed = select_peer_addresses_by_exact_peer_group(
-            update_groups,
+        bgp_helper = await self.driver.bgp()
+        bgp_config = await bgp_helper.async_get_running_config_struct()
+        selected, observed = select_peer_addresses_by_exact_config_peer_group(
+            bgp_config,
             exact_peer_group_names,
         )
         missing = set(exact_peer_group_names) - observed
@@ -251,7 +473,8 @@ class BgpRouteCountVerificationHealthCheck(
                 f"Exact BGP peer-group selection failed on {hostname}: "
                 f"requested={sorted(set(exact_peer_group_names))}, "
                 f"missing={sorted(missing)}, observed={sorted(observed)}, "
-                f"selected_peers={len(selected)}"
+                f"selected_peers={len(selected)}, "
+                f"configured_peers={len(getattr(bgp_config, 'peers', None) or [])}"
             )
         return selected
 
@@ -262,7 +485,9 @@ class BgpRouteCountVerificationHealthCheck(
         check_params: t.Dict[str, t.Any],
     ) -> hc_types.HealthCheckResult:
         """
-        Verify BGP route counts on ar-bgp (native EOS BGP) devices via EOS CLI.
+        Devices the TestConfig declares ``ARISTA_FBOSS`` in ``host_os_type_map``
+        run BGP++ and delegate to the thrift ``_run``. Other EOS devices are
+        native EOS BGP and are verified via EOS CLI.
 
         ar-bgp has no BGP++ thrift API, so getPrefilterReceivedNetworks() etc.
         are not available. Instead, uses 'show bgp ipv6 unicast summary | json'
@@ -274,27 +499,49 @@ class BgpRouteCountVerificationHealthCheck(
             check_params: Dictionary containing:
                 - address_family: "ipv4" or "ipv6" (optional, defaults to "ipv6")
                 - expected_count: Expected route count per peer (optional)
+                - expected_count_histogram_by_afi: Exact route-count distribution
+                  for each selected address family (optional)
                 - min_count: Minimum expected routes per peer (optional)
                 - max_count: Maximum expected routes per peer (optional)
                 - descriptions_to_check: List of peer descriptions to filter on (optional)
                 - descriptions_to_ignore: List of peer descriptions to ignore (optional)
                 - exact_peer_group_names: Exact BGP peer-group names to check (optional)
         """
+        if declares_bgpcpp(obj.name):
+            return await self._run(obj, input, check_params)
         hostname = obj.name
         address_family = check_params.get("address_family", "ipv6")
         expected_count = check_params.get("expected_count")
+        expected_count_histogram_by_afi = None
         min_count = check_params.get("min_count")
         max_count = check_params.get("max_count")
         descriptions_to_check = check_params.get("descriptions_to_check", [])
         descriptions_to_ignore = check_params.get("descriptions_to_ignore", [])
         exact_peer_group_names = check_params.get("exact_peer_group_names", [])
+        requested_peer_addresses = check_params.get("peer_addresses_to_check", [])
 
         try:
             self._validate_peer_selectors(
                 descriptions_to_ignore,
                 descriptions_to_check,
                 exact_peer_group_names,
+                requested_peer_addresses,
             )
+            expected_count_histogram_by_afi = normalize_expected_count_histogram_by_afi(
+                check_params.get("expected_count_histogram_by_afi")
+            )
+            if expected_count_histogram_by_afi is not None and any(
+                value is not None for value in (expected_count, min_count, max_count)
+            ):
+                raise ValueError(
+                    "expected_count_histogram_by_afi is mutually exclusive with "
+                    "expected_count, min_count, and max_count"
+                )
+            if expected_count_histogram_by_afi is None and address_family not in {
+                "ipv4",
+                "ipv6",
+            }:
+                raise ValueError(f"unsupported address_family {address_family!r}")
         except ValueError as e:
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.FAIL,
@@ -314,93 +561,168 @@ class BgpRouteCountVerificationHealthCheck(
                 message=f"Invalid route-count parameters on {hostname}: {e}",
             )
 
+        address_families = (
+            tuple(expected_count_histogram_by_afi)
+            if expected_count_histogram_by_afi is not None
+            else (address_family,)
+        )
         self.logger.info(
-            f"Running ar-bgp route count verification ({address_family}) on {hostname}"
+            "Running ar-bgp route count verification "
+            f"({', '.join(address_families)}) on {hostname}"
         )
 
         try:
-            if address_family == "ipv4":
-                cmd = "show bgp ipv4 unicast summary | json"
-            else:
-                cmd = "show bgp ipv6 unicast summary | json"
+            errors: list[str] = []
+            runtime_errors: list[str] = []
+            runtime_error_afis: set[str] = set()
+            filter_miss_afis: set[str] = set()
+            peers_by_afi: dict[str, t.Mapping[str, t.Any]] = {}
+            for afi in address_families:
+                cmd = f"show bgp {afi} unicast summary | json"
+                # pyrefly: ignore [missing-attribute]
+                result = await self.driver.async_execute_show_json_on_shell(cmd)
+                peers = result.get("vrfs", {}).get("default", {}).get("peers", {})
+                if not peers:
+                    runtime_errors.append(f"No BGP peers found on {hostname} for {afi}")
+                    runtime_error_afis.add(afi)
+                    continue
+                peers_by_afi[afi] = peers
 
-            # pyrefly: ignore [missing-attribute]
-            result = await self.driver.async_execute_show_json_on_shell(cmd)
-            peer_addresses_to_check = await self._resolve_peer_group_addresses(
-                hostname,
-                exact_peer_group_names,
+            peer_addresses_to_check = (
+                set(requested_peer_addresses)
+                if requested_peer_addresses
+                else await self._resolve_peer_group_addresses(
+                    hostname,
+                    exact_peer_group_names,
+                )
             )
-            peers = result.get("vrfs", {}).get("default", {}).get("peers", {})
-
-            if not peers:
-                return hc_types.HealthCheckResult(
-                    status=hc_types.HealthCheckStatus.FAIL,
-                    message=f"No BGP peers found on {hostname} for {address_family}",
-                )
-
-            # Filter peers by description
-            filtered_peers = {}
-            for peer_ip, peer_info in peers.items():
-                if (
-                    peer_addresses_to_check is not None
-                    and peer_ip not in peer_addresses_to_check
-                ):
-                    continue
-                desc = peer_info.get("description", "")
-                if descriptions_to_ignore and any(
-                    ignore in desc for ignore in descriptions_to_ignore
-                ):
-                    continue
-                if descriptions_to_check and not any(
-                    check in desc for check in descriptions_to_check
-                ):
-                    continue
-                filtered_peers[peer_ip] = peer_info
-
-            if peer_addresses_to_check is not None and not filtered_peers:
-                raise RuntimeError(
-                    "No established peers matched the selected exact peer groups"
-                )
-            if not filtered_peers:
-                return hc_types.HealthCheckResult(
-                    status=hc_types.HealthCheckStatus.FAIL,
-                    message=(
-                        f"No peers matched filter on {hostname}. "
-                        f"descriptions_to_check={descriptions_to_check}, "
-                        f"exact_peer_group_names={exact_peer_group_names}"
-                    ),
-                )
-
-            # Check route counts per peer
-            errors = []
-            for peer_ip, peer_info in filtered_peers.items():
-                state = peer_info.get("peerState", "Unknown")
-                if state != "Established":
-                    errors.append(f"Peer {peer_ip} not Established (state={state})")
-                    continue
-
-                prefix_received = peer_info.get("prefixReceived", 0)
-                desc = peer_info.get("description", peer_ip)
-
-                if expected_count is not None and prefix_received != expected_count:
-                    errors.append(
-                        f"Peer {peer_ip} ({desc}): got {prefix_received} routes, "
-                        f"expected {expected_count}"
+            peer_route_counts_by_afi: dict[str, dict[str, int]] = {
+                afi: {} for afi in address_families
+            }
+            checked_peer_addresses: set[str] = set()
+            for afi, peers in peers_by_afi.items():
+                filtered_peers = {
+                    peer_ip: peer_info
+                    for peer_ip, peer_info in peers.items()
+                    if (
+                        peer_addresses_to_check is None
+                        or peer_ip in peer_addresses_to_check
                     )
-                if min_count is not None and prefix_received < min_count:
-                    errors.append(
-                        f"Peer {peer_ip} ({desc}): got {prefix_received} routes, "
-                        f"min expected {min_count}"
+                    and not (
+                        descriptions_to_ignore
+                        and any(
+                            ignore in peer_info.get("description", "")
+                            for ignore in descriptions_to_ignore
+                        )
                     )
-                if max_count is not None and prefix_received > max_count:
+                    and not (
+                        descriptions_to_check
+                        and not any(
+                            check in peer_info.get("description", "")
+                            for check in descriptions_to_check
+                        )
+                    )
+                }
+                missing_peer_addresses = set(requested_peer_addresses) - set(
+                    filtered_peers
+                )
+                if requested_peer_addresses and missing_peer_addresses:
+                    runtime_errors.append(
+                        "Exact peer selection did not resolve for "
+                        f"{afi}: missing={sorted(missing_peer_addresses)}"
+                    )
+                    runtime_error_afis.add(afi)
+                    continue
+                if exact_peer_group_names and not filtered_peers:
+                    runtime_errors.append(
+                        "No established peers matched the selected exact peer groups "
+                        f"for {afi}"
+                    )
+                    runtime_error_afis.add(afi)
+                    continue
+                if not filtered_peers:
                     errors.append(
-                        f"Peer {peer_ip} ({desc}): got {prefix_received} routes, "
-                        f"max expected {max_count}"
+                        (
+                            f"No peers matched filter on {hostname} for {afi}. "
+                            f"descriptions_to_check={descriptions_to_check}, "
+                            f"exact_peer_group_names={exact_peer_group_names}"
+                        )
+                    )
+                    filter_miss_afis.add(afi)
+                    continue
+
+                for peer_ip, peer_info in filtered_peers.items():
+                    state = peer_info.get("peerState", "Unknown")
+                    if state != "Established":
+                        errors.append(f"Peer {peer_ip} not Established (state={state})")
+                        continue
+
+                    if "prefixReceived" not in peer_info:
+                        # Preserve the legacy EOS behavior for an omitted
+                        # field, while requiring present device evidence to
+                        # already have the exact JSON integer type.
+                        prefix_received = 0
+                    else:
+                        raw_prefix_received = peer_info["prefixReceived"]
+                        if (
+                            type(raw_prefix_received) is not int
+                            or raw_prefix_received < 0
+                        ):
+                            runtime_errors.append(
+                                f"Peer {peer_ip} for {afi}: invalid prefixReceived "
+                                f"value {raw_prefix_received!r}"
+                            )
+                            runtime_error_afis.add(afi)
+                            continue
+                        prefix_received = raw_prefix_received
+                    checked_peer_addresses.add(peer_ip)
+                    peer_route_counts_by_afi[afi][peer_ip] = prefix_received
+                    desc = peer_info.get("description", peer_ip)
+
+                    if expected_count is not None and prefix_received != expected_count:
+                        errors.append(
+                            f"Peer {peer_ip} ({desc}): got {prefix_received} routes, "
+                            f"expected {expected_count}"
+                        )
+                    if min_count is not None and prefix_received < min_count:
+                        errors.append(
+                            f"Peer {peer_ip} ({desc}): got {prefix_received} routes, "
+                            f"min expected {min_count}"
+                        )
+                    if max_count is not None and prefix_received > max_count:
+                        errors.append(
+                            f"Peer {peer_ip} ({desc}): got {prefix_received} routes, "
+                            f"max expected {max_count}"
+                        )
+
+                    self.logger.info(
+                        f"Peer {peer_ip} ({desc}): {prefix_received} routes received"
                     )
 
-                self.logger.info(
-                    f"Peer {peer_ip} ({desc}): {prefix_received} routes received"
-                )
+            if expected_count_histogram_by_afi is not None:
+                for afi, expected_histogram in expected_count_histogram_by_afi.items():
+                    if afi in runtime_error_afis or afi in filter_miss_afis:
+                        continue
+                    peer_counts = peer_route_counts_by_afi.get(afi, {})
+                    actual_histogram = dict(
+                        sorted(Counter(peer_counts.values()).items())
+                    )
+                    if actual_histogram != expected_histogram:
+                        errors.append(
+                            f"Expected route-count histogram for {afi} "
+                            f"{expected_histogram}, got {actual_histogram}"
+                        )
+
+            if runtime_errors:
+                # Malformed device output and exact-selector misses make the
+                # observation operationally untrustworthy. Continue all
+                # peers/AFIs first so validation mismatches remain available
+                # as context, but preserve ERROR precedence over FAIL.
+                all_errors = [*runtime_errors, *errors]
+                error_summary = "\n  ".join(all_errors[:10])
+                if len(all_errors) > 10:
+                    error_summary += f"\n  ... and {len(all_errors) - 10} more errors"
+                raise RuntimeError(error_summary)
 
             if errors:
                 error_summary = "\n  ".join(errors[:10])
@@ -410,7 +732,7 @@ class BgpRouteCountVerificationHealthCheck(
                     status=hc_types.HealthCheckStatus.FAIL,
                     message=(
                         f"ar-bgp route count verification FAILED on {hostname} "
-                        f"({address_family}):\n  {error_summary}"
+                        f"({', '.join(address_families)}):\n  {error_summary}"
                     ),
                 )
 
@@ -421,12 +743,17 @@ class BgpRouteCountVerificationHealthCheck(
                 criteria.append(f"min={min_count}")
             if max_count is not None:
                 criteria.append(f"max={max_count}")
+            if expected_count_histogram_by_afi is not None:
+                criteria.append(
+                    f"expected_count_histogram_by_afi={expected_count_histogram_by_afi}"
+                )
 
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.PASS,
                 message=(
                     f"ar-bgp route count verification PASSED on {hostname}: "
-                    f"{len(filtered_peers)} peers checked ({address_family})"
+                    f"{len(checked_peer_addresses)} peers checked "
+                    f"({', '.join(address_families)})"
                     + (f", criteria: {', '.join(criteria)}" if criteria else "")
                 ),
             )

@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# pyre-unsafe
 """
 Consolidated step definitions for TAAC test configurations.
 
@@ -13,6 +12,7 @@ import itertools
 import json
 import math
 import os
+import re
 import time
 import typing as t
 import uuid
@@ -20,8 +20,25 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import paramiko
+from taac.abstractions.churn.attribute import AttributeChurn
+from taac.abstractions.churn.session import SessionChurn
+from taac.abstractions.churn.workloads import (
+    IgpMetricChurn,
+    IgpUnresolvableChurn,
+    LongevityCommunityChurn,
+    MultipathChurn,
+)
+from taac.abstractions.eos_bgpcpp_setup_tasks import (
+    build_bgpcpp_policy_overlay_cmd,
+    POLICY_EVALUATION_SOURCE_CONFIG_PATH,
+)
 
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+from taac.abstractions.churn.route import (  # oss-rewrite (force ShipIt re-export to taac.* root)
+    RouteChurn,
+    RouteStorm,
+)
 
 if not TAAC_OSS:
     from libfb.py.asyncio.await_utils import convert_to_async
@@ -72,6 +89,7 @@ else:
 
 from taac.constants import (
     FAILED_HC_STATUSES,
+    FBOSS_COLD_BOOT_ONCE_FILE,
     OpenRRouteAction,
     TAAC_HEALTH_CHECK_SCUBA_TABLE,
     TestCaseFailure,
@@ -81,7 +99,9 @@ from taac.driver.driver_constants import (
     FbossSystemctlServiceName,
     OtherSystemctlServiceName,
     Service as DriverService,
+    SystemctlServiceStatus,
 )
+from taac.driver.fboss_switch import FbossSwitch
 from taac.health_checks.abstract_health_check import (
     AbstractDeviceHealthCheck,
     AbstractIxiaHealthCheck,
@@ -162,6 +182,8 @@ from taac.utils.json_thrift_utils import (
 from taac.utils.oss_taac_lib_utils import (
     async_retryable,
     none_throws,
+    oss_agent_restart_paths_enabled,
+    oss_config_patcher_enabled,
 )
 from taac.utils.system_stress_utils import (
     async_get_memory_current_pct,
@@ -192,10 +214,21 @@ else:
 
 
 if not TAAC_OSS:
+    from taac.internal.driver.lab_ssh_transport import (
+        async_exec as lab_ssh_async_exec,
+        lab_ssh_transport_enabled,
+    )
     from service_automation.fboss.remediations.utils.bmc_helper import (
         run_bmc_cmd_hwcontrol,
     )
 else:
+
+    def lab_ssh_transport_enabled() -> bool:  # type: ignore
+        """OSS has no lab-ssh daemon; BMC commands use run_bmc_cmd_hwcontrol."""
+        return False
+
+    async def lab_ssh_async_exec(*args, **kwargs):  # type: ignore
+        raise NotImplementedError("The lab-ssh transport is Meta-internal")
 
     def run_bmc_cmd_hwcontrol(hostname: str, cmd: str) -> str:  # type: ignore
         """OSS replacement - run a BMC command on the device's BMC via SSH.
@@ -252,6 +285,14 @@ __all_hc_reexports__ = ["create_next_hop_count_check"]
 # =============================================================================
 
 
+def create_dummy_step(description: t.Optional[str] = None) -> Step:
+    """Create a no-op step for stable-state validation playbooks."""
+    return Step(
+        name=StepName.DUMMY_STEP,
+        description=description,
+    )
+
+
 def create_custom_step(
     params_dict: t.Dict[str, t.Any],
     description: t.Optional[str] = None,
@@ -270,6 +311,106 @@ def create_custom_step(
         name=StepName.CUSTOM_STEP,
         step_params=Params(json_params=json.dumps(params_dict)),
         description=description,
+    )
+
+
+def create_cbag_acacia_transceiver_reset_step(
+    reset_device: str = "cbag001.qzp1",
+    traffic_items: t.Optional[t.List[str]] = None,
+    measured_interfaces_by_device: t.Optional[t.Dict[str, t.List[str]]] = None,
+    expected_bgp_sessions_by_device: t.Optional[t.Dict[str, int]] = None,
+    bgp_sessions_blocking: bool = False,
+    removal_hold_seconds: int = 120,
+    recovery_timeout_seconds: int = 600,
+    recovery_poll_interval_seconds: int = 10,
+    stability_window_seconds: int = 30,
+    traffic_observation_seconds: int = 240,
+    loss_settle_seconds: int = 60,
+    iteration_count: int = 50,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Create a fail-fast CBAG Acacia reset and traffic-measurement loop."""
+    traffic_items = traffic_items or [
+        "RDMA_CBAG001_TO_BAG001",
+        "RDMA_CBAG001_TO_BAG002",
+    ]
+    measured_interfaces_by_device = measured_interfaces_by_device or {
+        hostname: [
+            "Ethernet4/32/1",
+            "Ethernet4/32/5",
+            "Ethernet4/36/1",
+            "Ethernet4/36/5",
+        ]
+        for hostname in ("cbag001.qzp1", "bag001.qzq1", "bag002.qzq1")
+    }
+    expected_bgp_sessions_by_device = expected_bgp_sessions_by_device or {
+        "cbag001.qzp1": 404,
+        "bag001.qzq1": 204,
+        "bag002.qzq1": 204,
+    }
+    if not reset_device:
+        raise ValueError("reset_device must be non-empty")
+    if not traffic_items or any(not item for item in traffic_items):
+        raise ValueError("traffic_items must contain at least one non-empty name")
+    if not measured_interfaces_by_device or any(
+        not hostname or not interfaces or any(not interface for interface in interfaces)
+        for hostname, interfaces in measured_interfaces_by_device.items()
+    ):
+        raise ValueError("measured_interfaces_by_device must be non-empty")
+    if not expected_bgp_sessions_by_device or any(
+        not hostname
+        or isinstance(expected, bool)
+        or not isinstance(expected, int)
+        or expected < 0
+        for hostname, expected in expected_bgp_sessions_by_device.items()
+    ):
+        raise ValueError("expected_bgp_sessions_by_device must be non-negative")
+    if (
+        isinstance(iteration_count, bool)
+        or not isinstance(iteration_count, int)
+        or not 1 <= iteration_count <= 50
+    ):
+        raise ValueError("iteration_count must be an integer in [1, 50]")
+    positive_values = {
+        "recovery_timeout_seconds": recovery_timeout_seconds,
+        "recovery_poll_interval_seconds": recovery_poll_interval_seconds,
+        "traffic_observation_seconds": traffic_observation_seconds,
+    }
+    nonnegative_values = {
+        "removal_hold_seconds": removal_hold_seconds,
+        "stability_window_seconds": stability_window_seconds,
+        "loss_settle_seconds": loss_settle_seconds,
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in positive_values.values()
+    ):
+        raise ValueError(f"Timing values must be positive integers: {positive_values}")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in nonnegative_values.values()
+    ):
+        raise ValueError(
+            f"Timing values must be non-negative integers: {nonnegative_values}"
+        )
+    return create_custom_step(
+        {
+            "custom_step_name": "cbag_acacia_transceiver_reset",
+            "hostname": reset_device,
+            "reset_device": reset_device,
+            "traffic_items": traffic_items,
+            "measured_interfaces_by_device": measured_interfaces_by_device,
+            "expected_bgp_sessions_by_device": expected_bgp_sessions_by_device,
+            "bgp_sessions_blocking": bgp_sessions_blocking,
+            "removal_hold_seconds": removal_hold_seconds,
+            "recovery_timeout_seconds": recovery_timeout_seconds,
+            "recovery_poll_interval_seconds": recovery_poll_interval_seconds,
+            "stability_window_seconds": stability_window_seconds,
+            "traffic_observation_seconds": traffic_observation_seconds,
+            "loss_settle_seconds": loss_settle_seconds,
+            "iteration_count": iteration_count,
+        },
+        description=description or "Reset all Acacia optics and validate PCS/IXIA loss",
     )
 
 
@@ -465,6 +606,21 @@ def create_bgp_update_group_state_step(
 
 _DEFAULT_MAX_HARDWARE_CURRENT_DELTA = 100
 _DEFAULT_MAX_HARDWARE_HIGH_WATERMARK_INCREASE = 100
+_DEFAULT_HARDWARE_HIGH_WATERMARK_RESOURCES = ("fec", "ecmp")
+
+# Settle time after admin-enabling ports, before their state is asserted.
+# Testbeds on coherent ZR optics must raise this: ZR takes 120-180s to acquire
+# lock, so the stock wait fails a link that is merely still coming up.
+DEFAULT_LINK_UP_WAIT_S = 10
+
+# The agent rate-limits thrift per method via a token bucket (see
+# `thriftApiToRateLimitInQps` in the agent config): setPortState is 8 QPS and
+# getAllPortInfo is 4. Exceeding either returns APP_OVERLOAD, which the flap
+# step would otherwise treat as "thrift is unavailable" and fall back to SSH.
+_SET_PORT_STATE_BATCH = 4
+_SET_PORT_STATE_BATCH_DELAY_S = 0.5
+_THRIFT_RATE_LIMIT_RETRIES = 4
+_THRIFT_RATE_LIMIT_BACKOFF_S = 1.0
 
 
 def create_hardware_capacity_delta_step(
@@ -474,6 +630,9 @@ def create_hardware_capacity_delta_step(
     *,
     max_current_delta: int = _DEFAULT_MAX_HARDWARE_CURRENT_DELTA,
     max_high_watermark_increase: int = (_DEFAULT_MAX_HARDWARE_HIGH_WATERMARK_INCREASE),
+    high_watermark_resources: tuple[str, ...] = (
+        _DEFAULT_HARDWARE_HIGH_WATERMARK_RESOURCES
+    ),
     description: t.Optional[str] = None,
 ) -> Step:
     """Create a keyed capture, compare, or clear capacity-delta action."""
@@ -497,22 +656,74 @@ def create_hardware_capacity_delta_step(
     for name, value in thresholds:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
+    supported_resources = set(_DEFAULT_HARDWARE_HIGH_WATERMARK_RESOURCES)
+    if (
+        not isinstance(high_watermark_resources, tuple)
+        or not high_watermark_resources
+        or any(
+            not isinstance(resource, str) or resource not in supported_resources
+            for resource in high_watermark_resources
+        )
+        or len(set(high_watermark_resources)) != len(high_watermark_resources)
+    ):
+        raise ValueError(
+            "high_watermark_resources must be a non-empty tuple containing "
+            "only 'fec' and/or 'ecmp', without duplicates"
+        )
+    is_default_high_watermark_scope = (
+        set(high_watermark_resources) == supported_resources
+    )
     default_thresholds = {
         "max_current_delta": _DEFAULT_MAX_HARDWARE_CURRENT_DELTA,
         "max_high_watermark_increase": (_DEFAULT_MAX_HARDWARE_HIGH_WATERMARK_INCREASE),
     }
-    if action != "compare" and any(
-        value != default_thresholds[name] for name, value in thresholds
+    if action != "compare" and (
+        any(value != default_thresholds[name] for name, value in thresholds)
+        or not is_default_high_watermark_scope
     ):
         raise ValueError(
-            "hardware-capacity thresholds are supported only for compare actions"
+            "hardware-capacity comparison options are supported only for compare actions"
         )
     if action == "compare":
         for name, value in thresholds:
             payload[name] = value
+        if not is_default_high_watermark_scope:
+            payload["high_watermark_resources"] = high_watermark_resources
     return create_custom_step(
         params_dict=payload,
         description=description or f"Hardware-capacity delta: {action}",
+    )
+
+
+def create_bgp_ixia_session_recovery_step(
+    device_name: str,
+    ixia_bgp_peer_regex: str,
+    *,
+    initial_wait_seconds: int = 300,
+    restart_wait_seconds: int = 120,
+    poll_interval_seconds: int = 15,
+    max_restart_rounds: int = 3,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Gate on every IXIA session matching the regex reaching ESTABLISHED,
+    restarting stuck sessions between bounded waits and resetting their full
+    peer objects once if a sparse restart leaves the down set unchanged."""
+    if max_restart_rounds < 0:
+        raise ValueError("max_restart_rounds must be non-negative")
+    if min(initial_wait_seconds, restart_wait_seconds, poll_interval_seconds) <= 0:
+        raise ValueError("wait and poll intervals must be positive")
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "bgp_ixia_session_recovery",
+            "hostname": device_name,
+            "ixia_bgp_peer_regex": ixia_bgp_peer_regex,
+            "initial_wait_seconds": initial_wait_seconds,
+            "restart_wait_seconds": restart_wait_seconds,
+            "poll_interval_seconds": poll_interval_seconds,
+            "max_restart_rounds": max_restart_rounds,
+        },
+        description=description
+        or f"Wait for IXIA BGP sessions matching {ixia_bgp_peer_regex!r} to establish",
     )
 
 
@@ -996,61 +1207,135 @@ def _validate_bgp_attribute_churn_geometry(
         )
 
 
+def _bgp_attribute_churn_integer(value: t.Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        normalized = int(value)
+    except (OverflowError, ValueError) as error:
+        raise ValueError(f"{field} must be an integer") from error
+    if normalized != value:
+        raise ValueError(f"{field} must be an integer")
+    return normalized
+
+
 def create_bgp_attribute_churn_step(
     *,
     hostname: str,
-    prefix_pool_names: t.Mapping[str, t.Mapping[str, str]],
-    peer_count_per_plane: int,
-    selected_block_count_per_afi: int,
-    samples_per_block: int,
-    routes_per_block: int,
-    duration_seconds: int,
-    max_iterations: int,
-    cadence_seconds: int,
+    attribute_churn: AttributeChurn,
     poll_interval_seconds: int,
     transition_timeout_seconds: int,
     reference_setup_timeout_seconds: int,
-    restore_timeout_seconds: int,
     quiet_window_seconds: int,
     max_lookup_concurrency: int,
     openr_mode: str,
-    attribute_matrix: t.Mapping[str, t.Mapping[str, t.Any]],
+    ibgp_route_next_hop_starts: t.Mapping[str, t.Mapping[str, str]],
     convergence_hard_timeout_seconds: int = 300,
+    transient_observation_logging: str = "off",
     description: str | None = None,
 ) -> Step:
     """Create the audited CICD-EBB-10 dual-stack attribute-churn workflow."""
+    churn_params = attribute_churn.to_step_params()
     numeric_params = {
-        "peer_count_per_plane": peer_count_per_plane,
-        "selected_block_count_per_afi": selected_block_count_per_afi,
-        "samples_per_block": samples_per_block,
-        "routes_per_block": routes_per_block,
-        "duration_seconds": duration_seconds,
-        "max_iterations": max_iterations,
-        "cadence_seconds": cadence_seconds,
+        "peer_count_per_plane": _bgp_attribute_churn_integer(
+            churn_params["peer_count_per_plane"], "peer_count_per_plane"
+        ),
+        "selected_block_count_per_afi": _bgp_attribute_churn_integer(
+            churn_params["selected_block_count_per_afi"],
+            "selected_block_count_per_afi",
+        ),
+        "samples_per_block": _bgp_attribute_churn_integer(
+            churn_params["samples_per_block"], "samples_per_block"
+        ),
+        "routes_per_block": _bgp_attribute_churn_integer(
+            churn_params["routes_per_block"], "routes_per_block"
+        ),
+        "duration_seconds": _bgp_attribute_churn_integer(
+            churn_params["duration_seconds"], "duration_seconds"
+        ),
+        "max_iterations": _bgp_attribute_churn_integer(
+            churn_params["max_iterations"], "max_iterations"
+        ),
+        "cadence_seconds": _bgp_attribute_churn_integer(
+            churn_params["cadence_seconds"], "cadence_seconds"
+        ),
+        "geometry_timeout_seconds": _bgp_attribute_churn_integer(
+            churn_params["geometry_timeout_seconds"], "geometry_timeout_seconds"
+        ),
+        "snapshot_timeout_seconds": _bgp_attribute_churn_integer(
+            churn_params["snapshot_timeout_seconds"], "snapshot_timeout_seconds"
+        ),
+        "work_timeout_seconds": _bgp_attribute_churn_integer(
+            churn_params["work_timeout_seconds"], "work_timeout_seconds"
+        ),
+        "cleanup_timeout_seconds": _bgp_attribute_churn_integer(
+            churn_params["cleanup_timeout_seconds"], "cleanup_timeout_seconds"
+        ),
         "poll_interval_seconds": poll_interval_seconds,
         "transition_timeout_seconds": transition_timeout_seconds,
         "convergence_hard_timeout_seconds": convergence_hard_timeout_seconds,
         "reference_setup_timeout_seconds": reference_setup_timeout_seconds,
-        "restore_timeout_seconds": restore_timeout_seconds,
+        "restore_timeout_seconds": _bgp_attribute_churn_integer(
+            churn_params["restore_timeout_seconds"], "restore_timeout_seconds"
+        ),
+        "ixia_restore_timeout_seconds": _bgp_attribute_churn_integer(
+            churn_params["ixia_restore_timeout_seconds"],
+            "ixia_restore_timeout_seconds",
+        ),
+        "cancellation_grace_seconds": _bgp_attribute_churn_integer(
+            churn_params["cancellation_grace_seconds"],
+            "cancellation_grace_seconds",
+        ),
         "quiet_window_seconds": quiet_window_seconds,
         "max_lookup_concurrency": max_lookup_concurrency,
     }
+    if "ixia_apply_timeout_seconds" in churn_params:
+        numeric_params["ixia_apply_timeout_seconds"] = _bgp_attribute_churn_integer(
+            churn_params["ixia_apply_timeout_seconds"],
+            "ixia_apply_timeout_seconds",
+        )
     if not hostname:
         raise ValueError("hostname must be non-empty")
+    scenario_id = churn_params["scenario_id"]
+    if not isinstance(scenario_id, str) or not scenario_id:
+        raise ValueError("scenario_id must be non-empty")
     if openr_mode not in {"none", "standalone"}:
         raise ValueError("openr_mode must be none or standalone")
+    if transient_observation_logging not in {"off", "extended"}:
+        raise ValueError("transient_observation_logging must be off or extended")
     _validate_bgp_attribute_churn_geometry(numeric_params)
 
     params: t.Dict[str, t.Any] = {
         "custom_step_name": "bgp_attribute_churn",
+        "scenario_id": scenario_id,
         "hostname": hostname,
         "prefix_pool_names": _normalize_bgp_attribute_churn_pool_names(
-            prefix_pool_names
+            t.cast(
+                t.Mapping[str, t.Mapping[str, str]], churn_params["prefix_pool_names"]
+            )
         ),
-        "attribute_matrix": _normalize_bgp_attribute_churn_matrix(attribute_matrix),
+        "attribute_matrix": _normalize_bgp_attribute_churn_matrix(
+            t.cast(
+                t.Mapping[str, t.Mapping[str, t.Any]],
+                churn_params["attribute_matrix"],
+            )
+        ),
         "openr_mode": openr_mode,
+        "ibgp_route_next_hop_starts": {
+            afi: dict(planes) for afi, planes in ibgp_route_next_hop_starts.items()
+        },
         **numeric_params,
     }
+    if "prefix_sources" in churn_params:
+        params["prefix_sources"] = {
+            afi: dict(source)
+            for afi, source in t.cast(
+                t.Mapping[str, t.Mapping[str, object]],
+                churn_params["prefix_sources"],
+            ).items()
+        }
+    if transient_observation_logging == "extended":
+        params["transient_observation_logging"] = transient_observation_logging
     return create_custom_step(
         params_dict=params,
         description=description or "Run audited dual-stack BGP attribute churn",
@@ -1089,93 +1374,871 @@ def create_bgp_longevity_community_churn_step(
     )
 
 
+def create_longevity_community_churn_step(
+    churn: LongevityCommunityChurn,
+    *,
+    description: str | None = None,
+) -> Step:
+    """Lower typed longevity-community intent to the CustomStep boundary."""
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "bgp_longevity_community_churn",
+            **churn.to_step_params(),
+        },
+        description=description or "Run wall-clock bounded longevity community churn",
+    )
+
+
 def create_bgp_route_storm_step(
     *,
     hostname: str,
-    ixia_interface_mimic_ibgp: str,
-    expected_established_sessions: int,
-    observer_peer_parent_prefix: str,
-    prefix_pool_names: t.Mapping[str, str],
-    peer_count_per_plane: int,
-    selected_peer_rows: t.Sequence[int],
-    routes_per_peer: int,
-    samples_per_block: int,
-    cycles: int,
-    advertise_seconds: int,
-    withdraw_seconds: int,
-    poll_interval_seconds: int,
-    transition_timeout_seconds: int,
-    session_establish_timeout_seconds: int,
-    restore_timeout_seconds: int,
-    quiet_window_seconds: int,
-    max_lookup_concurrency: int,
-    as_path_pool_size: int,
-    as_path_length: int,
-    communities_per_route: int,
-    extended_communities_per_route: int,
-    convergence_hard_timeout_seconds: int = 300,
+    route_storm: RouteStorm,
     description: str | None = None,
 ) -> Step:
-    """Create the audited CICD-EBB-11 route-storm workflow."""
-    if not hostname or not ixia_interface_mimic_ibgp or not observer_peer_parent_prefix:
-        raise ValueError(
-            "hostname, IXIA iBGP interface, and observer prefix must be non-empty"
-        )
-    if set(prefix_pool_names) != {"ipv4", "ipv6"} or any(
-        not name for name in prefix_pool_names.values()
-    ):
-        raise ValueError("prefix_pool_names must define non-empty ipv4 and ipv6 pools")
-
-    rows = list(selected_peer_rows)
-    if rows != sorted(set(rows)) or any(
-        row < 0 or row >= peer_count_per_plane for row in rows
-    ):
-        raise ValueError("selected_peer_rows must be unique, sorted, and in range")
-    if len(rows) * routes_per_peer * 2 != 10_500:
-        raise ValueError("CICD-EBB-11 requires exactly 10,500 dual-stack route paths")
-    numeric_params = {
-        "expected_established_sessions": expected_established_sessions,
-        "peer_count_per_plane": peer_count_per_plane,
-        "routes_per_peer": routes_per_peer,
-        "samples_per_block": samples_per_block,
-        "cycles": cycles,
-        "advertise_seconds": advertise_seconds,
-        "withdraw_seconds": withdraw_seconds,
-        "poll_interval_seconds": poll_interval_seconds,
-        "transition_timeout_seconds": transition_timeout_seconds,
-        "convergence_hard_timeout_seconds": convergence_hard_timeout_seconds,
-        "session_establish_timeout_seconds": session_establish_timeout_seconds,
-        "restore_timeout_seconds": restore_timeout_seconds,
-        "quiet_window_seconds": quiet_window_seconds,
-        "max_lookup_concurrency": max_lookup_concurrency,
-        "as_path_pool_size": as_path_pool_size,
-        "as_path_length": as_path_length,
-        "communities_per_route": communities_per_route,
-        "extended_communities_per_route": extended_communities_per_route,
-    }
-    if any(value <= 0 for value in numeric_params.values()):
-        raise ValueError("BGP route-storm numeric parameters must be positive")
-    if convergence_hard_timeout_seconds <= transition_timeout_seconds:
-        raise ValueError(
-            "convergence_hard_timeout_seconds must exceed transition_timeout_seconds"
-        )
-    if extended_communities_per_route != 1:
-        raise ValueError(
-            "CICD-EBB-11 currently requires exactly one extended community pending "
-            "isolated IXIA capability validation"
-        )
-
+    """Lower typed CICD-EBB-11 route-storm intent to CustomStep."""
+    if not hostname:
+        raise ValueError("hostname must be non-empty")
     return create_custom_step(
         params_dict={
             "custom_step_name": "bgp_route_storm",
             "hostname": hostname,
-            "ixia_interface_mimic_ibgp": ixia_interface_mimic_ibgp,
-            "observer_peer_parent_prefix": observer_peer_parent_prefix,
-            "prefix_pool_names": dict(prefix_pool_names),
-            "selected_peer_rows": rows,
-            **numeric_params,
+            **route_storm.to_step_params(),
         },
         description=description or "Run audited dual-stack BGP route storm",
+    )
+
+
+def _normalize_nhg_storm_geometry(
+    inactive_paths_per_afi: int | None,
+    target_membership_width: int | None,
+) -> tuple[int | None, int | None]:
+    if inactive_paths_per_afi is None and target_membership_width is None:
+        inactive_paths_per_afi = 3_000
+    if (inactive_paths_per_afi is None) == (target_membership_width is None):
+        raise ValueError(
+            "NHG random storm requires exactly one of inactive_paths_per_afi "
+            "or target_membership_width"
+        )
+    geometry_parameter = (
+        target_membership_width
+        if target_membership_width is not None
+        else inactive_paths_per_afi
+    )
+    if (
+        isinstance(geometry_parameter, bool)
+        or not isinstance(geometry_parameter, int)
+        or geometry_parameter <= 0
+    ):
+        raise ValueError(
+            "NHG random-storm geometry parameter must be a positive integer"
+        )
+    return inactive_paths_per_afi, target_membership_width
+
+
+def create_bgp_nhg_random_storm_step(
+    *,
+    hostname: str,
+    ixia_items_by_afi: t.Mapping[str, t.Mapping[str, t.Any]],
+    prefix_pool_scope_regex: str | None = None,
+    seed: int = 160016,
+    inactive_paths_per_afi: int | None = None,
+    target_membership_width: int | None = None,
+    minimum_distinct_memberships_per_afi: int = 750,
+    minimum_observed_bgp_multiway_memberships: int = 1001,
+    minimum_paused_fibagent_samples: int = 1,
+    minimum_confirmed_pause_fap_samples: int = 3,
+    fibagent_nhg_watermark_high: int = 1000,
+    fibagent_nhg_watermark_low: int = 1000,
+    enable_control_plane_validation: bool = True,
+    control_plane_sample_interval_seconds: int = 5,
+    control_plane_read_timeout_seconds: int = 60,
+    minimum_changed_paths_per_epoch: int = 5_000,
+    epoch_count: int = 48,
+    epoch_interval_seconds: int = 25,
+    restoration_stage_prefix_count: int | None = None,
+    fibagent_restart_after_epoch: int | None = None,
+    description: str | None = None,
+) -> Step:
+    """Create the topology-bound CICD-EBB-16 peer-by-prefix random storm."""
+    if not hostname:
+        raise ValueError("hostname must be non-empty")
+    if set(ixia_items_by_afi) != {"ipv4", "ipv6"}:
+        raise ValueError("ixia_items_by_afi must contain exactly ipv4 and ipv6")
+    required = {
+        "logical_device_group",
+        "logical_route_advertisement",
+        "device_group_item",
+        "peer_item",
+        "route_item",
+        "expected_peer_count",
+        "expected_routes_per_peer",
+        "target_prefix_count",
+    }
+    items = {afi: dict(value) for afi, value in ixia_items_by_afi.items()}
+    for afi, value in items.items():
+        if set(value) != required or any(value[key] in (None, "") for key in required):
+            raise ValueError(f"{afi} IXIA item contract is incomplete")
+    for key in ("device_group_item", "peer_item", "route_item"):
+        names = tuple(str(items[afi][key]) for afi in ("ipv4", "ipv6"))
+        if len(set(names)) != len(names):
+            raise ValueError(f"{key} must be distinct by AFI")
+    expected_route_items = tuple(
+        str(items[afi]["route_item"]) for afi in ("ipv4", "ipv6")
+    )
+    exact_prefix_pool_scope_regex = (
+        rf"^(?:{'|'.join(re.escape(name) for name in expected_route_items)})$"
+    )
+    if (
+        prefix_pool_scope_regex is not None
+        and prefix_pool_scope_regex != exact_prefix_pool_scope_regex
+    ):
+        raise ValueError(
+            "prefix_pool_scope_regex must exactly select topology route items: "
+            f"{exact_prefix_pool_scope_regex!r}"
+        )
+    inactive_paths_per_afi, target_membership_width = (
+        _normalize_nhg_storm_geometry(
+            inactive_paths_per_afi,
+            target_membership_width,
+        )
+    )
+    numeric = {
+        "minimum_distinct_memberships_per_afi": minimum_distinct_memberships_per_afi,
+        "minimum_observed_bgp_multiway_memberships": (
+            minimum_observed_bgp_multiway_memberships
+        ),
+        "minimum_paused_fibagent_samples": minimum_paused_fibagent_samples,
+        "minimum_confirmed_pause_fap_samples": (
+            minimum_confirmed_pause_fap_samples
+        ),
+        "fibagent_nhg_watermark_high": fibagent_nhg_watermark_high,
+        "fibagent_nhg_watermark_low": fibagent_nhg_watermark_low,
+        "control_plane_sample_interval_seconds": (
+            control_plane_sample_interval_seconds
+        ),
+        "control_plane_read_timeout_seconds": control_plane_read_timeout_seconds,
+        "minimum_changed_paths_per_epoch": minimum_changed_paths_per_epoch,
+        "epoch_count": epoch_count,
+        "epoch_interval_seconds": epoch_interval_seconds,
+    }
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in numeric.values()):
+        raise ValueError("NHG random-storm numeric parameters must be positive integers")
+    if (
+        fibagent_nhg_watermark_low > fibagent_nhg_watermark_high
+        or fibagent_nhg_watermark_high > (1 << 31) - 1
+    ):
+        raise ValueError(
+            "FibAgentBgp NHG watermarks require low <= high <= INT32_MAX"
+        )
+    if (
+        minimum_observed_bgp_multiway_memberships
+        < fibagent_nhg_watermark_high + 1
+    ):
+        raise ValueError(
+            "minimum_observed_bgp_multiway_memberships must be >= "
+            "fibagent_nhg_watermark_high + 1"
+        )
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("NHG random-storm seed must be an integer")
+    if not isinstance(enable_control_plane_validation, bool):
+        raise ValueError("enable_control_plane_validation must be a boolean")
+    staged_restore: dict[str, int] = {}
+    if restoration_stage_prefix_count is not None:
+        if (
+            isinstance(restoration_stage_prefix_count, bool)
+            or not isinstance(restoration_stage_prefix_count, int)
+            or restoration_stage_prefix_count <= 0
+        ):
+            raise ValueError("restoration_stage_prefix_count must be a positive integer")
+        staged_restore["restoration_stage_prefix_count"] = (
+            restoration_stage_prefix_count
+        )
+    if fibagent_restart_after_epoch is not None:
+        if (
+            isinstance(fibagent_restart_after_epoch, bool)
+            or not isinstance(fibagent_restart_after_epoch, int)
+            or not 0 < fibagent_restart_after_epoch < epoch_count
+        ):
+            raise ValueError(
+                "fibagent_restart_after_epoch must be a positive integer below "
+                "epoch_count"
+            )
+        staged_restore["fibagent_restart_after_epoch"] = fibagent_restart_after_epoch
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "bgp_nhg_random_storm",
+            "hostname": hostname,
+            "ixia_items_by_afi": items,
+            "prefix_pool_scope_regex": exact_prefix_pool_scope_regex,
+            "seed": seed,
+            "inactive_paths_per_afi": inactive_paths_per_afi,
+            "target_membership_width": target_membership_width,
+            "enable_control_plane_validation": enable_control_plane_validation,
+            **numeric,
+            **staged_restore,
+        },
+        description=description or "Run seeded dual-stack peer-by-prefix NHG storm",
+    )
+
+
+def create_bgp_multipath_oscillation_step(
+    *,
+    hostname: str,
+    ipv4_peer_regex: str,
+    ipv6_peer_regex: str,
+    ipv4_session_count: int,
+    ipv6_session_count: int,
+    test_duration_seconds: int,
+    oscillation_interval_seconds: int,
+    min_peers_to_stop: int,
+    max_peers_to_stop: int,
+    cycle_count: int | None = None,
+    expected_min_baseline_width: int | None = None,
+    expected_max_baseline_width: int | None = None,
+    min_multipath_width: int | None = None,
+    prefix_subnets: t.Sequence[str] | None = None,
+    probe_prefixes_per_afi: int = 2,
+    poll_interval_seconds: float = 5,
+    stable_sample_count: int = 2,
+    bgp_read_timeout_seconds: float = 30,
+    description: str | None = None,
+) -> Step:
+    """Create the path-aware CICD-EBB-09 multipath workflow."""
+    if not hostname or not ipv4_peer_regex or not ipv6_peer_regex:
+        raise ValueError("hostname and both IXIA peer regexes must be non-empty")
+    params: dict[str, t.Any] = {
+        "custom_step_name": "bgp_multipath_oscillation",
+        "hostname": hostname,
+        "ipv4_peer_regex": ipv4_peer_regex,
+        "ipv6_peer_regex": ipv6_peer_regex,
+        "ipv4_session_count": ipv4_session_count,
+        "ipv6_session_count": ipv6_session_count,
+        "test_duration_seconds": test_duration_seconds,
+        "oscillation_interval_seconds": oscillation_interval_seconds,
+        "min_peers_to_stop": min_peers_to_stop,
+        "max_peers_to_stop": max_peers_to_stop,
+        "expected_min_baseline_width": expected_min_baseline_width,
+        "expected_max_baseline_width": expected_max_baseline_width,
+        "min_multipath_width": min_multipath_width,
+        "prefix_subnets": list(prefix_subnets or ()),
+        "probe_prefixes_per_afi": probe_prefixes_per_afi,
+        "poll_interval_seconds": poll_interval_seconds,
+        "stable_sample_count": stable_sample_count,
+        "bgp_read_timeout_seconds": bgp_read_timeout_seconds,
+    }
+    if cycle_count is not None:
+        params["cycle_count"] = cycle_count
+    return create_custom_step(
+        params_dict=params,
+        description=description or "Run path-aware dual-stack multipath oscillation",
+    )
+
+
+def create_multipath_churn_step(
+    churn: MultipathChurn,
+    *,
+    description: str | None = None,
+) -> Step:
+    """Lower typed multipath churn intent to the CustomStep boundary."""
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "bgp_multipath_oscillation",
+            **churn.to_step_params(),
+        },
+        description=description or "Run path-aware dual-stack multipath oscillation",
+    )
+
+
+def create_openr_scale_injection_step(
+    helper_name: str,
+    dut_name: str,
+    dut_host: str,
+    num_spines: int,
+    num_leaves: int,
+    dut_role: str = "leaf",
+    dut_port: int = 2018,
+    simulate_neighbors: bool = False,
+    verify_routes: bool = False,
+    remote_path: str = "/mnt/flash/scale_test_server",
+    forbidden_dut_hosts: t.Optional[t.List[str]] = None,
+    topology_type: t.Optional[str] = None,
+    num_prefixes_per_node: t.Optional[int] = None,
+    generate_ipv4_prefixes: bool = False,
+    num_sites: t.Optional[int] = None,
+    num_super_spines: t.Optional[int] = None,
+    prefix_seed: t.Optional[int] = None,
+    extra_flags: t.Optional[t.List[str]] = None,
+    run_duration_sec: t.Optional[int] = None,
+    run_timeout_sec: int = 240,
+    require_reachable: bool = True,
+    require_binary_present: bool = True,
+    restart_openr: bool = False,
+    openr_ready_timeout_sec: t.Optional[int] = None,
+    expected_updated_key_vals_delta: t.Optional[int] = None,
+    jq_var_prefix: str = "openr_scale",
+    area: t.Optional[str] = None,
+    areas: t.Optional[str] = None,
+    background: bool = False,
+    background_log_path: t.Optional[str] = None,
+    background_ready_timeout_sec: t.Optional[int] = None,
+    interfaces: t.Optional[t.Sequence[str]] = None,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Run the Open/R ``scale_test_server`` injector on ``helper_name``.
+
+    Injects a synthetic fabric into ``dut_name``'s KvStore and fails when the
+    DUT received fewer key-values than the fabric should have sent.
+    ``kvstore.received_key_vals`` is sampled from the DUT's own Open/R over
+    Thrift immediately before and after the injector runs; the injector's own
+    report of what it sent is exactly the number a policed path invalidates, so
+    it is never the source. ``kvstore.updated_key_vals`` is required and logged
+    over the same window by default. ``expected_updated_key_vals_delta`` opts into
+    exact equality for a KvStore-merge test with a clean-store precondition.
+
+    Also publishes what was injected, as jq variables for
+    ``create_openr_kvstore_keys_check``:
+
+    * ``<jq_var_prefix>_expected_nodes`` -- the synthetic node names the
+      injector builds, derived from the same topology flags this step passes to
+      it. The DUT replaces index 0 of its own role, so that name is excluded.
+    * ``<jq_var_prefix>_prefixes_per_node`` -- how many ``prefix:`` keys each of
+      those nodes must have.
+    * ``<jq_var_prefix>_expected_keys_sent``,
+      ``<jq_var_prefix>_expected_node_count`` and
+      ``<jq_var_prefix>_pre_injection_counts`` -- diagnostics for the run log.
+
+    The expectation is derived from the command line rather than read out of the
+    injector's output. The only count the binary reports before injecting is its
+    *generated* topology, logged before the DUT replaces a node, so it is high
+    by ``1 + num_prefixes_per_node`` and can never be the expectation.
+
+    Args:
+        helper_name: device running the injector. The binary is expected to be
+            pre-staged at ``remote_path``; this step never builds, copies or
+            removes it.
+        dut_name: device running real Open/R, whose KvStore is measured.
+        dut_host: address the injector connects to. MUST be the DUT's inband
+            address -- the mgmt path is control-plane policed and resets the
+            large ``adj:`` requests mid-flight.
+        forbidden_dut_hosts: addresses that must never be used as ``dut_host``.
+            List the DUT's mgmt address here to make that mistake fail loudly.
+        num_spines / num_leaves: fabric size. 64/40 is the BBF-representative
+            point: the target fabric is 99 nodes (64 spines + 31 data leaves +
+            4 control leaves), and per-leaf adjacency count is driven by spine
+            count x links-per-spine, so 64 spines makes a leaf DUT exactly
+            representative while leaf count only scales fabric size.
+        dut_role: ``leaf`` (neighbors are spines) or ``spine``.
+        simulate_neighbors: run SparkFaker as well as KvStore injection.
+            Defaults to False: Spark simulation needs a VLAN trunk between the
+            helper and the DUT.
+        verify_routes: have the injector wait for the DUT to compute routes.
+            Defaults to False -- this test gates on key-values reaching the
+            DUT's KvStore, not on route computation or FIB programming.
+        run_duration_sec: how long the injector serves the fabric before
+            exiting. The injected keys outlive it, so this only has to cover the
+            injection itself.
+        run_timeout_sec: cap on the foreground command; must exceed
+            ``run_duration_sec``. The device command channel gives up near 300s.
+        require_binary_present: verify ``test -x remote_path`` on the helper
+            before injecting, so a missing pre-staged binary fails as a setup
+            problem rather than as an empty injector run.
+        restart_openr: cycle Open/R on the DUT before injecting. Defaults to
+            False. The gate measures key-values received across the injection,
+            which is independent of what the store already holds, and a
+            restart's full sync from the peer inflates that same counter. Open/R
+            on EOS is a configured daemon, so this is ``daemon Openr`` /
+            ``shutdown`` then ``no shutdown``, verified from both sides via
+            Open/R's own Thrift interface.
+        openr_ready_timeout_sec: budget for Open/R to serve Thrift again after
+            the restart. Observed cost to INITIALIZED is ~26s.
+        expected_updated_key_vals_delta: optional exact increase required from
+            ``kvstore.updated_key_vals.sum``. Omitted by default so existing
+            Test 2 serialization and diagnostic-only behavior remain unchanged.
+        prefix_seed: derive each node's prefixes from
+            ``(prefix_seed, node, index)`` instead of drawing them at random,
+            which makes the injected ``prefix:`` key names computable off-box
+            and lets a check assert them by name. 0 or omitted keeps the
+            historical random behaviour. Published as
+            ``{jq_var_prefix}_prefix_seed``.
+        generate_ipv4_prefixes: ask the injector to append one IPv4 /32 prefix
+            for every IPv6 /128 prefix. Defaults to False.
+        area: restrict key accounting to one KvStore area. Read side only --
+            it scopes what the step counts, and does not reach the injector.
+        areas: comma-separated area names for the injector's ``--areas``. Two or
+            more replicate the topology into each area and patch the DUT in as an
+            ABR; the binary treats one name as single-area. Distinct from
+            ``area``, which only scopes counting.
+        background: leave the finite-duration injector running while later Steps
+            disrupt the physical test link. Foreground behavior remains the default.
+        background_log_path: absolute helper path used to capture detached injector
+            output. Required when ``background`` is true.
+        background_ready_timeout_sec: readiness budget for the detached injector.
+        interfaces: EOS interfaces used by SparkFaker. Required when
+            simulate_neighbors is true.
+    """
+    if num_spines <= 0 or num_leaves <= 0:
+        raise ValueError(
+            f"num_spines and num_leaves must be positive, got "
+            f"{num_spines} and {num_leaves}"
+        )
+    if dut_role not in ("leaf", "spine"):
+        raise ValueError(f"dut_role must be 'leaf' or 'spine', got {dut_role!r}")
+    if (
+        expected_updated_key_vals_delta is not None
+        and expected_updated_key_vals_delta < 0
+    ):
+        raise ValueError(
+            "expected_updated_key_vals_delta must be non-negative, got "
+            f"{expected_updated_key_vals_delta}"
+        )
+    if background and not background_log_path:
+        raise ValueError("background_log_path is required in background mode")
+    if (
+        background_ready_timeout_sec is not None
+        and background_ready_timeout_sec <= 0
+    ):
+        raise ValueError("background_ready_timeout_sec must be positive")
+    if simulate_neighbors and not interfaces:
+        raise ValueError("interfaces is required when simulate_neighbors is true")
+    if interfaces is not None and any(not interface for interface in interfaces):
+        raise ValueError("interfaces must contain only nonempty names")
+
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "openr_scale_injection",
+        "helper_name": helper_name,
+        "dut_name": dut_name,
+        "dut_host": dut_host,
+        "dut_port": dut_port,
+        "num_spines": num_spines,
+        "num_leaves": num_leaves,
+        "dut_role": dut_role,
+        "simulate_neighbors": simulate_neighbors,
+        "verify_routes": verify_routes,
+        "remote_path": remote_path,
+        "run_timeout_sec": run_timeout_sec,
+        "require_reachable": require_reachable,
+        "require_binary_present": require_binary_present,
+        "restart_openr": restart_openr,
+        "jq_var_prefix": jq_var_prefix,
+    }
+    if generate_ipv4_prefixes:
+        params["generate_ipv4_prefixes"] = True
+    if background:
+        params["background"] = True
+    for key, value in (
+        ("forbidden_dut_hosts", forbidden_dut_hosts),
+        ("topology_type", topology_type),
+        ("num_prefixes_per_node", num_prefixes_per_node),
+        ("num_sites", num_sites),
+        ("num_super_spines", num_super_spines),
+        ("prefix_seed", prefix_seed),
+        ("extra_flags", extra_flags),
+        ("run_duration_sec", run_duration_sec),
+        ("openr_ready_timeout_sec", openr_ready_timeout_sec),
+        ("expected_updated_key_vals_delta", expected_updated_key_vals_delta),
+        ("area", area),
+        ("areas", areas),
+        ("background_log_path", background_log_path),
+        ("background_ready_timeout_sec", background_ready_timeout_sec),
+        ("interfaces", list(interfaces) if interfaces is not None else None),
+    ):
+        if value is not None:
+            params[key] = value
+
+    return create_custom_step(
+        params_dict=params,
+        description=description
+        or (
+            f"Inject {num_spines}-spine/{num_leaves}-leaf Open/R topology into "
+            f"{dut_name} KvStore from {helper_name}"
+        ),
+    )
+
+
+def create_openr_scale_performance_step(
+    dut_name: str,
+    profile: str,
+    phase: str,
+    state_key: str,
+    action: t.Literal["start", "validate", "cleanup"],
+) -> Step:
+    """Create one side of an Open/R scale performance bracket."""
+    if action not in {"start", "validate", "cleanup"}:
+        raise ValueError(f"Unsupported performance action {action!r}")
+    if not profile or not dut_name or not phase or not state_key:
+        raise ValueError("performance step requires a profile, DUT, phase, and state key")
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "openr_scale_performance",
+            "action": action,
+            "dut_name": dut_name,
+            "profile": profile,
+            "phase": phase,
+            "state_key": state_key,
+        },
+        description=f"{action.title()} Open/R scale performance {phase} on {dut_name}",
+    )
+
+
+def create_openr_fibagent_pause_step(
+    dut_name: str,
+    pause_seconds: float = 1.0,
+    metric_increments: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
+    metric_interval_seconds: float = 0.0,
+    agent: str = "FibAgent",
+    description: t.Optional[str] = None,
+) -> Step:
+    """Freeze an EOS daemon (FibAgent by default) with SIGSTOP.
+
+    While the daemon is frozen, each ``metric_increments`` entry
+    (``{"interfaces": [...], "increment": N}``, 0 clears) is applied through
+    Open/R's ctrl Thrift API, ``metric_interval_seconds`` apart; the daemon
+    stays frozen ``pause_seconds`` longer, then gets SIGCONT. Fails if the
+    daemon's PID or start time changed.
+    """
+    params_dict: t.Dict[str, t.Any] = {
+        "custom_step_name": "openr_fibagent_pause",
+        "dut_name": dut_name,
+        "agent": agent,
+        "pause_seconds": pause_seconds,
+    }
+    if metric_increments:
+        params_dict["metric_increments"] = metric_increments
+        params_dict["metric_interval_seconds"] = metric_interval_seconds
+    return create_custom_step(
+        params_dict=params_dict,
+        description=description or f"Pause {agent} on {dut_name}",
+    )
+
+
+def create_openr_fib_pause_validation_step(
+    dut_name: str,
+    action: t.Literal["ready", "start", "validate", "burst_start", "burst_check"],
+    state_key: str = "fibagent_pause",
+    max_thrift_failures: int = 0,
+    max_sync_fib_calls: int = 0,
+    min_route_updates: int = 1,
+    max_route_updates: t.Optional[int] = None,
+    timeout_seconds: int = 120,
+    expected_routes: t.Optional[int] = None,
+    allowed_interfaces: t.Optional[t.List[str]] = None,
+    threshold_profile: t.Optional[str] = None,
+) -> Step:
+    """Bracket FibAgent pauses with Open/R Fib counter and programming checks.
+
+    ``ready`` waits until Open/R holds ``expected_routes`` routes, FibAgent has
+    programmed all of them, and every next hop is on ``allowed_interfaces``.
+    ``burst_start``/``burst_check`` bracket one pause: ``burst_check`` waits for
+    recovery, checks EOS, and gates the burst on the configerator threshold
+    ``threshold_profile`` (default ``fibagent_pause``): CPU, RSS, FibAgent route
+    sets per stall, and backlog drain time.
+    ``start`` records the Open/R Fib counters. ``validate`` waits until
+    ``fib.synced`` is 1 and FibAgent has programmed every Open/R route, then
+    asserts the thrift-failure and syncFib deltas stay within bounds and that at
+    least ``min_route_updates`` (and, when set, at most ``max_route_updates``)
+    route updates reached FibAgent.
+    """
+    if action not in {"ready", "start", "validate", "burst_start", "burst_check"}:
+        raise ValueError(f"Unsupported Open/R FIB pause validation action {action!r}")
+    if action in {"ready", "burst_check"} and expected_routes is None:
+        raise ValueError(f"{action} requires expected_routes")
+    params_dict: t.Dict[str, t.Any] = {
+        "custom_step_name": "openr_fib_pause_validation",
+        "action": action,
+        "dut_name": dut_name,
+        "state_key": state_key,
+        "max_thrift_failures": max_thrift_failures,
+        "max_sync_fib_calls": max_sync_fib_calls,
+        "min_route_updates": min_route_updates,
+        "timeout_seconds": timeout_seconds,
+    }
+    if max_route_updates is not None:
+        params_dict["max_route_updates"] = max_route_updates
+    if threshold_profile is not None:
+        params_dict["threshold_profile"] = threshold_profile
+    if expected_routes is not None:
+        params_dict["expected_routes"] = expected_routes
+        params_dict["allowed_interfaces"] = allowed_interfaces or []
+    return create_custom_step(
+        params_dict=params_dict,
+        description=f"{action.title()} Open/R FIB pause validation on {dut_name}",
+    )
+
+
+def create_openr_update_loss_validation_step(
+    dut_name: str,
+    action: t.Literal["ready", "validate"],
+    state_key: str = "update_loss",
+    timeout_seconds: int = 600,
+    min_moved_prefixes: int = 1,
+    stimulus_cmd: t.Optional[str] = None,
+    metric_interfaces: t.Optional[t.List[str]] = None,
+) -> Step:
+    """Bracket a FibAgent stall with Decision/Fib/EOS value comparison.
+
+    ``ready`` waits for a stable programmed fabric and snapshots the baseline
+    per-prefix Decision/Fib/EOS state. ``validate`` fails when Decision moved
+    (stimulus landed) but Fib or EOS kept stale values -- a route update lost
+    in the Decision->Fib queue -- and also fails when Decision never moved
+    (broken stimulus). ``stimulus_cmd`` is echoed into the failure evidence.
+    Open/R link-metric increments on ``metric_interfaces`` are cleared before
+    ``ready`` and after ``validate``.
+    """
+    if action not in {"ready", "validate"}:
+        raise ValueError(f"Unsupported Open/R update-loss action {action!r}")
+    params_dict: t.Dict[str, t.Any] = {
+        "custom_step_name": "openr_update_loss_validation",
+        "action": action,
+        "dut_name": dut_name,
+        "state_key": state_key,
+        "timeout_seconds": timeout_seconds,
+        "min_moved_prefixes": min_moved_prefixes,
+    }
+    if stimulus_cmd is not None:
+        params_dict["stimulus_cmd"] = stimulus_cmd
+    if metric_interfaces:
+        params_dict["metric_interfaces"] = metric_interfaces
+    return create_custom_step(
+        params_dict=params_dict,
+        description=f"{action.title()} Open/R update-loss validation on {dut_name}",
+    )
+
+
+def create_openr_scale_performance_cleanup_step(
+    dut_name: str,
+    profile: str,
+    phase: str,
+    state_key: str,
+) -> Step:
+    """Remove one exact performance bracket state during playbook cleanup."""
+    if not profile or not dut_name or not phase or not state_key:
+        raise ValueError("performance cleanup requires a profile, DUT, phase, and state key")
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "openr_scale_performance_cleanup",
+            "action": "cleanup",
+            "dut_name": dut_name,
+            "profile": profile,
+            "phase": phase,
+            "state_key": state_key,
+        },
+        description=f"Cleanup Open/R scale performance {phase} on {dut_name}",
+    )
+
+
+
+def create_openr_scale_cold_boot_step(
+    *,
+    action: t.Literal[
+        "baseline", "mark_reboot", "activate", "recover", "finalize", "cleanup"
+    ],
+    dut_name: str,
+    helper_name: str,
+    num_spines: int,
+    num_leaves: int,
+    num_control_nodes: int,
+    num_sites: int,
+    prefixes_per_node: int,
+    prefix_seed: int,
+    dut_role: t.Literal["leaf", "spine"],
+    area: str,
+    interface: str,
+    scale_interfaces: t.Sequence[str],
+    injector_jq_var_prefix: str = "openr_scale",
+    state_key: str = "openr_scale_dut_cold_boot",
+    profile: str = "cold_boot_64_256_leaf",
+    poll_interval_seconds: float = 1.0,
+    baseline_timeout_seconds: float = 120.0,
+    memory_settle_seconds: float = 60.0,
+) -> Step:
+    """Create one phase of full-fabric DUT cold-boot validation.
+
+    ``memory_settle_seconds`` after recovery, Open/R memory warnings are
+    reported but not gated; crashes and allocation failures always are.
+    """
+    if action not in {
+        "baseline",
+        "mark_reboot",
+        "activate",
+        "recover",
+        "finalize",
+        "cleanup",
+    }:
+        raise ValueError(f"unsupported cold-boot action {action!r}")
+    if not all(
+        (
+            dut_name,
+            helper_name,
+            area,
+            interface,
+            injector_jq_var_prefix,
+            state_key,
+            profile,
+        )
+    ):
+        raise ValueError("cold-boot step names, area, state key, and profile are required")
+    if not scale_interfaces or any(not interface for interface in scale_interfaces):
+        raise ValueError("cold-boot scale interfaces must be nonempty")
+    if dut_role not in {"leaf", "spine"}:
+        raise ValueError(f"unsupported DUT role {dut_role!r}")
+    if min(num_spines, num_leaves, prefixes_per_node, prefix_seed) <= 0:
+        raise ValueError("cold-boot topology counts and prefix seed must be positive")
+    if min(num_control_nodes, num_sites) < 0:
+        raise ValueError("cold-boot topology counts must be nonnegative")
+    if poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be positive")
+    if baseline_timeout_seconds <= 0:
+        raise ValueError("baseline_timeout_seconds must be positive")
+    if memory_settle_seconds < 0:
+        raise ValueError("memory_settle_seconds must be nonnegative")
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "openr_scale_cold_boot",
+            "action": action,
+            "dut_name": dut_name,
+            "helper_name": helper_name,
+            "num_spines": num_spines,
+            "num_leaves": num_leaves,
+            "num_control_nodes": num_control_nodes,
+            "num_sites": num_sites,
+            "prefixes_per_node": prefixes_per_node,
+            "prefix_seed": prefix_seed,
+            "dut_role": dut_role,
+            "area": area,
+            "interface": interface,
+            "scale_interfaces": list(scale_interfaces),
+            "injector_jq_var_prefix": injector_jq_var_prefix,
+            "state_key": state_key,
+            "profile": profile,
+            "poll_interval_seconds": poll_interval_seconds,
+            "baseline_timeout_seconds": baseline_timeout_seconds,
+            "memory_settle_seconds": memory_settle_seconds,
+        },
+        description=f"{action.title()} Open/R full-fabric DUT cold boot on {dut_name}",
+    )
+
+
+def create_openr_scale_kvstore_state_step(  # noqa: C901
+    dut_name: str,
+    seeds: t.Sequence[int],
+    num_spines: int,
+    num_leaves: int,
+    num_control_nodes: int,
+    num_sites: int,
+    ecmp_width: int,
+    prefixes_per_node: int,
+    dut_role: t.Literal["leaf", "spine"],
+    area: str,
+    generate_ipv4_prefixes: bool = False,
+    checkpoint: t.Literal["single", "after_a", "after_b"] = "single",
+    state_key: str | None = None,
+    retry_count: int = 6,
+    retry_delay_seconds: float = 5.0,
+    adjacency_batch_size: int = 16,
+    prefix_batch_size: int = 500,
+    enforce_production_counts: bool = True,
+    exact_scope: bool = False,
+    dut_neighbor_interfaces: t.Mapping[str, str] | None = None,
+) -> Step:
+    """Create a semantic KvStore validation barrier for one or two injections."""
+    expected_seed_count = {"single": 1, "after_a": 1, "after_b": 2}.get(checkpoint)
+    if expected_seed_count is None:
+        raise ValueError(f"Unsupported checkpoint {checkpoint!r}")
+    if len(seeds) != expected_seed_count or any(
+        not isinstance(seed, int) or isinstance(seed, bool) or seed <= 0
+        for seed in seeds
+    ):
+        raise ValueError(
+            f"{checkpoint} requires exactly {expected_seed_count} positive integer "
+            f"seed(s), got {seeds!r}"
+        )
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"seeds must be distinct positive integers, got {seeds!r}")
+    if not dut_name or not area:
+        raise ValueError("dut_name and area must be nonempty")
+    if dut_role not in {"leaf", "spine"}:
+        raise ValueError(f"dut_role must be 'leaf' or 'spine', got {dut_role!r}")
+    if checkpoint == "single" and state_key is not None:
+        raise ValueError("single must not include state_key")
+    if checkpoint != "single" and (not isinstance(state_key, str) or not state_key):
+        raise ValueError(f"{checkpoint} requires nonempty state_key")
+    if not isinstance(enforce_production_counts, bool):
+        raise ValueError("enforce_production_counts must be a boolean")
+    if not isinstance(generate_ipv4_prefixes, bool):
+        raise ValueError("generate_ipv4_prefixes must be a boolean")
+    if not isinstance(exact_scope, bool):
+        raise ValueError("exact_scope must be a boolean")
+    if checkpoint != "single" and enforce_production_counts and dut_role != "leaf":
+        raise ValueError("production KvStore counts require dut_role='leaf'")
+    if (
+        min(num_spines, num_leaves, ecmp_width, adjacency_batch_size, prefix_batch_size)
+        <= 0
+    ):
+        raise ValueError("spines, leaves, ECMP width, and batch sizes must be positive")
+    if min(num_control_nodes, num_sites, prefixes_per_node, retry_count) < 0:
+        raise ValueError("counts and retry_count must be nonnegative")
+    if retry_delay_seconds < 0:
+        raise ValueError("retry_delay_seconds must be nonnegative")
+    if dut_neighbor_interfaces is not None and (
+        not dut_neighbor_interfaces
+        or any(
+            not isinstance(node, str)
+            or not node
+            or not isinstance(interface, str)
+            or not interface
+            for node, interface in dut_neighbor_interfaces.items()
+        )
+    ):
+        raise ValueError(
+            "dut_neighbor_interfaces must be a nonempty string mapping"
+        )
+
+    params: dict[str, t.Any] = {
+        "custom_step_name": "openr_scale_kvstore_state",
+        "dut_name": dut_name,
+        "seeds": list(seeds),
+        "num_spines": num_spines,
+        "num_leaves": num_leaves,
+        "num_control_nodes": num_control_nodes,
+        "num_sites": num_sites,
+        "ecmp_width": ecmp_width,
+        "prefixes_per_node": prefixes_per_node,
+        "dut_role": dut_role,
+        "area": area,
+        "checkpoint": checkpoint,
+        "retry_count": retry_count,
+        "retry_delay_seconds": retry_delay_seconds,
+        "adjacency_batch_size": adjacency_batch_size,
+        "prefix_batch_size": prefix_batch_size,
+    }
+    if generate_ipv4_prefixes:
+        params["generate_ipv4_prefixes"] = True
+    if exact_scope:
+        params["exact_scope"] = True
+    if checkpoint != "single":
+        params.update(
+            action="validate",
+            state_key=state_key,
+            enforce_production_counts=enforce_production_counts,
+        )
+    if dut_neighbor_interfaces is not None:
+        params["dut_neighbor_interfaces"] = dict(dut_neighbor_interfaces)
+    return create_custom_step(
+        params_dict=params,
+        description=f"Validate Open/R scale KvStore state {checkpoint} on {dut_name}",
+    )
+
+
+def create_openr_scale_kvstore_state_cleanup_step(state_key: str) -> Step:
+    """Create an idempotent runner-local fingerprint cleanup step."""
+    if not state_key:
+        raise ValueError("state_key must be nonempty")
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "openr_scale_kvstore_state_cleanup",
+            "state_key": state_key,
+        },
+        description="Clear Open/R scale KvStore fingerprint state",
     )
 
 
@@ -1227,9 +2290,11 @@ def create_snapshot_bgp_sent_route_counts_step(
         _who = (
             f"peers under {peer_parent_prefixes}"
             if peer_parent_prefixes
-            else f"peer-group ~{peer_group_filter!r}"
-            if peer_group_filter
-            else f"{len(peer_addrs or [])} peer(s)"
+            else (
+                f"peer-group ~{peer_group_filter!r}"
+                if peer_group_filter
+                else f"{len(peer_addrs or [])} peer(s)"
+            )
         )
         description = (
             f"Snapshot BGP sent-count for {_who} on {hostname} (key={snapshot_key})"
@@ -1820,9 +2885,11 @@ def create_verify_bgp_sent_route_counts_uniform_step(
         _who = (
             f"peers under {peer_parent_prefixes}"
             if peer_parent_prefixes
-            else f"peer-group ~{peer_group_filter!r}"
-            if peer_group_filter
-            else f"{len(peer_addrs or [])} peer(s)"
+            else (
+                f"peer-group ~{peer_group_filter!r}"
+                if peer_group_filter
+                else f"{len(peer_addrs or [])} peer(s)"
+            )
         )
         description = (
             f"Verify BGP sent-count uniform (>= {min_count}, spread <= {max_spread}) "
@@ -2080,9 +3147,11 @@ def create_verify_bgp_notification_occurred_step(
         _who = (
             f"peers under {peer_parent_prefixes}"
             if peer_parent_prefixes
-            else f"peer-group ~{peer_group_filter!r}"
-            if peer_group_filter
-            else f"{len(peer_addrs or [])} peer(s)"
+            else (
+                f"peer-group ~{peer_group_filter!r}"
+                if peer_group_filter
+                else f"{len(peer_addrs or [])} peer(s)"
+            )
         )
         if mode == "snapshot":
             description = (
@@ -2152,9 +3221,11 @@ def create_verify_bgp_peers_joined_running_step(
         _who = (
             f"peers under {peer_parent_prefixes}"
             if peer_parent_prefixes
-            else f"peer-group ~{peer_group_filter!r}"
-            if peer_group_filter
-            else f"{len(peer_addrs or [])} peer(s)"
+            else (
+                f"peer-group ~{peer_group_filter!r}"
+                if peer_group_filter
+                else f"{len(peer_addrs or [])} peer(s)"
+            )
         )
         description = (
             f"Verify update-group state {expected_state} on {_who} on {hostname} "
@@ -2725,6 +3796,8 @@ def create_record_jq_timestamp_step(
 def create_fpf_set_interface_admin_step(
     interfaces: t.List[str],
     enable: bool,
+    best_effort: bool = False,
+    record_event_time: bool = True,
     description: t.Optional[str] = None,
 ) -> Step:
     """Disable/enable interface(s) on the live agent via thrift (held).
@@ -2736,59 +3809,87 @@ def create_fpf_set_interface_admin_step(
     tests that must have the port actually down during the assertion window; pair
     a disable (enable=False) with an enable (enable=True) to restore.
     """
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "fpf_set_interface_admin",
+        "interfaces": interfaces,
+        "is_enable": enable,
+    }
+    if best_effort:
+        params["best_effort"] = True
+    if not record_event_time:
+        params["record_event_time"] = False
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description
         or f"{'Enable' if enable else 'Disable'} {interfaces} (thrift admin state)",
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "custom_step_name": "fpf_set_interface_admin",
-                    "interfaces": interfaces,
-                    "is_enable": enable,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params)),
     )
 
 
 def create_fpf_drain_interface_step(
     interfaces: t.Optional[t.List[str]],
     drain: bool,
+    target_device: t.Optional[str] = None,
+    mutation_token: t.Optional[str] = None,
     description: t.Optional[str] = None,
 ) -> Step:
-    """Soft-drain / undrain via the on-box LOCAL_DRAINER, calling the driver
-    directly. With ``interfaces`` -> per-port (``async_softdrain_interface`` /
-    ``async_undrain_interface``); with EMPTY/None ``interfaces`` -> device-level
-    soft-drain of the whole DUT (``async_onbox_softdrain_device`` /
-    ``async_onbox_undrain_device``).
+    """Soft-drain / undrain through the on-box LOCAL_DRAINER FPF custom task.
 
-    Unlike ``create_drain_undrain_step(interfaces=...)`` (whose LOCAL_DRAINER path
-    resolves the interface against the discovered fabric topology and raises
-    "Interface not found" for the GPU-facing GTSW port), the per-port path here
-    passes the name straight to the drainer — the GPU-facing port is a real agent
-    port but is not in the fabric-discovered interface list. And unlike the
-    generic device path (which HARD-drains via ``async_onbox_drain_device``), the
-    device path here SOFT-drains for the control-up/data-drains contract. Use for
-    FPF link drain/undrain (per-port) and device drain/undrain (no interfaces).
+    Interface targets are passed directly to the FPF custom task, which applies
+    them through the singular local-drainer interface API. GPU-facing agent
+    ports therefore need not appear in testbed topology. With no interfaces,
+    this performs a whole-device soft drain or undrain. This FPF helper also
+    supports remote-device selection and mutation tokens; use the generic
+    drain/undrain factory for the bulk local/NDS workflow.
     """
     intfs = interfaces or []
     if intfs:
         default_desc = f"{'Soft-drain' if drain else 'Undrain'} {intfs} (local drainer)"
     else:
         default_desc = f"{'Soft-drain' if drain else 'Undrain'} DEVICE (local drainer)"
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "fpf_drain_interface",
+        "interfaces": intfs,
+        "is_drain": drain,
+    }
+    if target_device:
+        params["target_device"] = target_device
+    if mutation_token:
+        params["mutation_token"] = mutation_token
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description or default_desc,
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "custom_step_name": "fpf_drain_interface",
-                    "interfaces": intfs,
-                    "is_drain": drain,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params)),
+    )
+
+
+def create_fpf_conditional_undrain_step(
+    interfaces: t.Optional[t.List[str]],
+    mutation_token: str,
+    target_device: t.Optional[str] = None,
+    best_effort: bool = False,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Restore only a drain owned by this playbook's mutation token.
+
+    With no matching marker the step is an explicit no-op. This makes it safe
+    to put in ``Playbook.cleanup_steps``: cancellation after the drain is
+    restored, while a precondition failure cannot clear ambient drain state.
+    """
+    intfs = interfaces or []
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "fpf_conditional_undrain",
+        "interfaces": intfs,
+        "mutation_token": mutation_token,
+        "best_effort": best_effort,
+    }
+    if target_device:
+        params["target_device"] = target_device
+    scope = f"interface(s) {intfs}" if intfs else "whole device"
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or f"Restore owned drain on {scope}",
+        step_params=Params(json_params=json.dumps(params)),
     )
 
 
@@ -2799,6 +3900,7 @@ def create_fpf_verify_disruption_step(
     mode: str = "admin_oper",
     expect_drained: bool = True,
     fail_if_ineffective: bool = False,
+    target_device: t.Optional[str] = None,
     description: t.Optional[str] = None,
 ) -> Step:
     """Disruption-effectiveness gate: verify the disrupted interface(s) actually
@@ -2813,26 +3915,28 @@ def create_fpf_verify_disruption_step(
     ``expect_drained`` — the correct signal for a link DRAIN, where the port
     stays admin=ENABLED / oper=UP by design (control up, data depreferenced).
 
+    mode="device_clean": read-only precondition that requires both the
+    device-level drain flag and every per-port drain flag to be clear.
+
     fail_if_ineffective=True RAISES (fails the step / aborts the playbook) when
     the disruption did not take, instead of only recording it for downstream
     SKIP. Use for a disable, where a no-op makes the whole test meaningless.
     """
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "fpf_verify_disruption",
+        "interfaces": interfaces,
+        "mode": mode,
+        "expect_admin_enabled": expect_admin_enabled,
+        "expect_oper_up": expect_oper_up,
+        "expect_drained": expect_drained,
+        "fail_if_ineffective": fail_if_ineffective,
+    }
+    if target_device:
+        params["target_device"] = target_device
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description or f"Verify disruption effective on {interfaces}",
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "custom_step_name": "fpf_verify_disruption",
-                    "interfaces": interfaces,
-                    "mode": mode,
-                    "expect_admin_enabled": expect_admin_enabled,
-                    "expect_oper_up": expect_oper_up,
-                    "expect_drained": expect_drained,
-                    "fail_if_ineffective": fail_if_ineffective,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params)),
     )
 
 
@@ -2851,6 +3955,154 @@ def create_fpf_record_disruption_time_step(
         description=description or "Record FPF disruption time",
         step_params=Params(
             json_params=json.dumps({"custom_step_name": "record_fpf_disruption_time"})
+        ),
+    )
+
+
+def create_fpf_record_mutation_time_step(
+    description: t.Optional[str] = None,
+) -> Step:
+    """Record the wall-clock start of an FPF prefix scale mutation."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or "Record FPF scale mutation time",
+        step_params=Params(
+            json_params=json.dumps({"custom_step_name": "record_fpf_mutation_time"})
+        ),
+    )
+
+
+def create_fpf_record_recovered_baseline_time_step(
+    description: t.Optional[str] = None,
+) -> Step:
+    """Anchor strict collector windows after all current recovery gates pass."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or "Record recovered-baseline qualification start",
+        step_params=Params(
+            json_params=json.dumps(
+                {"custom_step_name": "record_fpf_recovered_baseline_time"}
+            )
+        ),
+    )
+
+
+def create_fpf_verify_recovered_state_step(
+    *,
+    device_planes_by_host: t.Dict[str, t.Dict[str, t.List[int]]],
+    expected_count: int,
+    expected_sessions: int,
+    prod_prefix_expectations_by_host: t.Dict[
+        str, t.Dict[str, t.Dict[str, t.List[int]]]
+    ],
+    rf_vf_groups: t.List[t.Dict[str, t.Any]],
+    max_age_sec: float = 30.0,
+    future_timestamp_grace_sec: float = 1.0,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Point gate for fresh exact recovered state before baseline qualification."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or "Verify current recovered FPF state",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_verify_recovered_state",
+                    "device_planes_by_host": device_planes_by_host,
+                    "expected_count": expected_count,
+                    "expected_sessions": expected_sessions,
+                    "prod_prefix_expectations_by_host": (
+                        prod_prefix_expectations_by_host
+                    ),
+                    "rf_vf_groups": rf_vf_groups,
+                    "max_age_sec": max_age_sec,
+                    "future_timestamp_grace_sec": future_timestamp_grace_sec,
+                }
+            )
+        ),
+    )
+
+
+def create_fpf_record_restart_time_step(
+    description: t.Optional[str] = None,
+) -> Step:
+    """Record an FPF recovery/restart timestamp without replacing disruption time.
+
+    Place immediately before starting a service after an intentional outage.
+    Restart-aware RIB checks can then measure their recovery SLA from this point
+    while disruption-window checks retain the original pre-outage timestamp.
+    """
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or "Record FPF restart time",
+        step_params=Params(
+            json_params=json.dumps({"custom_step_name": "record_fpf_restart_time"})
+        ),
+    )
+
+
+def create_fpf_record_restart_completion_time_step(
+    description: t.Optional[str] = None,
+) -> Step:
+    """Record the timestamp immediately after a restart command completes."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or "Record FPF restart completion time",
+        step_params=Params(
+            json_params=json.dumps(
+                {"custom_step_name": "record_fpf_restart_completion_time"}
+            )
+        ),
+    )
+
+
+def create_fpf_remote_prefix_gr_sequence_step(
+    local_gtsw: str,
+    remote_gtsw: str,
+    between_stops_sec: int = 30,
+    before_local_restart_sec: int = 30,
+    max_fsdb_outage_sec: int = 120,
+    service_state_timeout_sec: int = 30,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Stop local FSDB, stop remote BGP, then restore only local FSDB."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or "Create one-way remote-prefix withdrawal inside local FSDB GR",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_remote_prefix_gr_sequence",
+                    "local_gtsw": local_gtsw,
+                    "remote_gtsw": remote_gtsw,
+                    "between_stops_sec": int(between_stops_sec),
+                    "before_local_restart_sec": int(before_local_restart_sec),
+                    "max_fsdb_outage_sec": int(max_fsdb_outage_sec),
+                    "service_state_timeout_sec": int(service_state_timeout_sec),
+                }
+            )
+        ),
+    )
+
+
+def create_fpf_remote_prefix_start_origin_bgp_step(
+    remote_gtsw: str,
+    service_state_timeout_sec: int = 30,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Restore the remote origin BGP service without reinjecting its routes."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or f"Start remote bgpd on {remote_gtsw}",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_remote_prefix_start_origin_bgp",
+                    "remote_gtsw": remote_gtsw,
+                    "service_state_timeout_sec": int(service_state_timeout_sec),
+                }
+            )
         ),
     )
 
@@ -2895,7 +4147,51 @@ def create_fpf_repeated_service_crash_step(
     )
 
 
+def create_fpf_repeated_sw_hw_agent_crash_step(
+    every_sec: int = 15,
+    duration_sec: int = 300,
+    recovery_timeout_sec: int = 120,
+    recovery_poll_interval_sec: int = 5,
+    device_regexes: t.Optional[t.List[str]] = None,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Repeatedly SIGKILL only fboss_sw_agent and fboss_hw_agent.
+
+    Unlike ``Service.AGENT`` on a multi-switch FBOSS platform, this deliberately
+    avoids the broad ``pkill -f fboss_`` driver path. The custom handler issues
+    both exact process-name kills every cycle, collects errors independently,
+    and requires the corresponding systemd services to recover ACTIVE.
+    """
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or (
+            "SIGKILL fboss_sw_agent then fboss_hw_agent every "
+            f"{every_sec}s for {duration_sec}s"
+        ),
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_repeated_sw_hw_agent_crash",
+                    "process_names": ["fboss_sw_agent", "fboss_hw_agent"],
+                    "recovery_services": [
+                        int(taac_types.Service.FBOSS_SW_AGENT.value),
+                        int(taac_types.Service.FBOSS_HW_AGENT_0.value),
+                    ],
+                    "every_sec": every_sec,
+                    "duration_sec": duration_sec,
+                    "recovery_timeout_sec": recovery_timeout_sec,
+                    "recovery_poll_interval_sec": recovery_poll_interval_sec,
+                }
+            )
+        ),
+        device_regexes=device_regexes,
+    )
+
+
 def create_fpf_ndp_clear_loop_step(
+    target_interface: str,
+    neighbor_host: str,
     every_sec: int = 1,
     duration_sec: int = 120,
     device_regexes: t.Optional[t.List[str]] = None,
@@ -2903,17 +4199,39 @@ def create_fpf_ndp_clear_loop_step(
 ) -> Step:
     """Repeatedly clear the NDP table over a window on the target GTSW.
 
-    Runs ``fboss2 clear ndp`` every ``every_sec`` for ``duration_sec`` — a
-    persistent NDP flush that exercises neighbor re-resolution under sustained
-    clearing during a NIC-side link-flap FPF test. Implemented as a CUSTOM_STEP
-    (no new StepName enum).
+    Calls the sw-agent bulk neighbor-flush Thrift API every ``every_sec`` for
+    ``duration_sec`` — a persistent NDP flush that exercises neighbor
+    re-resolution under sustained clearing during a NIC-side link-flap FPF
+    test. Implemented as a CUSTOM_STEP (no new StepName enum).
 
     Args:
+        target_interface: Exact local interface whose NDP entries are cleared.
+        neighbor_host: Exact LLDP neighbor expected on ``target_interface``.
         every_sec: Seconds between successive clears (default 1).
         duration_sec: Total clearing window in seconds (default 120).
         device_regexes: Optional device-regex scope (e.g. the DUT GTSW).
         description: Custom step description.
     """
+    if not target_interface or not neighbor_host:
+        raise ValueError("NDP clear requires target_interface and neighbor_host")
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in (every_sec, duration_sec)
+    ) or not all(
+        math.isfinite(float(value)) and float(value) > 0
+        for value in (every_sec, duration_sec)
+    ):
+        raise ValueError("NDP clear duration and cadence must be finite and > 0")
+    slot_ratio = float(duration_sec) / float(every_sec)
+    if not math.isclose(
+        slot_ratio,
+        round(slot_ratio),
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            "NDP clear duration_sec must be an exact multiple of every_sec"
+        )
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description or f"Clear NDP every {every_sec}s for {duration_sec}s",
@@ -2921,6 +4239,8 @@ def create_fpf_ndp_clear_loop_step(
             json_params=json.dumps(
                 {
                     "custom_step_name": "fpf_ndp_clear_loop",
+                    "target_interface": target_interface,
+                    "neighbor_host": neighbor_host,
                     "every_sec": every_sec,
                     "duration_sec": duration_sec,
                 }
@@ -2930,12 +4250,26 @@ def create_fpf_ndp_clear_loop_step(
     )
 
 
+def _add_skip_start_traffic_param(
+    params: t.Dict[str, t.Any], start_traffic: bool
+) -> None:
+    if not start_traffic:
+        params["skip_start_traffic"] = True
+
+
+def _skip_start_traffic_step_params(start_traffic: bool) -> t.Optional[Params]:
+    params: t.Dict[str, t.Any] = {}
+    _add_skip_start_traffic_param(params, start_traffic)
+    return Params(json_params=json.dumps(params)) if params else None
+
+
 def create_fpf_rapid_flap_step(
     interfaces_by_device: t.Dict[str, t.List[str]],
     duration_sec: int,
     flap_interval_sec: int = 1,
     device_regexes: t.Optional[t.List[str]] = None,
     description: t.Optional[str] = None,
+    start_traffic: bool = True,
 ) -> Step:
     """Rapidly flap per-device interfaces over a window.
 
@@ -2953,21 +4287,96 @@ def create_fpf_rapid_flap_step(
             the per-flap cost used to derive the flap count (default 1).
         device_regexes: Optional device-regex scope.
         description: Custom step description.
+        start_traffic: Whether the generic step pre-hook should start IXIA.
     """
+    params_dict = {
+        "custom_step_name": "fpf_rapid_flap",
+        "interfaces_by_device": interfaces_by_device,
+        "duration_sec": duration_sec,
+        "flap_interval_sec": flap_interval_sec,
+    }
+    _add_skip_start_traffic_param(params_dict, start_traffic)
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description
         or f"Rapid-flap interfaces for {duration_sec}s "
         f"({', '.join(interfaces_by_device.keys())})",
+        step_params=Params(json_params=json.dumps(params_dict)),
+        device_regexes=device_regexes,
+    )
+
+
+def create_snake_rapid_a_end_flap_step(
+    duration_sec: int,
+    flap_interval_sec: int = 6,
+    device_regexes: t.Optional[t.List[str]] = None,
+    description: t.Optional[str] = None,
+    neighbor_hostnames: t.Optional[t.List[str]] = None,
+) -> Step:
+    """Rapidly flap the A-end of every snake circuit over a window.
+
+    CUSTOM_STEP wrapping the driver's ``async_do_rapid_interface_flaps``
+    (wedge_qsfp_util tx_disable/tx_enable). At run time the handler
+    (``snake_rapid_a_end_flap``) resolves this DUT's snake circuits from LLDP.
+    It supports same-device loopbacks and an explicit cross-device peer list;
+    IXIA taps and management ports are excluded. The handler selects one local
+    endpoint per circuit and flaps that set repeatedly until
+    ``duration_sec`` of WALL TIME has elapsed, holding ``flap_interval_sec`` s
+    between flaps. tx_disabling the A-end downs the whole circuit, so only one
+    end per circuit is toggled (gearbox sibling-lane safe).
+
+    ``duration_sec`` is a deadline, not a flap count. A flap costs
+    ``flap_interval_sec`` PLUS two ``wedge_qsfp_util`` invocations across every
+    A-end, which dominates on wide snakes (measured ~18.7s per flap against a 6s
+    interval on fboss159's 95 A-ends). The achieved flap count is therefore a
+    dependent variable and is logged by the handler; the step may overrun the
+    deadline by at most one flap, since the final flap is never interrupted
+    mid-cycle.
+
+    Args:
+        duration_sec: wall-clock flap window in seconds.
+        flap_interval_sec: seconds to hold the link UP between flaps
+            (== interval_to_link_up, default 6). NOT the per-flap cost.
+        device_regexes: Optional device-regex scope.
+        description: Custom step description.
+        neighbor_hostnames: Optional explicit peer devices for cross-device
+            snakes. The local endpoint of every link facing these peers is
+            selected instead of requiring a same-device loopback.
+    """
+    step_params: t.Dict[str, t.Any] = {
+        "custom_step_name": "snake_rapid_a_end_flap",
+        "duration_sec": duration_sec,
+        "flap_interval_sec": flap_interval_sec,
+    }
+    if neighbor_hostnames is not None:
+        step_params["neighbor_hostnames"] = neighbor_hostnames
+
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or f"Rapid-flap snake A-ends for {duration_sec}s "
+        f"(interval={flap_interval_sec}s)",
+        step_params=Params(json_params=json.dumps(step_params)),
+        device_regexes=device_regexes,
+    )
+
+
+def create_clear_port_stats_step(
+    device_regexes: t.Optional[t.List[str]] = None,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Clear all device port counters on the DUT (CUSTOM_STEP).
+
+    Wraps the driver's ``async_clear_all_port_counters`` via the
+    ``snake_clear_port_stats`` handler. Distinct from
+    ``create_clear_traffic_stats_step`` (which clears IXIA traffic-generator
+    stats); this clears the device's own interface/port counters.
+    """
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or "Clear all device port counters",
         step_params=Params(
-            json_params=json.dumps(
-                {
-                    "custom_step_name": "fpf_rapid_flap",
-                    "interfaces_by_device": interfaces_by_device,
-                    "duration_sec": duration_sec,
-                    "flap_interval_sec": flap_interval_sec,
-                }
-            )
+            json_params=json.dumps({"custom_step_name": "snake_clear_port_stats"})
         ),
         device_regexes=device_regexes,
     )
@@ -2980,6 +4389,14 @@ def create_fpf_rapid_flap_step_lldp(
     neighbor_hosts: t.Optional[t.List[str]] = None,
     flap_down_time_sec: float = 6.0,
     flap_up_time_sec: float = 6.0,
+    fail_closed: bool = False,
+    expected_interfaces: t.Optional[t.List[str]] = None,
+    require_exact_neighbor_hosts: bool = False,
+    final_up_timeout_sec: int = 60,
+    final_up_poll_interval_sec: int = 5,
+    nic_recovery_by_interface: t.Optional[
+        t.Dict[str, t.Dict[str, t.Union[str, int]]]
+    ] = None,
     device_regexes: t.Optional[t.List[str]] = None,
     description: t.Optional[str] = None,
 ) -> Step:
@@ -3019,9 +4436,44 @@ def create_fpf_rapid_flap_step_lldp(
             ``tx_enable -> sleep up -> tx_disable -> sleep down`` — and the
             handler leaves the link UP at the end. ``flap_interval_sec`` is
             unused with the symmetric cycle.
+        fail_closed: Opt into fatal discovery/execution/restore errors and
+            positive final-UP verification. False preserves legacy callers.
+        expected_interfaces: Exact LLDP-resolved interface set required when
+            fail_closed is enabled.
+        require_exact_neighbor_hosts: Require exact explicit-host LLDP coverage.
+        final_up_timeout_sec: Maximum wait for final admin+oper UP state.
+        final_up_poll_interval_sec: Final-state polling interval.
+        nic_recovery_by_interface: Optional exact interface -> {host, dev, lane}
+            PAOS-UP fallback for an admin-UP/oper-DOWN latch.
         device_regexes: Optional device-regex scope (e.g. the DUT GTSW).
         description: Custom step description.
     """
+    if fail_closed and not expected_interfaces:
+        raise ValueError(
+            "fail_closed rapid flap requires a non-empty exact "
+            "expected_interfaces scope"
+        )
+
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "fpf_rapid_flap_lldp",
+        "neighbor_pattern": None if neighbor_hosts else neighbor_pattern,
+        "neighbor_hosts": neighbor_hosts,
+        "duration_sec": duration_sec,
+        "flap_interval_sec": flap_interval_sec,
+        "down_time_sec": flap_down_time_sec,
+        "up_time_sec": flap_up_time_sec,
+    }
+    if fail_closed:
+        params.update(
+            {
+                "fail_closed": True,
+                "expected_interfaces": expected_interfaces,
+                "require_exact_neighbor_hosts": require_exact_neighbor_hosts,
+                "final_up_timeout_sec": final_up_timeout_sec,
+                "final_up_poll_interval_sec": final_up_poll_interval_sec,
+                "nic_recovery_by_interface": nic_recovery_by_interface,
+            }
+        )
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description
@@ -3030,19 +4482,7 @@ def create_fpf_rapid_flap_step_lldp(
             f"(neighbors~={neighbor_hosts or neighbor_pattern!r}) "
             f"for {duration_sec}s"
         ),
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "custom_step_name": "fpf_rapid_flap_lldp",
-                    "neighbor_pattern": neighbor_pattern,
-                    "neighbor_hosts": neighbor_hosts,
-                    "duration_sec": duration_sec,
-                    "flap_interval_sec": flap_interval_sec,
-                    "down_time_sec": flap_down_time_sec,
-                    "up_time_sec": flap_up_time_sec,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params)),
         device_regexes=device_regexes,
     )
 
@@ -3058,8 +4498,22 @@ def create_fpf_multi_gtsw_rapid_flap_step(
     churn_service: t.Optional[taac_types.Service] = None,
     churn_action: str = "restart",
     churn_every_sec: int = 120,
+    churn_initial_delay_sec: int = 0,
+    churn_recovery_timeout_sec: int = 0,
+    churn_recovery_poll_interval_sec: int = 5,
     churn_devices: t.Optional[t.List[str]] = None,
     uniform_interface_discovery: bool = False,
+    final_up_timeout_sec: int = 60,
+    final_up_poll_interval_sec: int = 5,
+    retry_final_cleanup_after_churn: bool = False,
+    final_cleanup_service_recovery_timeout_sec: int = 120,
+    final_cleanup_retry_timeout_sec: int = 120,
+    fail_closed: bool = False,
+    expected_interfaces: t.Optional[t.List[str]] = None,
+    require_exact_neighbor_hosts: bool = False,
+    nic_recovery_by_gtsw_interface: t.Optional[
+        t.Dict[str, t.Dict[str, t.Dict[str, t.Union[str, int]]]]
+    ] = None,
     description: t.Optional[str] = None,
 ) -> Step:
     """Flap the links facing a GPU host across MANY GTSWs CONCURRENTLY.
@@ -3088,14 +4542,41 @@ def create_fpf_multi_gtsw_rapid_flap_step(
         churn_service: optional service to churn in parallel; omit for pure flap.
         churn_action: "restart" (default) or "crash".
         churn_every_sec: seconds between churn rounds (default 120 = 2 min).
+        churn_initial_delay_sec: seconds of active flapping before the first
+            churn round. Zero preserves the legacy immediate-first-round mode.
+        churn_recovery_timeout_sec: when positive, require the churned service
+            to return ACTIVE within this timeout after every action.
+        churn_recovery_poll_interval_sec: service recovery polling interval.
         churn_devices: devices to churn (defaults to ``gtsws``).
+        final_up_timeout_sec: maximum wait for every touched interface to be
+            admin-enabled and operationally UP after cleanup (default 60).
+        final_up_poll_interval_sec: final-state polling interval (default 5).
+        fail_closed: Opt into fatal discovery/execution/restore errors and
+            positive final-UP verification. False preserves legacy callers.
+        expected_interfaces: Exact interface set required on each GTSW.
+        require_exact_neighbor_hosts: Require exact explicit-host LLDP coverage.
+        nic_recovery_by_gtsw_interface: Optional GTSW -> interface ->
+            {host, dev, lane} PAOS-UP fallback for an admin-UP/oper-DOWN latch.
         description: Custom step description.
     """
+    if fail_closed and not expected_interfaces:
+        raise ValueError(
+            "fail_closed multi-GTSW rapid flap requires a non-empty exact "
+            "expected_interfaces scope"
+        )
+    if churn_service is not None and churn_action not in ("restart", "crash"):
+        raise ValueError(
+            f"Unsupported service churn action {churn_action!r}; expected "
+            "'restart' or 'crash'"
+        )
+    if retry_final_cleanup_after_churn and churn_service is None:
+        raise ValueError("retry_final_cleanup_after_churn requires churn_service")
+
     params: t.Dict[str, t.Any] = {
         "custom_step_name": "fpf_multi_gtsw_rapid_flap",
         "gtsws": gtsws,
         "neighbor_hosts": neighbor_hosts,
-        "neighbor_pattern": neighbor_pattern,
+        "neighbor_pattern": None if neighbor_hosts else neighbor_pattern,
         "duration_sec": duration_sec,
         "down_time_sec": flap_down_time_sec,
         "up_time_sec": flap_up_time_sec,
@@ -3105,8 +4586,34 @@ def create_fpf_multi_gtsw_rapid_flap_step(
         "churn_devices": churn_devices,
         "uniform_interface_discovery": uniform_interface_discovery,
     }
+    if churn_initial_delay_sec:
+        params["churn_initial_delay_sec"] = churn_initial_delay_sec
+    if churn_recovery_timeout_sec:
+        params["churn_recovery_timeout_sec"] = churn_recovery_timeout_sec
+    if fail_closed:
+        params.update(
+            {
+                "fail_closed": True,
+                "expected_interfaces": expected_interfaces,
+                "require_exact_neighbor_hosts": require_exact_neighbor_hosts,
+                "final_up_timeout_sec": final_up_timeout_sec,
+                "final_up_poll_interval_sec": final_up_poll_interval_sec,
+                "nic_recovery_by_gtsw_interface": (nic_recovery_by_gtsw_interface),
+            }
+        )
     if churn_service is not None:
         params["churn_service"] = int(churn_service.value)
+        params["churn_recovery_poll_interval_sec"] = churn_recovery_poll_interval_sec
+    if retry_final_cleanup_after_churn:
+        params.update(
+            {
+                "retry_final_cleanup_after_churn": True,
+                "final_cleanup_service_recovery_timeout_sec": (
+                    final_cleanup_service_recovery_timeout_sec
+                ),
+                "final_cleanup_retry_timeout_sec": final_cleanup_retry_timeout_sec,
+            }
+        )
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description
@@ -3156,29 +4663,164 @@ def create_fpf_multi_device_drain_step(
     )
 
 
+def create_fpf_gar_set_links_step(
+    targets: t.List[t.Dict[str, t.Any]],
+    mode: str,
+    disrupt: bool,
+    device_regexes: t.Optional[t.List[str]] = None,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Disrupt or restore explicit GTSW-STSW member links for GAR tests.
+
+    Each target contains a device hostname and the exact interface list. The
+    custom step handles multiple devices concurrently, supports held admin-down
+    and per-interface soft-drain, and verifies the resulting state by read-back.
+    """
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or f"GAR {mode} {'disrupt' if disrupt else 'restore'} on {len(targets)} pair(s)",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_gar_set_links",
+                    "targets": targets,
+                    "mode": mode,
+                    "disrupt": disrupt,
+                }
+            )
+        ),
+        device_regexes=device_regexes,
+    )
+
+
+def create_fpf_gar_validate_step(
+    pairs: t.List[t.Dict[str, t.Any]],
+    prefix_base: str,
+    prefix_count: int,
+    increment_step: str = "0:0:1::",
+    timeout_sec: int = 120,
+    poll_interval_sec: int = 5,
+    device_regexes: t.Optional[t.List[str]] = None,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Validate GAR BGP and Agent/FIB signals for a scaled prefix set.
+
+    Each pair specifies source, spine, observer, and expected_capacity. For
+    nonzero capacity the validator checks every prefix at all three devices;
+    for zero capacity it requires the prefixes to be pruned from both spine and
+    observer while remaining locally originated on the source GTSW.
+    """
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or "Validate scaled GAR BGP and Agent signals",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_gar_validate",
+                    "pairs": pairs,
+                    "prefix_base": prefix_base,
+                    "prefix_count": prefix_count,
+                    "increment_step": increment_step,
+                    "timeout_sec": timeout_sec,
+                    "poll_interval_sec": poll_interval_sec,
+                }
+            )
+        ),
+        device_regexes=device_regexes,
+    )
+
+
+def create_fpf_nic_mstreg_paos_step(
+    host: str,
+    dev: int,
+    lane: int,
+    admin_up: bool,
+    state_timeout_sec: float = 30.0,
+    state_poll_interval_sec: float = 1.0,
+    verify_link_health: bool = False,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Set one NIC PAOS admin state and fail unless readback reaches it."""
+    action = "UP" if admin_up else "DOWN"
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or f"NIC-side mstreg PAOS {action} on {host}: dev={dev} lane={lane}",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_nic_mstreg_paos",
+                    "host": host,
+                    "dev": int(dev),
+                    "lane": int(lane),
+                    "admin_up": bool(admin_up),
+                    "state_timeout_sec": float(state_timeout_sec),
+                    "state_poll_interval_sec": float(state_poll_interval_sec),
+                    "verify_link_health": bool(verify_link_health),
+                }
+            )
+        ),
+    )
+
+
+def create_fpf_nic_mstreg_verify_link_step(
+    host: str,
+    dev: int,
+    lane: int,
+    timeout_sec: float = 120.0,
+    poll_interval_sec: float = 2.0,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Require PAOS UP plus an Active mlxlink state with status opcode zero."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or f"Verify NIC link health on {host}: dev={dev} lane={lane}",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_nic_mstreg_verify_link",
+                    "host": host,
+                    "dev": int(dev),
+                    "lane": int(lane),
+                    "timeout_sec": float(timeout_sec),
+                    "poll_interval_sec": float(poll_interval_sec),
+                }
+            )
+        ),
+    )
+
+
 def create_fpf_nic_mstreg_flap_step(
     host: str,
     dev: int,
     lane: int,
-    iterations: int = 5,
-    interval_sec: float = 2.0,
+    duration_sec: float = 900.0,
+    down_time_sec: float = 2.0,
+    up_time_sec: float = 2.0,
+    state_timeout_sec: float = 30.0,
+    state_poll_interval_sec: float = 1.0,
+    final_cleanup_timeout_sec: float = 120.0,
     description: t.Optional[str] = None,
 ) -> Step:
-    """Real NIC-side mstreg PAOS flap of a single beth lane on a GPU host.
+    """Deadline-bounded NIC-side mstreg PAOS flap of one GPU-host lane.
 
     Issues the same admin_status DOWN/UP sequence that
     ``scripts/pavanpatil/fpf_host_signal_test.py --flap-dev/--flap-lane`` runs
     against the GPU NIC. The handler computes the PCIe BDF deterministically
-    from ``dev`` + ``lane`` (no ethtool probe), then loops ``iterations`` times,
-    each round running
+    from ``dev`` + ``lane`` (no ethtool probe), then loops until the monotonic
+    ``duration_sec`` deadline, each round running
 
       DOWN: mstreg -d <BDF> --reg_name PAOS \\
               --set "admin_status=2,ase=1,fd=1" -i "local_port=1"
       UP:   mstreg -d <BDF> --reg_name PAOS \\
               --set "admin_status=1,ase=1,fd=1" -i "local_port=1"
 
-    with ``interval_sec`` between the DOWN and the UP (and after the UP before
-    the next round). This is a real link-down event on the NIC side (the GTSW
+    with ``down_time_sec`` after DOWN and ``up_time_sec`` after UP. Every state
+    transition is read back. A bounded ``finally`` cleanup always commands and
+    verifies UP, including on command failure or cancellation. This is a real
+    link-down event on the NIC side (the GTSW
     sees NDP go away on the peer port and withdraws the VF on that lane), so it
     is the genuine trigger for the tc37 NIC-side link-flap test rather than the
     thrift-admin placeholder previously used there.
@@ -3200,9 +4842,12 @@ def create_fpf_nic_mstreg_flap_step(
         host: GPU host (e.g. ``"rtptest1555.mwg2"``) to flap a beth lane on.
         dev: GPU device index (0..3). Maps to the PCIe DEV_BLOCK.
         lane: Lane within the GPU device (0..7). Maps to the PCIe function.
-        iterations: Number of DOWN/UP cycles (default 5).
-        interval_sec: Seconds between DOWN and UP, and between successive
-            cycles (default 2.0).
+        duration_sec: Wall-clock flap duration (default 900 seconds).
+        down_time_sec: Hold time after verified DOWN (default 2 seconds).
+        up_time_sec: Hold time after verified UP (default 2 seconds).
+        state_timeout_sec: Per-transition PAOS/oper readback timeout.
+        state_poll_interval_sec: PAOS readback poll interval.
+        final_cleanup_timeout_sec: Bound for the mandatory final UP cleanup.
         description: Custom step description.
     """
     return Step(
@@ -3210,7 +4855,8 @@ def create_fpf_nic_mstreg_flap_step(
         description=description
         or (
             f"NIC-side mstreg PAOS flap on {host}: dev={dev} lane={lane}, "
-            f"{iterations} iteration(s) every {interval_sec}s"
+            f"{duration_sec:g}s with {down_time_sec:g}s DOWN/"
+            f"{up_time_sec:g}s UP"
         ),
         step_params=Params(
             json_params=json.dumps(
@@ -3219,8 +4865,12 @@ def create_fpf_nic_mstreg_flap_step(
                     "host": host,
                     "dev": int(dev),
                     "lane": int(lane),
-                    "iterations": int(iterations),
-                    "interval_sec": float(interval_sec),
+                    "duration_sec": float(duration_sec),
+                    "down_time_sec": float(down_time_sec),
+                    "up_time_sec": float(up_time_sec),
+                    "state_timeout_sec": float(state_timeout_sec),
+                    "state_poll_interval_sec": float(state_poll_interval_sec),
+                    "final_cleanup_timeout_sec": float(final_cleanup_timeout_sec),
                 }
             )
         ),
@@ -3230,6 +4880,7 @@ def create_fpf_nic_mstreg_flap_step(
 def create_fpf_restart_ib_traffic_step(
     server: str,
     clients: t.List[str],
+    binary_path: t.Optional[str] = None,
     description: t.Optional[str] = None,
 ) -> Step:
     """Kill + restart the long-lived ``ib_write_bw`` flow on server + clients.
@@ -3246,27 +4897,40 @@ def create_fpf_restart_ib_traffic_step(
     Args:
         server: server host (e.g. ``"rtptest1544.mwg2"``).
         clients: client host(s) (non-empty).
+        binary_path: Absolute ib_write_bw path. Defaults to /usr/bin/ib_write_bw.
         description: Custom step description.
     """
+    payload: t.Dict[str, t.Any] = {
+        "custom_step_name": "fpf_restart_ib_traffic",
+        "server": server,
+        "clients": clients,
+    }
+    if binary_path is not None:
+        payload["binary_path"] = binary_path
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description
         or f"Restart ib_write_bw: server={server} clients={clients}",
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "custom_step_name": "fpf_restart_ib_traffic",
-                    "server": server,
-                    "clients": clients,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(payload)),
     )
 
 
 def create_fpf_ensure_traffic_step(
     server: str,
     clients: t.List[str],
+    binary_path: t.Optional[str] = None,
+    device: t.Optional[str] = None,
+    gid_iface: t.Optional[str] = None,
+    gid_prefix: t.Optional[str] = None,
+    gid_index: t.Optional[int] = None,
+    port: t.Optional[int] = None,
+    msg_size: t.Optional[int] = None,
+    qp: t.Optional[int] = None,
+    tclass: t.Optional[int] = None,
+    iters: t.Optional[int] = None,
+    min_egress_gbps: t.Optional[float] = None,
+    settle_sec: t.Optional[int] = None,
+    ods_window_sec: t.Optional[int] = None,
     traffic_floor_gbps: t.Optional[float] = None,
     description: t.Optional[str] = None,
 ) -> Step:
@@ -3274,16 +4938,22 @@ def create_fpf_ensure_traffic_step(
 
     Verifies all 4 RDMA traffic planes (beth0-3) carry traffic on server+clients
     by sampling ``/sys/class/net/bethN/statistics/tx_bytes`` directly (no ODS).
-    If any plane is below the floor it restarts ib_write_bw and re-checks; if a
-    plane STILL can't carry traffic it raises (fail fast) — converting a silent
-    plane wedge (e.g. the DUT not learning that plane's prefixes) into an early,
-    loud failure instead of a contaminated run. Place at the HEAD of each playbook
-    stage so every test case starts from verified-healthy traffic.
+    If all planes collapse or the exact configured process is absent/wrong, it
+    restarts ib_write_bw and re-checks process identity, ODS egress, and direct
+    lane rates. A partial dead-lane result fails without remediation so a fabric
+    verdict cannot be masked. Place at the HEAD of a subsequent playbook stage
+    so the preceding disruption verdict is recorded before any recovery.
 
     Args:
         server: server host (e.g. ``"rtptest1544.mwg2"``).
         clients: client host(s) (non-empty).
-        traffic_floor_gbps: per-plane egress floor in Gbps (default 50.0 in the
+        binary_path / device / gid_iface / gid_prefix / gid_index / port /
+            msg_size / qp / tclass / iters: The exact setup-time ib_write_bw
+            contract. Supplying these prevents recovery from silently using
+            different defaults.
+        min_egress_gbps / settle_sec / ods_window_sec: ODS recovery-validation
+            contract, shared with the setup task.
+        traffic_floor_gbps: per-plane egress floor in Gbps (default 5.0 in the
             handler — catches a dead/0 plane while tolerating normal variation).
         description: Custom step description.
     """
@@ -3292,6 +4962,24 @@ def create_fpf_ensure_traffic_step(
         "server": server,
         "clients": clients,
     }
+    optional_params = {
+        "binary_path": binary_path,
+        "device": device,
+        "gid_iface": gid_iface,
+        "gid_prefix": gid_prefix,
+        "gid_index": gid_index,
+        "port": port,
+        "msg_size": msg_size,
+        "qp": qp,
+        "tclass": tclass,
+        "iters": iters,
+        "min_egress_gbps": min_egress_gbps,
+        "settle_sec": settle_sec,
+        "ods_window_sec": ods_window_sec,
+    }
+    payload.update(
+        {key: value for key, value in optional_params.items() if value is not None}
+    )
     if traffic_floor_gbps is not None:
         payload["traffic_floor_gbps"] = traffic_floor_gbps
     return Step(
@@ -3333,10 +5021,104 @@ def create_fpf_restart_hrt_step(
     )
 
 
+def create_fpf_wait_hrt_warmboot_step(
+    host: str,
+    phase: str = "complete",
+    timeout_sec: float = 180.0,
+    poll_interval_sec: float = 0.5,
+    expected_devices: int = 8,
+    expected_subscribers: int = 32,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Poll HRT counters until a specific warmboot phase is proven."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description or f"Wait for HRT warmboot phase {phase} on {host}",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_wait_hrt_warmboot",
+                    "host": host,
+                    "phase": phase,
+                    "timeout_sec": timeout_sec,
+                    "poll_interval_sec": poll_interval_sec,
+                    "expected_devices": expected_devices,
+                    "expected_subscribers": expected_subscribers,
+                }
+            )
+        ),
+    )
+
+
+def create_fpf_restart_hrt_and_link_drain_step(
+    host: str,
+    target_device: str,
+    interfaces: t.List[str],
+    mutation_token: str,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Start HRT restart and link drain concurrently for WB-14."""
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or f"Restart HRT on {host} and drain {target_device} {interfaces} concurrently",
+        step_params=Params(
+            json_params=json.dumps(
+                {
+                    "custom_step_name": "fpf_restart_hrt_and_link_drain",
+                    "host": host,
+                    "target_device": target_device,
+                    "interfaces": interfaces,
+                    "mutation_token": mutation_token,
+                }
+            )
+        ),
+    )
+
+
+def create_fpf_up_port_baseline_step(
+    *,
+    action: str,
+    devices: t.List[str],
+    baseline_key: str,
+    expected_interfaces_by_device: t.Optional[t.Mapping[str, t.Sequence[str]]] = None,
+    device_regexes: t.Optional[t.List[str]] = None,
+    description: t.Optional[str] = None,
+) -> Step:
+    """Capture or verify the exact run-scoped set of operationally-UP ports."""
+    if action not in {"capture", "verify"}:
+        raise ValueError("action must be 'capture' or 'verify'")
+    if not devices:
+        raise ValueError("devices must be non-empty")
+    if not baseline_key:
+        raise ValueError("baseline_key must be non-empty")
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "fpf_up_port_baseline",
+        "action": action,
+        "devices": devices,
+        "baseline_key": baseline_key,
+    }
+    if expected_interfaces_by_device is not None:
+        params["expected_interfaces_by_device"] = {
+            str(device): [str(interface) for interface in interfaces]
+            for device, interfaces in expected_interfaces_by_device.items()
+        }
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        description=description
+        or f"{action.title()} UP-port baseline {baseline_key!r} on {devices}",
+        step_params=Params(json_params=json.dumps(params)),
+        device_regexes=device_regexes,
+    )
+
+
 def create_fpf_lldp_batched_set_interface_admin_step(
     neighbor_pattern: str,
     enable: bool,
     device_regexes: t.Optional[t.List[str]] = None,
+    interface_cache_key: t.Optional[str] = None,
+    use_cached_interfaces: bool = False,
+    expected_interfaces: t.Optional[t.List[str]] = None,
     description: t.Optional[str] = None,
 ) -> Step:
     """Resolve interfaces from LLDP at runtime, then batch admin-enable/disable.
@@ -3359,6 +5141,12 @@ def create_fpf_lldp_batched_set_interface_admin_step(
             LLDP remote system name on the DUT (e.g. ``"gtsw001*"``).
         enable: True to enable (no-shut), False to disable (held admin-down).
         device_regexes: Optional device-regex scope (e.g. the DUT STSW).
+        interface_cache_key: Run-scoped key under which a disable step stores
+            the exact resolved interface set for a later enable step.
+        use_cached_interfaces: Prefer the cached set when enabling. If the
+            cache is absent, ``expected_interfaces`` is the fail-closed fallback.
+        expected_interfaces: Exact allowlist for LLDP resolution and the
+            LLDP-independent restore-only fallback.
         description: Custom step description.
     """
     return Step(
@@ -3374,6 +5162,19 @@ def create_fpf_lldp_batched_set_interface_admin_step(
                     "custom_step_name": "fpf_lldp_batched_set_interface_admin",
                     "neighbor_pattern": neighbor_pattern,
                     "is_enable": enable,
+                    **(
+                        {"interface_cache_key": interface_cache_key}
+                        if interface_cache_key
+                        else {}
+                    ),
+                    **(
+                        {"use_cached_interfaces": True} if use_cached_interfaces else {}
+                    ),
+                    **(
+                        {"expected_interfaces": expected_interfaces}
+                        if expected_interfaces is not None
+                        else {}
+                    ),
                 }
             )
         ),
@@ -3388,15 +5189,17 @@ def create_fpf_stsw_drain_and_reinject_steps(
     prefix_count: int,
     community_list: str,
     drain_community: t.Optional[str] = None,
+    injection_groups: t.Optional[t.Sequence[t.Mapping[str, object]]] = None,
 ) -> t.List[Step]:
     """Drain (or undrain) an STSW plane, then re-inject the FPF prefixes.
 
     Composition (no new step type): drains/undrains ``stsw`` via the existing
-    LOCAL_DRAINER drain/undrain step, then re-injects ``prefix_count`` prefixes
-    on ``trigger_stsws`` via ``create_fpf_bgp_prefix_injection_step``. When
-    draining, an optional ``drain_community`` is appended to ``community_list`` so
-    the re-injected prefixes carry the extra drain-marker community; when
-    undraining, the base ``community_list`` is used unchanged.
+    LOCAL_DRAINER drain/undrain step, verifies the requested state fail-closed,
+    then re-injects ``prefix_count`` prefixes on ``trigger_stsws`` via
+    ``create_fpf_bgp_prefix_injection_step``. When draining, an optional
+    ``drain_community`` is supplied as an extra BGP community (not concatenated
+    into the named community-list preset); when undraining, only the base preset
+    is used.
 
     Used by the cascaded STSW-plane-drain + GTSW-device-drain FPF configs.
 
@@ -3408,26 +5211,75 @@ def create_fpf_stsw_drain_and_reinject_steps(
         community_list: Base community list string for the injection.
         drain_community: Optional extra community appended to ``community_list``
             when draining (ignored on undrain).
+        injection_groups: Optional split-VF group definitions. When supplied,
+            each group's devices, prefix base, and count are re-injected
+            independently instead of advertising one prefix base on every STSW.
 
     Returns:
-        Ordered [drain/undrain step, prefix-injection step].
+        Ordered drain/undrain, readback, and prefix-injection step(s).
     """
-    if drained and drain_community:
-        injected_communities = f"{community_list} {drain_community}"
-    else:
-        injected_communities = community_list
-
     action = "Drain" if drained else "Undrain"
+    drain_step = create_fpf_drain_interface_step(
+        interfaces=[],
+        drain=drained,
+        target_device=stsw,
+        description=f"{action} STSW {stsw} (local drainer)",
+    )
+    verify_step = create_fpf_verify_disruption_step(
+        interfaces=[],
+        mode="device_drain",
+        expect_drained=drained,
+        fail_if_ineffective=True,
+        target_device=stsw,
+        description=f"Fail-closed readback: STSW {stsw} is {action.lower()}ed",
+    )
+    if injection_groups is not None:
+        if not injection_groups:
+            raise ValueError("injection_groups must not be empty")
+        injection_steps = []
+        for group in injection_groups:
+            devices = group.get("devices")
+            prefix_base = group.get("prefix_base")
+            count = group.get("count")
+            batch_size = group.get("batch_size")
+            if (
+                not isinstance(devices, list)
+                or not devices
+                or not all(isinstance(device, str) for device in devices)
+                or not isinstance(prefix_base, str)
+                or not isinstance(count, int)
+                or count <= 0
+                or (batch_size is not None and not isinstance(batch_size, int))
+            ):
+                raise ValueError(f"Invalid FPF VF injection group: {group!r}")
+            injection_steps.append(
+                create_fpf_bgp_prefix_injection_step(
+                    devices=devices,
+                    prefix_base=prefix_base,
+                    count=count,
+                    batch_size=batch_size,
+                    community_list=str(group.get("community_list", community_list)),
+                    extra_communities=(
+                        [drain_community] if drained and drain_community else None
+                    ),
+                    description=(
+                        f"Re-inject {count} prefixes from {prefix_base} on "
+                        f"{', '.join(devices)} after {action.lower()} of {stsw}"
+                    ),
+                )
+            )
+        return [drain_step, verify_step, *injection_steps]
+
     return [
-        create_drain_undrain_step(
-            drain=drained,
-            drain_handler=taac_types.DrainHandler.LOCAL_DRAINER,
-            description=f"{action} STSW {stsw} (local drainer)",
-        ),
+        drain_step,
+        verify_step,
         create_fpf_bgp_prefix_injection_step(
             devices=trigger_stsws,
             count=prefix_count,
-            community_list=injected_communities,
+            community_list=community_list,
+            extra_communities=(
+                [drain_community] if drained and drain_community else None
+            ),
             description=f"Re-inject {prefix_count} prefixes on "
             f"{', '.join(trigger_stsws)} after {action.lower()} of {stsw}",
         ),
@@ -3563,6 +5415,8 @@ def create_run_task_step(
     params_dict: t.Dict[str, t.Any],
     description: t.Optional[str] = None,
     ixia_needed: bool = False,
+    start_traffic: bool = True,
+    set_outer_hostname: bool = False,
 ) -> Step:
     """
     Create a generic step to run a task.
@@ -3572,6 +5426,10 @@ def create_run_task_step(
         params_dict: Parameters to pass to the task
         description: Custom description for the step
         ixia_needed: Whether the task requires Ixia
+        start_traffic: Whether the generic step pre-hook should ensure IXIA
+            traffic is running before the task.
+        set_outer_hostname: Also copy ``params_dict["hostname"]`` to the outer
+            Task field used by runner-side routing.
 
     Returns:
         Step object for running the task
@@ -3590,9 +5448,13 @@ def create_run_task_step(
                     task_name=task_name,
                     params_dict=params_dict,
                     ixia_needed=ixia_needed,
+                    hostname=(
+                        params_dict.get("hostname") if set_outer_hostname else None
+                    ),
                 )
             )
         ),
+        step_params=_skip_start_traffic_step_params(start_traffic),
     )
 
 
@@ -3600,6 +5462,7 @@ def create_ixia_api_step(
     api_name: str,
     args_dict: t.Dict[str, t.Any],
     description: t.Optional[str] = None,
+    start_traffic: bool = True,
 ) -> Step:
     """
     Create an Ixia API step.
@@ -3608,6 +5471,7 @@ def create_ixia_api_step(
         api_name: Name of the Ixia API to call
         args_dict: Arguments to pass to the API
         description: Custom description for the step
+        start_traffic: Whether the generic step pre-hook should start traffic
 
     Returns:
         Step object for Ixia API call
@@ -3615,17 +5479,16 @@ def create_ixia_api_step(
     if description is None:
         description = f"Call Ixia API: {api_name}"
 
+    params = {
+        "api_name": api_name,
+        "args_json": json.dumps(args_dict),
+    }
+    _add_skip_start_traffic_param(params, start_traffic)
+
     return Step(
         name=StepName.INVOKE_IXIA_API_STEP,
         description=description,
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "api_name": api_name,
-                    "args_json": json.dumps(args_dict),
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params)),
     )
 
 
@@ -3680,9 +5543,38 @@ def create_ixia_device_group_toggle_step(
     )
 
 
+def create_ixia_gateway_resolution_step(
+    device_group_names: t.Sequence[str],
+    description: t.Optional[str] = None,
+) -> Step:
+    """
+    Create a step that re-resolves the gateway MAC of every named device group.
+
+    Place it right after the device groups are enabled and before a step that
+    needs their BGP sessions: IXIA does not re-resolve a gateway that stayed
+    unresolved, and BGP Stop/Start leaves the IP layer alone. The step fails
+    while any gateway MAC is unresolved.
+
+    Args:
+        device_group_names: Exact IXIA device group names to check
+        description: Custom description for the step
+
+    Returns:
+        Step object calling Ixia.refresh_and_verify_gateway_resolution
+    """
+    if not device_group_names:
+        raise ValueError("device_group_names must name at least one device group")
+    return create_ixia_api_step(
+        api_name="refresh_and_verify_gateway_resolution",
+        args_dict={"device_group_names": list(device_group_names)},
+        description=description
+        or f"Re-resolve gateway MACs of {len(device_group_names)} IXIA device group(s)",
+    )
+
+
 def create_daemon_control_step(
     device_name: str,
-    daemon_name: str = "Bgp",
+    daemon_name: str = "Bgpcpp",
     action: str = "enable",
     description: t.Optional[str] = None,
 ) -> Step:
@@ -3716,6 +5608,8 @@ def create_run_ssh_command_step(
     cmd: str,
     description: t.Optional[str] = None,
     step_id: t.Optional[str] = None,
+    device_regexes: t.Optional[t.List[str]] = None,
+    log_output: bool = False,
 ) -> Step:
     """Run an arbitrary shell command on the DUT via SSH.
 
@@ -3731,15 +5625,38 @@ def create_run_ssh_command_step(
             logs. If omitted, no description is rendered.
         step_id: Optional step id, used by downstream stages to reference
             this step's output via jq.
+        device_regexes: Optional device patterns restricting where the command runs.
+        log_output: When True the step logs the command's stdout/stderr at
+            INFO level (useful for smoke/connectivity checks). Default False
+            keeps the output out of the log.
 
     Returns:
         A `Step` with `step_name=StepName.RUN_SSH_COMMAND_STEP`.
     """
+    params: t.Dict[str, t.Any] = {"cmd": cmd}
+    if log_output:
+        params["log_output"] = True
     return Step(
         name=StepName.RUN_SSH_COMMAND_STEP,
-        step_params=Params(json_params=json.dumps({"cmd": cmd})),
+        step_params=Params(json_params=json.dumps(params)),
         description=description,
         id=step_id,
+        device_regexes=device_regexes,
+    )
+
+
+def create_wedge_agent_crash_step(
+    device_regexes: t.List[str],
+    description: t.Optional[str] = None,
+    step_id: t.Optional[str] = None,
+) -> Step:
+    """Crash Agent through the driver's OS-aware service-control API."""
+    return create_service_interruption_step(
+        service=taac_types.Service.AGENT,
+        trigger=taac_types.ServiceInterruptionTrigger.CRASH,
+        description=description or "Crash the wedge_agent main process with SIGKILL",
+        step_id=step_id,
+        device_regexes=device_regexes,
     )
 
 
@@ -3750,6 +5667,7 @@ def create_longevity_step(
     collect_port_state: bool = False,
     poll_interval: int = 5,
     fail_on_flap: bool = True,
+    start_traffic: bool = True,
 ) -> Step:
     """
     Create a longevity step that waits for a specified duration.
@@ -3768,11 +5686,13 @@ def create_longevity_step(
         fail_on_flap: When collecting port state, fail the step if any monitored
             interface flaps during the hold. A steady-state longevity hold
             should see zero flaps, so any flap is a real defect.
+        start_traffic: Whether the generic step pre-hook should start IXIA.
 
     Returns:
         Step object for longevity/wait
     """
     params_dict: t.Dict[str, t.Any] = {"duration": duration}
+    _add_skip_start_traffic_param(params_dict, start_traffic)
     if description:
         params_dict["description"] = description
     if collect_port_state:
@@ -3791,9 +5711,11 @@ def create_service_interruption_step(
     service: taac_types.Service,
     trigger: taac_types.ServiceInterruptionTrigger = taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
     create_cold_boot_file: bool = False,
+    intentional_stop: bool = False,
     description: t.Optional[str] = None,
     step_id: t.Optional[str] = None,
     device_regexes: t.Optional[t.List[str]] = None,
+    start_traffic: bool = True,
 ) -> Step:
     """
     Create a step to interrupt a service (restart, crash, etc.).
@@ -3802,17 +5724,31 @@ def create_service_interruption_step(
         service: The service to interrupt (e.g., Service.AGENT, Service.BGP)
         trigger: The trigger type (SYSTEMCTL_RESTART, CRASH, etc.)
         create_cold_boot_file: Whether to create a cold boot file
+        intentional_stop: For an explicit SYSTEMCTL_STOP, accept systemd's
+            FAILED state only when MainPID proves that the process is absent.
+            This bypasses the generic driver's INACTIVE-only retry behavior.
         description: Custom description for the step
         step_id: Optional step ID
+        start_traffic: Whether the generic step pre-hook should start IXIA.
 
     Returns:
         Step object for service interruption
     """
+    if (
+        intentional_stop
+        and trigger != taac_types.ServiceInterruptionTrigger.SYSTEMCTL_STOP
+    ):
+        raise ValueError("intentional_stop is valid only for SYSTEMCTL_STOP")
+
     input_obj = taac_types.ServiceInterruptionInput(
         name=service,
         trigger=trigger,
         create_cold_boot_file=create_cold_boot_file,
     )
+    step_params_dict: t.Dict[str, t.Any] = {}
+    if intentional_stop:
+        step_params_dict["intentional_stop"] = True
+    _add_skip_start_traffic_param(step_params_dict, start_traffic)
 
     return Step(
         name=StepName.SERVICE_INTERRUPTION_STEP,
@@ -3820,6 +5756,11 @@ def create_service_interruption_step(
         description=description,
         id=step_id,
         device_regexes=device_regexes,
+        step_params=(
+            Params(json_params=json.dumps(step_params_dict))
+            if step_params_dict
+            else None
+        ),
     )
 
 
@@ -3830,6 +5771,7 @@ def create_service_convergence_step(
     service_convergence_timeout: t.Optional[t.Dict[taac_types.Service, int]] = None,
     step_id: t.Optional[str] = None,
     device_regexes: t.Optional[t.List[str]] = None,
+    start_traffic: bool = True,
 ) -> Step:
     """
     Create a step to wait for service convergence.
@@ -3840,6 +5782,7 @@ def create_service_convergence_step(
         timeout: Optional timeout in seconds for convergence (simple timeout)
         service_convergence_timeout: Optional dict mapping services to their timeout values
         step_id: Optional step ID
+        start_traffic: Whether the generic step pre-hook should start IXIA.
 
     Returns:
         Step object for service convergence
@@ -3864,6 +5807,7 @@ def create_service_convergence_step(
         description=description,
         id=step_id,
         device_regexes=device_regexes,
+        step_params=_skip_start_traffic_step_params(start_traffic),
     )
 
 
@@ -3877,7 +5821,10 @@ def create_interface_flap_step(
     interface_flap_method: t.Optional[int] = None,
     delay: t.Optional[int] = None,
     device_name: t.Optional[str] = None,
+    sequential: bool = False,
     step_id: t.Optional[str] = None,
+    start_traffic: bool = True,
+    tolerate_failures: bool = False,
 ) -> Step:
     """
     Create a step to enable or disable interfaces.
@@ -3892,12 +5839,20 @@ def create_interface_flap_step(
         interface_flap_method: Optional interface flap method (e.g., 1 for thrift API, 4 for SSH)
         delay: Optional delay between interface operations in seconds
         device_name: Optional device name for the interface flap (used with SSH method)
+        sequential: Issue per-interface operations one at a time. This is useful
+            for cleanup after a concurrent stress action has partially failed.
         step_id: Optional step ID
+        start_traffic: Whether the generic step pre-hook should start IXIA.
+        tolerate_failures: Log rather than raise when the flap cannot be
+            delivered. Set this only where the device is expected to be
+            unreachable, e.g. flapping concurrently with an agent coldboot.
 
     Returns:
         Step object for interface flap
     """
     params_dict: t.Dict[str, t.Any] = {"enable": enable}
+    if tolerate_failures:
+        params_dict["tolerate_failures"] = True
     if interfaces is not None:
         params_dict["interfaces"] = interfaces
     if interface_flap_method is not None:
@@ -3906,6 +5861,9 @@ def create_interface_flap_step(
         params_dict["delay"] = delay
     if device_name is not None:
         params_dict["device_name"] = device_name
+    if sequential:
+        params_dict["sequential"] = True
+    _add_skip_start_traffic_param(params_dict, start_traffic)
 
     params = Params(
         json_params=json.dumps(params_dict),
@@ -3926,6 +5884,7 @@ def create_system_reboot_step(
     trigger: taac_types.SystemRebootTrigger,
     description: t.Optional[str] = None,
     use_ipv6: bool = True,
+    device_regexes: t.Optional[t.List[str]] = None,
 ) -> Step:
     """
     Create a step to reboot the system.
@@ -3934,6 +5893,7 @@ def create_system_reboot_step(
         trigger: The reboot trigger type (FULL_SYSTEM_REBOOT, BMC_POWER_RESET, etc.)
         description: Custom description for the step
         use_ipv6: Use IPv6 for post-reboot ping reachability check
+        device_regexes: Optional exact device scope for the reboot
 
     Returns:
         Step object for system reboot
@@ -3944,6 +5904,7 @@ def create_system_reboot_step(
         input_json=thrift_to_json(taac_types.SystemRebootInput(trigger=trigger)),
         description=description,
         step_params=Params(json_params=json.dumps(params_dict)),
+        device_regexes=device_regexes,
     )
 
 
@@ -3951,6 +5912,9 @@ def create_validation_step(
     point_in_time_checks: t.List[taac_types.PointInTimeHealthCheck],
     stage: taac_types.ValidationStage = taac_types.ValidationStage.MID_TEST,
     description: t.Optional[str] = None,
+    start_traffic: bool = True,
+    fail_on_failure: bool = False,
+    fail_fast: bool = False,
 ) -> Step:
     """
     Create a validation step with point-in-time health checks.
@@ -3959,19 +5923,32 @@ def create_validation_step(
         point_in_time_checks: List of health checks to perform
         stage: Validation stage (PRE_TEST, MID_TEST, POST_TEST)
         description: Custom description for the step
+        start_traffic: Whether the generic step pre-hook should ensure IXIA
+            traffic is running. Set False for recovery validation that must run
+            while traffic remains stopped.
+        fail_on_failure: Whether a failed MID_TEST check must stop the workload.
+        fail_fast: Report the validation step as failed as soon as a check fails
 
     Returns:
         Step object for validation
     """
+    params_dict: t.Dict[str, t.Any] = {}
+    _add_skip_start_traffic_param(params_dict, start_traffic)
+    if fail_on_failure:
+        params_dict["fail_on_failure"] = True
     return Step(
         name=StepName.VALIDATION_STEP,
         input_json=thrift_to_json(
             taac_types.ValidationInput(
                 point_in_time_checks=point_in_time_checks,
                 stage=stage,
+                fail_fast=fail_fast,
             )
         ),
         description=description,
+        step_params=(
+            Params(json_params=json.dumps(params_dict)) if params_dict else None
+        ),
     )
 
 
@@ -3979,6 +5956,8 @@ def create_verify_port_operational_state_step(
     interfaces: t.List[str],
     operational_state: bool,
     description: t.Optional[str] = None,
+    device_regexes: t.Optional[t.List[str]] = None,
+    start_traffic: bool = True,
 ) -> Step:
     """
     Create a step to verify port operational state.
@@ -3987,21 +5966,22 @@ def create_verify_port_operational_state_step(
         interfaces: List of interface names to verify
         operational_state: Expected operational state (True=up, False=down)
         description: Custom description for the step
+        device_regexes: Optional device patterns that scope the verification
+        start_traffic: Whether the generic step pre-hook should start IXIA traffic.
 
     Returns:
         Step object for port state verification
     """
+    params_dict = {
+        "interfaces": interfaces,
+        "operational_state": operational_state,
+    }
+    _add_skip_start_traffic_param(params_dict, start_traffic)
     return Step(
         name=StepName.VERIFY_PORT_OPERATIONAL_STATE,
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "interfaces": interfaces,
-                    "operational_state": operational_state,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params_dict)),
         description=description,
+        device_regexes=device_regexes,
     )
 
 
@@ -4224,6 +6204,9 @@ def create_drain_undrain_step(
     drain_handler: t.Optional[taac_types.DrainHandler] = None,
     interfaces: t.Optional[t.List[str]] = None,
     description: t.Optional[str] = None,
+    device_regexes: t.Optional[t.List[str]] = None,
+    hard_drain_interfaces: bool = False,
+    start_traffic: bool = True,
 ) -> Step:
     """
     Create a step to drain or undrain a device, or specific interfaces.
@@ -4237,23 +6220,47 @@ def create_drain_undrain_step(
             up); with NDS the interface list is passed through to the NDS drain.
             When omitted, the whole device is drained.
         description: Custom description for the step
+        device_regexes: Optional exact device scope for the drain operation
+        hard_drain_interfaces: For a LOCAL_DRAINER interface drain, use the
+            bulk hard ``drain_interfaces`` API instead of the bulk
+            ``softdrain_interfaces`` API. Set this on its paired undrain as
+            well, because hard-drained interfaces report UNKNOWN rather than
+            an authoritative ``isDrained`` value. Invalid for device drains.
+        start_traffic: Whether the generic step pre-hook should start IXIA.
 
     Returns:
         Step object for drain/undrain operation
     """
+    if hard_drain_interfaces and (
+        drain_handler != taac_types.DrainHandler.LOCAL_DRAINER or not interfaces
+    ):
+        raise ValueError(
+            "hard_drain_interfaces requires a LOCAL_DRAINER operation with at "
+            "least one interface"
+        )
     input_kwargs: t.Dict[str, t.Any] = {"drain": drain}
     if drain_handler is not None:
         input_kwargs["drain_handler"] = drain_handler
 
-    step_params = None
+    step_params_dict: t.Dict[str, t.Any] = {}
     if interfaces:
-        step_params = Params(json_params=json.dumps({"interfaces": interfaces}))
+        step_params_dict.update(
+            {
+                "interfaces": interfaces,
+                "hard_drain_interfaces": hard_drain_interfaces,
+            }
+        )
+    _add_skip_start_traffic_param(step_params_dict, start_traffic)
+    step_params = (
+        Params(json_params=json.dumps(step_params_dict)) if step_params_dict else None
+    )
 
     return Step(
         name=StepName.DRAIN_UNDRAIN_STEP,
         description=description,
         input_json=thrift_to_json(taac_types.DrainUndrainInput(**input_kwargs)),
         step_params=step_params,
+        device_regexes=device_regexes,
     )
 
 
@@ -4323,6 +6330,7 @@ def create_verify_port_speed_step_v2(
     ports: t.List[str],
     speed_to_verify: int,
     description: t.Optional[str] = None,
+    start_traffic: bool = True,
 ) -> Step:
     """
     Create a step to verify port speed.
@@ -4331,20 +6339,19 @@ def create_verify_port_speed_step_v2(
         ports: List of port names to verify
         speed_to_verify: Expected speed in Gbps
         description: Custom description for the step
+        start_traffic: Whether the generic step pre-hook should start IXIA.
 
     Returns:
         Step object for port speed verification
     """
+    params_dict: t.Dict[str, t.Any] = {
+        "ports": ports,
+        "speed_to_verify": speed_to_verify,
+    }
+    _add_skip_start_traffic_param(params_dict, start_traffic)
     return Step(
         name=StepName.VERIFY_PORT_SPEED,
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "ports": ports,
-                    "speed_to_verify": speed_to_verify,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params_dict)),
         description=description,
     )
 
@@ -4357,6 +6364,7 @@ def create_register_speed_flip_patcher_step(
     speed_in_gbps: int,
     description: t.Optional[str] = None,
     target_port_cage_count: int = 4,
+    apply_patcher_method: t.Optional[int] = None,
 ) -> Step:
     """
     Create a step to register/unregister speed flip patcher (v3 shape used by speed_flip_test_configs).
@@ -4373,21 +6381,23 @@ def create_register_speed_flip_patcher_step(
             runtime (see ``RegisterSpeedFlipPatcherStep.run``). The onus is on
             the POC configuring/running the test to supply at least this many
             cages per device; defaults to 4.
+        apply_patcher_method: ``ApplyPatcherMethod`` value used to activate the
+            change; AGENT_WARMBOOT when unset. AGENT_RELOAD applies it with a
+            config reload alone, without restarting the agent.
     """
+    params: t.Dict[str, t.Any] = {
+        "register_patcher": register_patcher,
+        "port_state_change": port_state_change,
+        "patcher_name": patcher_name,
+        "endpoints": endpoints,
+        "speed_in_gbps": speed_in_gbps,
+        "target_port_cage_count": target_port_cage_count,
+    }
+    if apply_patcher_method is not None:
+        params["apply_patcher_method"] = apply_patcher_method
     return Step(
         name=StepName.REGISTER_SPEED_FLIP_PATCHER,
-        step_params=Params(
-            json_params=json.dumps(
-                {
-                    "register_patcher": register_patcher,
-                    "port_state_change": port_state_change,
-                    "patcher_name": patcher_name,
-                    "endpoints": endpoints,
-                    "speed_in_gbps": speed_in_gbps,
-                    "target_port_cage_count": target_port_cage_count,
-                }
-            )
-        ),
+        step_params=Params(json_params=json.dumps(params)),
         description=description,
     )
 
@@ -4995,7 +7005,9 @@ def create_set_route_filter_step(
     config_path: t.Optional[str] = None,
     source: str = "configerator",
     json_file_path: t.Optional[str] = None,
+    formulaic_prefix_sources: t.Mapping[str, t.Mapping[str, object]] | None = None,
     description: t.Optional[str] = None,
+    verify_readback: bool = False,
 ) -> Step:
     """
     Create a step to set BGP route filter policy using setRouteFilterPolicy.
@@ -5037,6 +7049,13 @@ def create_set_route_filter_step(
 
     if json_file_path is not None:
         params_dict["json_file_path"] = json_file_path
+    if formulaic_prefix_sources is not None:
+        params_dict["formulaic_prefix_sources"] = {
+            statement: dict(prefix_source)
+            for statement, prefix_source in formulaic_prefix_sources.items()
+        }
+    if verify_readback:
+        params_dict["verify_readback"] = True
 
     return create_run_task_step(
         task_name="bgp_set_route_filter",
@@ -5101,6 +7120,9 @@ def create_set_peer_groups_policy_step(
 def _validated_route_stability_params(
     *,
     expected_count: t.Optional[int],
+    expected_count_histogram_by_afi: t.Optional[
+        t.Mapping[str, t.Mapping[int, int]]
+    ],
     min_count: t.Optional[int],
     max_count: t.Optional[int],
     convergence_enabled: bool,
@@ -5127,10 +7149,15 @@ def _validated_route_stability_params(
         )
     if convergence_enabled:
         raise ValueError("convergence and stability observation are mutually exclusive")
-    if expected_count is None or min_count is not None or max_count is not None:
+    if (
+        (expected_count is None) == (expected_count_histogram_by_afi is None)
+        or min_count is not None
+        or max_count is not None
+    ):
         raise ValueError(
-            "stability observation requires expected_count and does not support "
-            "min_count or max_count"
+            "stability observation requires exactly one of expected_count or "
+            "expected_count_histogram_by_afi and does not support min_count or "
+            "max_count"
         )
     duration = float(duration_seconds)
     hard_timeout = float(hard_timeout_seconds)
@@ -5152,6 +7179,9 @@ def _received_routes_step_description(
     *,
     device_name: str,
     expected_count: t.Optional[int],
+    expected_count_histogram_by_afi: t.Optional[
+        t.Mapping[str, t.Mapping[int, int]]
+    ],
     min_count: t.Optional[int],
     max_count: t.Optional[int],
     descriptions_to_check: t.Optional[t.List[str]],
@@ -5165,6 +7195,11 @@ def _received_routes_step_description(
 
     if expected_count is not None:
         return f"Verify {device_name} receives exactly {expected_count} routes{peer_filter}"
+    if expected_count_histogram_by_afi is not None:
+        return (
+            f"Verify {device_name} receives exact route-count distributions by AFI "
+            f"{dict(expected_count_histogram_by_afi)}{peer_filter}"
+        )
     if max_count is not None:
         return f"Verify {device_name} receives at most {max_count} routes{peer_filter}"
     if min_count is not None:
@@ -5172,9 +7207,12 @@ def _received_routes_step_description(
     return f"Check received routes count on {device_name}{peer_filter}"
 
 
-def create_verify_received_routes_step(
+def create_verify_received_routes_step(  # noqa: C901
     device_name: str,
     expected_count: t.Optional[int] = None,
+    expected_count_histogram_by_afi: t.Optional[
+        t.Mapping[str, t.Mapping[int, int]]
+    ] = None,
     min_count: t.Optional[int] = None,
     max_count: t.Optional[int] = None,
     descriptions_to_check: t.Optional[t.List[str]] = None,
@@ -5200,6 +7238,8 @@ def create_verify_received_routes_step(
     Args:
         device_name: Name of the device to check received routes on
         expected_count: Expected exact number of received routes (optional)
+        expected_count_histogram_by_afi: Exact mapping from address family
+            (ipv4/ipv6) to route-count/peer-cardinality histogram
         min_count: Minimum expected routes (optional)
         max_count: Maximum expected routes (optional)
         descriptions_to_check: List of description substrings to match peers (optional)
@@ -5222,10 +7262,35 @@ def create_verify_received_routes_step(
         raise ValueError(
             "description filters and exact_peer_group_names are mutually exclusive"
         )
+    if expected_count_histogram_by_afi is not None and any(
+        value is not None for value in (expected_count, min_count, max_count)
+    ):
+        raise ValueError(
+            "expected_count_histogram_by_afi is mutually exclusive with "
+            "expected_count, min_count, and max_count"
+        )
+    if expected_count_histogram_by_afi is not None:
+        if not expected_count_histogram_by_afi:
+            raise ValueError("expected_count_histogram_by_afi must not be empty")
+        if not all(
+            afi in ("ipv4", "ipv6")
+            for afi in expected_count_histogram_by_afi
+        ):
+            raise ValueError(
+                "expected_count_histogram_by_afi keys must be 'ipv4' or 'ipv6'"
+            )
+        if any(
+            not histogram
+            for histogram in expected_count_histogram_by_afi.values()
+        ):
+            raise ValueError(
+                "expected_count_histogram_by_afi values must be non-empty mappings"
+            )
     if description is None:
         description = _received_routes_step_description(
             device_name=device_name,
             expected_count=expected_count,
+            expected_count_histogram_by_afi=expected_count_histogram_by_afi,
             min_count=min_count,
             max_count=max_count,
             descriptions_to_check=descriptions_to_check,
@@ -5250,6 +7315,12 @@ def create_verify_received_routes_step(
     if expected_count is not None:
         params_dict["expected_count"] = expected_count
 
+    if expected_count_histogram_by_afi is not None:
+        params_dict["expected_count_histogram_by_afi"] = {
+            afi: dict(histogram)
+            for afi, histogram in expected_count_histogram_by_afi.items()
+        }
+
     if min_count is not None:
         params_dict["min_count"] = min_count
 
@@ -5268,6 +7339,7 @@ def create_verify_received_routes_step(
     params_dict.update(
         _validated_route_stability_params(
             expected_count=expected_count,
+            expected_count_histogram_by_afi=expected_count_histogram_by_afi,
             min_count=min_count,
             max_count=max_count,
             convergence_enabled=any(
@@ -5318,10 +7390,42 @@ def create_file_from_config_step(
     )
 
 
+def create_validate_bgpcpp_config_step(
+    *,
+    device_name: str,
+    config_path: str = "/mnt/flash/bgpcpp_config",
+    description: str | None = None,
+) -> Step:
+    return create_run_task_step(
+        task_name="validate_bgpcpp_config_on_device",
+        params_dict={"hostname": device_name, "config_path": config_path},
+        description=description or f"Validate BGP++ config on {device_name}",
+    )
+
+
+def create_validate_bgpcpp_update_group_state_step(
+    *,
+    device_name: str,
+    expect_enabled: bool,
+    description: str | None = None,
+) -> Step:
+    return create_run_task_step(
+        task_name="validate_bgpcpp_update_group_state",
+        params_dict={
+            "hostname": device_name,
+            "expect_enabled": expect_enabled,
+        },
+        description=(
+            description or f"Validate BGP++ update-group state on {device_name}"
+        ),
+    )
+
+
 def create_run_commands_on_shell_step(
     device_name: str,
     cmds: t.List[str],
     description: t.Optional[str] = None,
+    validate_output: bool = False,
 ) -> Step:
     """
     Create a step to run shell commands on a device.
@@ -5330,6 +7434,7 @@ def create_run_commands_on_shell_step(
         device_name: Name of the device (hostname)
         cmds: List of shell commands to execute
         description: Custom description for the step
+        validate_output: Fail the step when a shell command fails
 
     Returns:
         Step object for running shell commands
@@ -5337,12 +7442,15 @@ def create_run_commands_on_shell_step(
     if description is None:
         description = f"Run shell commands on {device_name}"
 
+    params_dict: dict[str, t.Any] = {
+        "hostname": device_name,
+        "cmds": cmds,
+    }
+    if validate_output:
+        params_dict["validate_output"] = True
     return create_run_task_step(
         task_name="run_commands_on_shell",
-        params_dict={
-            "hostname": device_name,
-            "cmds": cmds,
-        },
+        params_dict=params_dict,
         description=description,
     )
 
@@ -5469,6 +7577,7 @@ def create_restore_bgp_peer_ranges_step(
     peer_ranges: t.Sequence[t.Mapping[str, t.Any]],
     description: t.Optional[str] = None,
 ) -> Step:
+    """Restore peer Active vectors, apply/read back, then start the ranges."""
     return create_ixia_api_step(
         api_name="restore_bgp_peer_ranges",
         args_dict={"peer_ranges": list(peer_ranges)},
@@ -5486,19 +7595,44 @@ def create_validated_bgp_session_oscillation_step(
     downtime_seconds: int,
     parent_prefixes_to_ignore: t.Sequence[str] = (),
     description: t.Optional[str] = None,
+    ixia_restore_timeout_floor_seconds: float | None = None,
 ) -> Step:
     """Create a blocking session-oscillation workload with per-trigger checks."""
+    params_dict: dict[str, t.Any] = {
+        "custom_step_name": "bgp_session_oscillation",
+        "hostname": device_name,
+        "session_groups": list(session_groups),
+        "cycle_schedule": [list(groups) for groups in cycle_schedule],
+        "expected_established_sessions": expected_established_sessions,
+        "test_duration_seconds": test_duration_seconds,
+        "uptime_seconds": uptime_seconds,
+        "downtime_seconds": downtime_seconds,
+        "parent_prefixes_to_ignore": list(parent_prefixes_to_ignore),
+    }
+    if ixia_restore_timeout_floor_seconds is not None:
+        params_dict["ixia_restore_timeout_floor_seconds"] = (
+            ixia_restore_timeout_floor_seconds
+        )
+    return create_custom_step(
+        params_dict=params_dict,
+        description=description or "Run validated BGP session oscillations",
+    )
+
+
+def create_session_churn_step(
+    *,
+    hostname: str,
+    session_churn: SessionChurn,
+    description: str | None = None,
+) -> Step:
+    """Lower typed session-churn intent to the established CustomStep boundary."""
+    if not hostname:
+        raise ValueError("hostname must be non-empty")
     return create_custom_step(
         params_dict={
             "custom_step_name": "bgp_session_oscillation",
-            "hostname": device_name,
-            "session_groups": list(session_groups),
-            "cycle_schedule": [list(groups) for groups in cycle_schedule],
-            "expected_established_sessions": expected_established_sessions,
-            "test_duration_seconds": test_duration_seconds,
-            "uptime_seconds": uptime_seconds,
-            "downtime_seconds": downtime_seconds,
-            "parent_prefixes_to_ignore": list(parent_prefixes_to_ignore),
+            "hostname": hostname,
+            **session_churn.to_step_params(),
         },
         description=description or "Run validated BGP session oscillations",
     )
@@ -5619,6 +7753,13 @@ def create_advertise_withdraw_prefixes_step(
     expected_prefix_pool_count: t.Optional[int] = None,
     expected_number_of_addresses: t.Optional[int] = None,
     runtime_route_operation: bool = False,
+    expected_prefix_pool_names: t.Optional[t.Sequence[str]] = None,
+    strict_range: bool = False,
+    verify_readback: bool = False,
+    evidence_label: t.Optional[str] = None,
+    peer_prefix_exclusion_blocks: t.Optional[
+        t.Sequence[t.Mapping[str, object]]
+    ] = None,
 ) -> Step:
     """
     Create a step to advertise or withdraw BGP prefixes from matching prefix pools.
@@ -5633,6 +7774,12 @@ def create_advertise_withdraw_prefixes_step(
         expected_number_of_addresses: Exact compact-pool route capacity.
         runtime_route_operation: Stop/start the selected physical route-property
             rows around the Active mutation. Requires exactly one matched pool.
+        expected_prefix_pool_names: Exact names of matching IXIA prefix pools.
+        strict_range: Reject invalid, truncated, or empty logical ranges.
+        verify_readback: Require exact fresh IXIA readback verification.
+        evidence_label: Stable phase label for append-only trigger evidence.
+        peer_prefix_exclusion_blocks: Sparse topology-authored blocks that stay
+            inactive while the selected prefix slice is advertised.
 
     Returns:
         Step object for BGP prefix advertisement/withdrawal
@@ -5655,10 +7802,109 @@ def create_advertise_withdraw_prefixes_step(
         params_dicts["expected_number_of_addresses"] = expected_number_of_addresses
     if runtime_route_operation:
         params_dicts["runtime_route_operation"] = True
+    if expected_prefix_pool_names is not None:
+        params_dicts["expected_prefix_pool_names"] = list(expected_prefix_pool_names)
+    if strict_range:
+        params_dicts["strict_range"] = True
+    if verify_readback:
+        params_dicts["verify_readback"] = True
+    if evidence_label is not None:
+        params_dicts["evidence_label"] = evidence_label
+    if peer_prefix_exclusion_blocks is not None:
+        params_dicts["peer_prefix_exclusion_blocks"] = [
+            dict(block) for block in peer_prefix_exclusion_blocks
+        ]
 
     return create_run_task_step(
         task_name="ixia_enable_disable_bgp_prefixes",
         params_dict=params_dicts,
+        description=description,
+        ixia_needed=True,
+    )
+
+
+def create_route_registry_cleanup_step(
+    device_name: str,
+    prefix_pool_names: t.Sequence[str],
+    prefix_start_index: int,
+    prefix_end_index: int,
+    expanded_policy_path: str,
+    expected_route_count: int | None,
+    ebgp_peer_description: str,
+    expected_established_sessions: int | None,
+    parent_prefixes_to_ignore: t.Sequence[str],
+    expanded_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
+    exact_peer_group_names: t.Sequence[str] | None = None,
+    convergence_soft_threshold_seconds: float = 60,
+    convergence_hard_timeout_seconds: float = 300,
+    convergence_poll_interval_seconds: float = 5,
+    expected_route_count_histogram_by_afi: t.Mapping[
+        str, t.Mapping[int, int]
+    ]
+    | None = None,
+    peer_prefix_exclusion_blocks_by_pool: t.Mapping[
+        str, t.Sequence[t.Mapping[str, object]]
+    ]
+    | None = None,
+    description: str = "Restore and validate CICD-EBB-12 state",
+) -> Step:
+    """Create failure-safe D12 cleanup that attempts every restore operation."""
+    if (expected_route_count is None) == (
+        expected_route_count_histogram_by_afi is None
+    ):
+        raise ValueError(
+            "exactly one of expected_route_count or "
+            "expected_route_count_histogram_by_afi is required"
+        )
+    if peer_prefix_exclusion_blocks_by_pool is not None and set(
+        peer_prefix_exclusion_blocks_by_pool
+    ) != set(prefix_pool_names):
+        raise ValueError(
+            "peer_prefix_exclusion_blocks_by_pool must exactly match "
+            "prefix_pool_names"
+        )
+    params_dict: t.Dict[str, t.Any] = {
+        "hostname": device_name,
+        "prefix_pool_names": list(prefix_pool_names),
+        "prefix_start_index": prefix_start_index,
+        "prefix_end_index": prefix_end_index,
+        "expanded_policy_path": expanded_policy_path,
+    }
+    if expected_route_count is not None:
+        params_dict["expected_route_count"] = expected_route_count
+    if expected_route_count_histogram_by_afi is not None:
+        params_dict["expected_route_count_histogram_by_afi"] = {
+            afi: dict(histogram)
+            for afi, histogram in expected_route_count_histogram_by_afi.items()
+        }
+    params_dict.update(
+        {
+            "ebgp_peer_description": ebgp_peer_description,
+            "expected_established_sessions": expected_established_sessions,
+            "parent_prefixes_to_ignore": list(parent_prefixes_to_ignore),
+            "convergence_soft_threshold_seconds": convergence_soft_threshold_seconds,
+            "convergence_hard_timeout_seconds": convergence_hard_timeout_seconds,
+            "convergence_poll_interval_seconds": convergence_poll_interval_seconds,
+            "session_hard_timeout_seconds": convergence_hard_timeout_seconds,
+            "session_poll_interval_seconds": convergence_poll_interval_seconds,
+        }
+    )
+    if expanded_policy_prefix_sources is not None:
+        params_dict["expanded_policy_prefix_sources"] = {
+            statement: dict(prefix_source)
+            for statement, prefix_source in expanded_policy_prefix_sources.items()
+        }
+    if peer_prefix_exclusion_blocks_by_pool is not None:
+        params_dict["peer_prefix_exclusion_blocks_by_pool"] = {
+            pool_name: [dict(block) for block in blocks]
+            for pool_name, blocks in peer_prefix_exclusion_blocks_by_pool.items()
+        }
+    if exact_peer_group_names is not None:
+        params_dict["exact_peer_group_names"] = list(exact_peer_group_names)
+    return create_run_task_step(
+        task_name="bgp_route_registry_cleanup",
+        params_dict=params_dict,
         description=description,
         ixia_needed=True,
     )
@@ -5675,9 +7921,22 @@ def create_validated_bgp_route_oscillation_step(
     readvertise_time: int,
     test_duration_seconds: int,
     parent_prefixes_to_ignore: t.Sequence[str] = (),
+    transition_soft_threshold_seconds: t.Optional[float] = None,
+    advertise_transition_soft_threshold_seconds: t.Optional[float] = None,
+    fail_on_session_flap: t.Optional[bool] = None,
     description: t.Optional[str] = None,
 ) -> Step:
-    """Create route oscillations with IXIA, source, and exact-RIB verdicts."""
+    """Create route oscillations with IXIA, source, and exact-RIB verdicts.
+
+    ``transition_soft_threshold_seconds`` is a HARD gate despite the name:
+    ``_wait_transition`` waits until the route state converges or hits the hard
+    timeout. ``_require_transition_within_sla`` then raises ``TestCaseFailure``
+    unless the outcome is ``ConvergenceOutcome.WITHIN_SLA``, preserving detailed
+    evidence for a transition that converged late. The runtime default is 60s
+    and applies to both transitions unless
+    ``advertise_transition_soft_threshold_seconds`` overrides only the
+    readvertisement. Omitted values preserve the existing payload and defaults.
+    """
     return create_custom_step(
         params_dict={
             "custom_step_name": "bgp_route_oscillation",
@@ -5691,6 +7950,49 @@ def create_validated_bgp_route_oscillation_step(
             "readvertise_time": readvertise_time,
             "test_duration_seconds": test_duration_seconds,
             "parent_prefixes_to_ignore": list(parent_prefixes_to_ignore),
+            **(
+                {
+                    "transition_soft_threshold_seconds": (
+                        transition_soft_threshold_seconds
+                    )
+                }
+                if transition_soft_threshold_seconds is not None
+                else {}
+            ),
+            **(
+                {
+                    "advertise_transition_soft_threshold_seconds": (
+                        advertise_transition_soft_threshold_seconds
+                    )
+                }
+                if advertise_transition_soft_threshold_seconds is not None
+                else {}
+            ),
+            # Emitted only when set, so existing callers stay byte-identical.
+            **(
+                {"fail_on_session_flap": fail_on_session_flap}
+                if fail_on_session_flap is not None
+                else {}
+            ),
+        },
+        description=description or "Run validated dual-stack BGP route oscillations",
+    )
+
+
+def create_route_churn_step(
+    *,
+    hostname: str,
+    route_churn: RouteChurn,
+    description: str | None = None,
+) -> Step:
+    """Lower a typed route-churn specification to the CustomStep boundary."""
+    if not hostname:
+        raise ValueError("hostname must be non-empty")
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "bgp_route_oscillation",
+            "hostname": hostname,
+            **route_churn.to_step_params(),
         },
         description=description or "Run validated dual-stack BGP route oscillations",
     )
@@ -5725,6 +8027,17 @@ def create_validated_igp_pnh_metric_oscillation_step(
     )
 
 
+def create_igp_metric_churn_step(churn: IgpMetricChurn) -> Step:
+    """Lower typed IGP metric-churn intent to the CustomStep boundary."""
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "bgp_igp_pnh_metric_oscillation",
+            **churn.to_step_params(),
+        },
+        description="Run acknowledged Open/R PNH metric oscillations",
+    )
+
+
 def create_validated_igp_unresolvable_pnh_step(
     device_name: str,
     start_ipv4s: t.Sequence[str],
@@ -5738,8 +8051,22 @@ def create_validated_igp_unresolvable_pnh_step(
     delete_count: int,
     update_timeout_seconds: int,
     stability_duration_seconds: int,
+    expected_in_scope_sessions: int,
+    parent_prefixes_to_ignore: t.Sequence[str] = (),
+    convergence_stability_polls: int = 0,
+    convergence_stability_max_seconds: int = 300,
 ) -> Step:
-    """Create a failure-safe, acknowledged unresolvable-PNH workflow."""
+    """Create a failure-safe, acknowledged unresolvable-PNH workflow.
+
+    Args:
+        convergence_stability_polls: Consecutive unchanged sent-UPDATE reads
+            required before the convergence window closes. 0 keeps the legacy
+            fixed-timer behaviour, where the baseline is whatever the counter
+            reads when ``update_timeout_seconds`` expires.
+        convergence_stability_max_seconds: Cap on waiting for that stability.
+    """
+    if expected_in_scope_sessions <= 0:
+        raise ValueError("expected_in_scope_sessions must be positive")
     return create_custom_step(
         params_dict={
             "custom_step_name": "bgp_igp_unresolvable_pnh",
@@ -5755,6 +8082,21 @@ def create_validated_igp_unresolvable_pnh_step(
             "delete_count": delete_count,
             "update_timeout_seconds": update_timeout_seconds,
             "stability_duration_seconds": stability_duration_seconds,
+            "expected_in_scope_sessions": expected_in_scope_sessions,
+            "parent_prefixes_to_ignore": list(parent_prefixes_to_ignore),
+            "convergence_stability_polls": convergence_stability_polls,
+            "convergence_stability_max_seconds": (convergence_stability_max_seconds),
+        },
+        description="Run validated unresolvable Open/R PNH workflow",
+    )
+
+
+def create_igp_unresolvable_churn_step(churn: IgpUnresolvableChurn) -> Step:
+    """Lower typed unresolvable-PNH intent to the CustomStep boundary."""
+    return create_custom_step(
+        params_dict={
+            "custom_step_name": "bgp_igp_unresolvable_pnh",
+            **churn.to_step_params(),
         },
         description="Run validated unresolvable Open/R PNH workflow",
     )
@@ -5923,6 +8265,10 @@ def create_drain_convergence_verification_step(
     convergence_signal: str = "global_table_version",
     peer_scope: t.Optional[t.Dict[str, t.Any]] = None,
     expected_min_peers: int = 1,
+    require_updates: bool = True,
+    expected_origin: t.Optional[str] = None,
+    expected_local_pref: t.Optional[int] = None,
+    expected_attribute_prefixes: t.Optional[t.Sequence[t.Mapping[str, t.Any]]] = None,
 ) -> Step:
     """
     Create a step to verify drain/undrain convergence from PCAP analysis.
@@ -5949,9 +8295,11 @@ def create_drain_convergence_verification_step(
             counter-based step that has no capture behind it at all. None is
             not the same as "": an empty name would look like a capture whose
             filename was lost, and the playbook contract tests reject it.
-        max_convergence_time_seconds: Maximum allowed convergence time (default: 600s/10min)
-        expected_as_path_asn: Expected ASN in AS_PATH (default: None, skips AS_PATH check)
-        phase: "drain" or "undrain" for proper ORIGIN verification
+        max_convergence_time_seconds: Counter-based path only: how long the
+            rib_version / table-version poll may run before failing (default:
+            600s/10min). The PCAP path does not time convergence and ignores it.
+        expected_as_path_asn: Reserved; the AS_PATH check is not implemented.
+        phase: "drain" or "undrain", used in log and verdict messages
         description: Custom description for the step
         use_pcap_analysis: When True use the legacy PCAP+tshark path; when False
             (default) use the counter-based path
@@ -5966,28 +8314,65 @@ def create_drain_convergence_verification_step(
             A peer matches if it satisfies ANY provided key; empty means all peers.
         expected_min_peers: per_peer_rib_version mode: fail unless at least this
             many in-scope established peers with rib_version>0 were seen.
+        require_updates: PCAP mode: fail when the capture holds no BGP UPDATE at
+            all (default True). The drain/undrain captures sit on the interfaces
+            the churn must cross, so an empty one means the stimulus never
+            propagated; only a capture allowed to be silent should clear this.
+        expected_origin: PCAP mode: "igp", "egp" or "incomplete". Every route
+            advertisement in the capture must carry it, proving the attribute
+            the stage set is the attribute that reached the peer. Omit to skip.
+            An expectation set against a capture holding no advertisement fails
+            rather than passing vacuously.
+        expected_local_pref: PCAP mode: LOCAL_PREF the drained prefixes must
+            carry. Same semantics as expected_origin, except that the correct
+            value depends on which leg the capture sits on. LOCAL_PREF is not
+            transitive across an eBGP boundary: RFC 4271 5.1.5 requires a
+            speaker to ignore a LOCAL_PREF received from an external peer and to
+            originate its own toward internal peers. On a capture of the tester
+            advertising over eBGP, expect the value the tester set; on a capture
+            of the DUT advertising over iBGP, expect the DUT's own value (its
+            default, typically 100), not the tester's. Omit to skip.
+        expected_attribute_prefixes: PCAP mode: formulaic descriptors for the
+            prefixes the stage actually drained, each with start_prefix,
+            prefix_step, prefix_length, start_index and end_index. Required
+            whenever an attribute expectation is set: a drain touches only part
+            of a pool, so an unscoped assertion would flag the untouched
+            majority as wrong.
 
     Returns:
         Step object for drain convergence verification
     """
     if description is None:
         if use_pcap_analysis:
-            mode = "pcap"
-        elif convergence_signal == "per_peer_rib_version":
-            mode = "per-peer-rib"
+            # The pcap path verifies the capture and its attributes; it does
+            # not time convergence, so no threshold belongs in the label.
+            checked = ", ".join(
+                label
+                for label, value in (
+                    (f"ORIGIN={expected_origin}", expected_origin),
+                    (f"LOCAL_PREF={expected_local_pref}", expected_local_pref),
+                )
+                if value is not None
+            )
+            description = f"Verify {phase} capture via pcap" + (
+                f" ({checked})" if checked else ""
+            )
         else:
-            mode = "counters"
-        description = (
-            f"Verify {phase} convergence via {mode} "
-            f"(max {max_convergence_time_seconds}s)"
-        )
+            mode = (
+                "per-peer-rib"
+                if convergence_signal == "per_peer_rib_version"
+                else "counters"
+            )
+            description = (
+                f"Verify {phase} convergence via {mode} "
+                f"(max {max_convergence_time_seconds}s)"
+            )
 
     params = {
         "custom_step_name": "verify_drain_convergence",
         "pcap_filename": pcap_filename,
         "max_convergence_time_seconds": max_convergence_time_seconds,
         "expected_as_path_asn": expected_as_path_asn,
-        "verify_origin_incomplete": True,
         "phase": phase,
         "use_pcap_analysis": use_pcap_analysis,
         "quiescence_window_seconds": quiescence_window_seconds,
@@ -5995,12 +8380,240 @@ def create_drain_convergence_verification_step(
         "convergence_signal": convergence_signal,
         "peer_scope": peer_scope or {},
         "expected_min_peers": expected_min_peers,
+        "require_updates": require_updates,
+        "expected_origin": expected_origin,
+        "expected_local_pref": expected_local_pref,
+        "expected_attribute_prefixes": [
+            dict(descriptor) for descriptor in (expected_attribute_prefixes or [])
+        ],
     }
 
     return Step(
         name=StepName.CUSTOM_STEP,
         step_params=Params(json_params=json.dumps(params)),
         description=description,
+    )
+
+
+def create_bgp_restoration_baseline_step(
+    snapshot_key: str,
+    peer_scope: t.Optional[t.Dict[str, t.Any]] = None,
+    expected_min_peers: int = 1,
+    compare_route_count: bool = True,
+    require_stable_baseline: bool = False,
+    expected_peer_count: int | None = None,
+    expected_peer_addresses: t.Optional[t.Sequence[str]] = None,
+    stability_window_seconds: int = 30,
+    stability_timeout_seconds: int | None = None,
+    poll_interval_seconds: int = 10,
+    description: t.Optional[str] = None,
+) -> Step:
+    """
+    Create a step that captures the pre-drain state an undrain must restore.
+
+    Pairs with ``create_bgp_restoration_verification_step``. Place this before
+    the first drain step of the stage and the verify step after the undrain.
+
+    Args:
+        snapshot_key: Name tying this baseline to its verify step, e.g. "fauu".
+        peer_scope: Optional {"remote_as": [...]} and/or
+            {"egress_policy_names": [...]} filter; empty means all peers. Must
+            match the verify step's scope.
+        expected_min_peers: Fail unless the baseline holds at least this many
+            peers. A baseline of zero peers would let the verify step match
+            trivially, so this is the anti-vacuousness floor.
+        compare_route_count: Also record the BGP++ RIB entry count (default
+            True). Must match the verify step's value.
+        require_stable_baseline: Poll the raw peer view until it remains unchanged
+            before recording the complete baseline.
+        expected_peer_count: Exact peer inventory size required by the stable
+            path when explicit identities are unavailable.
+        expected_peer_addresses: Exact topology-derived identities required by
+            the stable path; when set, their size must match expected_peer_count.
+        stability_window_seconds: Required unchanged interval.
+        stability_timeout_seconds: Optional bounded wait; when omitted, scales
+            from the expected peer count with a 300-second floor.
+        poll_interval_seconds: Delay between peer-view samples.
+        description: Custom description for the step.
+
+    Returns:
+        Step object for the pre-drain restoration baseline
+    """
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "snapshot_bgp_restoration_baseline",
+        "snapshot_key": snapshot_key,
+        "peer_scope": peer_scope or {},
+        "expected_min_peers": expected_min_peers,
+        "compare_route_count": compare_route_count,
+    }
+    if require_stable_baseline:
+        try:
+            normalized_peer_addresses = tuple(
+                sorted(
+                    str(ipaddress.ip_address(peer.split("/", 1)[0]))
+                    for peer in (str(value) for value in (expected_peer_addresses or ()))
+                )
+            )
+        except ValueError as error:
+            raise ValueError(
+                "stable BGP restoration peer identities must be IP addresses"
+            ) from error
+        if len(set(normalized_peer_addresses)) != len(normalized_peer_addresses):
+            raise ValueError("stable BGP restoration peer identities must be unique")
+        if normalized_peer_addresses:
+            if (
+                expected_peer_count is not None
+                and expected_peer_count != len(normalized_peer_addresses)
+            ):
+                raise ValueError(
+                    "stable BGP restoration peer count must match the exact "
+                    "peer identities"
+                )
+            expected_peer_count = len(normalized_peer_addresses)
+        if expected_peer_count is None or expected_peer_count <= 0:
+            raise ValueError(
+                "stable BGP restoration baseline requires exact peer identities "
+                "or a positive expected_peer_count"
+            )
+        if stability_window_seconds <= 0 or poll_interval_seconds <= 0:
+            raise ValueError(
+                "baseline stability window and poll interval must be positive"
+            )
+        derived_timeout = max(300, 60 * math.ceil(expected_peer_count / 250))
+        timeout = (
+            derived_timeout
+            if stability_timeout_seconds is None
+            else stability_timeout_seconds
+        )
+        if timeout < stability_window_seconds:
+            raise ValueError(
+                "baseline stability timeout must cover the stability window"
+            )
+        params.update(
+            {
+                "require_stable_baseline": True,
+                "expected_peer_count": expected_peer_count,
+                "stability_timeout_seconds": timeout,
+            }
+        )
+        if normalized_peer_addresses:
+            params["expected_peer_addresses"] = list(normalized_peer_addresses)
+        if stability_window_seconds != 30:
+            params["stability_window_seconds"] = stability_window_seconds
+        if poll_interval_seconds != 10:
+            params["poll_interval_seconds"] = poll_interval_seconds
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        step_params=Params(json_params=json.dumps(params)),
+        description=description
+        or f"Snapshot pre-drain {snapshot_key} peer views, policies and route count",
+    )
+
+
+def create_bgp_restoration_verification_step(
+    snapshot_key: str,
+    peer_scope: t.Optional[t.Dict[str, t.Any]] = None,
+    compare_route_count: bool = True,
+    route_count_tolerance: int = 0,
+    settle_timeout_seconds: int = 300,
+    poll_interval_seconds: int = 10,
+    description: t.Optional[str] = None,
+) -> Step:
+    """
+    Create a step that requires the post-undrain state to match the baseline.
+
+    The drain/undrain postchecks assert sessions are up and that RIB, FIB Agent
+    and hardware FIB agree with each other; all three stay self-consistent when
+    an undrain restores the wrong state. This step compares absolute values
+    against ``create_bgp_restoration_baseline_step``: per-peer ingress/egress
+    policy names, per-peer pre/post-policy received and sent prefix counts, the
+    peer set, and the total RIB route count.
+
+    Args:
+        snapshot_key: The key used by the matching baseline step.
+        peer_scope: Must match the baseline step's scope.
+        compare_route_count: Must match the baseline step's value.
+        route_count_tolerance: Allowed absolute RIB route-count drift
+            (default 0, i.e. exact restoration).
+        settle_timeout_seconds: Keep re-reading for this long before failing;
+            the last peers can still be draining their AdjRibOut when the step
+            starts (default: 300s).
+        poll_interval_seconds: Gap between re-reads (default: 10s).
+        description: Custom description for the step.
+
+    Returns:
+        Step object for the post-undrain restoration check
+    """
+    params = {
+        "custom_step_name": "verify_bgp_restoration_against_baseline",
+        "snapshot_key": snapshot_key,
+        "peer_scope": peer_scope or {},
+        "compare_route_count": compare_route_count,
+        "route_count_tolerance": route_count_tolerance,
+        "settle_timeout_seconds": settle_timeout_seconds,
+        "poll_interval_seconds": poll_interval_seconds,
+        "report_only": False,
+    }
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        step_params=Params(json_params=json.dumps(params)),
+        description=description
+        or (
+            f"Verify post-undrain {snapshot_key} peer views, policies and route "
+            f"count match the pre-drain baseline exactly"
+        ),
+    )
+
+
+def create_bgp_restoration_probe_step(
+    snapshot_key: str,
+    peer_scope: t.Optional[t.Dict[str, t.Any]] = None,
+    compare_route_count: bool = True,
+    description: t.Optional[str] = None,
+) -> Step:
+    """
+    Create a report-only mid-stage sample of the restoration comparison.
+
+    The gate at the end of the undrain says the final state is wrong; it cannot
+    say which half of the stage made it wrong, because both the drain and the
+    undrain sit between the baseline and the comparison. Placing one of these at
+    the end of the drain phase splits that window: the same comparison against
+    the same baseline, taken at the same relative position in its own phase.
+
+    Never fails the stage. A differing sample publishes SKIP, a matching one
+    PASS, and the message says it is not a verdict. Takes exactly one sample
+    (no settle window) because it is measuring a moment, not waiting for one.
+
+    Args:
+        snapshot_key: The key used by the matching baseline step.
+        peer_scope: Must match the baseline step's scope.
+        compare_route_count: Also compare the BGP++ RIB entry count. Costs one
+            full-table read; worth it because "did the RIB move during the
+            drain" is the other half of the question.
+        description: Custom description for the step.
+
+    Returns:
+        Step object for the report-only mid-stage sample
+    """
+    params = {
+        "custom_step_name": "verify_bgp_restoration_against_baseline",
+        "snapshot_key": snapshot_key,
+        "peer_scope": peer_scope or {},
+        "compare_route_count": compare_route_count,
+        "route_count_tolerance": 0,
+        "settle_timeout_seconds": 0,
+        "poll_interval_seconds": 0,
+        "report_only": True,
+        "check_name": f"probe_{snapshot_key}_post_drain_drift",
+    }
+    return Step(
+        name=StepName.CUSTOM_STEP,
+        step_params=Params(json_params=json.dumps(params)),
+        description=description
+        or (
+            f"Sample post-drain {snapshot_key} peer views, policies and route "
+            f"count against the pre-drain baseline (report-only)"
+        ),
     )
 
 
@@ -6142,6 +8755,11 @@ def create_multipath_nexthop_count_health_check_step(
     use_discovered_prefixes: bool = False,
     use_discovered_width: bool = False,
     peers_stopped_delta: t.Optional[int] = None,
+    convergence_hard_timeout_seconds: t.Optional[float] = None,
+    convergence_poll_interval_seconds: t.Optional[float] = None,
+    convergence_stability_window_seconds: t.Optional[float] = None,
+    convergence_predicate_timeout_seconds: t.Optional[float] = None,
+    stage: t.Optional[taac_types.ValidationStage] = None,
     description: t.Optional[str] = None,
 ) -> Step:
     """
@@ -6176,6 +8794,22 @@ def create_multipath_nexthop_count_health_check_step(
         use_discovered_width: If True, derive expected_nexthop_count from the
             stored baseline width minus peers_stopped_delta
         peers_stopped_delta: Peers currently stopped (default 0 / restore phase)
+        convergence_hard_timeout_seconds: Discovery-only. When set, the step
+            POLLS until the measured width satisfies the sanity bounds and
+            holds, rather than reading once after a fixed settle. Omitted =
+            today's single read.
+        convergence_poll_interval_seconds: Upper bound between polls.
+        convergence_stability_window_seconds: How long the measurement must
+            hold before it is accepted.
+        convergence_predicate_timeout_seconds: Per-read cap.
+        stage: Validation stage. This decides whether a FAILING check aborts
+            the run: ``ValidationStep.run`` maps PRE_TEST to ``TestbedError``
+            and POST_TEST to ``TestCaseFailure``, and everything else --
+            INCLUDING MID_TEST and the default of None -- to no exception at
+            all, so the step logs its failure and the playbook continues.
+            ``fail_fast=True`` does not change that; it is gated on the same
+            mapping. Leave unset for today's non-blocking behaviour; pass
+            POST_TEST when a failure here must stop the test.
         description: Custom description for the step
 
     Returns:
@@ -6249,9 +8883,14 @@ def create_multipath_nexthop_count_health_check_step(
                         expected_nexthop_count=expected_nexthop_count,
                         min_nexthop_count=min_nexthop_count,
                         max_nexthop_count=max_nexthop_count,
+                        convergence_hard_timeout_seconds=convergence_hard_timeout_seconds,
+                        convergence_poll_interval_seconds=convergence_poll_interval_seconds,
+                        convergence_stability_window_seconds=convergence_stability_window_seconds,
+                        convergence_predicate_timeout_seconds=convergence_predicate_timeout_seconds,
                     )
                 ],
                 fail_fast=True,
+                stage=stage,
             )
         ),
     )
@@ -6267,13 +8906,14 @@ def create_performance_scaling_convergence_step(
     ibgp_peer_count: int = 0,
     ebgp_peer_count: int = 0,
     convergence_wait_seconds: int = 600,
+    advertisement_settle_seconds: t.Optional[int] = None,
     soak_seconds: int = 120,
     test_name: str = "BGP_PLUS_PLUS_PERFORMANCE_SCALING_CONVERGENCE",
     description: t.Optional[str] = None,
 ) -> Step:
     """
-    Create a custom step that iterates all prefix counts for a given peer count,
-    measures BGP convergence time for each, and plots convergence time vs prefix count.
+    Create a custom step that measures peak/stable CPU and RSS while iterating
+    prefix counts for a fixed peer count.
 
     This replaces separate per-prefix-count playbooks with a single step that
     sequentially tests each prefix count and generates consolidated results.
@@ -6295,17 +8935,20 @@ def create_performance_scaling_convergence_step(
         total_peer_count: Total peer count for labeling/Scuba
         ibgp_peer_count: IBGP peer count for Scuba logging
         ebgp_peer_count: EBGP peer count for Scuba logging
-        convergence_wait_seconds: Maximum wait for convergence per iteration (default: 600)
+        convergence_wait_seconds: Legacy serialized parameter retained for
+            compatibility; convergence timing is not measured by this step.
+        advertisement_settle_seconds: Burst observation window before the soak.
+            When omitted, the custom step uses its default.
         soak_seconds: Soak period after convergence per iteration (default: 120)
         test_name: Scuba logging label
         description: Custom description for the step
 
     Returns:
-        Step object for the performance scaling convergence custom step
+        Step object for the performance-scaling resource measurement.
     """
     if description is None:
         description = (
-            f"Measure convergence across prefix counts "
+            f"Measure peak/stable CPU and RSS across prefix counts "
             f"{prefix_counts} with {total_peer_count} peers"
         )
 
@@ -6324,6 +8967,8 @@ def create_performance_scaling_convergence_step(
     }
     if address_families is not None:
         step_params["address_families"] = address_families
+    if advertisement_settle_seconds is not None:
+        step_params["advertisement_settle_seconds"] = advertisement_settle_seconds
 
     return Step(
         name=StepName.CUSTOM_STEP,
@@ -6335,12 +8980,12 @@ def create_performance_scaling_convergence_step(
 def create_performance_scaling_egress_sweep_aggregator_step(
     test_name: str = "BGP_PLUS_PLUS_PERFORMANCE_SCALING_CONVERGENCE",
     prefix_count: t.Optional[int] = None,
+    apply_sc1_gates: bool = False,
     description: t.Optional[str] = None,
 ) -> Step:
     """
-    Create a custom step that aggregates per-stage convergence results from
-    a single Playbook's egress-peer sweep and produces ONE consolidated plot
-    showing convergence-time vs total-peer-count.
+    Create a custom step that aggregates per-stage resource measurements from
+    a peer sweep and produces one consolidated resource-scaling plot.
 
     The companion ``aggregate_performance_scaling_egress_sweep_plot`` custom
     step reads every ``performance_scaling_<N>_peers`` entry from
@@ -6355,22 +9000,23 @@ def create_performance_scaling_egress_sweep_aggregator_step(
             prefix counts, pick which one to plot. When ``None`` (default)
             and only one prefix count was tested per Stage, that single
             value is used automatically.
+        apply_sc1_gates: Apply the SC1 egress-sweep gates to the aggregated
+            measurements. The shared ingress-sweep caller leaves this false.
         description: Custom description for the step.
 
     Returns:
         Step object for the egress-sweep aggregator custom step.
     """
     if description is None:
-        description = (
-            "Aggregate per-Stage convergence results into a single plot"
-            " of convergence-time vs total-peer-count"
-        )
+        description = "Aggregate peak/stable CPU and RSS across the peer-count sweep"
     step_params: t.Dict[str, t.Any] = {
         "custom_step_name": "aggregate_performance_scaling_egress_sweep_plot",
         "test_name": test_name,
     }
     if prefix_count is not None:
         step_params["prefix_count"] = prefix_count
+    if apply_sc1_gates:
+        step_params["apply_sc1_gates"] = True
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description,
@@ -6388,7 +9034,7 @@ def create_standard_setup_steps(
     disable_all_device_groups: bool = True,
     enable_all_device_groups: bool = False,
     enable_bgp_daemon: bool = True,
-    daemon_name: str = "Bgp",
+    daemon_name: str = "Bgpcpp",
     validate_device_group_toggle: bool = False,
 ) -> t.List[Step]:
     """
@@ -6498,7 +9144,9 @@ def create_bgp_restart_setup_steps(
 
 
 def create_bgp_instability_setup_steps(
-    device_name: str, convergence_wait_seconds: int = 300
+    device_name: str,
+    convergence_wait_seconds: int = 300,
+    start_device_groups_after_enable: bool = False,
 ) -> t.List[Step]:
     """
     Create setup steps for BGP instability tests where sessions should be pre-established.
@@ -6509,6 +9157,9 @@ def create_bgp_instability_setup_steps(
     Args:
         device_name: Name of the device
         convergence_wait_seconds: Time to wait for BGP convergence (default: 5 minutes)
+        start_device_groups_after_enable: Start newly enabled IXIA device groups
+            and resolve their next-hops. Required when the declarative IXIA
+            config initializes the groups disabled.
 
     Returns:
         List of setup steps for BGP instability tests
@@ -6518,6 +9169,15 @@ def create_bgp_instability_setup_steps(
         enable_all_device_groups=True,
         enable_bgp_daemon=True,
     )
+    if start_device_groups_after_enable:
+        steps.insert(
+            1,
+            create_ixia_api_step(
+                api_name="start_device_groups",
+                args_dict={"device_group_name_regex": ".*"},
+                description="Start all device groups and resolve next-hops",
+            ),
+        )
 
     steps.append(
         create_longevity_step(
@@ -6535,11 +9195,20 @@ def create_route_registry_prefix_list_setup_steps(
     prefix_start_index: int = 0,
     prefix_end_index: int = 100,
     baseline_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_650.json",
+    baseline_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
     expected_route_count: int | None = None,
+    expected_route_count_histogram_by_afi: t.Optional[
+        t.Mapping[str, t.Mapping[int, int]]
+    ] = None,
     convergence_soft_threshold_seconds: float | None = None,
     convergence_hard_timeout_seconds: float | None = None,
     convergence_poll_interval_seconds: float | None = None,
     exact_peer_group_names: t.Optional[t.List[str]] = None,
+    prefix_pool_regex: str = ".*EBGP.*",
+    expected_prefix_pool_names: t.Optional[t.Sequence[str]] = None,
+    verify_trigger_readback: bool = False,
+    verify_policy_readback: bool = False,
 ) -> t.List[Step]:
     """
     Create setup steps for BGP route registry prefix list runtime update testing.
@@ -6557,6 +9226,8 @@ def create_route_registry_prefix_list_setup_steps(
         prefix_end_index: Last runtime-update prefix index (exclusive)
         baseline_policy_path: Route-filter policy that excludes the test slice
         expected_route_count: Optional exact baseline count to observe
+        expected_route_count_histogram_by_afi: Optional exact baseline route-count
+            distributions by address family across selected peers
         convergence_soft_threshold_seconds: Optional exact-count SLA
         convergence_hard_timeout_seconds: Optional observation timeout
         convergence_poll_interval_seconds: Optional polling interval
@@ -6571,12 +9242,14 @@ def create_route_registry_prefix_list_setup_steps(
     )
     convergence_enabled = any(value is not None for value in convergence_params)
     if convergence_enabled and (
-        expected_route_count is None
+        (expected_route_count is None)
+        == (expected_route_count_histogram_by_afi is None)
         or not all(value is not None for value in convergence_params)
     ):
         raise ValueError(
-            "expected_route_count and all convergence parameters must be "
-            "provided together"
+            "exactly one of expected_route_count or "
+            "expected_route_count_histogram_by_afi and all convergence parameters "
+            "must be provided together"
         )
     standard_steps = create_standard_setup_steps(
         device_name=device_name,
@@ -6599,32 +9272,62 @@ def create_route_registry_prefix_list_setup_steps(
         else f"Load baseline route filter policy without test prefixes ({baseline_policy_path})"
     )
 
-    withdraw_step = create_advertise_withdraw_prefixes_step(
-        device_name=device_name,
-        advertise=False,
-        prefix_pool_regex=".*EBGP.*",
-        prefix_start_index=prefix_start_index,
-        prefix_end_index=prefix_end_index,
-        description=withdraw_description,
-    )
+    if expected_prefix_pool_names is None:
+        withdraw_steps = [
+            create_advertise_withdraw_prefixes_step(
+                device_name=device_name,
+                advertise=False,
+                prefix_pool_regex=prefix_pool_regex,
+                prefix_start_index=prefix_start_index,
+                prefix_end_index=prefix_end_index,
+                strict_range=verify_trigger_readback,
+                verify_readback=verify_trigger_readback,
+                evidence_label="setup_withdraw",
+                description=withdraw_description,
+            )
+        ]
+    else:
+        withdraw_steps = [
+            create_advertise_withdraw_prefixes_step(
+                device_name=device_name,
+                advertise=False,
+                prefix_pool_regex=rf"^{re.escape(pool_name)}$",
+                prefix_start_index=prefix_start_index,
+                prefix_end_index=prefix_end_index,
+                expected_prefix_pool_names=(pool_name,),
+                strict_range=verify_trigger_readback,
+                verify_readback=verify_trigger_readback,
+                evidence_label=f"setup_withdraw:{pool_name}",
+                description=f"{withdraw_description} ({pool_name})",
+            )
+            for pool_name in expected_prefix_pool_names
+        ]
     baseline_policy_step = create_set_route_filter_step(
         device_name=device_name,
         config_path=baseline_policy_path,
+        formulaic_prefix_sources=baseline_policy_prefix_sources,
+        verify_readback=verify_policy_readback,
         description=policy_description,
     )
 
     if convergence_enabled:
-        steps = [withdraw_step, baseline_policy_step, *standard_steps]
+        steps = [*withdraw_steps, baseline_policy_step, *standard_steps]
         steps.append(
             create_verify_received_routes_step(
                 device_name=device_name,
                 descriptions_to_check=(None if exact_peer_group_names else ["EBGP"]),
                 exact_peer_group_names=exact_peer_group_names,
                 expected_count=expected_route_count,
+                expected_count_histogram_by_afi=(
+                    expected_route_count_histogram_by_afi
+                ),
                 convergence_soft_threshold_seconds=(convergence_soft_threshold_seconds),
                 convergence_hard_timeout_seconds=(convergence_hard_timeout_seconds),
                 convergence_poll_interval_seconds=(convergence_poll_interval_seconds),
-                description=f"Observe exact baseline route-count convergence to {expected_route_count}",
+                description=(
+                    "Observe exact baseline route-count convergence to "
+                    f"{expected_route_count_histogram_by_afi or expected_route_count}"
+                ),
             )
         )
     else:
@@ -6634,7 +9337,7 @@ def create_route_registry_prefix_list_setup_steps(
                 duration=convergence_wait_seconds,
                 description=f"Wait for BGP session establishment and convergence ({convergence_wait_seconds}s)",
             ),
-            withdraw_step,
+            *withdraw_steps,
             baseline_policy_step,
         ]
 
@@ -6720,6 +9423,232 @@ def create_sc_8_setup_steps(
     return steps
 
 
+def create_policy_evaluation_sweep_control_step(
+    *,
+    action: str,
+    state_key: str,
+    prefix_counts: t.Sequence[int] | None = None,
+    max_absolute_overhead_us: float | None = None,
+    max_slope_overhead_us_per_10k: float | None = None,
+    check_name: str = "policy_evaluation_overhead",
+    description: str | None = None,
+) -> Step:
+    """Create the initialize or final paired policy-verdict step."""
+    if action not in {"initialize", "evaluate"}:
+        raise ValueError("policy-evaluation control action must be initialize or evaluate")
+    params: dict[str, t.Any] = {
+        "custom_step_name": "policy_evaluation_sweep",
+        "action": action,
+        "state_key": state_key,
+    }
+    if action == "evaluate":
+        if (
+            prefix_counts is None
+            or max_absolute_overhead_us is None
+            or max_slope_overhead_us_per_10k is None
+        ):
+            raise ValueError("policy-evaluation evaluate action requires all gate inputs")
+        if not check_name.strip():
+            raise ValueError("policy-evaluation check_name must be non-empty")
+        params.update(
+            {
+                "prefix_counts": list(prefix_counts),
+                "max_absolute_overhead_us": max_absolute_overhead_us,
+                "max_slope_overhead_us_per_10k": (
+                    max_slope_overhead_us_per_10k
+                ),
+                "check_name": check_name,
+            }
+        )
+    return create_custom_step(params_dict=params, description=description)
+
+
+def create_policy_evaluation_point_steps(
+    *,
+    device_name: str,
+    arm: str,
+    policy_name: str,
+    policy_configerator_path: str,
+    prefix_count: int,
+    prefix_capacity: int,
+    prefix_pool_names_by_afi: t.Mapping[str, str],
+    peer_group_names_by_afi: t.Mapping[str, str],
+    peer_counts_by_afi: t.Mapping[str, int],
+    expected_peers: t.Sequence[t.Mapping[str, t.Any]],
+    expected_local_as_4_byte: int,
+    expect_update_group_enabled: bool,
+    allowed_prefix_counts: t.Sequence[int],
+    state_key: str,
+    evidence_label_prefix: str = "policy-evaluation",
+) -> t.List[Step]:
+    """Create one fresh, exact-route policy measurement point."""
+    if arm not in {"baseline", "candidate"}:
+        raise ValueError("policy-evaluation arm must be baseline or candidate")
+    if not 0 < prefix_count <= prefix_capacity:
+        raise ValueError("policy-evaluation prefix_count exceeds pool capacity")
+    required_afis = ("ipv4", "ipv6")
+    for label, handles in (
+        ("prefix_pool_names_by_afi", prefix_pool_names_by_afi),
+        ("peer_group_names_by_afi", peer_group_names_by_afi),
+        ("peer_counts_by_afi", peer_counts_by_afi),
+    ):
+        if set(handles) != set(required_afis):
+            raise ValueError(
+                f"policy-evaluation {label} must contain exactly {required_afis}"
+            )
+    if any(
+        not prefix_pool_names_by_afi[afi] or not peer_group_names_by_afi[afi]
+        for afi in required_afis
+    ):
+        raise ValueError("policy-evaluation runtime handles must be non-empty")
+    if len({prefix_pool_names_by_afi[afi] for afi in required_afis}) != 2 or len(
+        {peer_group_names_by_afi[afi] for afi in required_afis}
+    ) != 2:
+        raise ValueError("policy-evaluation runtime handles must be distinct by AFI")
+    if any(peer_counts_by_afi[afi] <= 0 for afi in required_afis):
+        raise ValueError("policy-evaluation peer counts must be positive")
+    if not evidence_label_prefix.strip():
+        raise ValueError("policy-evaluation evidence_label_prefix must be non-empty")
+    normalized_allowed_counts = tuple(dict.fromkeys(allowed_prefix_counts))
+    if (
+        prefix_capacity not in normalized_allowed_counts
+        or prefix_count not in normalized_allowed_counts
+        or any(
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 0 < count <= prefix_capacity
+            for count in normalized_allowed_counts
+        )
+    ):
+        raise ValueError(
+            "policy-evaluation allowed_prefix_counts must contain the point and "
+            "capacity and consist of positive counts within capacity"
+        )
+
+    steps: list[Step] = [
+        create_daemon_control_step(
+            device_name=device_name,
+            daemon_name="Bgpcpp",
+            action="disable",
+            description=f"Reset BGP policy counters for {arm} {prefix_count:,}",
+        )
+    ]
+    for afi in required_afis:
+        pool_name = prefix_pool_names_by_afi[afi]
+        steps.append(
+            create_prepare_compact_bgp_prefix_pool_step(
+                device_name=device_name,
+                prefix_pool_regex=rf"^{re.escape(pool_name)}$",
+                target_number_of_addresses=prefix_count,
+                allowed_current_number_of_addresses=normalized_allowed_counts,
+                safe_number_of_addresses=prefix_capacity,
+                description=(
+                    f"Withdraw and resize {afi} pool to {prefix_count:,}"
+                ),
+            )
+        )
+
+    steps.extend(
+        [
+            create_file_from_config_step(
+                device_name=device_name,
+                configerator_path=policy_configerator_path,
+                file_path=POLICY_EVALUATION_SOURCE_CONFIG_PATH,
+                description=f"Stage {arm} BGP policy source",
+            ),
+            create_run_commands_on_shell_step(
+                device_name=device_name,
+                cmds=[
+                    build_bgpcpp_policy_overlay_cmd(
+                        source_config_path=POLICY_EVALUATION_SOURCE_CONFIG_PATH,
+                        policy_name=policy_name,
+                        peer_group_names=tuple(
+                            peer_group_names_by_afi[afi] for afi in required_afis
+                        ),
+                        expected_peers=expected_peers,
+                        expected_local_as_4_byte=expected_local_as_4_byte,
+                        expect_update_group_enabled=expect_update_group_enabled,
+                    )
+                ],
+                description=f"Apply {arm} policy-only BGP config overlay",
+                validate_output=True,
+            ),
+            create_validate_bgpcpp_config_step(
+                device_name=device_name,
+                description=f"Validate {arm} policy-only BGP config",
+            ),
+        ]
+    )
+    for afi in required_afis:
+        pool_name = prefix_pool_names_by_afi[afi]
+        steps.append(
+            create_advertise_withdraw_prefixes_step(
+                device_name=device_name,
+                advertise=True,
+                prefix_pool_regex=rf"^{re.escape(pool_name)}$",
+                prefix_start_index=0,
+                prefix_end_index=prefix_count,
+                expected_prefix_pool_count=1,
+                expected_number_of_addresses=prefix_count,
+                expected_prefix_pool_names=[pool_name],
+                strict_range=True,
+                verify_readback=True,
+                evidence_label=(
+                    f"{evidence_label_prefix}-{arm}-{prefix_count}-{afi}-advertise"
+                ),
+                description=f"Advertise {prefix_count:,} {afi} routes",
+            )
+        )
+    steps.extend(
+        [
+            create_daemon_control_step(
+                device_name=device_name,
+                daemon_name="Bgpcpp",
+                action="enable",
+                description=f"Start BGP for {arm} {prefix_count:,} measurement",
+            ),
+            create_validate_bgpcpp_update_group_state_step(
+                device_name=device_name,
+                expect_enabled=expect_update_group_enabled,
+                description=(
+                    f"Verify {arm} update-group state after policy overlay"
+                ),
+            ),
+            create_verify_received_routes_step(
+                device_name=device_name,
+                expected_count_histogram_by_afi={
+                    afi: {prefix_count: peer_counts_by_afi[afi]}
+                    for afi in required_afis
+                },
+                exact_peer_group_names=[
+                    peer_group_names_by_afi[afi] for afi in required_afis
+                ],
+                convergence_soft_threshold_seconds=300,
+                convergence_hard_timeout_seconds=600,
+                convergence_poll_interval_seconds=10,
+                description=(
+                    f"Prove exact dual-stack {prefix_count:,}-route {arm} workload"
+                ),
+            ),
+            create_custom_step(
+                params_dict={
+                    "custom_step_name": "policy_evaluation_sweep",
+                    "action": "collect",
+                    "state_key": state_key,
+                    "hostname": device_name,
+                    "arm": arm,
+                    "policy_name": policy_name,
+                    "prefix_count": prefix_count,
+                },
+                description=(
+                    f"Collect {arm} policy cost at {prefix_count:,} routes per AFI"
+                ),
+            ),
+        ]
+    )
+    return steps
+
+
 def create_sc_8_steps(
     device_name: str,
     prefix_count: int = 10000,
@@ -6742,7 +9671,7 @@ def create_sc_8_steps(
         List of test steps
     """
     steps = []
-    daemon_name = "Bgp"
+    daemon_name = "Bgpcpp"
 
     steps.append(
         create_daemon_control_step(
@@ -7527,7 +10456,7 @@ def create_traffic_duration_step(duration_seconds: int = 300) -> Step:
     )
 
 
-def create_clear_traffic_stats_step() -> Step:
+def create_clear_traffic_stats_step(*, start_traffic: bool = True) -> Step:
     """Zero out IXIA traffic counters before a measurement window.
 
     Wraps the IXIA `clear_traffic_stats` API. Run after a topology change
@@ -7543,6 +10472,7 @@ def create_clear_traffic_stats_step() -> Step:
         api_name="clear_traffic_stats",
         args_dict={},
         description="Clear traffic statistics",
+        start_traffic=start_traffic,
     )
 
 
@@ -7860,6 +10790,8 @@ def create_toggle_device_group_step(
     distribution_type: str,
     enable: bool,
     description: t.Optional[str] = None,
+    require_match: bool = False,
+    expected_match_count: int | None = None,
 ) -> Step:
     """Toggle the IXIA `PREFIX_STRESSER_*` device group on or off.
 
@@ -7875,6 +10807,8 @@ def create_toggle_device_group_step(
         enable: True to enable the device group, False to disable.
         description: Custom description for the step. If omitted, a
             default is generated from the args.
+        require_match: Fail when no device group matches the distribution.
+        expected_match_count: Exact number of matching device groups required.
 
     Returns:
         A `Step` with `step_name=StepName.INVOKE_IXIA_API_STEP` calling
@@ -7884,13 +10818,14 @@ def create_toggle_device_group_step(
         description
         or f"{'Enable' if enable else 'Disable'} {distribution_type} device group"
     )
-    return create_ixia_api_step(
-        api_name="toggle_device_groups",
-        args_dict={
-            "enable": enable,
-            "device_group_name_regex": f".*PREFIX_STRESSER_{distribution_type.upper()}.*",
-        },
+    return create_ixia_device_group_toggle_step(
+        enable=enable,
+        device_group_name_regex=(
+            f".*PREFIX_STRESSER_{distribution_type.upper()}.*"
+        ),
         description=desc,
+        require_match=require_match,
+        expected_match_count=expected_match_count,
     )
 
 
@@ -8027,8 +10962,10 @@ def create_configure_prefix_length_step(
     network_group_regex: str,
     prefix_length: int,
     distribution_type: str,
+    starting_ip: str | None = None,
+    increment_ip: str | None = None,
 ) -> Step:
-    """Set the advertised prefix length for a CONTIGUOUS-distribution group.
+    """Set the advertised address pattern for a CONTIGUOUS-distribution group.
 
     Wraps the IXIA `configure_advertised_prefixes` API, used in MP3N
     prefix-profiling tests with the INCREMENT pattern. Adjusting the
@@ -8042,17 +10979,25 @@ def create_configure_prefix_length_step(
         prefix_length: New prefix length (e.g. 24, 32, 48, 64, 128).
         distribution_type: Label for the step description (typically
             `CONTIGUOUS`).
+        starting_ip: First advertised prefix for the selected mask.
+        increment_ip: Address increment between consecutive prefixes.
 
     Returns:
         A `Step` with `step_name=StepName.INVOKE_IXIA_API_STEP` calling
         `configure_advertised_prefixes`.
     """
+    args: dict[str, t.Any] = {
+        "network_group_regex": network_group_regex,
+        "prefix_length": prefix_length,
+    }
+    if starting_ip is not None:
+        args["starting_ip"] = starting_ip
+    if increment_ip is not None:
+        args["increment_ip"] = increment_ip
+
     return create_ixia_api_step(
         api_name="configure_advertised_prefixes",
-        args_dict={
-            "network_group_regex": network_group_regex,
-            "prefix_length": prefix_length,
-        },
+        args_dict=args,
         description=f"Configure prefix length for {distribution_type} (/{prefix_length})",
     )
 
@@ -8442,6 +11387,9 @@ def create_route_convergence_health_check_step(
     iterations: int = 5,
     time_threshold: int = 35,
     wait_time_seconds: int = 60,
+    expected_route_count: int | None = None,
+    observation_timeout_seconds: int = 15,
+    observation_poll_interval_seconds: float = 1,
 ) -> Step:
     """Run the Route Convergence health check N times to measure converge time.
 
@@ -8475,6 +11423,9 @@ def create_route_convergence_health_check_step(
                 iterations=iterations,
                 time_threshold=time_threshold,
                 wait_time_seconds=wait_time_seconds,
+                expected_route_count=expected_route_count,
+                observation_timeout_seconds=observation_timeout_seconds,
+                observation_poll_interval_seconds=observation_poll_interval_seconds,
             ),
         ],
         stage=taac_types.ValidationStage.MID_TEST,
@@ -8693,6 +11644,92 @@ class RunSSHCmdStep(StepBase[taac_types.BaseInput]):
 
 class DrainUndrainStep(StepBase[taac_types.DrainUndrainInput]):
     STEP_NAME = taac_types.StepName.DRAIN_UNDRAIN_STEP
+    LOCAL_DRAINER_READBACK_ATTEMPTS = 3
+    LOCAL_DRAINER_READBACK_INTERVAL_SECONDS = 5
+    LOCAL_DRAINER_READBACK_TIMEOUT_SECONDS = 30.0
+
+    async def _read_local_drainer_interface_states(
+        self,
+        fboss_driver: t.Any,
+        names: t.Sequence[str],
+        expected_drained: bool,
+    ) -> t.Tuple[t.Dict[str, object], BaseException | None]:
+        try:
+            all_ports = await fboss_driver.async_get_all_port_info()
+        except Exception as error:
+            observed = f"not read ({type(error).__name__}: {error})"
+            return dict.fromkeys(names, observed), error
+
+        ports_by_name = {
+            port.name: port
+            for port in all_ports.values()
+            if getattr(port, "name", None)
+        }
+        mismatches = {}
+        for name in names:
+            port = ports_by_name.get(name)
+            observed: object = "not present in Agent port map"
+            if port is not None:
+                observed = port.isDrained
+            if observed is None or observed != expected_drained:
+                mismatches[name] = observed
+        return mismatches, None
+
+    async def _wait_for_local_drainer_interface_state(
+        self,
+        fboss_driver: t.Any,
+        interface_names: t.Sequence[str],
+        expected_drained: bool,
+    ) -> None:
+        pending = set(interface_names)
+        mismatched_interfaces: t.Dict[str, object] = dict.fromkeys(
+            interface_names, "not read"
+        )
+        last_exception: BaseException | None = None
+
+        async def poll() -> None:
+            nonlocal last_exception, mismatched_interfaces
+            for attempt in range(1, self.LOCAL_DRAINER_READBACK_ATTEMPTS + 1):
+                names = sorted(pending)
+                (
+                    mismatched_interfaces,
+                    read_error,
+                ) = await self._read_local_drainer_interface_states(
+                    fboss_driver, names, expected_drained
+                )
+                if read_error is not None:
+                    last_exception = read_error
+                    self.logger.warning(
+                        "LOCAL_DRAINER readback incomplete for %s (attempt %s/%s)",
+                        names,
+                        attempt,
+                        self.LOCAL_DRAINER_READBACK_ATTEMPTS,
+                    )
+                pending.clear()
+                pending.update(mismatched_interfaces)
+                if not pending:
+                    return
+                if attempt < self.LOCAL_DRAINER_READBACK_ATTEMPTS:
+                    await asyncio.sleep(self.LOCAL_DRAINER_READBACK_INTERVAL_SECONDS)
+
+        try:
+            await asyncio.wait_for(
+                poll(), timeout=self.LOCAL_DRAINER_READBACK_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError as error:
+            last_exception = error
+
+        if not pending:
+            return
+
+        expected = "drained" if expected_drained else "undrained"
+        error = RuntimeError(
+            f"LOCAL_DRAINER interface readback did not reach "
+            f"{expected}: {mismatched_interfaces}"
+        )
+        if last_exception is not None:
+            raise error from last_exception
+        raise error
 
     async def run(
         self,
@@ -8705,33 +11742,53 @@ class DrainUndrainStep(StepBase[taac_types.DrainUndrainInput]):
                 try_json_to_thrift(interface, taac_types.TestInterface)
                 for interface in try_json_loads(interfaces)
             ]
-            interfaces = [
-                (
-                    self.device.get_interface_by_name(interface)
-                    if isinstance(interface, str)
-                    else interface
-                )
+        if input.drain_handler == taac_types.DrainHandler.LOCAL_DRAINER:
+            # A local-drainer target need not be part of the testbed topology.
+            # Preserve raw names so unrelated DUT uplinks remain valid targets.
+            interface_names = [
+                interface if isinstance(interface, str) else interface.interface_name
                 for interface in interfaces
             ]
-        interface_names = [interface.interface_name for interface in interfaces]
-        if input.drain_handler == taac_types.DrainHandler.LOCAL_DRAINER:
             if interface_names:
-                # Per-port (link) drain: soft-drain each interface on-box
-                # (depreferences BGP advertisements without bringing the link
-                # down at the data plane). undrain_interface reverses it.
-                # softdrain/undrain_interface are FbossSwitch-only; cast to Any
-                # to avoid importing FbossSwitch here (keeps the BUCK target light).
+                # Use one bulk request so all link policies are applied before
+                # the local drainer restarts BGP. Singular calls would trigger
+                # one BGP restart per interface.
                 fboss_driver = t.cast(t.Any, self.driver)
-                for name in interface_names:
-                    if input.drain:
-                        await fboss_driver.async_softdrain_interface(name)
-                    else:
-                        await fboss_driver.async_undrain_interface(name)
+                hard_interface_operation = params.get("hard_drain_interfaces", False)
+                hard_interface_drain = input.drain and hard_interface_operation
+                if hard_interface_drain:
+                    await fboss_driver.async_drain_interfaces(interface_names)
+                elif input.drain:
+                    await fboss_driver.async_softdrain_interfaces(interface_names)
+                else:
+                    await fboss_driver.async_undrain_interfaces(interface_names)
+                # FBOSS hard drain is a routing-policy operation and does not
+                # populate Agent PortInfo.isDrained (local_drainer explicitly
+                # reports per-interface state as UNKNOWN).  That field is an
+                # authoritative readback only for soft drain and undrain. The
+                # OSS drain is BGP policy alone too, and the driver reads the
+                # live config back itself.
+                if not hard_interface_operation and not oss_config_patcher_enabled():
+                    await self._wait_for_local_drainer_interface_state(
+                        fboss_driver,
+                        interface_names,
+                        input.drain,
+                    )
             elif input.drain:
                 await self.driver.async_onbox_drain_device()
             else:
                 await self.driver.async_onbox_undrain_device()
         elif input.drain_handler == taac_types.DrainHandler.NDS:
+            # NDS requires topology-backed interfaces. Resolve and validate raw
+            # names before constructing the external drainer request.
+            interface_names = [
+                (
+                    self.device.get_interface_by_name(interface).interface_name
+                    if isinstance(interface, str)
+                    else interface.interface_name
+                )
+                for interface in interfaces
+            ]
             await async_nds_drain(
                 self.device.name,
                 force_undrain=not input.drain,
@@ -8743,6 +11800,24 @@ class DrainUndrainStep(StepBase[taac_types.DrainUndrainInput]):
 
 class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
     STEP_NAME = taac_types.StepName.SERVICE_CONVERGENCE_STEP
+
+    async def _async_wait_for_systemd_active(
+        self,
+        driver: FbossSwitch,
+        service: FbossSystemctlServiceName,
+        timeout: int,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            status = await driver.async_get_service_status(service)
+            if status == SystemctlServiceStatus.ACTIVE:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"{service.value} did not reach systemd ACTIVE within "
+                    f"{timeout} seconds (last status: {status.name})"
+                )
+            await asyncio.sleep(2)
 
     async def run(
         self,
@@ -8766,6 +11841,29 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             self.logger.info(
                 f"Agent reached configured state in {end_time - start_time} seconds"
             )
+        if taac_types.Service.OPENR in input.services and self.is_fboss:
+            fboss_driver = t.cast(FbossSwitch, self.driver)
+            timeout = (
+                input.service_convergence_timeout.get(taac_types.Service.OPENR)
+                or input.timeout
+            )
+            start_time = time.time()
+            if TAAC_OSS:
+                # OpenR initialization events need the Meta-internal OpenR client.
+                await self._async_wait_for_systemd_active(
+                    fboss_driver, FbossSystemctlServiceName.OPENR, timeout
+                )
+                openr_state = "systemd active"
+            else:
+                await fboss_driver.async_wait_for_openr_initialized()
+                await self._async_wait_for_systemd_active(
+                    fboss_driver, FbossSystemctlServiceName.OPENR, timeout
+                )
+                openr_state = "initialized and systemd active"
+            end_time = time.time()
+            self.logger.info(
+                f"OpenR reached {openr_state} state in {end_time - start_time} seconds"
+            )
         if taac_types.Service.BGP in input.services:
             if self.ixia and "rsw" in self.hostname:
                 self.ixia.restart_bgp_peers([self.hostname.upper()])
@@ -8785,6 +11883,11 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             start_time = time.time()
             # pyre-ignore
             await self.driver.async_wait_for_qsfp_service_state_active(timeout)
+            await self._async_wait_for_systemd_active(
+                t.cast(FbossSwitch, self.driver),
+                FbossSystemctlServiceName.QSFP,
+                timeout,
+            )
             end_time = time.time()
             self.logger.info(
                 f"qsfp_service reached active state in {end_time - start_time} seconds"
@@ -8797,10 +11900,27 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             start_time = time.time()
             # pyre-ignore
             await self.driver.async_wait_for_fsdb_state_active(timeout)
+            await self._async_wait_for_systemd_active(
+                t.cast(FbossSwitch, self.driver),
+                FbossSystemctlServiceName.FSDB,
+                timeout,
+            )
             end_time = time.time()
             self.logger.info(
                 f"fsdb reached active state in {end_time - start_time} seconds"
             )
+
+
+# Services whose start consumes the agent's cold-boot flag. qsfp_service owns a
+# separate `cold_boot_once_qsfp_service` and is deliberately absent.
+_COLD_BOOT_FLAG_SERVICES: t.FrozenSet[taac_types.Service] = frozenset(
+    {
+        taac_types.Service.AGENT,
+        taac_types.Service.FBOSS_SW_AGENT,
+        taac_types.Service.FBOSS_HW_AGENT_0,
+        taac_types.Service.FBOSS_HW_AGENT_1,
+    }
+)
 
 
 class ServiceInterruptionStep(StepBase[taac_types.ServiceInterruptionInput]):
@@ -8837,13 +11957,36 @@ class ServiceInterruptionStep(StepBase[taac_types.ServiceInterruptionInput]):
         service = self.service_factory(input.name)
         agents = list(input.agents) if input.agents is not None else None
 
-        if input.create_cold_boot_file and self.is_fboss:
+        if self.is_fboss and oss_agent_restart_paths_enabled():
+            # Only the agent reads its cold-boot flags, so interrupting
+            # qsfp_service or fsdb has no business touching them. Clear before
+            # starting the agent so it is only ever as cold as this step asked
+            # for -- the sw agent never deletes its flag once honoured.
+            if input.name in _COLD_BOOT_FLAG_SERVICES:
+                await self.driver.async_remove_cold_boot_file()
+                if input.create_cold_boot_file:
+                    await self.driver.async_create_cold_boot_file(service)
+        elif self.is_fboss and input.create_cold_boot_file:
             await self.driver.async_run_cmd_on_shell(
-                "touch /dev/shm/fboss/warm_boot/cold_boot_once_0"
+                f"touch {FBOSS_COLD_BOOT_ONCE_FILE}"
             )
         match input.trigger:
             case taac_types.ServiceInterruptionTrigger.SYSTEMCTL_STOP:
-                await self.driver.async_stop_service(service, agents)
+                if params.get("intentional_stop", False):
+                    if agents is not None:
+                        raise ValueError(
+                            "intentional_stop does not support per-agent service control"
+                        )
+                    if not self.is_fboss or not isinstance(self.driver, FbossSwitch):
+                        raise ValueError(
+                            "intentional_stop is supported only by the FBOSS driver"
+                        )
+                    await self.driver.async_stop_service(
+                        service,
+                        accept_failed_if_process_absent=True,
+                    )
+                else:
+                    await self.driver.async_stop_service(service, agents)
             case taac_types.ServiceInterruptionTrigger.SYSTEMCTL_START:
                 await self.driver.async_start_service(service, agents)
             case taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART:
@@ -8883,9 +12026,22 @@ class RunTaskStep(StepBase[taac_types.RunTaskInput]):
         task = input.task
         dict_params = self.parameter_evaluator.evaluate(task.params)
         if input.blocking:
-            await run_task(task, dict_params, self.ixia, self.logger)
+            await run_task(
+                task,
+                dict_params,
+                self.ixia,
+                self.logger,
+                self.shared_data,
+            )
         else:
-            run_in_thread(run_task, task, dict_params, self.ixia, self.logger)
+            run_in_thread(
+                run_task,
+                task,
+                dict_params,
+                self.ixia,
+                self.logger,
+                self.shared_data,
+            )
 
 
 _PERCENT_ECMP_MEMBERS_VALID_BGP = 0.25
@@ -9207,16 +12363,35 @@ class RegisterPatcherStep(StepBase[taac_types.RegisterPatcherInput]):
                 config_name=input.config_name,
                 patcher_name=input.name,
             )
+        await self._install_oss_configs()
+
+    async def _install_oss_configs(self) -> None:
+        """COOP renders a config on register and unregister, and a later step
+        restarts the daemon onto it. The OSS patcher stages configs on the
+        devserver, so install them now; activation is left to that step."""
+        if oss_config_patcher_enabled():
+            # pyre-fixme[16]
+            await self.driver.async_apply_patchers(restart_services=False)
 
     async def cleanUp(
         self, input: taac_types.RegisterPatcherInput, params: t.Dict[str, t.Any]
     ) -> None:
-        if self.registered_patcher_name:
-            await async_unregister_patcher(
-                self.hostname,
-                input.config_name,
-                self.registered_patcher_name,
+        if not self.registered_patcher_name:
+            return
+        if oss_config_patcher_enabled():
+            # The coop_utils helper is Meta-internal.
+            # pyre-fixme[16]
+            await self.driver.async_unregister_python_patcher(
+                config_name=input.config_name,
+                patcher_name=self.registered_patcher_name,
             )
+            await self._install_oss_configs()
+            return
+        await async_unregister_patcher(
+            self.hostname,
+            input.config_name,
+            self.registered_patcher_name,
+        )
 
 
 class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
@@ -9520,6 +12695,10 @@ class ChronosNode(StepBase[taac_types.BaseInput]):
 class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
     STEP_NAME = taac_types.StepName.INTERFACE_FLAP_STEP
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._port_id_cache: t.Optional[t.Dict[str, int]] = None
+
     async def run(
         self,
         input: taac_types.BaseInput,
@@ -9547,12 +12726,20 @@ class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
         interface_flap_method = taac_types.InterfaceFlapMethod(
             params["interface_flap_method"]
         )
+        # A thrift port-state change needs direct agent reachability, which a
+        # run driven from a devserver does not have. Pin every flap to the SSH
+        # path instead of threading the method through each playbook builder.
+        if os.environ.get("TAAC_FORCE_SSH_FLAP") == "1":
+            interface_flap_method = (
+                taac_types.InterfaceFlapMethod.SSH_PORT_STATE_CHANGE
+            )
         await self.async_flap_interfaces(
             device_name,
             interfaces,
             interface_flap_method,
             enable,
             sequential,
+            params.get("tolerate_failures", False),
         )
         if delay:
             self.logger.info(f"Sleeping for {delay} seconds...")
@@ -9565,14 +12752,22 @@ class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
         interface_flap_method: taac_types.InterfaceFlapMethod,
         enable: bool,
         sequential: bool,
+        tolerate_failures: bool = False,
     ) -> None:
-        # Lazy import of internal driver class.
-        from taac.internal.driver.arista_switch import (
-            AristaSwitch,
-        )
+        # Lazy import of internal driver class (keeps the BUCK target light).
+        # The EOS driver isn't shipped in the OSS slice, and no OSS driver can
+        # be an AristaSwitch, so the guard below simply doesn't apply there --
+        # importing unconditionally would fail the step with
+        # ModuleNotFoundError before any flap method got a chance to run.
+        AristaSwitch = None
+        if not TAAC_OSS:
+            from taac.internal.driver.arista_switch import (
+                AristaSwitch,
+            )
 
         if (
-            isinstance(self.driver, AristaSwitch)
+            AristaSwitch is not None
+            and isinstance(self.driver, AristaSwitch)
             and interface_flap_method
             != taac_types.InterfaceFlapMethod.SSH_PORT_STATE_CHANGE
         ):
@@ -9580,6 +12775,35 @@ class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
                 f"Interface flap method {interface_flap_method} not supported for EOS devices. "
                 "Only SSH_PORT_STATE_CHANGE is supported for EOS devices"
             )
+        try:
+            await self._dispatch_flap(
+                interface_names, interface_flap_method, enable, sequential
+            )
+        except NotImplementedError:
+            raise
+        except Exception as e:
+            if not tolerate_failures:
+                raise
+            # A step running concurrently with an agent restart loses both thrift
+            # and SSH for part of the window, so a blocked call is expected here
+            # and must not abort the playbook.
+            self.logger.warning(
+                f"Tolerating interface flap failure on {hostname} via "
+                f"{interface_flap_method.name}: {e}"
+            )
+            return
+        action: str = "enabled" if enable else "disabled"
+        self.logger.info(
+            f"Successfully {action} interfaces {interface_names} via {interface_flap_method.name}"
+        )
+
+    async def _dispatch_flap(
+        self,
+        interface_names: t.List[str],
+        interface_flap_method: taac_types.InterfaceFlapMethod,
+        enable: bool,
+        sequential: bool,
+    ) -> None:
         if (
             interface_flap_method
             == taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE
@@ -9616,10 +12840,6 @@ class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
             raise NotImplementedError(
                 f"Interface flap method {interface_flap_method} not supported"
             )
-        action: str = "enabled" if enable else "disabled"
-        self.logger.info(
-            f"Successfully {action} interfaces {interface_names} via {interface_flap_method.name}"
-        )
 
     async def run_coroutines(
         self,
@@ -9640,6 +12860,32 @@ class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
                     self.logger.debug(f"Error during interface flap: {result}")
                     raise result
 
+    async def _async_port_ids(self, interface_names: t.List[str]) -> t.List[int]:
+        """Resolve interface names to port ids, retrying past the QPS limit.
+
+        `getAllPortInfo` is capped at 4 QPS on the agent and is also called by
+        the health checks, so a flap that merely looks up its own port ids can
+        be rejected with APP_OVERLOAD. The mapping does not change during a
+        run, so it is resolved once per device and reused.
+        """
+        if self._port_id_cache is None:
+            last: t.Optional[Exception] = None
+            for attempt in range(_THRIFT_RATE_LIMIT_RETRIES):
+                try:
+                    # pyre-ignore
+                    info = await self.driver.async_get_all_interfaces_info()
+                    self._port_id_cache = {n: i.port_id for n, i in info.items()}
+                    break
+                except Exception as e:
+                    if "APP_OVERLOAD" not in str(e):
+                        raise
+                    last = e
+                    await asyncio.sleep(_THRIFT_RATE_LIMIT_BACKOFF_S * (attempt + 1))
+            else:
+                raise none_throws(last)
+        cache = none_throws(self._port_id_cache)
+        return [cache[name] for name in interface_names]
+
     async def flap_with_thrift(
         self,
         interface_names: t.List[str],
@@ -9647,16 +12893,19 @@ class InterfaceFlapStep(StepBase[taac_types.BaseInput]):
         sequential: bool,
     ) -> bool:
         try:
-            interfaces_info = (
-                # pyre-ignore
-                await self.driver.async_get_all_interfaces_info()
-            )
-            coros = [
-                # pyre-ignore
-                self.driver.async_set_port_state(interfaces_info[iface].port_id, enable)
-                for iface in interface_names
-            ]
-            await self.run_coroutines(coros, sequential)
+            port_ids = await self._async_port_ids(interface_names)
+            # setPortState is capped at 8 QPS by a token bucket of the same
+            # depth, so a 32-member LAG issued at once is a 4x overrun. Pace
+            # the writes instead of letting them fail into the SSH fallback.
+            for start in range(0, len(port_ids), _SET_PORT_STATE_BATCH):
+                batch = port_ids[start : start + _SET_PORT_STATE_BATCH]
+                await self.run_coroutines(
+                    # pyre-ignore
+                    [self.driver.async_set_port_state(pid, enable) for pid in batch],
+                    sequential,
+                )
+                if start + _SET_PORT_STATE_BATCH < len(port_ids):
+                    await asyncio.sleep(_SET_PORT_STATE_BATCH_DELAY_S)
             return True
         except Exception as e:
             self.logger.debug(
@@ -9764,7 +13013,7 @@ class RegisterPortChannelMinLinkPercentagePatchers(StepBase[taac_types.BaseInput
             "port_channel_name": port_channel_name,
         }
         if min_link_up_percentage is not None:
-            patcher_args["min_link_up_percentage"] = str(min_link_up_percentage)
+            patcher_args["link_up_percentage"] = str(min_link_up_percentage)
         return patcher_args
 
     async def _register_and_apply_port_channel_min_link_percentage_patcher(
@@ -9790,6 +13039,12 @@ class RegisterPortChannelMinLinkPercentagePatchers(StepBase[taac_types.BaseInput
             )
         else:
             await driver.async_unregister_python_patcher(patcher_name, AGENT_CONFIG)
+        if oss_config_patcher_enabled():
+            # COOP renders the config at register time, so the restart below
+            # picks it up; the OSS patcher stages it, and the apply installs it
+            # and cold boots the agent.
+            await driver.async_apply_patchers(coldboot=True)
+            return
         await driver.async_create_cold_boot_file()
         await driver.async_restart_service(FbossSystemctlServiceName.AGENT)
         await driver.async_wait_for_agent_configured()
@@ -9803,6 +13058,18 @@ _SUPPORTED_51T_SPEED_COMBINATIONS = {
     (400, 400),
 }
 _PLATFORM_SPEED_PROFILE_MAPPING = {
+    # Wedge800 (TH5-T, NextHop). Optical-family cage profiles per the on-box
+    # platform_mapping.json (nexthop/wedge800bnhp): 800G=39, 400G=38, 200G=25,
+    # 100G=23. Copper-family cages carry 22/24 at 100G/200G instead, so this
+    # one-id-per-speed table can satisfy only one end of a mixed-media link.
+    # 800G exists only on the /1 subport; flipping /1 to 800G subsumes its
+    # /5 mate.
+    "WEDGE800BNHP": {
+        PortSpeed.EIGHTHUNDREDG: "PROFILE_800G_8_PAM4_RS544X2N_OPTICAL",
+        PortSpeed.FOURHUNDREDG: "PROFILE_400G_4_PAM4_RS544X2N_OPTICAL",
+        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
+        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
+    },
     "MONTBLANC": {
         PortSpeed.EIGHTHUNDREDG: "PROFILE_800G_8_PAM4_RS544X2N_OPTICAL",
         PortSpeed.FOURHUNDREDG: "PROFILE_400G_4_PAM4_RS544X2N_OPTICAL",
@@ -9888,6 +13155,13 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
         if port_state_change:
             await self._disable_device_ports(device_infos)
 
+        # AGENT_RELOAD when a config reload is enough and a restart is not.
+        apply_patcher_method = taac_types.ApplyPatcherMethod(
+            params.get(
+                "apply_patcher_method", taac_types.ApplyPatcherMethod.AGENT_WARMBOOT
+            )
+        )
+
         if register_patcher:
             await self._register_speed_flip_patchers(
                 device_infos=device_infos,
@@ -9900,7 +13174,7 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
                 device_infos=device_infos,
             )
 
-        await self._warmboot_agent(device_infos=device_infos)
+        await self._apply_patchers(device_infos, apply_patcher_method)
 
     def _assert_target_port_cage_count(
         self,
@@ -9961,12 +13235,14 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
             ]
         )
 
-    async def _warmboot_agent(self, device_infos: t.List[_SpeedFlipDeviceInfo]) -> None:
+    async def _apply_patchers(
+        self,
+        device_infos: t.List[_SpeedFlipDeviceInfo],
+        apply_patcher_method: taac_types.ApplyPatcherMethod,
+    ) -> None:
         await asyncio.gather(
             *[
-                device_info.driver.async_apply_patchers(
-                    taac_types.ApplyPatcherMethod.AGENT_WARMBOOT
-                )
+                device_info.driver.async_apply_patchers(apply_patcher_method)
                 for device_info in device_infos
             ]
         )
@@ -10055,6 +13331,15 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
 # =============================================================================
 
 _WEDGE_POWER_CMD: str = "/usr/local/bin/wedge_power.sh"
+_BOOT_ID_CMD: str = "cat /proc/sys/kernel/random/boot_id"
+_REBOOT_VERIFY_TIMEOUT_S: int = 900
+_REBOOT_VERIFY_INTERVAL_S: int = 10
+
+
+def _bmc_hostname(hostname: str) -> str:
+    """``<short>-oob.<domain>``, the BMC naming the OSS BMC helper also uses."""
+    short, _, domain = hostname.partition(".")
+    return f"{short}-oob.{domain}" if domain else f"{short}-oob"
 
 
 class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
@@ -10067,6 +13352,7 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
     ) -> None:
         start_time = time.time()
         sleep_time_after_reboot = params.get("sleep_time_after_reboot", 0)
+        boot_id_before = await self._async_read_boot_id() if self.is_fboss else None
         if input.trigger == taac_types.SystemRebootTrigger.FULL_SYSTEM_REBOOT:
             await self.driver.async_full_system_reboot()
             self.logger.info(
@@ -10077,42 +13363,13 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
             input.trigger == taac_types.SystemRebootTrigger.BMC_POWER_RESET
             and self.is_fboss
         ):
-            wedge_power_reset = f"{_WEDGE_POWER_CMD} reset"
-            try:
-                run_bmc_cmd_hwcontrol(self.device.name, wedge_power_reset)
-                self.logger.info(
-                    f"Successfully initiated the system reboot via the BMC command: {wedge_power_reset}"
-                )
-            except (
-                EOFError,
-                OSError,
-                paramiko.SSHException,
-                RuntimeError,
-            ) as e:
-                self.logger.info(
-                    f"BMC command {wedge_power_reset!r} raised {type(e).__name__} "
-                    f"(expected post-reboot disconnect): {e}"
-                )
+            # `reset -s` power-cycles the whole chassis; bare `reset` is microserver-only.
+            await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset -s")
         elif (
             input.trigger == taac_types.SystemRebootTrigger.BMC_MICROSERVER_ONLY_RESET
             and self.is_fboss
         ):
-            wedge_power_microserver_reset = f"{_WEDGE_POWER_CMD} reset -s"
-            try:
-                run_bmc_cmd_hwcontrol(self.device.name, wedge_power_microserver_reset)
-                self.logger.info(
-                    f"Successfully initiated the system reboot via the BMC command: {wedge_power_microserver_reset}"
-                )
-            except (
-                EOFError,
-                OSError,
-                paramiko.SSHException,
-                RuntimeError,
-            ) as e:
-                self.logger.info(
-                    f"BMC command {wedge_power_microserver_reset!r} raised {type(e).__name__} "
-                    f"(expected post-reboot disconnect): {e}"
-                )
+            await self._async_run_bmc_reset(f"{_WEDGE_POWER_CMD} reset")
         if sleep_time_after_reboot > 0:
             self.logger.info(
                 f"Waiting for {sleep_time_after_reboot} seconds after reboot"
@@ -10139,6 +13396,93 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
         await self.driver.wait_for_ssh_reachable()
         self.logger.debug(
             f"{self.device.name} is ssh-able {time.time() - start_time} seconds after {input.trigger.name}"
+        )
+        if boot_id_before is not None:
+            await self._async_wait_for_new_boot_id(
+                boot_id_before,
+                start_time,
+                input.trigger,
+                params.get("reboot_verify_timeout", _REBOOT_VERIFY_TIMEOUT_S),
+            )
+
+    async def _async_read_boot_id(self) -> str:
+        boot_id = (await self.driver.async_run_cmd_on_shell(_BOOT_ID_CMD)).strip()
+        if not boot_id:
+            raise RuntimeError(f"{self.device.name} returned an empty boot_id")
+        return boot_id
+
+    async def _async_run_bmc_reset(self, cmd: str) -> None:
+        if lab_ssh_transport_enabled():
+            # The lab-ssh daemon authenticates to the BMC with the caller's
+            # certificate; the hwcontrol path needs a Rotor password instead.
+            bmc = _bmc_hostname(self.device.name)
+            result = await lab_ssh_async_exec(
+                host=bmc, command=cmd, timeout_sec=60, username="root"
+            )
+            # The daemon encodes remote BMC SSH disconnects as exit -1;
+            # local daemon/RPC errors still propagate from lab_ssh_async_exec.
+            # A real non-zero command exit status is a failure.
+            if result.exit_code > 0:
+                raise RuntimeError(
+                    f"BMC command {cmd!r} failed on {bmc} (exit {result.exit_code}): "
+                    f"{result.stderr or result.stdout}"
+                )
+            self.logger.info(
+                f"BMC command {cmd!r} on {bmc}: exit {result.exit_code}, "
+                f"output {result.stdout.strip()!r}"
+            )
+            return
+        try:
+            output = run_bmc_cmd_hwcontrol(self.device.name, cmd)
+            self.logger.info(f"BMC command {cmd!r} returned {output!r}")
+        except (
+            EOFError,
+            OSError,
+            paramiko.SSHException,
+            RuntimeError,
+        ) as e:
+            self.logger.info(
+                f"BMC command {cmd!r} raised {type(e).__name__} "
+                f"(expected post-reboot disconnect): {e}"
+            )
+
+    async def _async_wait_for_new_boot_id(
+        self,
+        boot_id_before: str,
+        start_time: float,
+        trigger: taac_types.SystemRebootTrigger,
+        timeout: int,
+    ) -> None:
+        """Fail unless the device came back with a new kernel boot ID.
+
+        Ping and SSH cannot tell a reboot from a reset that never happened: a
+        host that stayed up answers both at once. The BMC helper also returns
+        an empty result instead of raising when it cannot run the command.
+        """
+        deadline = start_time + timeout
+        last_error = None
+        while True:
+            try:
+                boot_id = await self._async_read_boot_id()
+            except Exception as e:
+                # Down, or not serving SSH yet, partway through the reboot.
+                last_error = e
+            else:
+                if boot_id and boot_id != boot_id_before:
+                    self.logger.info(
+                        f"{self.device.name} rebooted: boot_id {boot_id_before} -> "
+                        f"{boot_id} ({time.time() - start_time:.0f}s after "
+                        f"{trigger.name})"
+                    )
+                    return
+                last_error = None
+            if time.time() >= deadline:
+                break
+            await asyncio.sleep(_REBOOT_VERIFY_INTERVAL_S)
+        raise RuntimeError(
+            f"{self.device.name} did not reboot after {trigger.name}: no new "
+            f"boot_id within {timeout}s (before: {boot_id_before})"
+            + (f"; last error: {last_error}" if last_error else "")
         )
 
 
@@ -10208,15 +13552,35 @@ class ValidationStep(StepBase[taac_types.ValidationInput]):
     ) -> None:
         if input.stage == taac_types.ValidationStage.PRE_TEST:
             exception_cls = TestbedError
-        elif input.stage == taac_types.ValidationStage.POST_TEST:
+        elif (
+            input.stage == taac_types.ValidationStage.POST_TEST
+            or params.get("fail_on_failure", False)
+        ):
             exception_cls = TestCaseFailure
         else:
             exception_cls = None
         all_check_results = []
         all_check_device_names = []
         all_check_ids = []
+        # --skip-health-checks (TAAC_SKIP_HEALTH_CHECKS): drop checks by name at
+        # every stage. For checks a config requests but that cannot run in this
+        # environment -- e.g. DRAIN_STATE_CHECK needs the Meta-only LocalDrainer
+        # client -- so the config's check list stays untouched. Skips are logged
+        # individually: a silently-dropped check reads as a pass in the summary.
+        _skip_names = {
+            n.strip().upper()
+            for n in os.environ.get("TAAC_SKIP_HEALTH_CHECKS", "").split(",")
+            if n.strip()
+        }
         priority_to_hcs = defaultdict(list)
         for check in input.point_in_time_checks:
+            if _skip_names and check.name.name in _skip_names:
+                self.logger.warning(
+                    f"Skipping health check {check.name.name} on "
+                    f"{self.device.name} -- requested via --skip-health-checks. "
+                    f"This check is NOT being evaluated."
+                )
+                continue
             check_impl = NAME_TO_POINT_IN_TIME_HEALTH_CHECK[check.name]
             check_priority = check.priority or check_impl.DEFAULT_PRIORITY
             priority_to_hcs[check_priority].append(check)
@@ -10230,7 +13594,7 @@ class ValidationStep(StepBase[taac_types.ValidationInput]):
             checks_to_run = []
             for check in checks:
                 check_impl = NAME_TO_POINT_IN_TIME_HEALTH_CHECK[check.name]
-                check_impl_obj = check_impl(self.logger, self.ixia)  # pyre-ignore
+                check_impl_obj = check_impl(self.logger, self.ixia)
                 input_struct = HEALTH_CHECK_NAME_TO_INPUT[check.name]
                 check_input = (
                     json_to_thrift(check.input_json, input_struct)
@@ -10267,9 +13631,7 @@ class ValidationStep(StepBase[taac_types.ValidationInput]):
                     checks_to_run.extend(
                         [
                             (
-                                check_impl(  # pyre-ignore[45]
-                                    self.logger, self.ixia
-                                ).run_wrapper(
+                                check_impl(self.logger, self.ixia).run_wrapper(
                                     device, check_input, default_input, check_params
                                 ),
                                 [device],
@@ -10306,7 +13668,7 @@ class ValidationStep(StepBase[taac_types.ValidationInput]):
                     message=check_result.message,
                 )
                 self.test_case_results.append(test_result)
-            failed_checks = self.check_failure(check_results)  # pyre-ignore[6]
+            failed_checks = self.check_failure(check_results)
             if failed_checks and input.fail_fast and exception_cls:
                 raise exception_cls(
                     f"Health check(s) {[check.name for check in failed_checks]} failed."
@@ -10406,26 +13768,43 @@ class ValidationStep(StepBase[taac_types.ValidationInput]):
 
 def create_lag_cleanup_steps(
     all_member_interfaces: t.List[str],
+    interface_flap_method: taac_types.InterfaceFlapMethod = taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+    link_up_wait_s: int = DEFAULT_LINK_UP_WAIT_S,
 ) -> t.List[Step]:
     """Build the teardown step list for a LAG / port-channel test.
 
-    Returns two steps in order: (1) re-enable every interface in
-    `all_member_interfaces`, then (2) verify the port-channel itself is
-    operationally UP. Use as the tail of any playbook that flapped LAG
-    members so the testbed is left in a clean state.
+    Returns four steps in order: (1) wait for the agent to reach its configured
+    state, (2) re-enable every interface in `all_member_interfaces`, (3) give
+    the links time to come up, then (4) verify the port-channel is
+    operationally UP. Use as the tail of any playbook that flapped LAG members
+    so the testbed is left in a clean state.
+
+    After a coldboot the agent can stay unconfigured for minutes. Cleanup is
+    the only phase guaranteed to run when a stage aborts, so it carries the
+    wait: without it the re-enable is issued at a device that cannot accept it
+    and the next playbook inherits a down port-channel.
 
     Args:
         port_channel_name: Name of the port-channel interface to verify.
         all_member_interfaces: All physical members of the port-channel
             that should be re-enabled.
+        link_up_wait_s: Seconds to wait after enabling before asserting state.
 
     Returns:
-        A list of two `Step`s — one `INTERFACE_FLAP_STEP` and one
-        `VERIFY_PORT_OPERATIONAL_STATE` — ready to inline into a
-        teardown stage.
+        A list of four `Step`s — `SERVICE_CONVERGENCE_STEP`,
+        `INTERFACE_FLAP_STEP`, `LONGEVITY_STEP` and
+        `VERIFY_PORT_OPERATIONAL_STATE` — ready to inline into a teardown stage.
     """
     return [
-        create_interface_flap_step(enable=True, interfaces=all_member_interfaces),
+        create_service_convergence_step(
+            services=[taac_types.Service.AGENT, taac_types.Service.BGP], timeout=300
+        ),
+        create_interface_flap_step(
+            enable=True,
+            interfaces=all_member_interfaces,
+            interface_flap_method=interface_flap_method,
+        ),
+        create_longevity_step(duration=link_up_wait_s),
         create_verify_port_operational_state_step(
             interfaces=all_member_interfaces, operational_state=True
         ),
@@ -10433,7 +13812,18 @@ def create_lag_cleanup_steps(
 
 
 def create_lag_permanent_cleanup_steps() -> list[taac_types.Step]:
+    """Restore a LAG test that disabled members via the permanent patcher.
+
+    The convergence wait comes first for the same reason as in
+    `create_lag_cleanup_steps`: cleanup is the only phase guaranteed to run
+    when a stage aborts, and after a coldboot the patcher cannot be
+    unregistered — nor the box handed to the next playbook — until the agent
+    and BGP are back.
+    """
     return [
+        create_service_convergence_step(
+            services=[taac_types.Service.AGENT, taac_types.Service.BGP], timeout=300
+        ),
         create_unregister_patcher_step(
             patcher_name="permanently_disable_interface_patcher", config_name="agent"
         ),
@@ -10996,6 +14386,8 @@ def create_fpf_bgp_prefix_injection_step(
     increment_step: str = "0:0:1::",
     community_list: t.Optional[str] = None,
     communities: t.Optional[t.List[str]] = None,
+    extra_communities: t.Optional[t.List[str]] = None,
+    batch_size: t.Optional[int] = None,
     withdraw_only: bool = False,
     description: t.Optional[str] = None,
 ) -> Step:
@@ -11010,10 +14402,14 @@ def create_fpf_bgp_prefix_injection_step(
         "increment_step": increment_step,
         "withdraw_only": withdraw_only,
     }
+    if batch_size is not None:
+        params["batch_size"] = batch_size
     if community_list is not None:
         params["community_list"] = community_list
     if communities is not None:
         params["communities"] = communities
+    if extra_communities is not None:
+        params["extra_communities"] = extra_communities
     return Step(
         name=StepName.FPF_BGP_PREFIX_INJECTION_STEP,
         step_params=Params(json_params=json.dumps(params)),
@@ -11064,9 +14460,11 @@ def create_fpf_continuous_collector_step(
 def create_rss_start_step(
     device_name: str,
     session_key: str,
-    interval_seconds: float = 3.0,
+    interval_seconds: float = 2.0,
     process_name: str = "bgpcpp",
     baseline_settle_max_seconds: float = 90.0,
+    on_device: bool = False,
+    keep_ondevice_log: bool = False,
     description: t.Optional[str] = None,
 ) -> Step:
     """START of an embeddable bgpcpp RSS delta bracket.
@@ -11081,10 +14479,20 @@ def create_rss_start_step(
     Args:
         device_name: DUT under test.
         session_key: unique id tying this START to its matching STOP.
-        interval_seconds: background sampling interval (default 3.0s).
+        interval_seconds: sampling interval (default 2.0s). Honored on both
+            paths: the DUT loop's sleep when ``on_device`` is set, the
+            background sampler's interval otherwise.
         process_name: BGP++ process name (default "bgpcpp").
         baseline_settle_max_seconds: cap on the plateau wait before baselining
             (default 90.0); the wait ends early once RSS stops climbing.
+        on_device: run the VmRSS sampler ON the DUT as a detached loop and
+            retrieve its log in one read at STOP, instead of one FCR round trip
+            per sample. The per-sample path measured 5.84s effective against a
+            3.0s nominal interval on bag011. Also yields VmHWM. Left out of the
+            serialized params when False so playbooks that have not opted in
+            stay golden byte-equivalent.
+        keep_ondevice_log: leave the DUT-side sampler log in place after STOP.
+            Same byte-equivalence treatment as ``on_device``.
         description: optional step description override.
     """
     params: t.Dict[str, t.Any] = {
@@ -11095,6 +14503,10 @@ def create_rss_start_step(
         "process_name": process_name,
         "baseline_settle_max_seconds": baseline_settle_max_seconds,
     }
+    if on_device:
+        params["on_device"] = on_device
+    if keep_ondevice_log:
+        params["keep_ondevice_log"] = keep_ondevice_log
     return Step(
         name=StepName.CUSTOM_STEP,
         step_params=Params(json_params=json.dumps(params)),
@@ -11143,6 +14555,9 @@ def create_cpu_percentile_start_step(
     session_key: str,
     interval_seconds: float = 2.0,
     process_name: str = "bgpcpp",
+    on_device: bool = False,
+    compare_with_legacy: bool = False,
+    keep_ondevice_log: bool = False,
     description: t.Optional[str] = None,
 ) -> Step:
     """START of an embeddable bgpcpp CPU percentile bracket.
@@ -11157,8 +14572,21 @@ def create_cpu_percentile_start_step(
     Args:
         device_name: DUT under test.
         session_key: unique id tying this START to its matching STOP.
-        interval_seconds: sampling interval (default 2.0s).
+        interval_seconds: sampling interval (default 2.0s). Honored on both
+            paths: the DUT loop's sleep when ``on_device`` is set, the
+            background sampler's interval otherwise.
         process_name: BGP++ process name (default "bgpcpp").
+        on_device: run the sampler ON the DUT as a detached loop and retrieve
+            its log in one read at STOP, instead of one FCR round-trip per
+            sample: two device queries per span rather than ~800, at a cadence
+            the loop actually honours. Left out of the serialized params when
+            False so the playbooks that have not opted in stay golden
+            byte-equivalent.
+        compare_with_legacy: also run the per-sample sampler over the same span
+            and log both p95 values. Validation only: it re-incurs the round
+            trips ``on_device`` exists to remove.
+        keep_ondevice_log: leave the DUT-side sampler log in place after STOP.
+            Same byte-equivalence treatment as ``on_device``.
         description: optional step description override.
     """
     params: t.Dict[str, t.Any] = {
@@ -11168,6 +14596,12 @@ def create_cpu_percentile_start_step(
         "interval_seconds": interval_seconds,
         "process_name": process_name,
     }
+    if on_device:
+        params["on_device"] = on_device
+    if compare_with_legacy:
+        params["compare_with_legacy"] = compare_with_legacy
+    if keep_ondevice_log:
+        params["keep_ondevice_log"] = keep_ondevice_log
     return Step(
         name=StepName.CUSTOM_STEP,
         step_params=Params(json_params=json.dumps(params)),
@@ -11227,4 +14661,31 @@ def create_cpu_percentile_stop_step(
             or f"Stop bgpcpp CPU percentile sampling and emit percentiles "
             f"(session {session_key})"
         ),
+    )
+
+
+def create_be_qos_ixia_api_step(
+    api_name: str,
+    args_dict: t.Optional[t.Dict[str, t.Any]] = None,
+    step_id: t.Optional[str] = None,
+) -> Step:
+    """Build an `INVOKE_IXIA_API_STEP` for the backend (DSF/RTSW) QoS suite.
+
+    Differs from `create_ixia_api_step` in two ways the BE QoS playbooks rely
+    on: it accepts an explicit `step_id` (the BE QoS snapshot checks address
+    checkpoints as `stage.<stage_id>.step.<step_id>.start/.end`), and it omits
+    `args_json` entirely for no-argument APIs rather than sending `"{}"`.
+
+    Args:
+        api_name: IXIA API to invoke, e.g. `start_traffic`.
+        args_dict: Arguments for the API, or None for no-argument APIs.
+        step_id: Explicit step id, used to build checkpoint references.
+    """
+    payload: t.Dict[str, t.Any] = {"api_name": api_name}
+    if args_dict is not None:
+        payload["args_json"] = json.dumps(args_dict)
+    return Step(
+        id=step_id,
+        name=StepName.INVOKE_IXIA_API_STEP,
+        step_params=Params(json_params=json.dumps(payload)),
     )

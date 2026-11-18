@@ -62,7 +62,10 @@ def _resolve_prefix_slots(
                 "range; resize NumberOfAddresses and select the full pool"
             )
         return [(index, 0) for index in range(total_route_ranges)], number_of_addresses
-    end_idx = min(prefix_end_index or prefixes_per_peer, prefixes_per_peer)
+    end_idx = min(
+        prefixes_per_peer if prefix_end_index is None else prefix_end_index,
+        prefixes_per_peer,
+    )
     slots = [
         (i, i % prefixes_per_peer)
         for i in range(total_route_ranges)
@@ -74,6 +77,16 @@ def _resolve_prefix_slots(
 _IXIA_PREFIX_CONFIG_LOCK = threading.RLock()
 _IXIA_BUSY_OPERATION_RETRY_TIMEOUT_SECONDS = 300.0
 _IXIA_BUSY_OPERATION_RETRY_DELAY_SECONDS = 30.0
+
+_PeerPrefixExclusionBlock = tuple[int, int, tuple[int, ...]]
+_PrefixMutationPlanEntry = tuple[
+    t.Any,
+    t.Any,
+    list[bool],
+    int,
+    tuple[int, ...],
+    int,
+]
 
 
 def _is_ixia_busy_operation_error(error: Exception) -> bool:
@@ -88,25 +101,33 @@ def _is_ixia_busy_operation_error(error: Exception) -> bool:
 def _retry_ixia_busy_operation(function):
     @functools.wraps(function)
     def wrapper(*args, **kwargs):
-        deadline = time.monotonic() + _IXIA_BUSY_OPERATION_RETRY_TIMEOUT_SECONDS
+        task = args[0]
+        deadline = getattr(task, "_ixia_busy_operation_retry_deadline", None)
+        owns_deadline = deadline is None
+        if owns_deadline:
+            deadline = time.monotonic() + _IXIA_BUSY_OPERATION_RETRY_TIMEOUT_SECONDS
+            task._ixia_busy_operation_retry_deadline = deadline
         attempt = 1
-        while True:
-            try:
-                return function(*args, **kwargs)
-            except BadRequestError as error:
-                if not _is_ixia_busy_operation_error(error):
-                    raise
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise
-                delay = min(_IXIA_BUSY_OPERATION_RETRY_DELAY_SECONDS, remaining)
-                task = args[0]
-                task.logger.warning(
-                    "IXIA chassis operation is busy; retrying prefix mutation "
-                    f"after {delay:.1f}s (attempt {attempt + 1}): {error}"
-                )
-                time.sleep(delay)
-                attempt += 1
+        try:
+            while True:
+                try:
+                    return function(*args, **kwargs)
+                except BadRequestError as error:
+                    if not _is_ixia_busy_operation_error(error):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    delay = min(_IXIA_BUSY_OPERATION_RETRY_DELAY_SECONDS, remaining)
+                    task.logger.warning(
+                        "IXIA chassis operation is busy; retrying prefix mutation "
+                        f"after {delay:.1f}s (attempt {attempt + 1}): {error}"
+                    )
+                    time.sleep(delay)
+                    attempt += 1
+        finally:
+            if owns_deadline:
+                del task._ixia_busy_operation_retry_deadline
 
     return wrapper
 
@@ -122,6 +143,111 @@ def _serialized_ixia_prefix_config(function):
 
 class IxiaEnableDisableBgpPrefixes(BaseTask):
     NAME = "ixia_enable_disable_bgp_prefixes"
+
+    @staticmethod
+    def _validate_prefix_toggle_range(
+        prefix_start_index: int,
+        prefix_end_index: int | None,
+        strict_range: bool,
+    ) -> None:
+        structurally_invalid = (
+            isinstance(prefix_start_index, bool)
+            or not isinstance(prefix_start_index, int)
+            or prefix_start_index < 0
+            or (
+                prefix_end_index is not None
+                and (
+                    isinstance(prefix_end_index, bool)
+                    or not isinstance(prefix_end_index, int)
+                    or prefix_end_index < 0
+                )
+            )
+        )
+        if structurally_invalid:
+            raise ValueError("prefix range requires non-negative integer indices")
+        if (
+            strict_range
+            and prefix_end_index is not None
+            and prefix_end_index <= prefix_start_index
+        ):
+            raise ValueError("strict prefix range requires integer 0 <= start < end")
+
+    @staticmethod
+    def _normalize_expected_prefix_pool_names(
+        expected_prefix_pool_names: t.Sequence[str] | None,
+    ) -> tuple[str, ...] | None:
+        if expected_prefix_pool_names is None:
+            return None
+        names = tuple(str(name) for name in expected_prefix_pool_names)
+        if not names or len(set(names)) != len(names):
+            raise ValueError("expected_prefix_pool_names must be nonempty and unique")
+        return names
+
+    @staticmethod
+    def _normalize_peer_prefix_exclusion_blocks(
+        peer_prefix_exclusion_blocks: t.Sequence[t.Mapping[str, t.Any]] | None,
+    ) -> tuple[_PeerPrefixExclusionBlock, ...] | None:
+        if peer_prefix_exclusion_blocks is None:
+            return None
+        if isinstance(peer_prefix_exclusion_blocks, (str, bytes)):
+            raise ValueError("peer_prefix_exclusion_blocks must be a sequence of maps")
+        try:
+            raw_blocks = tuple(peer_prefix_exclusion_blocks)
+        except TypeError as error:
+            raise ValueError(
+                "peer_prefix_exclusion_blocks must be a sequence of maps"
+            ) from error
+
+        normalized = []
+        expected_keys = {"prefix_start_index", "prefix_count", "peer_indices"}
+        for block_index, block in enumerate(raw_blocks):
+            if not isinstance(block, dict) or set(block) != expected_keys:
+                raise ValueError(
+                    "peer_prefix_exclusion_blocks entries must contain exactly "
+                    "prefix_start_index, prefix_count, and peer_indices; "
+                    f"got entry {block_index}: {block!r}"
+                )
+            prefix_start_index = block["prefix_start_index"]
+            prefix_count = block["prefix_count"]
+            peer_indices = block["peer_indices"]
+            if (
+                isinstance(prefix_start_index, bool)
+                or not isinstance(prefix_start_index, int)
+                or prefix_start_index < 0
+                or isinstance(prefix_count, bool)
+                or not isinstance(prefix_count, int)
+                or prefix_count <= 0
+            ):
+                raise ValueError(
+                    "peer_prefix_exclusion_blocks require a non-negative integer "
+                    "prefix_start_index and a positive integer prefix_count; "
+                    f"got entry {block_index}: {block!r}"
+                )
+            if not isinstance(peer_indices, (list, tuple)) or not peer_indices:
+                raise ValueError(
+                    "peer_prefix_exclusion_blocks peer_indices must be a nonempty "
+                    f"sequence; got entry {block_index}: {peer_indices!r}"
+                )
+            normalized_peer_indices = tuple(peer_indices)
+            if any(
+                isinstance(peer_index, bool)
+                or not isinstance(peer_index, int)
+                or peer_index < 0
+                for peer_index in normalized_peer_indices
+            ) or len(set(normalized_peer_indices)) != len(normalized_peer_indices):
+                raise ValueError(
+                    "peer_prefix_exclusion_blocks peer_indices must contain unique "
+                    "non-negative integers; "
+                    f"got entry {block_index}: {peer_indices!r}"
+                )
+            normalized.append(
+                (
+                    prefix_start_index,
+                    prefix_count,
+                    normalized_peer_indices,
+                )
+            )
+        return tuple(normalized)
 
     @staticmethod
     def _strict_active_bool(value: object, *, context: str) -> bool:
@@ -162,7 +288,10 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
         return properties[0]
 
     def _exact_prefix_pools(
-        self, prefix_pool_regex: str, expected_prefix_pool_count: int
+        self,
+        prefix_pool_regex: str,
+        expected_prefix_pool_count: int,
+        expected_prefix_pool_names: t.Collection[str] | None = None,
     ) -> list[t.Any]:
         pools = list(
             self.ixia.get_prefix_pools_by_regexes(prefix_pool_regex=prefix_pool_regex)
@@ -176,6 +305,14 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
                 f"IXIA prefix-pool regex {prefix_pool_regex!r} matched "
                 f"{len(pools)} pools, expected {expected_prefix_pool_count}: "
                 f"{[pool.Name for pool in pools]}"
+            )
+        if expected_prefix_pool_names is not None and {
+            str(pool.Name) for pool in pools
+        } != set(expected_prefix_pool_names):
+            raise ValueError(
+                "prefix pool match mismatch; "
+                f"expected={sorted(expected_prefix_pool_names)}, "
+                f"observed={sorted(str(pool.Name) for pool in pools)}"
             )
         return pools
 
@@ -520,6 +657,11 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
         )
         safe_number_of_addresses = params.get("safe_number_of_addresses")
         runtime_route_operation = params.get("runtime_route_operation", False)
+        expected_prefix_pool_names = params.get("expected_prefix_pool_names")
+        strict_range = params.get("strict_range", False)
+        verify_readback = params.get("verify_readback", False)
+        peer_prefix_exclusion_blocks = params.get("peer_prefix_exclusion_blocks")
+        evidence_label = params.get("evidence_label")
         enable = params["enable"]
         legacy_args = (
             enable,
@@ -539,7 +681,29 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
             value is not None for value in extended_values[:-1]
         ) or bool(runtime_route_operation)
         args = (*legacy_args, *extended_values) if has_extended_values else legacy_args
-        await asyncio.to_thread(self.configure_bgp_prefixes_active_state, *args)
+        extra_kwargs = {}
+        if expected_prefix_pool_names is not None:
+            extra_kwargs["expected_prefix_pool_names"] = expected_prefix_pool_names
+        if strict_range:
+            extra_kwargs["strict_range"] = strict_range
+        if verify_readback:
+            extra_kwargs["verify_readback"] = verify_readback
+        if peer_prefix_exclusion_blocks is not None:
+            extra_kwargs["peer_prefix_exclusion_blocks"] = peer_prefix_exclusion_blocks
+        evidence = await asyncio.to_thread(
+            self.configure_bgp_prefixes_active_state, *args, **extra_kwargs
+        )
+        evidence_record = dict(evidence)
+        if evidence_label is not None:
+            evidence_record["label"] = str(evidence_label)
+        history = (
+            list(self._data["prefix_toggle_history"])
+            if "prefix_toggle_history" in self._data
+            else []
+        )
+        history.append(evidence_record)
+        self._data["prefix_toggle_history"] = history
+        self._data["prefix_toggle"] = evidence_record
 
     @_serialized_ixia_prefix_config
     @_retry_ixia_busy_operation
@@ -555,7 +719,13 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
         allowed_current_number_of_addresses: t.Optional[t.Sequence[int]] = None,
         safe_number_of_addresses: t.Optional[int] = None,
         runtime_route_operation: bool = False,
-    ) -> None:
+        expected_prefix_pool_names: t.Optional[t.Sequence[str]] = None,
+        strict_range: bool = False,
+        verify_readback: bool = False,
+        peer_prefix_exclusion_blocks: t.Optional[
+            t.Sequence[t.Mapping[str, t.Any]]
+        ] = None,
+    ) -> t.Mapping[str, t.Any]:
         """
         Advertise or withdraw BGP prefixes within a specified range for matching prefix pools.
 
@@ -581,7 +751,48 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
                 If None, uses the network group multiplier value (all remaining prefixes).
             expected_prefix_pool_count: If set, require exactly this many matching
                 prefix pools. Must be a positive integer.
+            peer_prefix_exclusion_blocks: Optional serialized peer/prefix cells to
+                keep inactive when enabling. Each entry has prefix_start_index,
+                prefix_count, and peer_indices. Disable operations still withdraw
+                every selected row.
         """
+        # Cleanup failure leaves IXIA state unknown. This instance stays poisoned;
+        # recovery requires a fresh task after external IXIA remediation.
+        terminal_error = getattr(self, "_prefix_toggle_terminal_error", None)
+        if terminal_error is not None:
+            raise ValueError(
+                "IXIA prefix toggle is terminal after cleanup failure. Create a new "
+                "IxiaEnableDisableBgpPrefixes instance after external IXIA remediation. "
+                f"Original error: {terminal_error}"
+            ) from terminal_error
+        if not isinstance(strict_range, bool):
+            raise ValueError(f"strict_range must be a boolean, got {strict_range!r}")
+        if not isinstance(verify_readback, bool):
+            raise ValueError(
+                f"verify_readback must be a boolean, got {verify_readback!r}"
+            )
+        self._validate_prefix_toggle_range(
+            prefix_start_index, prefix_end_index, strict_range
+        )
+        expected_names = self._normalize_expected_prefix_pool_names(
+            expected_prefix_pool_names
+        )
+        exclusion_blocks = self._normalize_peer_prefix_exclusion_blocks(
+            peer_prefix_exclusion_blocks
+        )
+        if expected_names is not None:
+            if expected_prefix_pool_count is None:
+                expected_prefix_pool_count = len(expected_names)
+            elif expected_prefix_pool_count != len(expected_names):
+                raise ValueError(
+                    "expected_prefix_pool_count does not match "
+                    f"expected_prefix_pool_names: {expected_prefix_pool_count} != "
+                    f"{len(expected_names)}"
+                )
+        if verify_readback and expected_prefix_pool_count is None:
+            raise ValueError(
+                "verify_readback requires expected prefix-pool identity or cardinality"
+            )
         allowed_counts = self._validate_prefix_mutation_inputs(
             active_state=active_state,
             prefix_start_index=prefix_start_index,
@@ -593,6 +804,28 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
             safe_number_of_addresses=safe_number_of_addresses,
             runtime_route_operation=runtime_route_operation,
         )
+        if exclusion_blocks and target_number_of_addresses is not None:
+            raise ValueError(
+                "peer_prefix_exclusion_blocks cannot be combined with compact "
+                "prefix-pool resize"
+            )
+        compact_evidence = (
+            None
+            if exclusion_blocks
+            else self._apply_strict_compact_logical_slice(
+                active_state=active_state,
+                prefix_pool_regex=prefix_pool_regex,
+                prefix_start_index=prefix_start_index,
+                prefix_end_index=prefix_end_index,
+                expected_prefix_pool_count=expected_prefix_pool_count,
+                expected_prefix_pool_names=expected_names,
+                strict_range=strict_range,
+                verify_readback=verify_readback,
+                target_number_of_addresses=target_number_of_addresses,
+            )
+        )
+        if compact_evidence is not None:
+            return compact_evidence
         mutation_plan, safe_values_by_pool, current_counts_by_pool, active_counts = (
             self._build_prefix_mutation_plan(
                 active_state=active_state,
@@ -604,6 +837,9 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
                 target_number_of_addresses=target_number_of_addresses,
                 allowed_counts=allowed_counts,
                 safe_number_of_addresses=safe_number_of_addresses,
+                expected_prefix_pool_names=expected_names,
+                strict_range=strict_range,
+                peer_prefix_exclusion_blocks=exclusion_blocks,
             )
         )
         self._apply_prefix_mutation_plan(
@@ -620,6 +856,160 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
             current_counts_by_pool=current_counts_by_pool,
             active_value_counts_by_pool=active_counts,
         )
+        return self._prefix_toggle_evidence(
+            active_state=active_state,
+            prefix_start_index=prefix_start_index,
+            prefix_end_index=prefix_end_index,
+            mutation_plan=mutation_plan,
+            readback_verified=expected_prefix_pool_count is not None,
+            report_exclusions=bool(exclusion_blocks),
+        )
+
+    def _apply_strict_compact_logical_slice(
+        self,
+        *,
+        active_state: bool,
+        prefix_pool_regex: str,
+        prefix_start_index: int,
+        prefix_end_index: int | None,
+        expected_prefix_pool_count: int | None,
+        expected_prefix_pool_names: tuple[str, ...] | None,
+        strict_range: bool,
+        verify_readback: bool,
+        target_number_of_addresses: int | None,
+    ) -> t.Mapping[str, t.Any] | None:
+        if (
+            not strict_range
+            or prefix_end_index is None
+            or prefix_start_index == 0
+            or target_number_of_addresses is not None
+            or expected_prefix_pool_count != 1
+            or expected_prefix_pool_names is None
+        ):
+            return None
+        pools = self._exact_prefix_pools(
+            prefix_pool_regex,
+            expected_prefix_pool_count,
+            expected_prefix_pool_names,
+        )
+        pool = pools[0]
+        multiplier = int(self.ixia.map_prefix_pool_to_network_group(pool).Multiplier)
+        current_capacity = int(pool.NumberOfAddresses)
+        if multiplier != 1 or current_capacity <= 1:
+            return None
+        allowed_capacities = (prefix_start_index, prefix_end_index)
+        if current_capacity not in allowed_capacities:
+            raise ValueError(
+                f"IXIA compact prefix pool {pool.Name!r} has "
+                f"NumberOfAddresses={current_capacity}, expected one of "
+                f"{allowed_capacities!r} for logical slice "
+                f"[{prefix_start_index}, {prefix_end_index})"
+            )
+        desired_capacity = prefix_end_index if active_state else prefix_start_index
+        route_property = self._route_property(pool)
+        current_active_values = self._normalized_active_values(
+            route_property.Active.Values,
+            context=f"compact logical slice for {pool.Name!r}",
+        )
+        already_armed = bool(current_active_values) and all(current_active_values)
+        if current_capacity != desired_capacity:
+            self.configure_bgp_prefixes_active_state(
+                False,
+                prefix_pool_regex,
+                0,
+                None,
+                expected_prefix_pool_count,
+                target_number_of_addresses=desired_capacity,
+                allowed_current_number_of_addresses=allowed_capacities,
+                safe_number_of_addresses=prefix_end_index,
+                runtime_route_operation=True,
+                expected_prefix_pool_names=expected_prefix_pool_names,
+                strict_range=strict_range,
+                verify_readback=verify_readback,
+            )
+        if current_capacity != desired_capacity or not already_armed:
+            self.configure_bgp_prefixes_active_state(
+                True,
+                prefix_pool_regex,
+                0,
+                None,
+                expected_prefix_pool_count,
+                expected_number_of_addresses=desired_capacity,
+                runtime_route_operation=True,
+                expected_prefix_pool_names=expected_prefix_pool_names,
+                strict_range=strict_range,
+                verify_readback=verify_readback,
+            )
+        elif verify_readback:
+            self._verify_fresh_active_values(
+                prefix_pool_regex,
+                expected_prefix_pool_count,
+                {str(pool.Name): current_active_values},
+                expected_number_of_addresses=desired_capacity,
+            )
+        return {
+            "active": active_state,
+            "prefix_start_index": prefix_start_index,
+            "prefix_end_index": prefix_end_index,
+            "pools": [
+                {
+                    "name": str(pool.Name),
+                    "prefixes_per_peer": desired_capacity,
+                    "selected_logical_prefix_count": (
+                        prefix_end_index - prefix_start_index
+                    ),
+                    "logical_prefix_capacity_after_operation": desired_capacity,
+                    "selected_row_count": int(route_property.Count),
+                    "resolved_end_index": prefix_end_index,
+                    "readback_verified": verify_readback,
+                }
+            ],
+        }
+
+    def _prefix_toggle_evidence(
+        self,
+        *,
+        active_state: bool,
+        prefix_start_index: int,
+        prefix_end_index: int | None,
+        mutation_plan: t.Sequence[_PrefixMutationPlanEntry],
+        readback_verified: bool,
+        report_exclusions: bool,
+    ) -> t.Mapping[str, t.Any]:
+        pools = []
+        for (
+            pool,
+            _route_property,
+            _values,
+            resolved_end_index,
+            indices,
+            excluded_selected_row_count,
+        ) in mutation_plan:
+            multiplier = int(
+                self.ixia.map_prefix_pool_to_network_group(pool).Multiplier
+            )
+            prefixes_per_peer = multiplier * int(pool.NumberOfAddresses)
+            pool_evidence = {
+                "name": str(pool.Name),
+                "prefixes_per_peer": prefixes_per_peer,
+                "selected_logical_prefix_count": max(
+                    0, resolved_end_index - prefix_start_index
+                ),
+                "selected_row_count": len(indices),
+                "resolved_end_index": resolved_end_index,
+                "readback_verified": readback_verified,
+            }
+            if report_exclusions:
+                pool_evidence["excluded_selected_row_count"] = (
+                    excluded_selected_row_count
+                )
+            pools.append(pool_evidence)
+        return {
+            "active": active_state,
+            "prefix_start_index": prefix_start_index,
+            "prefix_end_index": prefix_end_index,
+            "pools": pools,
+        }
 
     @staticmethod
     def _validate_positive_optional_int(name: str, value: t.Any) -> None:
@@ -735,11 +1125,13 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
                 safe_number_of_addresses,
             )
         except Exception as cleanup_error:
-            raise ValueError(
+            combined_error = ValueError(
                 "IXIA compact prefix-pool precondition and fail-closed "
                 f"restoration failed: precondition={error!r}, "
                 f"cleanup={cleanup_error!r}"
-            ) from ExceptionGroup(
+            )
+            self._prefix_toggle_terminal_error = combined_error
+            raise combined_error from ExceptionGroup(
                 "IXIA compact resize precondition and cleanup failures",
                 [error, cleanup_error],
             )
@@ -848,6 +1240,78 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
             prefix_end_index,
         )
 
+    @staticmethod
+    def _excluded_selected_row_indices(
+        prefix_pool_obj: t.Any,
+        *,
+        network_group_multiplier: int,
+        active_value_count: int,
+        selected_slots: t.Sequence[tuple[int, int]],
+        peer_prefix_exclusion_blocks: tuple[_PeerPrefixExclusionBlock, ...] | None,
+        raise_precondition: t.Callable[[Exception], t.NoReturn],
+    ) -> frozenset[int]:
+        if not peer_prefix_exclusion_blocks:
+            return frozenset()
+        number_of_addresses = int(prefix_pool_obj.NumberOfAddresses)
+        if network_group_multiplier == 1 and number_of_addresses > 1:
+            raise_precondition(
+                ValueError(
+                    "peer_prefix_exclusion_blocks require flat IXIA prefix-pool "
+                    f"geometry for {prefix_pool_obj.Name!r}"
+                )
+            )
+        prefixes_per_peer = network_group_multiplier * number_of_addresses
+        if active_value_count == 0 or active_value_count % prefixes_per_peer != 0:
+            raise_precondition(
+                ValueError(
+                    f"IXIA prefix pool {prefix_pool_obj.Name!r} has "
+                    f"{active_value_count} Active.Values, which is not a positive "
+                    f"multiple of {prefixes_per_peer} prefixes per peer"
+                )
+            )
+        peer_count = active_value_count // prefixes_per_peer
+        selected_indices = {index for index, _ in selected_slots}
+        all_excluded_indices: set[int] = set()
+        excluded_selected_indices: set[int] = set()
+        for (
+            prefix_start_index,
+            prefix_count,
+            peer_indices,
+        ) in peer_prefix_exclusion_blocks:
+            prefix_end_index = prefix_start_index + prefix_count
+            if prefix_end_index > prefixes_per_peer:
+                raise_precondition(
+                    ValueError(
+                        "peer_prefix_exclusion_blocks prefix range "
+                        f"[{prefix_start_index}, {prefix_end_index}) exceeds "
+                        f"{prefixes_per_peer} prefixes per peer for "
+                        f"{prefix_pool_obj.Name!r}"
+                    )
+                )
+            for peer_index in peer_indices:
+                if peer_index >= peer_count:
+                    raise_precondition(
+                        ValueError(
+                            "peer_prefix_exclusion_blocks peer index "
+                            f"{peer_index} exceeds the valid range [0, {peer_count}) "
+                            f"for {prefix_pool_obj.Name!r}"
+                        )
+                    )
+                first_row_index = peer_index * prefixes_per_peer + prefix_start_index
+                for row_index in range(first_row_index, first_row_index + prefix_count):
+                    if row_index in all_excluded_indices:
+                        raise_precondition(
+                            ValueError(
+                                "peer_prefix_exclusion_blocks overlap at peer "
+                                f"{peer_index}, prefix "
+                                f"{row_index - peer_index * prefixes_per_peer}"
+                            )
+                        )
+                    all_excluded_indices.add(row_index)
+                    if row_index in selected_indices:
+                        excluded_selected_indices.add(row_index)
+        return frozenset(excluded_selected_indices)
+
     def _build_prefix_mutation_entry(
         self,
         prefix_pool_obj: t.Any,
@@ -858,9 +1322,11 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
         expected_number_of_addresses: int | None,
         target_number_of_addresses: int | None,
         allowed_counts: tuple[int, ...],
+        strict_range: bool,
+        peer_prefix_exclusion_blocks: tuple[_PeerPrefixExclusionBlock, ...] | None,
         raise_precondition: t.Callable[[Exception], t.NoReturn],
     ) -> tuple[
-        tuple[t.Any, t.Any, list[bool], int, tuple[int, ...]],
+        _PrefixMutationPlanEntry,
         list[bool],
         int | None,
         int | None,
@@ -875,6 +1341,21 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
             ).Multiplier
         except Exception as error:
             raise_precondition(error)
+        prefixes_per_peer = int(network_group_multiplier) * int(
+            prefix_pool_obj.NumberOfAddresses
+        )
+        if (
+            strict_range
+            and prefix_end_index is not None
+            and prefix_end_index > prefixes_per_peer
+        ):
+            raise_precondition(
+                ValueError(
+                    f"{prefix_pool_obj.Name}: prefix range "
+                    f"[{prefix_start_index}, {prefix_end_index}) exceeds "
+                    f"{prefixes_per_peer} prefixes per peer"
+                )
+            )
         current_count = self._resolve_prefix_pool_current_count(
             prefix_pool_obj,
             network_group_multiplier=network_group_multiplier,
@@ -911,8 +1392,26 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
             prefix_end_index,
             raise_precondition,
         )
+        if strict_range and not slots:
+            raise_precondition(
+                ValueError(
+                    f"{prefix_pool_obj.Name}: prefix range "
+                    f"[{prefix_start_index}, {resolved_end_index}) selected no "
+                    f"IXIA rows within {prefixes_per_peer} prefixes per peer"
+                )
+            )
+        excluded_selected_indices = self._excluded_selected_row_indices(
+            prefix_pool_obj,
+            network_group_multiplier=int(network_group_multiplier),
+            active_value_count=len(active_values),
+            selected_slots=slots,
+            peer_prefix_exclusion_blocks=peer_prefix_exclusion_blocks,
+            raise_precondition=raise_precondition,
+        )
         for index, _within_peer_index in slots:
-            active_values[index] = active_state
+            active_values[index] = active_state and (
+                index not in excluded_selected_indices
+            )
             safe_values[index] = False
         return (
             (
@@ -921,6 +1420,7 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
                 active_values,
                 resolved_end_index,
                 tuple(index + 1 for index, _ in slots),
+                len(excluded_selected_indices),
             ),
             safe_values,
             current_count,
@@ -939,14 +1439,21 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
         target_number_of_addresses: int | None,
         allowed_counts: tuple[int, ...],
         safe_number_of_addresses: int | None,
+        expected_prefix_pool_names: t.Collection[str] | None,
+        strict_range: bool,
+        peer_prefix_exclusion_blocks: tuple[_PeerPrefixExclusionBlock, ...] | None,
     ) -> tuple[
-        list[tuple[t.Any, t.Any, list[bool], int, tuple[int, ...]]],
+        list[_PrefixMutationPlanEntry],
         dict[str, list[bool]],
         dict[str, int],
         dict[str, int],
     ]:
         pools = (
-            self._exact_prefix_pools(prefix_pool_regex, expected_prefix_pool_count)
+            self._exact_prefix_pools(
+                prefix_pool_regex,
+                expected_prefix_pool_count,
+                expected_prefix_pool_names,
+            )
             if expected_prefix_pool_count is not None
             else self.ixia.get_prefix_pools_by_regexes(
                 prefix_pool_regex=prefix_pool_regex
@@ -981,6 +1488,8 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
                     expected_number_of_addresses=expected_number_of_addresses,
                     target_number_of_addresses=target_number_of_addresses,
                     allowed_counts=allowed_counts,
+                    strict_range=strict_range,
+                    peer_prefix_exclusion_blocks=peer_prefix_exclusion_blocks,
                     raise_precondition=raise_precondition,
                 )
             )
@@ -1000,20 +1509,46 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
 
     def _write_prefix_mutation_plan(
         self,
-        mutation_plan: t.Sequence[
-            tuple[t.Any, t.Any, list[bool], int, tuple[int, ...]]
-        ],
+        mutation_plan: t.Sequence[_PrefixMutationPlanEntry],
         *,
         prefix_start_index: int,
         active_state: bool,
     ) -> None:
-        for pool, route_property, values, end_index, _ in mutation_plan:
+        for pool, route_property, values, end_index, _, _ in mutation_plan:
             route_property.Active.ValueList(values)
             self.logger.info(
                 f"Configured prefixes in range {prefix_start_index} - "
                 f"{end_index} active state to {active_state} for {pool.Name}"
             )
         self.ixia.apply_changes()
+
+    @staticmethod
+    def _set_prefix_mutation_rows_running(
+        mutation_plan: t.Sequence[_PrefixMutationPlanEntry],
+        running: bool,
+    ) -> None:
+        for _, route_property, values, _, indices, _ in mutation_plan:
+            operation = route_property.Start if running else route_property.Stop
+            operation_indices = (
+                [index for index in indices if values[index - 1]]
+                if running
+                else list(indices)
+            )
+            if operation_indices:
+                operation(SessionIndices=operation_indices)
+
+    def _stop_prefix_mutation_rows_and_apply(
+        self,
+        mutation_plan: t.Sequence[_PrefixMutationPlanEntry],
+    ) -> None:
+        failures = self._run_cleanup_operations(
+            (
+                lambda: self._set_prefix_mutation_rows_running(mutation_plan, False),
+                self.ixia.apply_changes,
+            )
+        )
+        if failures:
+            raise ExceptionGroup("IXIA route-property stop failures", failures)
 
     def _apply_prefix_mutation_plan(
         self,
@@ -1026,21 +1561,14 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
         target_number_of_addresses: int | None,
         safe_number_of_addresses: int | None,
         runtime_route_operation: bool,
-        mutation_plan: t.Sequence[
-            tuple[t.Any, t.Any, list[bool], int, tuple[int, ...]]
-        ],
+        mutation_plan: t.Sequence[_PrefixMutationPlanEntry],
         safe_values_by_pool: t.Mapping[str, list[bool]],
         current_counts_by_pool: t.Mapping[str, int],
         active_value_counts_by_pool: t.Mapping[str, int],
     ) -> None:
         expected_values_by_pool = {
-            str(pool.Name): values for pool, _, values, _, _ in mutation_plan
+            str(pool.Name): values for pool, _, values, _, _, _ in mutation_plan
         }
-
-        def set_running(running: bool) -> None:
-            for _, route_property, _, _, indices in mutation_plan:
-                operation = route_property.Start if running else route_property.Stop
-                operation(SessionIndices=list(indices))
 
         def mutate() -> None:
             self._write_prefix_mutation_plan(
@@ -1054,7 +1582,7 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
             return
         try:
             if runtime_route_operation:
-                set_running(False)
+                self._set_prefix_mutation_rows_running(mutation_plan, False)
             mutate()
             self._verify_fresh_active_values(
                 prefix_pool_regex,
@@ -1084,10 +1612,13 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
                     active_value_counts_by_pool,
                 )
             if runtime_route_operation and active_state:
-                set_running(True)
+                self._set_prefix_mutation_rows_running(mutation_plan, True)
+                self.ixia.apply_changes()
         except Exception as mutation_error:
             cleanup_failures = self._run_cleanup_operations(
-                (lambda: set_running(False),) if runtime_route_operation else ()
+                (lambda: self._stop_prefix_mutation_rows_and_apply(mutation_plan),)
+                if runtime_route_operation
+                else ()
             )
             cleanup_failures.extend(
                 self._run_cleanup_operations(
@@ -1105,10 +1636,12 @@ class IxiaEnableDisableBgpPrefixes(BaseTask):
                 cleanup_error = ExceptionGroup(
                     "IXIA prefix mutation cleanup failures", cleanup_failures
                 )
-                raise ValueError(
+                combined_error = ValueError(
                     "IXIA prefix mutation and fail-closed withdrawal failed: "
                     f"mutation={mutation_error!r}, cleanup={cleanup_error!r}"
-                ) from ExceptionGroup(
+                )
+                self._prefix_toggle_terminal_error = combined_error
+                raise combined_error from ExceptionGroup(
                     "IXIA prefix mutation and cleanup failures",
                     [mutation_error, cleanup_error],
                 )

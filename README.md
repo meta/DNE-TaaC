@@ -7,7 +7,7 @@ A test is a `TestConfig` containing one or more **playbooks**; a playbook runs a
 
 ## Quick start
 
-Smoke-tested via [facebook/fboss](https://github.com/facebook/fboss)'s public Docker images on **CentOS Stream 9**. Docker is the only host-side dependency.
+Smoke-tested via [meta/fboss](https://github.com/meta/fboss)'s public Docker images on **CentOS Stream 9**. Docker is the only host-side dependency.
 
 ```bash
 # Build the vendor-shippable TAAC image (auto-builds base image if missing)
@@ -15,6 +15,11 @@ Smoke-tested via [facebook/fboss](https://github.com/facebook/fboss)'s public Do
 ```
 
 That single command builds the FBOSS CentOS base image if missing, compiles the full dep tree (folly, fizz, wangle, mvfst, fbthrift), builds TAAC, and produces `fboss-taac` — a self-contained image with all transitive deps baked in.
+
+The normal command reuses the revision-tagged FBOSS/Thrift base image and
+unchanged TAAC layers. Use `--rebuild-taac-image` to rebuild TAAC without its
+layer cache, `--rebuild-base-image` to refresh the compiler/runtime base, or
+`--no-cache` as the compatibility shortcut for rebuilding both.
 
 ### Validating a change
 
@@ -54,6 +59,24 @@ For iterative work on TAAC source or thrift schemas in a bind-mounted workspace 
 ### Build cost
 
 First build takes ~22 min cold (mostly the deps compile). Docker's layer cache makes subsequent rebuilds after TAAC-only source changes finish in ~30 sec. See [`docker/README.md`](docker/README.md) for the layer cache contract and when to rebuild what.
+
+## Python packages
+
+TAAC also has a Python package build that uses standard `pyproject.toml`
+metadata. The existing Docker build is another supported workflow.
+
+The initial package artifacts target Linux x86_64 and CPython 3.12. Until the
+native runtime wheel is published, install from a release wheelhouse:
+
+```bash
+python -m pip install --find-links /path/to/wheelhouse dne-taac
+# Or, in an activated environment:
+uv pip install --find-links /path/to/wheelhouse dne-taac
+tictaac --help
+```
+
+See [Python packaging](docs/python-packaging.md) for source installation,
+running Python configs, and the current config-exporter limitation.
 
 ## Outputs
 

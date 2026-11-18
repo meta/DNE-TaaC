@@ -16,11 +16,43 @@ from taac.utils import log_parsing_utils
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+ARISTA_FILE_TRANSFER_CHUNK_SIZE = 30000
+ARISTA_FILE_TRANSFER_MAX_RETRIES = 3
 AGENT_LOGS_PATH = "/var/log/agents"
 ARCHIVED_AGENT_LOGS_PATH = "/mnt/flash/archive/current/var/log/agents"
 _ARCHIVED_LOG_ROTATION_EPOCH_RE = re.compile(r"_(\d{10})\.gz$")
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_SHELL_PROMPT_RE = re.compile(r"^(?:bash-[\d.]+|[\w.-]+)#(?:\s|$)")
+# Sentinels that bracket the real payload of a privileged-shell read.
+#
+# Recognising the shell's command echo by the shape of its prompt does not work,
+# and the prompt-matching predicate this replaced is deliberately gone rather
+# than merely unused, so nothing reaches for it again. The prompt varies by user
+# and device: the netcastle bot gets
+# `[root@bag011.ash6:/home/svc-netcastle_bot]$`, while that pattern required a
+# trailing `#` and so matched nothing here. When the echo
+# survives, every caller that searches the returned text can match the command
+# instead of the file, and a read whose command embeds a search literal then
+# finds its own literal. That is not hypothetical: it failed a bag011 route
+# oscillation run on 2026-08-26, reporting five bogus "Memory Limit Reached"
+# hits that were five echoed `grep -F -- 'Memory Limit Reached'` commands, one
+# per archive swept, while the string appeared nowhere on the device.
+#
+# Markers remove the guessing. Whatever the prompt looks like, only the lines
+# strictly between them are device output.
+_OUTPUT_BEGIN_MARKER = "__TAAC_SHELL_OUTPUT_BEGIN__"
+_OUTPUT_END_MARKER = "__TAAC_SHELL_OUTPUT_END__"
+_EOS_SHOW_LOGGING_ERRORS_COMMAND = "show logging errors"
+_EOS_LOG_MNEMONIC_RE = re.compile(r"%[A-Z0-9_]+-\d+-([A-Z0-9_]+):", re.IGNORECASE)
+_EOS_EXCLUDED_MNEMONIC_SUFFIXES = ("_NORMAL",)
+
+
+@dataclass(frozen=True)
+class EosSystemLogClassification:
+    """EOS system-log entries partitioned by explicit exclusion rules."""
+
+    issues: tuple[str, ...]
+    excluded: tuple[str, ...]
+    issues_with_indexes: tuple[tuple[int, str], ...] = ()
 
 
 def find_pid_in_output(output: str) -> t.Optional[str]:
@@ -181,7 +213,7 @@ async def get_archived_agent_logs(
             content = await driver.async_execute_show_or_configure_cmd_on_shell(
                 read_cmd
             )
-            content = _strip_privileged_shell_output(content)
+            content = _extract_marked_output(content, archived_file)
 
             if content:
                 combined_contents.append(content)
@@ -263,13 +295,15 @@ def _build_archived_log_read_cmd(
 ) -> str:
     quoted_file = shlex.quote(archived_file)
     if start_time is None or end_time is None:
-        command = f"bash sudo su\ngzip -cd -- {quoted_file} 2>/dev/null"
+        payload = f"gzip -cd -- {quoted_file} 2>/dev/null"
         if matching_literal is not None:
-            command += f" | grep -F -- {shlex.quote(matching_literal)} || true"
-        return f"{command}\nexit"
+            payload += f" | grep -F -- {shlex.quote(matching_literal)} || true"
+        return _wrap_in_privileged_shell(payload)
 
-    start_key = shlex.quote(time.strftime("%m%d %H:%M:%S", time.localtime(start_time)))
-    end_key = shlex.quote(time.strftime("%m%d %H:%M:%S", time.localtime(end_time)))
+    # Device logs are stamped in UTC, so the device-side keys must be UTC too;
+    # local-time keys select the wrong window and the Python filter then drops it.
+    start_key = shlex.quote(time.strftime("%m%d %H:%M:%S", time.gmtime(start_time)))
+    end_key = shlex.quote(time.strftime("%m%d %H:%M:%S", time.gmtime(end_time)))
     awk_program = (
         "BEGIN { wraps = start > end } "
         "{ is_timestamp = length($0) >= 15 "
@@ -286,27 +320,78 @@ def _build_archived_log_read_cmd(
         ": (key >= start && key <= end) } "
         "if (keep) print }"
     )
-    command = (
-        "bash sudo su\n"
+    payload = (
         f"gzip -cd -- {quoted_file} 2>/dev/null | "
         f"awk -v start={start_key} -v end={end_key} {shlex.quote(awk_program)}"
     )
     if matching_literal is not None:
-        command += f" | grep -F -- {shlex.quote(matching_literal)} || true"
-    return f"{command}\nexit"
+        payload += f" | grep -F -- {shlex.quote(matching_literal)} || true"
+    return _wrap_in_privileged_shell(payload)
 
 
-def _strip_privileged_shell_output(content: str) -> str:
-    lines = []
-    for line in content.splitlines():
-        line_without_ansi = _ANSI_ESCAPE_RE.sub("", line)
-        shell_line = line_without_ansi.strip()
-        if not shell_line or shell_line in {"exit", "logout"}:
-            continue
-        if _SHELL_PROMPT_RE.match(shell_line):
-            continue
-        lines.append(line_without_ansi)
-    return "\n".join(lines)
+def _wrap_in_privileged_shell(payload: str) -> str:
+    """Bracket ``payload`` with sentinels so its output can be found exactly.
+
+    The markers are echoed on the SAME shell line as the payload, deliberately.
+    The shell echoes a line before executing it, so a separate ``echo BEGIN``
+    line would put the payload's own echo AFTER the begin marker and back inside
+    the extracted region, which is precisely the failure this exists to prevent.
+    Emitting all three as one compound command means the single echoed line
+    precedes the begin marker and lands outside.
+
+    Args:
+        payload: Shell command whose stdout is the content the caller wants.
+
+    Returns:
+        The full privileged-shell command, ready for
+        ``async_execute_show_or_configure_cmd_on_shell``.
+    """
+    return (
+        "bash sudo su\n"
+        f"echo {_OUTPUT_BEGIN_MARKER}; {payload}; echo {_OUTPUT_END_MARKER}\n"
+        "exit"
+    )
+
+
+def _extract_marked_output(content: str, source: str) -> str:
+    """Return only the lines strictly between the sentinels.
+
+    Matching is by exact line equality, not substring: the echoed command
+    CONTAINS both marker names, so a substring test would select the echo as the
+    begin marker and defeat the whole mechanism.
+
+    Args:
+        content: Raw text returned by the privileged shell.
+        source: Archived file the content came from, for the error message.
+
+    Returns:
+        The device output with the command echo, prompts and banners removed.
+
+    Raises:
+        ArchivedLogError: Either sentinel is missing or they arrive out of
+            order. Read output that cannot be delimited is not returned as-is,
+            because an undelimited read is how the command echo reached the
+            callers' matching in the first place; failing here is loud, whereas
+            passing it through is a wrong answer that looks like a real one.
+    """
+    lines = [_ANSI_ESCAPE_RE.sub("", line) for line in content.splitlines()]
+    begin_index: Optional[int] = None
+    end_index: Optional[int] = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if begin_index is None:
+            if stripped == _OUTPUT_BEGIN_MARKER:
+                begin_index = index
+        elif stripped == _OUTPUT_END_MARKER:
+            end_index = index
+            break
+    if begin_index is None or end_index is None:
+        raise ArchivedLogError(
+            f"[ARISTA_UTILS] Could not delimit shell output for {source}: "
+            f"begin marker {'found' if begin_index is not None else 'missing'}, "
+            f"end marker {'found' if end_index is not None else 'missing'}"
+        )
+    return "\n".join(lines[begin_index + 1 : end_index]).strip("\n")
 
 
 async def check_eos_system_logs(
@@ -328,7 +413,7 @@ async def check_eos_system_logs(
     log_commands = [
         ("show logging emergencies", "emergency"),
         ("show logging critical", "critical"),
-        ("show logging errors", "error"),
+        (_EOS_SHOW_LOGGING_ERRORS_COMMAND, "error"),
     ]
 
     all_entries = []
@@ -385,6 +470,37 @@ def parse_eos_log_output(
     return [f"[{log_type.upper()}] {line}" for line in raw_entries]
 
 
+def classify_eos_system_log_entries(
+    entries: t.Sequence[str],
+) -> EosSystemLogClassification:
+    """Exclude recovery mnemonics and classify every other entry as an issue."""
+    issues_with_indexes: list[tuple[int, str]] = []
+    excluded: list[str] = []
+    for index, entry in enumerate(entries):
+        mnemonic_match = _EOS_LOG_MNEMONIC_RE.search(entry)
+        mnemonic = mnemonic_match.group(1).upper() if mnemonic_match else ""
+        if any(mnemonic.endswith(suffix) for suffix in _EOS_EXCLUDED_MNEMONIC_SUFFIXES):
+            excluded.append(entry)
+        else:
+            issues_with_indexes.append((index, entry))
+    return EosSystemLogClassification(
+        issues=tuple(entry for _, entry in issues_with_indexes),
+        excluded=tuple(excluded),
+        issues_with_indexes=tuple(issues_with_indexes),
+    )
+
+
+async def get_eos_error_log_classification(
+    driver: t.Any,
+    start_time: t.Optional[int] = None,
+    end_time: t.Optional[int] = None,
+) -> EosSystemLogClassification:
+    """Read EOS error logs and apply the shared exclusion policy."""
+    output = await driver.async_run_cmd_on_shell(_EOS_SHOW_LOGGING_ERRORS_COMMAND)
+    entries = parse_eos_log_output(output, "error", start_time, end_time)
+    return classify_eos_system_log_entries(entries)
+
+
 # Daemon status monitoring utilities
 
 
@@ -414,7 +530,7 @@ def parse_daemon_output(daemon_name: str, output: str) -> DaemonStatus:
     Parse daemon command output to extract status information.
 
     Expected format from 'show daemon <name>':
-    Process: Bgp (running with PID 12765)
+    Process: Bgpcpp (running with PID 12765)
     Uptime: 0:33:54 (Start time: Fri Sep 26 04:40:12 2025)
 
     Args:
@@ -919,6 +1035,98 @@ class NexthopGroupSummary:
     nexthop_group_types: t.Dict[str, int]
 
 
+def _parse_nexthop_group_rows(
+    data: t.Any,
+    *,
+    name_prefix: str | None = None,
+) -> dict[str, tuple[int, bool, int]]:
+    groups = data.get("nexthopGroups") if isinstance(data, dict) else None
+    if not isinstance(groups, dict):
+        raise ValueError("show nexthop-group JSON is missing nexthopGroups")
+
+    result: dict[str, tuple[int, bool, int]] = {}
+    for key, group in groups.items():
+        if not isinstance(group, dict):
+            raise ValueError(f"nexthop group {key!r} is not a JSON object")
+        name = group.get("nexthopGroupName")
+        if not isinstance(name, str):
+            raise ValueError(f"nexthop group {key!r} has invalid name {name!r}")
+        if name_prefix is not None and not name.startswith(name_prefix):
+            continue
+        if name in result:
+            raise ValueError(f"duplicate nexthop group name {name!r}")
+        size = group.get("size")
+        programmed_tunnels = group.get("numProgrammedTunnels")
+        programmed = group.get("programmed")
+        if isinstance(size, bool) or not isinstance(size, int):
+            raise ValueError(f"nexthop group {name!r} has invalid size {size!r}")
+        if not isinstance(programmed, bool):
+            raise ValueError(
+                f"nexthop group {name!r} has invalid programmed state {programmed!r}"
+            )
+        if (
+            isinstance(programmed_tunnels, bool)
+            or not isinstance(programmed_tunnels, int)
+            or programmed_tunnels < 0
+        ):
+            raise ValueError(
+                f"nexthop group {name!r} has invalid numProgrammedTunnels "
+                f"{programmed_tunnels!r}"
+            )
+        result[name] = (size, programmed, programmed_tunnels)
+    return result
+
+
+def parse_bgp_nexthop_group_sizes(data: t.Any) -> dict[str, int]:
+    """Return all configured ``bgpgrp_*`` groups and their widths."""
+    return {
+        name: size
+        for name, (
+            size,
+            _programmed,
+            _programmed_tunnels,
+        ) in _parse_nexthop_group_rows(data, name_prefix="bgpgrp_").items()
+    }
+
+
+def parse_programmed_bgp_nexthop_group_sizes(data: t.Any) -> dict[str, int]:
+    """Return BGP groups whose EOS group-level ``programmed`` state is true."""
+    return {
+        name: size
+        for name, (
+            size,
+            programmed,
+            _programmed_tunnels,
+        ) in _parse_nexthop_group_rows(data, name_prefix="bgpgrp_").items()
+        if programmed
+    }
+
+
+def parse_nexthop_group_sizes(data: t.Any) -> dict[str, int]:
+    """Return every configured EOS nexthop group and its width."""
+    return {
+        name: size
+        for name, (
+            size,
+            _programmed,
+            _programmed_tunnels,
+        ) in _parse_nexthop_group_rows(data).items()
+    }
+
+
+def parse_programmed_nexthop_group_sizes(data: t.Any) -> dict[str, int]:
+    """Return every EOS nexthop group whose ``programmed`` state is true."""
+    return {
+        name: size
+        for name, (
+            size,
+            programmed,
+            _programmed_tunnels,
+        ) in _parse_nexthop_group_rows(data).items()
+        if programmed
+    }
+
+
 async def get_bgpcpp_version(driver: t.Any) -> str:
     """
     Get BGP++ version from Arista EOS device using driver interface.
@@ -933,6 +1141,32 @@ async def get_bgpcpp_version(driver: t.Any) -> str:
         or "BGP++ (version unknown)" if command fails
     """
     return await driver.async_get_bgpcpp_version()
+
+
+def _assert_nhg_counters_found(
+    found_configured: bool, found_unprogrammed: bool
+) -> None:
+    """Raise unless both counter lines were seen in the command output.
+
+    Both counts start at 0, so a change to the EOS output wording would
+    otherwise yield a well-formed summary reporting zero nexthop groups --
+    indistinguishable from a healthy idle device, and passing any
+    "count below threshold" assertion forever.
+    """
+    missing = [
+        name
+        for name, found in (
+            ("Number of Nexthop Groups configured", found_configured),
+            ("Number of unprogrammed Nexthop Groups", found_unprogrammed),
+        )
+        if not found
+    ]
+    if missing:
+        raise ValueError(
+            "show nexthop-group summary did not contain the expected counter "
+            f"line(s): {', '.join(missing)}. Refusing to report a zero count "
+            "that was never read."
+        )
 
 
 async def get_nexthop_group_summary(driver: t.Any) -> NexthopGroupSummary:
@@ -972,6 +1206,13 @@ async def get_nexthop_group_summary(driver: t.Any) -> NexthopGroupSummary:
 
         num_groups_configured = 0
         num_unprogrammed_groups = 0
+        # Whether the counter lines were actually present. Without this, a
+        # change to the EOS output wording leaves both counts at their 0
+        # initialisers and the function returns a well-formed summary reporting
+        # zero groups -- which reads as a healthy device and passes any
+        # "count below threshold" check forever.
+        found_configured = False
+        found_unprogrammed = False
         nexthop_group_sizes: t.Dict[int, int] = {}
         nexthop_group_types: t.Dict[str, int] = {}
 
@@ -988,6 +1229,7 @@ async def get_nexthop_group_summary(driver: t.Any) -> NexthopGroupSummary:
                 match = re.search(r"configured:\s*(\d+)", line)
                 if match:
                     num_groups_configured = int(match.group(1))
+                    found_configured = True
                     logger.debug(
                         f"[ARISTA_UTILS] Found num_groups_configured: {num_groups_configured}"
                     )
@@ -998,6 +1240,7 @@ async def get_nexthop_group_summary(driver: t.Any) -> NexthopGroupSummary:
                 match = re.search(r"unprogrammed Nexthop Groups:\s*(\d+)", line)
                 if match:
                     num_unprogrammed_groups = int(match.group(1))
+                    found_unprogrammed = True
                     logger.debug(
                         f"[ARISTA_UTILS] Found num_unprogrammed_groups: {num_unprogrammed_groups}"
                     )
@@ -1031,6 +1274,8 @@ async def get_nexthop_group_summary(driver: t.Any) -> NexthopGroupSummary:
                     count = int(parts[1])
                     nexthop_group_sizes[size] = count
                     logger.debug(f"[ARISTA_UTILS] Found group size: {size} = {count}")
+
+        _assert_nhg_counters_found(found_configured, found_unprogrammed)
 
         logger.info(
             f"[ARISTA_UTILS] Parsed nexthop group summary: "
@@ -1432,7 +1677,8 @@ async def backup_config_exists(driver: t.Any, backup_file: str) -> bool:
     output = await driver.async_run_cmd_on_shell(
         f"bash test -f {shlex.quote(backup_path)} && echo {sentinel} || true"
     )
-    return sentinel in (output or "")
+    # The output starts with the echoed command, which contains the sentinel too.
+    return any(line.strip() == sentinel for line in (output or "").splitlines())
 
 
 async def restore_running_config(

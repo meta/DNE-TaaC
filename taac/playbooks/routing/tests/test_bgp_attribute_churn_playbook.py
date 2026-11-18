@@ -1,30 +1,101 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-strict
 
+import dataclasses
+import functools
 import json
+import typing as t
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from taac.abstractions.churn.attribute import (
+    AttributeChurn,
+    AttributePoolIdentity,
+    AttributeTargetSelector,
+    BaselineExpectation,
+    BlockGeometryExpectation,
+)
+from taac.abstractions.churn.geometry import (
+    sample_prefix_range,
+    select_uniform_rows,
+)
+from taac.abstractions.churn.policies import (
+    ExecutionPolicy,
+    PreparationPolicy,
+    RecoveryPolicy,
+)
+from taac.abstractions.churn.selectors import UniformRowSelection
+from taac.abstractions.churn.specs import (
+    AttributeFamily,
+    AttributePhase,
+    ChurnScenario,
+    ChurnWorkload,
+)
+from taac.abstractions.physical_inventory import (
+    NRQEB006_ASH6,
+    NRQEB007_ASH6,
+    NRQEB008_ASH6,
+    NRQEB009_ASH6,
+)
+from taac.abstractions.topologies.ebb_full_scale import (
+    EBB_AS_NUMBERS,
+    EBB_FY26_SCALE,
+    EBB_FY27_SCALE,
+    ebb_ibgp_route_next_hops,
+    EBB_NEXT_HOPS,
+    EBB_NEXT_HOPS_IXIA03,
+    EBB_PARENT_NETWORKS,
+    EBB_PARENT_NETWORKS_IXIA03,
+    EBB_PEER_GROUPS,
+    EBB_PORT_MAP_WITH_BGPMON,
+    ebb_topology,
+)
+from taac.abstractions.topology.model import (
+    BoundTopology,
+    OpenRInjectionPlan,
+    OpenRMode,
+    RoutingDeviceConfig,
+)
 from taac.constants import BgpPlusPlusProfile
 from taac.playbooks.routing.bgp_ebb_playbooks import (
+    _ebb_drained_prefix_descriptors,
     get_bgp_ebb_attribute_churn_playbook,
+    get_bgp_ebb_ebgp_route_oscillation_playbook,
+    get_bgp_ebb_ebgp_session_oscillation_playbook,
     get_bgp_ebb_fauu_drain_undrain_playbook,
+    get_bgp_ebb_ibgp_plane_session_oscillation_playbook,
+    get_bgp_ebb_ibgp_route_oscillation_playbook,
+    get_bgp_ebb_nexthop_group_count_threshold_playbook,
     get_bgp_ebb_plane_drain_undrain_playbook,
 )
 from taac.stages.stage_definitions import (
     create_bgp_ebb_attribute_churn_stage,
+    create_bgp_nhg_random_storm_stage,
     create_fauu_drain_undrain_stage,
     create_plane_drain_undrain_stage,
 )
 from taac.steps.step_definitions import (
     create_bgp_attribute_churn_step,
+    create_bgp_nhg_random_storm_step,
+)
+from taac.testconfigs.routing.cicd_ebb_int_tc import (
+    NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+    NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+    NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
+    NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+    NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
 )
 from taac.testconfigs.routing.factories.bgp_ebb_full_scale import (
+    _ebb_automation_contract,
+    _EbbAutomationContract,
     _get_bgp_ebb_full_scale_playbooks,
+    _nhg_storm_ixia_items,
     _TC7_PLAYBOOK_NAMES,
     create_bgp_ebb_full_scale_test_config,
 )
+from taac.utils.json_thrift_utils import thrift_to_json
+from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
 
 
@@ -61,28 +132,292 @@ EXPECTED_MATRIX = {
     },
 }
 
+_EBB16_IXIA_ITEMS = {
+    afi: {
+        "logical_device_group": f"dg_ebgp_{suffix}",
+        "logical_route_advertisement": f"dg_ebgp_{suffix}_routes",
+        "device_group_item": f"DEVICE_GROUP_{afi.upper()}_EBGP",
+        "peer_item": f"BGP_PEER_{afi.upper()}_EBGP",
+        "route_item": f"PREFIX_POOL_{afi.upper()}_EBGP",
+        "expected_peer_count": 140,
+        "expected_routes_per_peer": 750,
+        "target_prefix_count": 750,
+    }
+    for afi, suffix in (("ipv4", "v4"), ("ipv6", "v6"))
+}
+_EBB16_ITEMS_TARGET = (
+    "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+    "bgp_ebb_full_scale._nhg_storm_ixia_items"
+)
+_ROUTE_NEXT_HOP_STARTS = {
+    afi_key: {
+        str(plane): ebb_ibgp_route_next_hops(
+            afi, plane, 1, OpenRMode.STANDALONE, EBB_NEXT_HOPS
+        )[0]
+        for plane in range(1, 5)
+    }
+    for afi_key, afi in (("ipv4", "v4"), ("ipv6", "v6"))
+}
+_ROUTE_NEXT_HOP_STARTS_TARGET = (
+    "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+    "bgp_ebb_full_scale.ebb_ibgp_route_next_hop_starts"
+)
+_AUTOMATION_CONTRACT_TARGET = (
+    "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+    "bgp_ebb_full_scale._ebb_automation_contract"
+)
+_CANONICAL_AUTOMATION_CONTRACT = _EbbAutomationContract(
+    non_monitor_established_session_count=1272,
+    has_bgp_monitor=True,
+    internal_peer_group_names_by_afi={
+        "ipv4": "EB-EB-V4",
+        "ipv6": "EB-EB-V6",
+    },
+    ebgp_peer_group_names_by_afi={
+        "ipv4": "EB-FA-V4",
+        "ipv6": "EB-FA-V6",
+    },
+    ebgp_peer_item_names_by_afi={
+        "ipv4": "BGP_PEER_IPV4_EBGP",
+        "ipv6": "BGP_PEER_IPV6_EBGP",
+    },
+    ebgp_peer_counts_by_afi={"ipv4": 140, "ipv6": 140},
+    ebgp_route_item_names_by_afi={
+        "ipv4": "PREFIX_POOL_IPV4_EBGP",
+        "ipv6": "PREFIX_POOL_IPV6_EBGP",
+    },
+)
+
+
+def _bound_full_scale_automation_artifact(
+    inventory: t.Any,
+    *,
+    parent_networks: t.Mapping[str, str],
+    next_hops: t.Any,
+) -> BoundTopology:
+    topology = ebb_topology(
+        scale=EBB_FY26_SCALE,
+        openr_mode=OpenRMode.STANDALONE,
+        include_bgpmon=True,
+        ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
+        next_hops=next_hops,
+    )
+    return topology.bind_to_inventory(
+        physical_inventory=inventory,
+        port_map=EBB_PORT_MAP_WITH_BGPMON,
+        parent_networks=parent_networks,
+        peer_groups=EBB_PEER_GROUPS,
+        as_numbers=EBB_AS_NUMBERS,
+    )
+
+
+_EBB_ROUTE_HISTOGRAM_TARGET = (
+    "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+    "bgp_ebb_full_scale._ebb_route_count_histogram_by_afi"
+)
+_EBB_EXCLUSION_BLOCKS_TARGET = (
+    "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+    "bgp_ebb_full_scale._ebb_peer_prefix_exclusion_blocks_by_pool"
+)
+_EBB_ROUTE_HISTOGRAM = {
+    "ipv4": {720: 50, 750: 90},
+    "ipv6": {720: 50, 750: 90},
+}
+_EBB_EXCLUSION_BLOCKS = {
+    "PREFIX_POOL_IPV4_EBGP": [],
+    "PREFIX_POOL_IPV6_EBGP": [],
+}
+_TEST_BGP_MON_PARENT_NETWORK = "2001:db8:ffff:1"
+_TEST_PARENT_NETWORKS = {
+    **EBB_PARENT_NETWORKS,
+    "bgpmon_v6": _TEST_BGP_MON_PARENT_NETWORK,
+}
+
+
+# The complete flat CustomStep payload the production Playbook serializes.
+#
+# The golden manifest stores only a hash and seven structural counts, and no
+# factory snapshot covers `get_bgp_ebb_*` factories, so without this literal a
+# reviewer cannot see which field of the payload a diff changed -- only that
+# some byte moved. Frozen against the Playbook factory rather than the Step
+# factory because the Playbook is where the production values are authored.
+_FROZEN_CHURN_PAYLOAD: dict = {
+    "custom_step_name": "bgp_attribute_churn",
+    "scenario_id": "bgp_ebb_attribute_churn",
+    "hostname": "dut.example.com",
+    "prefix_pool_names": EXPECTED_POOLS,
+    "attribute_matrix": EXPECTED_MATRIX,
+    "openr_mode": "standalone",
+    "ibgp_route_next_hop_starts": {
+        "ipv4": {
+            "1": "20.164.28.10",
+            "2": "20.165.28.10",
+            "3": "20.166.28.10",
+            "4": "20.167.28.10",
+        },
+        "ipv6": {
+            "1": "2401:db00:e80d:11:9::10",
+            "2": "2401:db00:e80d:11:10::10",
+            "3": "2401:db00:e80d:11:11::10",
+            "4": "2401:db00:e80d:11:12::10",
+        },
+    },
+    "peer_count_per_plane": 62,
+    "selected_block_count_per_afi": 7,
+    "samples_per_block": 2,
+    "routes_per_block": 750,
+    "duration_seconds": 3_600,
+    "max_iterations": 100_000,
+    "cadence_seconds": 60,
+    "geometry_timeout_seconds": 480,
+    "snapshot_timeout_seconds": 480,
+    "work_timeout_seconds": 5_100,
+    "cleanup_timeout_seconds": 720,
+    "poll_interval_seconds": 5,
+    "transition_timeout_seconds": 60,
+    "convergence_hard_timeout_seconds": 300,
+    "reference_setup_timeout_seconds": 120,
+    "restore_timeout_seconds": 400,
+    "ixia_restore_timeout_seconds": 120,
+    "cancellation_grace_seconds": 10,
+    "quiet_window_seconds": 120,
+    "max_lookup_concurrency": 8,
+}
+
+
+def _locked_attribute_churn() -> AttributeChurn:
+    return AttributeChurn(
+        scenario=ChurnScenario(
+            scenario_id="bgp_ebb_attribute_churn",
+            workload=ChurnWorkload(
+                families=tuple(
+                    AttributeFamily(
+                        name=family,
+                        phases=tuple(
+                            AttributePhase(name=phase, value=value)
+                            for phase, value in EXPECTED_MATRIX[family].items()
+                        ),
+                    )
+                    for family in ("med", "origin", "local_pref")
+                )
+            ),
+            preparation=PreparationPolicy(
+                initial_resolution_timeout_seconds=480.0,
+                baseline_capture_timeout_seconds=480.0,
+                total_timeout_seconds=5_100.0,
+            ),
+            execution=ExecutionPolicy(
+                duration_seconds=3_600.0,
+                cadence_seconds=60.0,
+                max_iterations=100_000,
+            ),
+            recovery=RecoveryPolicy(
+                total_timeout_seconds=720.0,
+                restore_observation_timeout_seconds=400.0,
+                ixia_restore_timeout_seconds=120.0,
+                cancellation_grace_seconds=10.0,
+            ),
+        ),
+        selector=AttributeTargetSelector(
+            prefix_pools=tuple(
+                AttributePoolIdentity(
+                    afi=afi,
+                    plane=plane,
+                    name=EXPECTED_POOLS[afi][str(plane)],
+                )
+                for afi in ("ipv4", "ipv6")
+                for plane in range(1, 5)
+            ),
+            peer_count_per_pool=62,
+            row_selection=UniformRowSelection(rows_per_pool=7),
+        ),
+        baseline_expectation=BaselineExpectation(
+            block_geometry=BlockGeometryExpectation(
+                routes_per_block=750,
+                samples_per_block=2,
+            )
+        ),
+    )
+
 
 def _locked_step_kwargs() -> dict:
     return {
         "hostname": "dut.example.com",
-        "prefix_pool_names": EXPECTED_POOLS,
-        "peer_count_per_plane": 62,
-        "selected_block_count_per_afi": 7,
-        "samples_per_block": 2,
-        "routes_per_block": 750,
-        "duration_seconds": 3_600,
-        "max_iterations": 100_000,
-        "cadence_seconds": 60,
+        "attribute_churn": _locked_attribute_churn(),
         "poll_interval_seconds": 5,
         "transition_timeout_seconds": 60,
         "convergence_hard_timeout_seconds": 300,
         "reference_setup_timeout_seconds": 120,
-        "restore_timeout_seconds": 120,
         "quiet_window_seconds": 120,
         "max_lookup_concurrency": 8,
         "openr_mode": "standalone",
-        "attribute_matrix": EXPECTED_MATRIX,
+        "ibgp_route_next_hop_starts": _ROUTE_NEXT_HOP_STARTS,
     }
+
+
+# The factory threads one resolved injection plan into the PNH checks and the
+# Open/R churn steps, and those land in JSON step params, so the fake bound
+# topology has to return a real plan rather than a MagicMock.
+_FULL_SCALE_INJECTION = OpenRInjectionPlan(
+    start_ipv4s=tuple(
+        _ROUTE_NEXT_HOP_STARTS["ipv4"][str(plane)] for plane in range(1, 5)
+    ),
+    start_ipv6s=tuple(
+        _ROUTE_NEXT_HOP_STARTS["ipv6"][str(plane)] for plane in range(1, 5)
+    ),
+    count=EBB_FY26_SCALE.he_sites_per_range,
+    step=EBB_FY26_SCALE.next_hop_step,
+)
+
+
+def _full_scale_bound() -> BoundTopology:
+    bound = MagicMock()
+    bound.device_config = RoutingDeviceConfig(
+        fibagent_bgp_nhg_watermark_high=1000,
+        fibagent_bgp_nhg_watermark_low=1000,
+        openr_injection_scale=EBB_FY26_SCALE.openr_injection_scale,
+    )
+    bound.parent_networks = dict(_TEST_PARENT_NETWORKS)
+    bound.resolve_openr_injection_plan.return_value = _FULL_SCALE_INJECTION
+    capture_bound = ebb_topology(
+        scale=EBB_FY26_SCALE, openr_mode=OpenRMode.NONE, include_bgpmon=False
+    ).bind_to_inventory(
+        NRQEB008_ASH6,
+        port_map={"uplink": 0, "ibgp": 1},
+        parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+        peer_groups=EBB_PEER_GROUPS,
+        as_numbers=EBB_AS_NUMBERS,
+    )
+    bound.port_map = capture_bound.port_map
+    bound.device_groups = tuple(
+        dataclasses.replace(
+            group,
+            port_assignment=dataclasses.replace(
+                group.port_assignment, dut_interface="Ethernet2"
+            ),
+        )
+        for group in capture_bound.device_groups
+        if group.port_assignment is not None
+        and group.port_assignment.logical_role == "ibgp"
+    )
+    return t.cast(BoundTopology, bound)
+
+
+# The fauu captures assert ORIGIN and LOCAL_PREF on the drained prefixes, so the
+# factory requires the window; the plane factory takes no such argument. Bind it
+# here so the shared loops below can pass identical kwargs to both.
+_DRAINED_WINDOW: list[dict] = [
+    {
+        "start_prefix": "120.0.0.0",
+        "prefix_step": 256,
+        "prefix_length": 24,
+        "start_index": 0,
+        "end_index": 96,
+    }
+]
+_fauu_stage_with_window = functools.partial(
+    create_fauu_drain_undrain_stage, drained_prefix_descriptors=_DRAINED_WINDOW
+)
 
 
 def _step_payload(step: taac_types.Step) -> dict:
@@ -93,6 +428,13 @@ def _step_payload(step: taac_types.Step) -> dict:
     if json_params is None:
         raise AssertionError("custom step is missing serialized json_params")
     return json.loads(json_params)
+
+
+def _task_params(step: taac_types.Step) -> dict:
+    if step.input_json is None:
+        raise AssertionError("RUN_TASK step is missing input_json")
+    payload = json.loads(step.input_json)
+    return json.loads(payload["task"]["params"]["json_params"])
 
 
 def _sequential_steps(playbook: taac_types.Playbook) -> list[taac_types.Step]:
@@ -173,7 +515,243 @@ def _convergence_contract(
     return verifier_pcaps, report_interfaces
 
 
+class FauuDualScaleCaptureTest(unittest.TestCase):
+    def test_optional_pnh_range_reaches_readiness_without_changing_legacy_default(
+        self,
+    ) -> None:
+        playbook = get_bgp_ebb_fauu_drain_undrain_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="IBGP_V6",
+            peergroup_ibgp_v4="IBGP_V4",
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            ibgp_pnh_start_ipv4s=["10.2.0.0"],
+            ibgp_pnh_start_ipv6s=["2001:db8:2::"],
+            ibgp_pnh_count=100,
+            ibgp_pnh_step=2,
+        )
+        (check,) = [
+            check
+            for check in playbook.prechecks or []
+            if check.check_id == "startup_ibgp_pnh_verification"
+        ]
+        params = check.check_params
+        if params is None or params.json_params is None:
+            raise AssertionError("PNH readiness check has no serialized parameters")
+        self.assertEqual(
+            {
+                "expected_openr_metric": 10,
+                "expected_openr_ad": 10,
+                "start_ipv4s": ["10.2.0.0"],
+                "start_ipv6s": ["2001:db8:2::"],
+                "count": 100,
+                "step": 2,
+            },
+            json.loads(params.json_params),
+        )
+
+    def test_single_plural_interface_preserves_legacy_serialization(self) -> None:
+        kwargs: dict[str, t.Any] = {
+            "device_name": "dut.example.com",
+            "peergroup_ibgp_v6": "IBGP_V6",
+            "peergroup_ibgp_v4": "IBGP_V4",
+            "tcp_dump_capture_interface_ebgp": "Ethernet1",
+        }
+        singular = get_bgp_ebb_fauu_drain_undrain_playbook(
+            **kwargs, tcp_dump_capture_interface_ibgp="Ethernet2"
+        )
+        plural = get_bgp_ebb_fauu_drain_undrain_playbook(
+            **kwargs, tcp_dump_capture_interfaces_ibgp=["Ethernet2"]
+        )
+        self.assertEqual(thrift_to_json(singular), thrift_to_json(plural))
+
+    def test_two_receivers_are_captured_and_verified_in_both_phases(self) -> None:
+        stage = _fauu_stage_with_window(
+            device_name="dut.example.com",
+            prefix_pool_regex=".*EBGP.*",
+            tcp_dump_capture_interface_ebgp="Ethernet1",
+            tcp_dump_capture_interfaces_ibgp=["Ethernet2", "Ethernet3"],
+        )
+        captures = [
+            _task_params(step)
+            for step in stage.steps
+            if step.name == taac_types.StepName.RUN_TASK_STEP
+            and step.input_json is not None
+            and json.loads(step.input_json)["task"]["task_name"]
+            == "ixia_packet_capture"
+        ]
+        payloads = [
+            _step_payload(step)
+            for step in stage.steps
+            if step.name == taac_types.StepName.CUSTOM_STEP
+        ]
+        verifiers = [
+            payload
+            for payload in payloads
+            if payload.get("custom_step_name") == "verify_drain_convergence"
+            and payload["use_pcap_analysis"]
+        ]
+        reports = [
+            payload
+            for payload in payloads
+            if payload.get("custom_step_name")
+            == "generate_consolidated_convergence_report"
+        ]
+        self.assertEqual(18, len(captures))
+        self.assertEqual(6, len(verifiers))
+        self.assertEqual(6, len({payload["phase"] for payload in verifiers}))
+        self.assertEqual(2, len(reports))
+        for phase, origin in (("drain", "incomplete"), ("undrain", "igp")):
+            for index, interface in enumerate(("Ethernet2", "Ethernet3"), start=1):
+                with self.subTest(phase=phase, interface=interface):
+                    capture_id = f"fauu_{phase}_ibgp_{index}"
+                    filename = f"bgp_{capture_id}.pcap"
+                    matching = [p for p in captures if p["capture_id"] == capture_id]
+                    self.assertEqual(
+                        ["start", "stop", "save"], [p["mode"] for p in matching]
+                    )
+                    self.assertEqual({interface}, {p["interface"] for p in matching})
+                    self.assertEqual(filename, matching[-1]["pcap_filename"])
+                    (verifier,) = [
+                        p for p in verifiers if p["pcap_filename"] == filename
+                    ]
+                    self.assertEqual(origin, verifier["expected_origin"])
+                    self.assertEqual(100, verifier["expected_local_pref"])
+                    self.assertTrue(verifier["require_updates"])
+                    self.assertEqual(
+                        _DRAINED_WINDOW, verifier["expected_attribute_prefixes"]
+                    )
+            (report,) = [p for p in reports if p["phase"] == phase]
+            self.assertEqual(
+                {"ebgp_source", "ibgp_receiver_1", "ibgp_receiver_2"},
+                set(report["pcap_files"]),
+            )
+            self.assertEqual(3, len(set(report["pcap_files"].values())))
+        saves = [p for p in captures if p["mode"] == "save"]
+        self.assertEqual(6, len({p["capture_id"] for p in saves}))
+        self.assertEqual(6, len({p["pcap_filename"] for p in saves}))
+        self.assertEqual(
+            {p["pcap_filename"] for p in saves},
+            {p["pcap_filename"] for p in verifiers},
+        )
+
+    def test_invalid_receiver_inputs_fail_at_stage_and_playbook_boundaries(
+        self,
+    ) -> None:
+        invalid_inputs: tuple[dict[str, t.Any], ...] = (
+            {"tcp_dump_capture_interfaces_ibgp": []},
+            {"tcp_dump_capture_interfaces_ibgp": [""]},
+            {"tcp_dump_capture_interfaces_ibgp": [" "]},
+            {"tcp_dump_capture_interfaces_ibgp": ["Ethernet2", "Ethernet2"]},
+            {"tcp_dump_capture_interfaces_ibgp": "Ethernet2"},
+            {"tcp_dump_capture_interface_ibgp": ""},
+            {
+                "tcp_dump_capture_interface_ibgp": "Ethernet2",
+                "tcp_dump_capture_interfaces_ibgp": ["Ethernet3"],
+            },
+        )
+        for inputs in invalid_inputs:
+            with self.subTest(inputs=inputs):
+                with self.assertRaisesRegex(ValueError, "iBGP capture interfaces"):
+                    _fauu_stage_with_window(
+                        device_name="dut.example.com",
+                        prefix_pool_regex=".*EBGP.*",
+                        **inputs,
+                    )
+                with self.assertRaisesRegex(ValueError, "iBGP capture interfaces"):
+                    get_bgp_ebb_fauu_drain_undrain_playbook(
+                        device_name="dut.example.com",
+                        peergroup_ibgp_v6="IBGP_V6",
+                        peergroup_ibgp_v4="IBGP_V4",
+                        **inputs,
+                    )
+
+    def test_plural_captures_still_require_a_drained_prefix_window(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "drained_prefix_descriptors is required"
+        ):
+            create_fauu_drain_undrain_stage(
+                device_name="dut.example.com",
+                prefix_pool_regex=".*EBGP.*",
+                tcp_dump_capture_interfaces_ibgp=["Ethernet2", "Ethernet3"],
+            )
+        stage = create_fauu_drain_undrain_stage(
+            device_name="dut.example.com",
+            prefix_pool_regex=".*EBGP.*",
+            tcp_dump_capture_interfaces_ibgp=["Ethernet2", "Ethernet3"],
+            convergence_mode="counter",
+        )
+        self.assertEqual((2, 0), _count_convergence_verifiers(self, stage))
+        self.assertFalse(
+            any(
+                step.name == taac_types.StepName.RUN_TASK_STEP
+                and step.input_json is not None
+                and json.loads(step.input_json)["task"]["task_name"]
+                == "ixia_packet_capture"
+                for step in stage.steps
+            )
+        )
+
+
 class BgpAttributeChurnPlaybookTest(unittest.TestCase):
+    def test_fauu_singular_capture_contract_matches_fy26(self) -> None:
+        playbook = get_bgp_ebb_fauu_drain_undrain_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="IBGP_V6",
+            peergroup_ibgp_v4="IBGP_V4",
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            tcp_dump_capture_interface_ebgp="Ethernet1",
+            tcp_dump_capture_interface_ibgp="Ethernet2",
+        )
+        captures = [
+            _task_params(step)
+            for step in _sequential_steps(playbook)
+            if step.name == taac_types.StepName.RUN_TASK_STEP
+            and step.input_json is not None
+            and json.loads(step.input_json)["task"]["task_name"]
+            == "ixia_packet_capture"
+        ]
+        expected_interfaces = {
+            "fauu_drain_ebgp": "Ethernet1",
+            "fauu_drain_ibgp": "Ethernet2",
+            "fauu_undrain_ebgp": "Ethernet1",
+            "fauu_undrain_ibgp": "Ethernet2",
+        }
+        self.assertEqual(
+            expected_interfaces,
+            {
+                capture["capture_id"]: capture["interface"]
+                for capture in captures
+                if capture["mode"] == "start"
+            },
+        )
+        for capture_id in expected_interfaces:
+            with self.subTest(capture_id=capture_id):
+                self.assertEqual(
+                    ["start", "stop", "save"],
+                    [
+                        capture["mode"]
+                        for capture in captures
+                        if capture["capture_id"] == capture_id
+                    ],
+                )
+        verifier_pcaps, report_interfaces = _convergence_contract(playbook)
+        self.assertEqual(
+            {
+                "bgp_fauu_drain_ebgp.pcap",
+                "bgp_fauu_drain_ibgp.pcap",
+                "bgp_fauu_undrain_ebgp.pcap",
+                "bgp_fauu_undrain_ibgp.pcap",
+            },
+            verifier_pcaps,
+        )
+        self.assertEqual(
+            {
+                "drain": {"ebgp_source", "ibgp_receiver"},
+                "undrain": {"ebgp_source", "ibgp_receiver"},
+            },
+            report_interfaces,
+        )
+
     def test_drain_playbooks_keep_core_verdicts_without_auxiliary_monitor(
         self,
     ) -> None:
@@ -279,7 +857,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         read.
         """
         stages = (
-            ("fauu", create_fauu_drain_undrain_stage, ".*EBGP.*"),
+            ("fauu", _fauu_stage_with_window, ".*EBGP.*"),
             ("plane", create_plane_drain_undrain_stage, ".*IBGP.*PLANE_.*"),
         )
         # counter: poll only, no capture. pcap: capture only, no poll.
@@ -299,6 +877,425 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                     self.assertEqual(expected_polls, polls)
                     self.assertEqual(expected_pcap_verifiers, pcap_verifiers)
 
+    def test_drained_window_follows_the_selected_pools(self) -> None:
+        """A single-AFI drain must not demand coverage of the other pool.
+
+        prefix_pool_regex is configurable and the capture asserts that every
+        described prefix was advertised, so describing both families while
+        draining one would fail a healthy run on the untouched family.
+        """
+        both = _ebb_drained_prefix_descriptors(96)
+        self.assertEqual(
+            ["120.0.0.0", "2402:db00::"],
+            sorted(d["start_prefix"] for d in both),
+        )
+
+        v4_only = _ebb_drained_prefix_descriptors(96, prefix_pool_regex=".*IPV4_EBGP.*")
+        self.assertEqual(["120.0.0.0"], [d["start_prefix"] for d in v4_only])
+
+        v6_only = _ebb_drained_prefix_descriptors(
+            96, prefix_pool_regex="PREFIX_POOL_IPV6_EBGP"
+        )
+        self.assertEqual(["2402:db00::"], [d["start_prefix"] for d in v6_only])
+
+        # A regex matching no pool means the drain touches nothing, which is a
+        # typo rather than a valid narrowing.
+        with self.assertRaises(ValueError) as raised:
+            _ebb_drained_prefix_descriptors(96, prefix_pool_regex=".*IBGP.*")
+
+        self.assertIn("matches none of the EBB", str(raised.exception))
+
+    def test_playbook_scopes_the_window_to_its_own_pool_regex(self) -> None:
+        """The window must follow the regex the playbook hands the drain."""
+        playbook = get_bgp_ebb_fauu_drain_undrain_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="IBGP_V6",
+            peergroup_ibgp_v4="IBGP_V4",
+            tcp_dump_capture_interface_ebgp="Ethernet1",
+            tcp_dump_capture_interface_ibgp="Ethernet2",
+            prefix_pool_regex=".*IPV4_EBGP.*",
+        )
+        windows = [
+            payload["expected_attribute_prefixes"]
+            for payload in (
+                _step_payload(step)
+                for step in _sequential_steps(playbook)
+                if step.name == taac_types.StepName.CUSTOM_STEP
+                and step.step_params is not None
+            )
+            if payload.get("custom_step_name") == "verify_drain_convergence"
+            and payload.get("use_pcap_analysis")
+        ]
+        self.assertTrue(windows)
+        for window in windows:
+            self.assertEqual(["120.0.0.0"], [d["start_prefix"] for d in window])
+
+    def test_captures_without_a_drained_window_are_rejected_at_construction(
+        self,
+    ) -> None:
+        """A missing window must fail here, not 35 minutes into a hardware run.
+
+        Every pcap step sets an attribute expectation, and an expectation with
+        no window is rejected at verification time as a misconfiguration. That
+        verdict arrives only after the drain has already run, so the factory
+        refuses to build the stage instead.
+        """
+        with self.assertRaises(ValueError) as raised:
+            create_fauu_drain_undrain_stage(
+                device_name="dut.example.com",
+                prefix_pool_regex=".*EBGP.*",
+                tcp_dump_capture_interface_ebgp="Ethernet1",
+                tcp_dump_capture_interface_ibgp="Ethernet2",
+            )
+
+        self.assertIn("drained_prefix_descriptors is required", str(raised.exception))
+
+        # Counter-only mode takes no capture, so it has nothing to scope and
+        # must still build.
+        create_fauu_drain_undrain_stage(
+            device_name="dut.example.com",
+            prefix_pool_regex=".*EBGP.*",
+            tcp_dump_capture_interface_ebgp="Ethernet1",
+            tcp_dump_capture_interface_ibgp="Ethernet2",
+            convergence_mode="counter",
+        )
+
+    def test_pcap_legs_expect_local_pref_per_bgp_semantics(self) -> None:
+        """LOCAL_PREF does not survive the eBGP hop, ORIGIN does.
+
+        RFC 4271 5.1.5: a speaker MUST ignore a LOCAL_PREF received from an
+        external peer and originates its own toward internal peers. So the eBGP
+        capture must carry the value IXIA set (120 while drained) and the iBGP
+        capture the DUT's own default (100 in both phases), while ORIGIN is
+        identical on both legs. Expecting the tester's 120 on the iBGP leg
+        failed a hardware run against a correctly behaving DUT.
+        """
+        expected = {
+            "bgp_fauu_drain_ebgp.pcap": ("incomplete", 120),
+            "bgp_fauu_drain_ibgp.pcap": ("incomplete", 100),
+            "bgp_fauu_undrain_ebgp.pcap": ("igp", 100),
+            "bgp_fauu_undrain_ibgp.pcap": ("igp", 100),
+        }
+        steps = _stage_steps(
+            _fauu_stage_with_window(
+                device_name="dut.example.com",
+                prefix_pool_regex=".*EBGP.*",
+                tcp_dump_capture_interface_ebgp="Ethernet1",
+                tcp_dump_capture_interface_ibgp="Ethernet2",
+            )
+        )
+        payloads = [
+            _step_payload(step)
+            for step in steps
+            if step.name == taac_types.StepName.CUSTOM_STEP
+            and step.step_params is not None
+        ]
+        observed = {
+            payload["pcap_filename"]: (
+                payload.get("expected_origin"),
+                payload.get("expected_local_pref"),
+            )
+            for payload in payloads
+            if payload.get("custom_step_name") == "verify_drain_convergence"
+            and payload.get("use_pcap_analysis")
+        }
+        self.assertEqual(expected, observed)
+
+    def test_drain_stages_bracket_the_run_with_a_restoration_gate(self) -> None:
+        """The undrain must be compared against the exact pre-drain state.
+
+        The postcheck chain proves sessions are up and that RIB, FIB Agent and
+        hardware FIB agree with each other; all three stay self-consistent when
+        an undrain restores the wrong view or leaves a -DRAIN egress policy
+        applied. The gate is only meaningful if the baseline is taken before
+        any drain step and the comparison is the last thing the stage does.
+        """
+        stages = (
+            ("fauu", _fauu_stage_with_window, ".*EBGP.*"),
+            ("plane", create_plane_drain_undrain_stage, ".*IBGP.*PLANE_.*"),
+        )
+        for name, stage_factory, prefix_pool_regex in stages:
+            with self.subTest(stage=name):
+                steps = _stage_steps(
+                    stage_factory(
+                        device_name="dut.example.com",
+                        prefix_pool_regex=prefix_pool_regex,
+                        tcp_dump_capture_interface_ebgp="Ethernet1",
+                        tcp_dump_capture_interface_ibgp="Ethernet2",
+                    )
+                )
+                payloads = [
+                    _step_payload(step)
+                    for step in steps
+                    if step.name == taac_types.StepName.CUSTOM_STEP
+                    and step.step_params is not None
+                ]
+                custom_names = [payload.get("custom_step_name") for payload in payloads]
+                self.assertEqual(
+                    1, custom_names.count("snapshot_bgp_restoration_baseline")
+                )
+                self.assertEqual("snapshot_bgp_restoration_baseline", custom_names[0])
+
+                # The probe shares the custom step, so count by role: exactly
+                # one blocking gate and exactly one report-only sample.
+                comparisons = [
+                    payload
+                    for payload in payloads
+                    if payload.get("custom_step_name")
+                    == "verify_bgp_restoration_against_baseline"
+                ]
+                blocking = [p for p in comparisons if not p["report_only"]]
+                report_only = [p for p in comparisons if p["report_only"]]
+                self.assertEqual(1, len(blocking))
+                self.assertEqual(1, len(report_only))
+                # The gate is last; the probe sits between the baseline and it.
+                self.assertIs(blocking[0], comparisons[-1])
+                self.assertEqual(
+                    "verify_bgp_restoration_against_baseline", custom_names[-1]
+                )
+
+    def test_drain_stage_restoration_halves_agree_on_key_and_scope(self) -> None:
+        """A snapshot and a verify that disagree would compare nothing."""
+        stages = (
+            ("fauu", _fauu_stage_with_window, ".*EBGP.*"),
+            ("plane", create_plane_drain_undrain_stage, ".*IBGP.*PLANE_.*"),
+        )
+        for name, stage_factory, prefix_pool_regex in stages:
+            with self.subTest(stage=name):
+                payloads = {}
+                for step in _stage_steps(
+                    stage_factory(
+                        device_name="dut.example.com",
+                        prefix_pool_regex=prefix_pool_regex,
+                    )
+                ):
+                    if (
+                        step.name != taac_types.StepName.CUSTOM_STEP
+                        or step.step_params is None
+                    ):
+                        continue
+                    payload = _step_payload(step)
+                    custom_step_name = payload.get("custom_step_name")
+                    if custom_step_name == "snapshot_bgp_restoration_baseline":
+                        payloads[custom_step_name] = payload
+                    elif custom_step_name == "verify_bgp_restoration_against_baseline":
+                        # Key the two comparisons apart: the probe shares the
+                        # custom step name and would otherwise overwrite the gate.
+                        role = "probe" if payload["report_only"] else "gate"
+                        payloads[role] = payload
+
+                snapshot = payloads["snapshot_bgp_restoration_baseline"]
+                verify = payloads["gate"]
+                probe = payloads["probe"]
+                # The probe is only comparable to the gate if it reads the same
+                # state against the same baseline.
+                self.assertEqual(snapshot["snapshot_key"], probe["snapshot_key"])
+                self.assertEqual(snapshot["peer_scope"], probe["peer_scope"])
+                self.assertEqual(
+                    snapshot["compare_route_count"], probe["compare_route_count"]
+                )
+                self.assertEqual(snapshot["snapshot_key"], verify["snapshot_key"])
+                self.assertEqual(snapshot["peer_scope"], verify["peer_scope"])
+                self.assertEqual(
+                    snapshot["compare_route_count"], verify["compare_route_count"]
+                )
+                # Anything above zero would let the reported 192-route shortfall
+                # through, and a floor of zero peers makes the whole comparison
+                # vacuous.
+                self.assertEqual(0, verify["route_count_tolerance"])
+                self.assertGreater(snapshot["expected_min_peers"], 0)
+
+    def test_mid_stage_probe_can_never_fail_the_stage(self) -> None:
+        """The probe exists to say WHERE the state diverged.
+
+        A diagnostic that can turn a run red is worse than no diagnostic, and a
+        gate that is silently report-only is worse still, so the two roles are
+        pinned here rather than left to the call site.
+        """
+        stages = (
+            ("fauu", _fauu_stage_with_window, ".*EBGP.*"),
+            ("plane", create_plane_drain_undrain_stage, ".*IBGP.*PLANE_.*"),
+        )
+        for name, stage_factory, prefix_pool_regex in stages:
+            with self.subTest(stage=name):
+                comparisons = [
+                    _step_payload(step)
+                    for step in _stage_steps(
+                        stage_factory(
+                            device_name="dut.example.com",
+                            prefix_pool_regex=prefix_pool_regex,
+                        )
+                    )
+                    if step.name == taac_types.StepName.CUSTOM_STEP
+                    and step.step_params is not None
+                    and _step_payload(step).get("custom_step_name")
+                    == "verify_bgp_restoration_against_baseline"
+                ]
+                probe = next(p for p in comparisons if p["report_only"])
+                gate = next(p for p in comparisons if not p["report_only"])
+
+                # One sample, not a settle window: the probe measures a moment.
+                self.assertEqual(0, probe["settle_timeout_seconds"])
+                # A distinct result row, so the probe is never read as a verdict.
+                self.assertIn("probe", probe["check_name"])
+                self.assertNotIn("check_name", gate)
+                # The gate still waits for the drain tail to finish.
+                self.assertGreater(gate["settle_timeout_seconds"], 0)
+
+    def test_drain_stages_can_opt_out_of_the_restoration_gate(self) -> None:
+        stages = (
+            ("fauu", _fauu_stage_with_window, ".*EBGP.*"),
+            ("plane", create_plane_drain_undrain_stage, ".*IBGP.*PLANE_.*"),
+        )
+        for name, stage_factory, prefix_pool_regex in stages:
+            with self.subTest(stage=name):
+                steps = _stage_steps(
+                    stage_factory(
+                        device_name="dut.example.com",
+                        prefix_pool_regex=prefix_pool_regex,
+                        verify_restoration=False,
+                    )
+                )
+                custom_names = {
+                    _step_payload(step).get("custom_step_name")
+                    for step in steps
+                    if step.name == taac_types.StepName.CUSTOM_STEP
+                    and step.step_params is not None
+                }
+                self.assertNotIn("snapshot_bgp_restoration_baseline", custom_names)
+                self.assertNotIn(
+                    "verify_bgp_restoration_against_baseline", custom_names
+                )
+
+    def test_pcap_verifiers_require_their_capture_to_carry_updates(self) -> None:
+        """An empty required capture used to be logged and passed over."""
+        stages = (
+            ("fauu", _fauu_stage_with_window, ".*EBGP.*"),
+            ("plane", create_plane_drain_undrain_stage, ".*IBGP.*PLANE_.*"),
+        )
+        for name, stage_factory, prefix_pool_regex in stages:
+            with self.subTest(stage=name):
+                verifiers = 0
+                for step in _stage_steps(
+                    stage_factory(
+                        device_name="dut.example.com",
+                        prefix_pool_regex=prefix_pool_regex,
+                        tcp_dump_capture_interface_ebgp="Ethernet1",
+                        tcp_dump_capture_interface_ibgp="Ethernet2",
+                    )
+                ):
+                    if (
+                        step.name != taac_types.StepName.CUSTOM_STEP
+                        or step.step_params is None
+                    ):
+                        continue
+                    payload = _step_payload(step)
+                    if payload.get(
+                        "custom_step_name"
+                    ) != "verify_drain_convergence" or not payload.get(
+                        "use_pcap_analysis"
+                    ):
+                        continue
+                    verifiers += 1
+                    self.assertTrue(payload["require_updates"])
+                self.assertEqual(4, verifiers)
+
+    def test_playbook_payload_matches_frozen_contract(self) -> None:
+        """Byte-level oracle for the serialized CustomStep payload.
+
+        A field-by-field diff on failure, which neither the hash-only golden
+        manifest nor the `create_*_playbook`-only factory snapshots provide for
+        this Playbook. Any intended payload change updates this literal in the
+        same diff, so the change is visible in review.
+        """
+        playbook = get_bgp_ebb_attribute_churn_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="IBGP_V6",
+            peergroup_ibgp_v4="IBGP_V4",
+            total_session_count=1272,
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            ibgp_route_next_hop_starts=_ROUTE_NEXT_HOP_STARTS,
+        )
+
+        # characterization defaults to DISABLED, so no START/STOP bracket is
+        # added and the churn Stage is the only one. Production wraps it; that
+        # composition is asserted separately.
+        self.assertEqual(1, len(playbook.stages))
+        self.assertEqual(1, len(playbook.stages[0].steps))
+        self.assertTrue(playbook.restore_topology_baseline)
+
+        self.assertEqual(
+            _FROZEN_CHURN_PAYLOAD, _step_payload(playbook.stages[0].steps[0])
+        )
+
+    def test_fy27_block_geometry_is_derived_from_the_profile(self) -> None:
+        """The builder and runtime accept profile-sized rows and route blocks."""
+        prefix_sources = {
+            "ipv4": {
+                "start_prefix": "11.0.0.0",
+                "prefix_step": 256,
+                "count": 100_000,
+                "prefix_length": 24,
+                "excluded_indices": [],
+            },
+            "ipv6": {
+                "start_prefix": "2001:db8::",
+                "prefix_step": 1 << 64,
+                "count": 100_000,
+                "prefix_length": 64,
+                "excluded_indices": [],
+            },
+        }
+        playbook = get_bgp_ebb_attribute_churn_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="IBGP_V6",
+            peergroup_ibgp_v4="IBGP_V4",
+            total_session_count=1880,
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            ibgp_route_next_hop_starts=_ROUTE_NEXT_HOP_STARTS,
+            scale=EBB_FY27_SCALE,
+            ibgp_prefix_sources=prefix_sources,
+        )
+        payload = _step_payload(playbook.stages[0].steps[0])
+        self.assertEqual(100, payload["peer_count_per_plane"])
+        self.assertEqual(1_000, payload["routes_per_block"])
+        self.assertEqual(240, payload["cadence_seconds"])
+        self.assertEqual(150, payload["transition_timeout_seconds"])
+        self.assertEqual(150, payload["ixia_apply_timeout_seconds"])
+        self.assertEqual(prefix_sources, payload["prefix_sources"])
+        self.assertEqual(
+            prefix_sources, AttributeChurn.from_step_params(payload).prefix_sources
+        )
+        self.assertEqual((0, 16, 33, 49, 66, 82, 99), select_uniform_rows(100, 7))
+        self.assertEqual(
+            ("11.0.0.0/24", "11.3.231.0/24"),
+            sample_prefix_range("11.0.0.0", 24, route_count=1_000, sample_count=2),
+        )
+
+    def test_playbook_passes_typed_attribute_churn_to_stage(self) -> None:
+        target = (
+            "neteng.test_infra.dne.taac.playbooks.routing."
+            "bgp_ebb_playbooks.create_bgp_ebb_attribute_churn_stage"
+        )
+        with patch(target) as create_stage:
+            create_stage.return_value = taac_types.Stage(steps=[])
+            get_bgp_ebb_attribute_churn_playbook(
+                device_name="dut.example.com",
+                peergroup_ibgp_v6="IBGP_V6",
+                peergroup_ibgp_v4="IBGP_V4",
+                total_session_count=1272,
+                profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                ibgp_route_next_hop_starts=_ROUTE_NEXT_HOP_STARTS,
+            )
+
+        attribute_churn = create_stage.call_args.kwargs["attribute_churn"]
+        self.assertIsInstance(attribute_churn, AttributeChurn)
+        self.assertEqual(
+            ("med", "origin", "local_pref"),
+            tuple(family.name for family in attribute_churn.scenario.workload.families),
+        )
+        self.assertEqual(3_600, attribute_churn.scenario.execution.duration_seconds)
+
     def test_step_factory_serializes_locked_contract(self) -> None:
         step = create_bgp_attribute_churn_step(**_locked_step_kwargs())
 
@@ -311,13 +1308,63 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         self.assertEqual(3_600, payload["duration_seconds"])
         self.assertEqual(100_000, payload["max_iterations"])
         self.assertEqual(300, payload["convergence_hard_timeout_seconds"])
+        self.assertNotIn("transient_observation_logging", payload)
+
+    def test_step_factory_enables_extended_transient_observation_logging(
+        self,
+    ) -> None:
+        kwargs = _locked_step_kwargs()
+        kwargs["transient_observation_logging"] = "extended"
+
+        payload = _step_payload(create_bgp_attribute_churn_step(**kwargs))
+
+        self.assertEqual("extended", payload["transient_observation_logging"])
+
+    def test_step_factory_rejects_unknown_transient_observation_logging(
+        self,
+    ) -> None:
+        kwargs = _locked_step_kwargs()
+        kwargs["transient_observation_logging"] = "verbose"
+
+        with self.assertRaisesRegex(ValueError, "must be off or extended"):
+            create_bgp_attribute_churn_step(**kwargs)
+
+    def test_attribute_churn_step_params_round_trip_without_redefaulting(self) -> None:
+        attribute_churn = _locked_attribute_churn()
+
+        decoded = AttributeChurn.from_step_params(attribute_churn.to_step_params())
+
+        self.assertEqual(attribute_churn, decoded)
+
+    def test_attribute_churn_prefix_sources_require_both_families(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly ipv4 and ipv6"):
+            dataclasses.replace(
+                _locked_attribute_churn(),
+                prefix_sources={
+                    "ipv4": {
+                        "start_prefix": "11.0.0.0",
+                        "prefix_step": 256,
+                        "count": 100_000,
+                        "prefix_length": 24,
+                        "excluded_indices": [],
+                    }
+                },
+            )
 
     def test_step_factory_rejects_incomplete_pool_geometry(self) -> None:
         kwargs = _locked_step_kwargs()
-        kwargs["prefix_pool_names"] = {
-            "ipv4": EXPECTED_POOLS["ipv4"],
-            "ipv6": {"1": EXPECTED_POOLS["ipv6"]["1"]},
-        }
+        attribute_churn = t.cast(AttributeChurn, kwargs["attribute_churn"])
+        kwargs["attribute_churn"] = dataclasses.replace(
+            attribute_churn,
+            selector=dataclasses.replace(
+                attribute_churn.selector,
+                prefix_pools=tuple(
+                    pool
+                    for pool in attribute_churn.selector.prefix_pools
+                    if pool.afi == "ipv4" or pool.plane == 1
+                ),
+            ),
+        )
 
         with self.assertRaises(ValueError):
             create_bgp_attribute_churn_step(**kwargs)
@@ -339,7 +1386,14 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
 
     def test_step_factory_requires_two_selected_blocks_per_afi(self) -> None:
         kwargs = _locked_step_kwargs()
-        kwargs["selected_block_count_per_afi"] = 1
+        attribute_churn = t.cast(AttributeChurn, kwargs["attribute_churn"])
+        kwargs["attribute_churn"] = dataclasses.replace(
+            attribute_churn,
+            selector=dataclasses.replace(
+                attribute_churn.selector,
+                row_selection=UniformRowSelection(1),
+            ),
+        )
 
         with self.assertRaisesRegex(
             ValueError,
@@ -354,9 +1408,48 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must exceed"):
             create_bgp_attribute_churn_step(**kwargs)
 
+    def test_step_factory_rejects_fractional_typed_cadence(self) -> None:
+        kwargs = _locked_step_kwargs()
+        attribute_churn = t.cast(AttributeChurn, kwargs["attribute_churn"])
+        kwargs["attribute_churn"] = dataclasses.replace(
+            attribute_churn,
+            scenario=dataclasses.replace(
+                attribute_churn.scenario,
+                execution=dataclasses.replace(
+                    attribute_churn.scenario.execution,
+                    cadence_seconds=60.5,
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "cadence_seconds must be an integer"):
+            create_bgp_attribute_churn_step(**kwargs)
+
+    def test_step_factory_rejects_non_finite_typed_cadence(self) -> None:
+        for cadence_seconds in (float("inf"), float("nan")):
+            with self.subTest(cadence_seconds=cadence_seconds):
+                kwargs = _locked_step_kwargs()
+                attribute_churn = t.cast(AttributeChurn, kwargs["attribute_churn"])
+                kwargs["attribute_churn"] = dataclasses.replace(
+                    attribute_churn,
+                    scenario=dataclasses.replace(
+                        attribute_churn.scenario,
+                        execution=dataclasses.replace(
+                            attribute_churn.scenario.execution,
+                            cadence_seconds=cadence_seconds,
+                        ),
+                    ),
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError, "cadence_seconds must be an integer"
+                ):
+                    create_bgp_attribute_churn_step(**kwargs)
+
     def test_stage_contains_only_the_audited_custom_step(self) -> None:
         stage = create_bgp_ebb_attribute_churn_stage(**_locked_step_kwargs())
 
+        self.assertEqual("BGP attribute churn (CICD-EBB-10)", stage.description)
         self.assertEqual(1, len(stage.steps))
         payload = _step_payload(stage.steps[0])
         self.assertEqual("bgp_attribute_churn", payload["custom_step_name"])
@@ -368,8 +1461,8 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             peergroup_ibgp_v4="IBGP_V4",
             total_session_count=1272,
             profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            ibgp_route_next_hop_starts=_ROUTE_NEXT_HOP_STARTS,
         )
-
         self.assertEqual(1, len(playbook.stages))
         self.assertEqual(1, len(playbook.stages[0].steps))
         payload = _step_payload(playbook.stages[0].steps[0])
@@ -377,6 +1470,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         self.assertEqual(EXPECTED_MATRIX, payload["attribute_matrix"])
         self.assertEqual(
             {
+                "scenario_id": "bgp_ebb_attribute_churn",
                 "peer_count_per_plane": 62,
                 "selected_block_count_per_afi": 7,
                 "samples_per_block": 2,
@@ -384,11 +1478,17 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                 "duration_seconds": 3_600,
                 "max_iterations": 100_000,
                 "cadence_seconds": 60,
+                "geometry_timeout_seconds": 480,
+                "snapshot_timeout_seconds": 480,
+                "work_timeout_seconds": 5_100,
+                "cleanup_timeout_seconds": 720,
                 "poll_interval_seconds": 5,
                 "transition_timeout_seconds": 60,
                 "convergence_hard_timeout_seconds": 300,
                 "reference_setup_timeout_seconds": 120,
-                "restore_timeout_seconds": 120,
+                "restore_timeout_seconds": 400,
+                "ixia_restore_timeout_seconds": 120,
+                "cancellation_grace_seconds": 10,
                 "quiet_window_seconds": 120,
                 "max_lookup_concurrency": 8,
                 "openr_mode": "standalone",
@@ -396,6 +1496,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             {
                 key: payload[key]
                 for key in (
+                    "scenario_id",
                     "peer_count_per_plane",
                     "selected_block_count_per_afi",
                     "samples_per_block",
@@ -403,11 +1504,17 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                     "duration_seconds",
                     "max_iterations",
                     "cadence_seconds",
+                    "geometry_timeout_seconds",
+                    "snapshot_timeout_seconds",
+                    "work_timeout_seconds",
+                    "cleanup_timeout_seconds",
                     "poll_interval_seconds",
                     "transition_timeout_seconds",
                     "convergence_hard_timeout_seconds",
                     "reference_setup_timeout_seconds",
                     "restore_timeout_seconds",
+                    "ixia_restore_timeout_seconds",
+                    "cancellation_grace_seconds",
                     "quiet_window_seconds",
                     "max_lookup_concurrency",
                     "openr_mode",
@@ -422,6 +1529,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             peergroup_ibgp_v4="IBGP_V4",
             total_session_count=1272,
             profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            ibgp_route_next_hop_starts=_ROUTE_NEXT_HOP_STARTS,
             duration_seconds=6 * 60 * 60,
         )
 
@@ -435,6 +1543,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             peergroup_ibgp_v4="IBGP_V4",
             total_session_count=1272,
             profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
+            ibgp_route_next_hop_starts=_ROUTE_NEXT_HOP_STARTS,
         )
 
         payload = _step_payload(playbook.stages[0].steps[0])
@@ -457,9 +1566,153 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                 peergroup_ibgp_v4="IBGP_V4",
                 total_session_count=1272,
                 profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                ibgp_route_next_hop_starts=_ROUTE_NEXT_HOP_STARTS,
             )
 
         self.assertTrue(get_checks.call_args.args[1].check_ibgp_pnh)
+
+    def test_ebb05_checks_and_workload_share_merged_prefix_exclusions(
+        self,
+    ) -> None:
+        target = (
+            "neteng.test_infra.dne.taac.playbooks.routing."
+            "bgp_ebb_playbooks.get_profile_checks"
+        )
+        expected_ignored_prefixes = [
+            "2001:db8:feed::/64",
+            "2001:db8:44:a::/80",
+        ]
+        with patch(target) as get_checks:
+            get_checks.return_value = SimpleNamespace(
+                prechecks=[],
+                postchecks=[],
+                snapshot_checks=[],
+            )
+            playbook = get_bgp_ebb_ebgp_route_oscillation_playbook(
+                device_name="dut.example.com",
+                peergroup_ibgp_v6="IBGP_V6",
+                peergroup_ibgp_v4="IBGP_V4",
+                parent_prefixes_to_ignore=["2001:db8:feed::/64"],
+                bgp_mon_parent_network="2001:db8:44:a",
+            )
+
+        workload = next(
+            _step_payload(step)
+            for step in _sequential_steps(playbook)
+            if step.step_params is not None
+            and step.step_params.json_params is not None
+            and _step_payload(step).get("custom_step_name") == "bgp_route_oscillation"
+        )
+        self.assertEqual(
+            expected_ignored_prefixes,
+            get_checks.call_args.args[1].parent_prefixes_to_ignore,
+        )
+        self.assertEqual(
+            expected_ignored_prefixes,
+            workload["parent_prefixes_to_ignore"],
+        )
+
+    def test_ebb06_checks_and_workload_share_merged_prefix_exclusions(
+        self,
+    ) -> None:
+        target = (
+            "neteng.test_infra.dne.taac.playbooks.routing."
+            "bgp_ebb_playbooks.get_profile_checks"
+        )
+        expected_ignored_prefixes = [
+            "2001:db8:feed::/64",
+            "2001:db8:44:a::/80",
+        ]
+        with patch(target) as get_checks:
+            get_checks.return_value = SimpleNamespace(
+                prechecks=[],
+                postchecks=[],
+                snapshot_checks=[],
+            )
+            playbook = get_bgp_ebb_ibgp_route_oscillation_playbook(
+                device_name="dut.example.com",
+                peergroup_ibgp_v6="IBGP_V6",
+                peergroup_ibgp_v4="IBGP_V4",
+                parent_prefixes_to_ignore=["2001:db8:feed::/64"],
+                bgp_mon_parent_network="2001:db8:44:a",
+            )
+
+        workload = next(
+            _step_payload(step)
+            for step in _sequential_steps(playbook)
+            if step.step_params is not None
+            and step.step_params.json_params is not None
+            and _step_payload(step).get("custom_step_name") == "bgp_route_oscillation"
+        )
+        self.assertEqual(
+            expected_ignored_prefixes,
+            get_checks.call_args.args[1].parent_prefixes_to_ignore,
+        )
+        self.assertEqual(
+            expected_ignored_prefixes,
+            workload["parent_prefixes_to_ignore"],
+        )
+
+    def test_ebb03_and_ebb04_checks_share_merged_prefix_exclusions(
+        self,
+    ) -> None:
+        target = (
+            "neteng.test_infra.dne.taac.playbooks.routing."
+            "bgp_ebb_playbooks.get_profile_checks"
+        )
+        expected_ignored_prefixes = [
+            "2001:db8:feed::/64",
+            "2001:db8:44:a::/80",
+        ]
+        with patch(target) as get_checks:
+            get_checks.return_value = SimpleNamespace(
+                prechecks=[],
+                postchecks=[],
+                snapshot_checks=[],
+            )
+            playbooks = (
+                get_bgp_ebb_ebgp_session_oscillation_playbook(
+                    device_name="dut.example.com",
+                    peergroup_ibgp_v6="IBGP_V6",
+                    peergroup_ibgp_v4="IBGP_V4",
+                    ipv4_session_count=10,
+                    ipv6_session_count=10,
+                    sessions_per_cycle=2,
+                    parent_prefixes_to_ignore=["2001:db8:feed::/64"],
+                    bgp_mon_parent_network="2001:db8:44:a",
+                ),
+                get_bgp_ebb_ibgp_plane_session_oscillation_playbook(
+                    device_name="dut.example.com",
+                    peergroup_ibgp_v6="IBGP_V6",
+                    peergroup_ibgp_v4="IBGP_V4",
+                    ipv4_sessions_per_plane=10,
+                    ipv6_sessions_per_plane=10,
+                    sessions_per_plane=2,
+                    parent_prefixes_to_ignore=["2001:db8:feed::/64"],
+                    bgp_mon_parent_network="2001:db8:44:a",
+                ),
+            )
+
+        self.assertEqual(
+            [expected_ignored_prefixes, expected_ignored_prefixes],
+            [
+                call.args[1].parent_prefixes_to_ignore
+                for call in get_checks.call_args_list
+            ],
+        )
+        for playbook in playbooks:
+            workload = next(
+                _step_payload(step)
+                for step in _sequential_steps(playbook)
+                if step.step_params is not None
+                and step.step_params.json_params is not None
+                and _step_payload(step).get("custom_step_name")
+                == "bgp_session_oscillation"
+            )
+            self.assertEqual(
+                expected_ignored_prefixes,
+                workload["parent_prefixes_to_ignore"],
+            )
 
     def test_full_scale_factory_does_not_require_observer_parent(self) -> None:
         inventory = MagicMock()
@@ -467,24 +1720,890 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         inventory.ixia_ports = [["Ethernet1"], ["Ethernet2"]]
         inventory.openr_standalone_link.owner = "owner"
         inventory.openr_standalone_link.helper = "helper"
-        inventory.openr_standalone_link.kv_link.return_value = {}
+        inventory.openr_standalone_link.kv_link.return_value = {"ifName": "Ethernet1"}
         target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
             "bgp_ebb_full_scale.get_bgp_ebb_attribute_churn_playbook"
         )
 
-        with patch(target) as playbook_factory:
+        with (
+            patch(target) as playbook_factory,
+            patch(
+                _AUTOMATION_CONTRACT_TARGET,
+                return_value=_CANONICAL_AUTOMATION_CONTRACT,
+            ),
+            patch(_EBB16_ITEMS_TARGET, return_value=_EBB16_IXIA_ITEMS),
+            patch(_ROUTE_NEXT_HOP_STARTS_TARGET, return_value=_ROUTE_NEXT_HOP_STARTS),
+            patch(_EBB_ROUTE_HISTOGRAM_TARGET, return_value=_EBB_ROUTE_HISTOGRAM),
+            patch(_EBB_EXCLUSION_BLOCKS_TARGET, return_value=_EBB_EXCLUSION_BLOCKS),
+        ):
             playbook_factory.return_value = MagicMock()
             _get_bgp_ebb_full_scale_playbooks(
                 inventory,
                 BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
-                bound=MagicMock(),
+                bound=_full_scale_bound(),
+                ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
                 selected_tc7_playbooks=set(),
             )
 
+        self.assertEqual(
+            _TEST_BGP_MON_PARENT_NETWORK,
+            playbook_factory.call_args.kwargs["bgp_mon_parent_network"],
+        )
         self.assertNotIn(
             "observer_peer_parent_prefix", playbook_factory.call_args.kwargs
         )
+
+    def test_scheduled_full_scale_playbooks_use_canonical_hardware_guards(
+        self,
+    ) -> None:
+        playbooks_by_name = {
+            playbook.name: playbook
+            for test_config in (
+                NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+                NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+                NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+                NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+            )
+            for playbook in test_config.playbooks
+        }
+        expected_without_hardware_precheck = {
+            "bgp_ebb_longevity_playbook",
+            "bgp_ebb_nexthop_group_count_threshold_playbook",
+        }
+        without_hardware_precheck = set()
+
+        for name, playbook in playbooks_by_name.items():
+            hardware_prechecks = [
+                check
+                for check in playbook.prechecks or []
+                if check.name == hc_types.CheckName.HARDWARE_CAPACITY_CHECK
+            ]
+            if not hardware_prechecks:
+                without_hardware_precheck.add(name)
+                continue
+            self.assertEqual(1, len(hardware_prechecks), name)
+            check_params = hardware_prechecks[0].check_params
+            if check_params is None or check_params.json_params is None:
+                self.fail(f"{name} hardware precheck must carry JSON parameters")
+            payload = json.loads(check_params.json_params)
+            self.assertEqual(15_000, payload["fec_threshold"], name)
+
+        self.assertEqual(16, len(playbooks_by_name))
+        self.assertEqual(
+            expected_without_hardware_precheck,
+            without_hardware_precheck,
+        )
+
+    def test_full_scale_factory_rejects_missing_port_map_roles(self) -> None:
+        inventory = MagicMock()
+        inventory.device_name = "dut.example.com"
+        inventory.ixia_ports = [["Ethernet1"], ["Ethernet2"]]
+
+        for port_map, missing_role in (
+            ({"uplink": 0}, "ibgp"),
+            ({"ibgp": 1}, "uplink"),
+        ):
+            with (
+                self.subTest(missing_role=missing_role),
+                self.assertRaisesRegex(
+                    ValueError,
+                    rf"missing required roles: \['{missing_role}'\]",
+                ),
+            ):
+                _get_bgp_ebb_full_scale_playbooks(
+                    inventory,
+                    BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                    bound=MagicMock(),
+                    ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
+                    selected_tc7_playbooks=set(),
+                    port_map=port_map,
+                )
+
+    def test_full_scale_factory_rejects_out_of_range_port_map_indices(
+        self,
+    ) -> None:
+        inventory = MagicMock()
+        inventory.device_name = "dut.example.com"
+        inventory.ixia_ports = [["Ethernet1"], ["Ethernet2"]]
+
+        for port_map, role, index in (
+            ({"uplink": -1, "ibgp": 1}, "uplink", -1),
+            ({"uplink": 0, "ibgp": 2}, "ibgp", 2),
+            ({"uplink": 0, "ibgp": 1, "bgpmon": 2}, "bgpmon", 2),
+        ):
+            with (
+                self.subTest(role=role, index=index),
+                self.assertRaisesRegex(
+                    ValueError,
+                    rf"out-of-range indices.*'{role}': {index}",
+                ),
+            ):
+                _get_bgp_ebb_full_scale_playbooks(
+                    inventory,
+                    BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                    bound=MagicMock(),
+                    ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
+                    selected_tc7_playbooks=set(),
+                    port_map=port_map,
+                )
+
+    def test_full_scale_factory_wires_update_group_mode_to_ebb16(self) -> None:
+        inventory = MagicMock()
+        inventory.device_name = "dut.example.com"
+        inventory.ixia_ports = [["Ethernet1"], ["Ethernet2"]]
+        inventory.openr_standalone_link.owner = "owner"
+        inventory.openr_standalone_link.helper = "helper"
+        inventory.openr_standalone_link.kv_link.return_value = {"ifName": "Ethernet1"}
+        target = (
+            "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+            "bgp_ebb_full_scale.get_bgp_ebb_nexthop_group_count_threshold_playbook"
+        )
+
+        with (
+            patch(target, return_value=MagicMock()) as playbook_factory,
+            patch(
+                _AUTOMATION_CONTRACT_TARGET,
+                return_value=_CANONICAL_AUTOMATION_CONTRACT,
+            ),
+            patch(_EBB16_ITEMS_TARGET, return_value=_EBB16_IXIA_ITEMS),
+            patch(_ROUTE_NEXT_HOP_STARTS_TARGET, return_value=_ROUTE_NEXT_HOP_STARTS),
+            patch(_EBB_ROUTE_HISTOGRAM_TARGET, return_value=_EBB_ROUTE_HISTOGRAM),
+            patch(_EBB_EXCLUSION_BLOCKS_TARGET, return_value=_EBB_EXCLUSION_BLOCKS),
+        ):
+            _get_bgp_ebb_full_scale_playbooks(
+                inventory,
+                BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                bound=_full_scale_bound(),
+                ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
+                selected_tc7_playbooks=set(),
+                enable_update_group=False,
+            )
+
+        self.assertFalse(playbook_factory.call_args.kwargs["enable_update_group"])
+        self.assertEqual(
+            25,
+            playbook_factory.call_args.kwargs["target_membership_width"],
+        )
+        self.assertEqual(
+            _TEST_BGP_MON_PARENT_NETWORK,
+            playbook_factory.call_args.kwargs["bgp_mon_parent_network"],
+        )
+        self.assertEqual(
+            _EBB16_IXIA_ITEMS,
+            playbook_factory.call_args.kwargs["ixia_items_by_afi"],
+        )
+        self.assertEqual(
+            ("EB-FA-V6", "EB-FA-V4"),
+            playbook_factory.call_args.kwargs["exact_ebgp_peer_group_names"],
+        )
+        self.assertEqual(
+            _EBB_ROUTE_HISTOGRAM,
+            playbook_factory.call_args.kwargs["route_count_histogram_by_afi"],
+        )
+
+    def test_full_scale_factory_wires_sparse_oracles_to_ebb12(self) -> None:
+        inventory = MagicMock()
+        inventory.device_name = "dut.example.com"
+        inventory.ixia_ports = [["Ethernet1"], ["Ethernet2"]]
+        inventory.openr_standalone_link.owner = "owner"
+        inventory.openr_standalone_link.helper = "helper"
+        inventory.openr_standalone_link.kv_link.return_value = {"ifName": "Ethernet1"}
+        automation = _CANONICAL_AUTOMATION_CONTRACT._replace(
+            non_monitor_established_session_count=321,
+            internal_peer_group_names_by_afi={
+                "ipv4": "CORE.IBGP[V4]",
+                "ipv6": "CORE+IBGP(V6)",
+            },
+            ebgp_peer_group_names_by_afi={
+                "ipv4": "EDGE.PG[V4]",
+                "ipv6": "EDGE+PG(V6)",
+            },
+            ebgp_route_item_names_by_afi={
+                "ipv4": "EDGE.ROUTE[V4]",
+                "ipv6": "EDGE+ROUTE(V6)",
+            },
+        )
+        expanded_histogram = {
+            "ipv4": {816: 50, 850: 90},
+            "ipv6": {816: 50, 850: 90},
+        }
+        exclusion_blocks = {
+            "EDGE.ROUTE[V4]": [
+                {
+                    "prefix_start_index": 750,
+                    "prefix_count": 4,
+                    "peer_indices": [90, 91],
+                }
+            ],
+            "EDGE+ROUTE(V6)": [
+                {
+                    "prefix_start_index": 750,
+                    "prefix_count": 4,
+                    "peer_indices": [90, 91],
+                }
+            ],
+        }
+        target = (
+            "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+            "bgp_ebb_full_scale.get_bgp_ebb_route_registry_runtime_update_playbook"
+        )
+        ebb16_target = (
+            "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+            "bgp_ebb_full_scale."
+            "get_bgp_ebb_nexthop_group_count_threshold_playbook"
+        )
+
+        with (
+            patch(target, return_value=MagicMock()) as playbook_factory,
+            patch(ebb16_target, return_value=MagicMock()),
+            patch(_AUTOMATION_CONTRACT_TARGET, return_value=automation),
+            patch(_EBB16_ITEMS_TARGET, return_value=_EBB16_IXIA_ITEMS),
+            patch(_ROUTE_NEXT_HOP_STARTS_TARGET, return_value=_ROUTE_NEXT_HOP_STARTS),
+            patch(
+                _EBB_ROUTE_HISTOGRAM_TARGET,
+                side_effect=(_EBB_ROUTE_HISTOGRAM, expanded_histogram),
+            ),
+            patch(_EBB_EXCLUSION_BLOCKS_TARGET, return_value=exclusion_blocks),
+        ):
+            _get_bgp_ebb_full_scale_playbooks(
+                inventory,
+                BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                bound=_full_scale_bound(),
+                ebgp_prefix_count=850,
+                selected_tc7_playbooks=set(),
+            )
+
+        self.assertEqual(
+            _TEST_BGP_MON_PARENT_NETWORK,
+            playbook_factory.call_args.kwargs["bgp_mon_parent_network"],
+        )
+        self.assertEqual(
+            _EBB_ROUTE_HISTOGRAM,
+            playbook_factory.call_args.kwargs["expected_route_count_histogram_by_afi"],
+        )
+        self.assertEqual(
+            expanded_histogram,
+            playbook_factory.call_args.kwargs["expanded_route_count_histogram_by_afi"],
+        )
+        self.assertEqual(
+            exclusion_blocks,
+            playbook_factory.call_args.kwargs["peer_prefix_exclusion_blocks_by_pool"],
+        )
+        self.assertEqual(
+            r"^(?:EDGE\.ROUTE\[V4\]|EDGE\+ROUTE\(V6\))$",
+            playbook_factory.call_args.kwargs["prefix_pool_regex"],
+        )
+        self.assertEqual(
+            ("EDGE.ROUTE[V4]", "EDGE+ROUTE(V6)"),
+            playbook_factory.call_args.kwargs["expected_prefix_pool_names"],
+        )
+        self.assertEqual(
+            ("EDGE+PG(V6)", "EDGE.PG[V4]"),
+            playbook_factory.call_args.kwargs["exact_ebgp_peer_group_names"],
+        )
+        self.assertEqual(
+            "CORE+IBGP(V6)", playbook_factory.call_args.kwargs["peergroup_ibgp_v6"]
+        )
+        self.assertEqual(
+            "CORE.IBGP[V4]", playbook_factory.call_args.kwargs["peergroup_ibgp_v4"]
+        )
+        self.assertEqual(
+            321, playbook_factory.call_args.kwargs["expected_established_sessions"]
+        )
+
+    def test_ebb12_matches_nrqeb006_bound_artifacts(self) -> None:
+        profiles = (
+            (
+                NRQEB006_ASH6,
+                EBB_PARENT_NETWORKS_IXIA03,
+                EBB_NEXT_HOPS_IXIA03,
+                EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
+                EBB_PARENT_NETWORKS["bgpmon_v6"],
+            ),
+        )
+
+        for (
+            inventory,
+            parent_networks,
+            next_hops,
+            expected_bgp_mon,
+            forbidden_bgp_mon,
+        ) in profiles:
+            with self.subTest(inventory=inventory.device_name):
+                config = create_bgp_ebb_full_scale_test_config(
+                    inventory,
+                    name=f"{inventory.device_name}:EBB12",
+                    playbooks_selected=[
+                        "bgp_ebb_route_registry_runtime_update_playbook"
+                    ],
+                    profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                    parent_networks=dict(parent_networks),
+                    next_hops=next_hops,
+                )
+
+                self.assertEqual(1, len(config.playbooks))
+                playbook = config.playbooks[0]
+                serialized = thrift_to_json(playbook)
+                self.assertIn(inventory.device_name, serialized)
+                self.assertIn(f"{expected_bgp_mon}::/80", serialized)
+                self.assertNotIn(f"{forbidden_bgp_mon}::/80", serialized)
+
+                cleanup_steps = playbook.cleanup_steps
+                self.assertIsNotNone(cleanup_steps)
+                assert cleanup_steps is not None
+                cleanup = _task_params(cleanup_steps[0])
+                self.assertEqual(1272, cleanup["expected_established_sessions"])
+                self.assertEqual(
+                    ["EB-FA-V6", "EB-FA-V4"],
+                    cleanup["exact_peer_group_names"],
+                )
+                self.assertEqual(
+                    ["PREFIX_POOL_IPV4_EBGP", "PREFIX_POOL_IPV6_EBGP"],
+                    cleanup["prefix_pool_names"],
+                )
+                self.assertEqual(
+                    {
+                        "ipv4": {"816": 50, "850": 90},
+                        "ipv6": {"816": 50, "850": 90},
+                    },
+                    cleanup["expected_route_count_histogram_by_afi"],
+                )
+                self.assertEqual(
+                    [f"{expected_bgp_mon}::/80"],
+                    cleanup["parent_prefixes_to_ignore"],
+                )
+                blocks_by_pool = cleanup["peer_prefix_exclusion_blocks_by_pool"]
+                self.assertEqual(
+                    {"PREFIX_POOL_IPV4_EBGP", "PREFIX_POOL_IPV6_EBGP"},
+                    set(blocks_by_pool),
+                )
+                for blocks in blocks_by_pool.values():
+                    runtime_blocks = [
+                        block for block in blocks if block["prefix_start_index"] >= 750
+                    ]
+                    self.assertEqual(25, len(runtime_blocks))
+                    self.assertTrue(
+                        all(block["prefix_count"] == 4 for block in runtime_blocks)
+                    )
+
+    def test_ebb16_items_are_derived_from_every_topology_handle(self) -> None:
+        groups = []
+        for afi, suffix in (("v4", "v4"), ("v6", "v6")):
+            advertisement = SimpleNamespace(
+                spec=SimpleNamespace(
+                    name=f"dg_ebgp_{suffix}_routes",
+                    legacy_ixia_name=f"PREFIX_POOL_IPV{4 if afi == 'v4' else 6}_EBGP",
+                ),
+                paths_by_peer=(tuple(object() for _ in range(850)),) * 2,
+            )
+            groups.append(
+                SimpleNamespace(
+                    role="uplink",
+                    afi=afi,
+                    name=f"dg_ebgp_{suffix}",
+                    peer_count=2,
+                    legacy_ixia_bgp_peer_name=(
+                        f"BGP_PEER_IPV{4 if afi == 'v4' else 6}_EBGP"
+                    ),
+                    legacy_ixia_tag_name=None,
+                    legacy_ixia_device_group_name=(
+                        f"DEVICE_GROUP_IPV{4 if afi == 'v4' else 6}_EBGP"
+                    ),
+                    prefix_advertisements=(advertisement,),
+                )
+            )
+
+        items = _nhg_storm_ixia_items(
+            t.cast(BoundTopology, SimpleNamespace(device_groups=groups)),
+            target_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
+        )
+
+        self.assertEqual({"ipv4", "ipv6"}, set(items))
+        self.assertEqual("BGP_PEER_IPV4_EBGP", items["ipv4"]["peer_item"])
+        self.assertEqual("PREFIX_POOL_IPV6_EBGP", items["ipv6"]["route_item"])
+        self.assertEqual(2, items["ipv4"]["expected_peer_count"])
+        self.assertEqual(850, items["ipv6"]["expected_routes_per_peer"])
+        self.assertEqual(750, items["ipv4"]["target_prefix_count"])
+        self.assertEqual(750, items["ipv6"]["target_prefix_count"])
+
+    def test_automation_contract_matches_every_nrq_inventory(self) -> None:
+        for inventory in (
+            NRQEB006_ASH6,
+            NRQEB007_ASH6,
+            NRQEB008_ASH6,
+            NRQEB009_ASH6,
+        ):
+            with self.subTest(inventory=inventory.device_name):
+                bound = _bound_full_scale_automation_artifact(
+                    inventory,
+                    parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+                    next_hops=EBB_NEXT_HOPS_IXIA03,
+                )
+                self.assertEqual(
+                    _CANONICAL_AUTOMATION_CONTRACT,
+                    _ebb_automation_contract(bound),
+                )
+                self.assertEqual(
+                    EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
+                    bound.parent_networks["bgpmon_v6"],
+                )
+                self.assertNotEqual(
+                    EBB_PARENT_NETWORKS["bgpmon_v6"],
+                    bound.parent_networks["bgpmon_v6"],
+                )
+
+    def test_automation_contract_anchors_and_escapes_exact_ixia_names(self) -> None:
+        contract = _CANONICAL_AUTOMATION_CONTRACT._replace(
+            ebgp_peer_item_names_by_afi={
+                "ipv4": "BGP.PEER[IPV4]",
+                "ipv6": "BGP+PEER(IPV6)",
+            },
+            ebgp_route_item_names_by_afi={
+                "ipv4": "POOL.IPV4[EBGP]",
+                "ipv6": "POOL+IPV6(EBGP)",
+            },
+        )
+
+        self.assertEqual(
+            r"^BGP\.PEER\[IPV4\]$",
+            contract.exact_ebgp_peer_regex("ipv4"),
+        )
+        self.assertEqual(
+            r"^(?:POOL\.IPV4\[EBGP\]|POOL\+IPV6\(EBGP\))$",
+            contract.exact_ebgp_route_regex(),
+        )
+
+    def test_ebb05_uses_exact_route_handles_on_nrqeb009(self) -> None:
+        profiles = (
+            (
+                NRQEB009_ASH6,
+                EBB_PARENT_NETWORKS_IXIA03,
+                EBB_NEXT_HOPS_IXIA03,
+                EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
+                EBB_PARENT_NETWORKS["bgpmon_v6"],
+            ),
+        )
+
+        for (
+            inventory,
+            parent_networks,
+            next_hops,
+            expected_bgp_mon,
+            forbidden_bgp_mon,
+        ) in profiles:
+            with self.subTest(inventory=inventory.device_name):
+                config = create_bgp_ebb_full_scale_test_config(
+                    inventory,
+                    name=f"{inventory.device_name}:EBB05",
+                    playbooks_selected=["bgp_ebb_ebgp_route_oscillation_playbook"],
+                    profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                    parent_networks=dict(parent_networks),
+                    next_hops=next_hops,
+                )
+
+                self.assertEqual(1, len(config.playbooks))
+                playbook = config.playbooks[0]
+                serialized = thrift_to_json(playbook)
+                self.assertIn(inventory.device_name, serialized)
+
+                workload = next(
+                    _step_payload(step)
+                    for step in _sequential_steps(playbook)
+                    if step.step_params is not None
+                    and step.step_params.json_params is not None
+                    and _step_payload(step).get("custom_step_name")
+                    == "bgp_route_oscillation"
+                )
+                self.assertEqual(
+                    r"^(?:PREFIX_POOL_IPV4_EBGP|PREFIX_POOL_IPV6_EBGP)$",
+                    workload["prefix_pool_regex"],
+                )
+                self.assertEqual(
+                    {
+                        "ipv4": "PREFIX_POOL_IPV4_EBGP",
+                        "ipv6": "PREFIX_POOL_IPV6_EBGP",
+                    },
+                    workload["prefix_pool_names_by_afi"],
+                )
+                self.assertEqual(
+                    ["PREFIX_POOL_IPV4_EBGP", "PREFIX_POOL_IPV6_EBGP"],
+                    workload["expected_prefix_pool_names"],
+                )
+                self.assertEqual(1272, workload["expected_established_sessions"])
+                self.assertEqual(
+                    [f"{expected_bgp_mon}::/80"],
+                    workload["parent_prefixes_to_ignore"],
+                )
+                self.assertNotIn(
+                    f"{forbidden_bgp_mon}::/80",
+                    workload["parent_prefixes_to_ignore"],
+                )
+
+    def test_ebb09_and_ebb16_use_exact_handles_on_nrq(self) -> None:
+        cases = (
+            (
+                "bgp_ebb_multipath_group_oscillation_playbook",
+                NRQEB008_ASH6,
+            ),
+            (
+                "bgp_ebb_nexthop_group_count_threshold_playbook",
+                NRQEB009_ASH6,
+            ),
+        )
+        profiles = (
+            (
+                EBB_PARENT_NETWORKS_IXIA03,
+                EBB_NEXT_HOPS_IXIA03,
+                EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
+                EBB_PARENT_NETWORKS["bgpmon_v6"],
+            ),
+        )
+
+        for playbook_name, inventory in cases:
+            for (
+                parent_networks,
+                next_hops,
+                expected_bgp_mon,
+                forbidden_bgp_mon,
+            ) in profiles:
+                with self.subTest(
+                    playbook=playbook_name,
+                    inventory=inventory.device_name,
+                ):
+                    config = create_bgp_ebb_full_scale_test_config(
+                        inventory,
+                        name=f"{inventory.device_name}:{playbook_name}",
+                        playbooks_selected=[playbook_name],
+                        profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                        parent_networks=dict(parent_networks),
+                        next_hops=next_hops,
+                    )
+                    self.assertEqual(1, len(config.playbooks))
+                    playbook = config.playbooks[0]
+                    serialized = thrift_to_json(playbook)
+                    self.assertIn(inventory.device_name, serialized)
+                    self.assertIn(f"{expected_bgp_mon}::/80", serialized)
+                    self.assertNotIn(f"{forbidden_bgp_mon}::/80", serialized)
+
+                    endpoint = next(
+                        endpoint
+                        for endpoint in config.endpoints
+                        if endpoint.name == inventory.device_name
+                    )
+                    self.assertEqual(
+                        [
+                            (interface, inventory.primary_ixia_chassis_ip, ixia_port)
+                            for interface, ixia_port in inventory.ixia_ports[:3]
+                        ],
+                        [
+                            (
+                                connection.interface,
+                                connection.ixia_chassis_ip,
+                                connection.ixia_port,
+                            )
+                            for connection in endpoint.direct_ixia_connections or []
+                        ],
+                    )
+
+                    payloads = [
+                        _step_payload(step)
+                        for step in _sequential_steps(playbook)
+                        if step.step_params is not None
+                        and step.step_params.json_params is not None
+                    ]
+                    if playbook_name == (
+                        "bgp_ebb_multipath_group_oscillation_playbook"
+                    ):
+                        workload = next(
+                            payload
+                            for payload in payloads
+                            if payload.get("custom_step_name")
+                            == "bgp_multipath_oscillation"
+                        )
+                        self.assertEqual(
+                            "^BGP_PEER_IPV4_EBGP$",
+                            workload["ipv4_peer_regex"],
+                        )
+                        self.assertEqual(
+                            "^BGP_PEER_IPV6_EBGP$",
+                            workload["ipv6_peer_regex"],
+                        )
+                        self.assertEqual(140, workload["ipv4_session_count"])
+                        self.assertEqual(140, workload["ipv6_session_count"])
+                        cleanup = playbook.cleanup_steps
+                        self.assertIsNotNone(cleanup)
+                        assert cleanup is not None
+                        cleanup_params = _step_payload(cleanup[0])
+                        cleanup_args = json.loads(cleanup_params["args_json"])
+                        self.assertEqual(
+                            [
+                                "^BGP_PEER_IPV4_EBGP$",
+                                "^BGP_PEER_IPV6_EBGP$",
+                            ],
+                            [
+                                peer_range["regex"]
+                                for peer_range in cleanup_args["peer_ranges"]
+                            ],
+                        )
+                        self.assertEqual(
+                            [140, 140],
+                            [
+                                peer_range["session_end_idx"]
+                                for peer_range in cleanup_args["peer_ranges"]
+                            ],
+                        )
+                    else:
+                        storm = next(
+                            payload
+                            for payload in payloads
+                            if payload.get("custom_step_name") == "bgp_nhg_random_storm"
+                        )
+                        self.assertEqual(
+                            "^(?:PREFIX_POOL_IPV4_EBGP|PREFIX_POOL_IPV6_EBGP)$",
+                            storm["prefix_pool_scope_regex"],
+                        )
+                        self.assertNotEqual(
+                            ".*EBGP.*",
+                            storm["prefix_pool_scope_regex"],
+                        )
+
+    def test_ebb16_step_stage_and_playbook_lock_random_storm_contract(self) -> None:
+        step = create_bgp_nhg_random_storm_step(
+            hostname="dut.example.com",
+            ixia_items_by_afi=_EBB16_IXIA_ITEMS,
+            epoch_count=2,
+            epoch_interval_seconds=1,
+        )
+        payload = _step_payload(step)
+        self.assertEqual("bgp_nhg_random_storm", payload["custom_step_name"])
+        self.assertEqual(_EBB16_IXIA_ITEMS, payload["ixia_items_by_afi"])
+        self.assertEqual(3_000, payload["inactive_paths_per_afi"])
+        self.assertIsNone(payload["target_membership_width"])
+        self.assertEqual(750, payload["minimum_distinct_memberships_per_afi"])
+        self.assertEqual(1001, payload["minimum_observed_bgp_multiway_memberships"])
+        self.assertEqual(1000, payload["fibagent_nhg_watermark_high"])
+        self.assertEqual(1000, payload["fibagent_nhg_watermark_low"])
+        self.assertTrue(payload["enable_control_plane_validation"])
+        self.assertEqual(3, payload["minimum_confirmed_pause_fap_samples"])
+        self.assertEqual(5, payload["control_plane_sample_interval_seconds"])
+        self.assertEqual(60, payload["control_plane_read_timeout_seconds"])
+        self.assertEqual(
+            "^(?:PREFIX_POOL_IPV4_EBGP|PREFIX_POOL_IPV6_EBGP)$",
+            payload["prefix_pool_scope_regex"],
+        )
+        target_width_payload = _step_payload(
+            create_bgp_nhg_random_storm_step(
+                hostname="dut.example.com",
+                ixia_items_by_afi=_EBB16_IXIA_ITEMS,
+                target_membership_width=80,
+                epoch_count=2,
+                epoch_interval_seconds=1,
+            )
+        )
+        self.assertIsNone(target_width_payload["inactive_paths_per_afi"])
+        self.assertEqual(80, target_width_payload["target_membership_width"])
+        with self.assertRaisesRegex(ValueError, "requires exactly one"):
+            create_bgp_nhg_random_storm_step(
+                hostname="dut.example.com",
+                ixia_items_by_afi=_EBB16_IXIA_ITEMS,
+                inactive_paths_per_afi=3_000,
+                target_membership_width=80,
+            )
+
+        stage = create_bgp_nhg_random_storm_stage(
+            hostname="dut.example.com",
+            ixia_items_by_afi=_EBB16_IXIA_ITEMS,
+            epoch_count=2,
+            epoch_interval_seconds=1,
+        )
+        self.assertEqual(1, len(stage.steps))
+        self.assertEqual(
+            "bgp_nhg_random_storm",
+            _step_payload(stage.steps[0])["custom_step_name"],
+        )
+        self.assertEqual(
+            3_000,
+            _step_payload(stage.steps[0])["inactive_paths_per_afi"],
+        )
+        self.assertIsNone(_step_payload(stage.steps[0])["target_membership_width"])
+        self.assertEqual(
+            1001,
+            _step_payload(stage.steps[0])["minimum_observed_bgp_multiway_memberships"],
+        )
+        self.assertEqual(
+            1000,
+            _step_payload(stage.steps[0])["fibagent_nhg_watermark_high"],
+        )
+        self.assertEqual(
+            1000,
+            _step_payload(stage.steps[0])["fibagent_nhg_watermark_low"],
+        )
+        self.assertEqual(
+            "^(?:PREFIX_POOL_IPV4_EBGP|PREFIX_POOL_IPV6_EBGP)$",
+            _step_payload(stage.steps[0])["prefix_pool_scope_regex"],
+        )
+
+        playbook = get_bgp_ebb_nexthop_group_count_threshold_playbook(
+            device_name="dut.example.com",
+            expected_established_sessions=1272,
+            route_count_expected=750,
+            ixia_items_by_afi=_EBB16_IXIA_ITEMS,
+            epoch_count=2,
+            epoch_interval_seconds=1,
+            soak_duration=1,
+        )
+        storm = _step_payload(playbook.stages[0].steps[0])
+        self.assertEqual(_EBB16_IXIA_ITEMS, storm["ixia_items_by_afi"])
+        self.assertEqual(3_000, storm["inactive_paths_per_afi"])
+        self.assertIsNone(storm["target_membership_width"])
+        self.assertEqual(1001, storm["minimum_observed_bgp_multiway_memberships"])
+        self.assertEqual(1, storm["minimum_paused_fibagent_samples"])
+        self.assertEqual(1000, storm["fibagent_nhg_watermark_high"])
+        self.assertEqual(1000, storm["fibagent_nhg_watermark_low"])
+        self.assertTrue(storm["enable_control_plane_validation"])
+        self.assertEqual(3, storm["minimum_confirmed_pause_fap_samples"])
+        self.assertEqual(
+            "^(?:PREFIX_POOL_IPV4_EBGP|PREFIX_POOL_IPV6_EBGP)$",
+            storm["prefix_pool_scope_regex"],
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "prefix_pool_scope_regex must exactly select topology route items",
+        ):
+            create_bgp_nhg_random_storm_step(
+                hostname="dut.example.com",
+                ixia_items_by_afi=_EBB16_IXIA_ITEMS,
+                prefix_pool_scope_regex=".*EBGP.*",
+            )
+        expanded_items = {
+            afi: {**items, "expected_routes_per_peer": 850}
+            for afi, items in _EBB16_IXIA_ITEMS.items()
+        }
+        expanded_playbook = get_bgp_ebb_nexthop_group_count_threshold_playbook(
+            device_name="dut.example.com",
+            expected_established_sessions=1272,
+            route_count_expected=850,
+            ixia_items_by_afi=expanded_items,
+            epoch_count=2,
+            epoch_interval_seconds=1,
+            soak_duration=1,
+        )
+        expanded_storm = _step_payload(expanded_playbook.stages[0].steps[0])
+        self.assertEqual(3_000, expanded_storm["inactive_paths_per_afi"])
+        self.assertIsNone(expanded_storm["target_membership_width"])
+        self.assertEqual(
+            {"ipv4": 750, "ipv6": 750},
+            {
+                afi: items["target_prefix_count"]
+                for afi, items in _step_payload(expanded_playbook.stages[0].steps[0])[
+                    "ixia_items_by_afi"
+                ].items()
+            },
+        )
+        periodic_tasks = playbook.periodic_tasks
+        if periodic_tasks is None:
+            self.fail("CICD-EBB-16 must install its NHG periodic observer")
+        nhg_task = next(
+            task for task in periodic_tasks if task.name == "nexthop_group_check"
+        )
+        params_list = nhg_task.params_list
+        if params_list is None or params_list[0].json_params is None:
+            self.fail("CICD-EBB-16 NHG observer must carry JSON parameters")
+        nhg_params = json.loads(params_list[0].json_params)
+        self.assertEqual(8192, nhg_params["threshold"])
+        self.assertEqual(60, nhg_task.interval)
+        self.assertNotIn("max_unprogrammed", nhg_params)
+        self.assertEqual(1000, nhg_params["min_observed_groups"])
+        self.assertEqual(1, nhg_params["min_observed_multiway_groups"])
+        self.assertEqual(3, nhg_params["min_observed_groups_consecutive_samples"])
+        self.assertNotIn("min_bgp_groups", nhg_params)
+        self.assertNotIn("min_bgp_groups_consecutive_samples", nhg_params)
+        self.assertNotIn("min_programmed_groups", nhg_params)
+        self.assertEqual(1000, nhg_params["max_programmed_groups"])
+        self.assertNotIn("min_bgp_multiway_groups", nhg_params)
+        self.assertNotIn("min_bgp_multiway_consecutive_samples", nhg_params)
+
+    def test_ebb16_step_rejects_desired_floor_at_high_watermark(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "minimum_observed_bgp_multiway_memberships must be >= "
+            "fibagent_nhg_watermark_high \\+ 1",
+        ):
+            create_bgp_nhg_random_storm_step(
+                hostname="dut.example.com",
+                ixia_items_by_afi=_EBB16_IXIA_ITEMS,
+                minimum_observed_bgp_multiway_memberships=1000,
+                fibagent_nhg_watermark_high=1000,
+                fibagent_nhg_watermark_low=1000,
+            )
+
+    def test_scheduled_ebb16_uses_canonical_48_epoch_contract(self) -> None:
+        playbook = next(
+            playbook
+            for playbook in NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG.playbooks
+            if playbook.name == "bgp_ebb_nexthop_group_count_threshold_playbook"
+        )
+        # Run-task and validation steps carry their inputs outside
+        # step_params, so only parameterized steps are decoded here.
+        payloads = [
+            _step_payload(step)
+            for stage in playbook.stages or []
+            for step in stage.steps or []
+            if step.step_params is not None
+        ]
+        storm = next(
+            payload
+            for payload in payloads
+            if payload.get("custom_step_name") == "bgp_nhg_random_storm"
+        )
+        stage_ids = [stage.id for stage in playbook.stages or []]
+        self.assertNotIn("ebb16_fibagent_restart", stage_ids)
+
+        self.assertEqual(48, storm["epoch_count"])
+        self.assertEqual(24, storm["fibagent_restart_after_epoch"])
+        self.assertEqual(25, storm["epoch_interval_seconds"])
+        self.assertIsNone(storm["inactive_paths_per_afi"])
+        self.assertEqual(25, storm["target_membership_width"])
+        self.assertEqual(750, storm["minimum_distinct_memberships_per_afi"])
+        self.assertEqual(1001, storm["minimum_observed_bgp_multiway_memberships"])
+        self.assertEqual(1000, storm["fibagent_nhg_watermark_high"])
+        self.assertEqual(1000, storm["fibagent_nhg_watermark_low"])
+        self.assertTrue(storm["enable_control_plane_validation"])
+        self.assertEqual(3, storm["minimum_confirmed_pause_fap_samples"])
+        self.assertEqual(
+            {"ipv4": 750, "ipv6": 750},
+            {
+                afi: items["expected_routes_per_peer"]
+                for afi, items in storm["ixia_items_by_afi"].items()
+            },
+        )
+        self.assertEqual(
+            {"ipv4": 750, "ipv6": 750},
+            {
+                afi: items["target_prefix_count"]
+                for afi, items in storm["ixia_items_by_afi"].items()
+            },
+        )
+        self.assertIn(300, [payload.get("duration") for payload in payloads])
+
+    def test_ebb16_factory_does_not_gate_aggregate_ecmp_high_watermark(
+        self,
+    ) -> None:
+        playbook = get_bgp_ebb_nexthop_group_count_threshold_playbook(
+            device_name="dut.example.com",
+            expected_established_sessions=1272,
+            route_count_expected=105_000,
+            ixia_items_by_afi=_EBB16_IXIA_ITEMS,
+        )
+
+        for checks in (playbook.prechecks or [], playbook.postchecks or []):
+            hardware_checks = [
+                check
+                for check in checks
+                if check.name == hc_types.CheckName.HARDWARE_CAPACITY_CHECK
+            ]
+            self.assertEqual([], hardware_checks)
 
     def test_full_scale_factory_wires_optional_bgp_monitor_port(self) -> None:
         fauu_target = (
@@ -505,20 +2624,43 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             inventory.ixia_ports = [[port] for port in ports]
             inventory.openr_standalone_link.owner = "owner"
             inventory.openr_standalone_link.helper = "helper"
-            inventory.openr_standalone_link.kv_link.return_value = {}
+            inventory.openr_standalone_link.kv_link.return_value = {
+                "ifName": "Ethernet1"
+            }
             with (
                 self.subTest(port_count=len(ports)),
                 patch(fauu_target, return_value=MagicMock()) as fauu_factory,
                 patch(plane_target, return_value=MagicMock()) as plane_factory,
+                patch(
+                    _AUTOMATION_CONTRACT_TARGET,
+                    return_value=_CANONICAL_AUTOMATION_CONTRACT,
+                ),
+                patch(_EBB16_ITEMS_TARGET, return_value=_EBB16_IXIA_ITEMS),
+                patch(
+                    _ROUTE_NEXT_HOP_STARTS_TARGET, return_value=_ROUTE_NEXT_HOP_STARTS
+                ),
+                patch(
+                    _EBB_ROUTE_HISTOGRAM_TARGET,
+                    return_value=_EBB_ROUTE_HISTOGRAM,
+                ),
+                patch(
+                    _EBB_EXCLUSION_BLOCKS_TARGET,
+                    return_value=_EBB_EXCLUSION_BLOCKS,
+                ),
             ):
                 _get_bgp_ebb_full_scale_playbooks(
                     inventory,
                     BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
-                    bound=MagicMock(),
+                    bound=_full_scale_bound(),
+                    ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
                     selected_tc7_playbooks=set(),
                 )
 
                 for factory in (fauu_factory, plane_factory):
+                    self.assertEqual(
+                        _TEST_BGP_MON_PARENT_NETWORK,
+                        factory.call_args.kwargs["bgp_mon_parent_network"],
+                    )
                     self.assertEqual(
                         "Ethernet1",
                         factory.call_args.kwargs["tcp_dump_capture_interface_ebgp"],
@@ -532,32 +2674,114 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                         factory.call_args.kwargs,
                     )
 
-    def test_full_scale_factory_enables_churn_baseline_only_when_selected(
+    def test_full_scale_factory_wires_c09_peer_range_overrides(self) -> None:
+        inventory = MagicMock()
+        inventory.device_name = "dut.example.com"
+        inventory.ixia_ports = [["Ethernet1"], ["Ethernet2"]]
+        inventory.openr_standalone_link.owner = "owner"
+        inventory.openr_standalone_link.helper = "helper"
+        inventory.openr_standalone_link.kv_link.return_value = {"ifName": "Ethernet1"}
+        multipath_target = (
+            "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+            "bgp_ebb_full_scale.get_bgp_ebb_multipath_group_oscillation_playbook"
+        )
+
+        with (
+            patch(multipath_target, return_value=MagicMock()) as multipath_factory,
+            patch(
+                _AUTOMATION_CONTRACT_TARGET,
+                return_value=_CANONICAL_AUTOMATION_CONTRACT,
+            ),
+            patch(_EBB16_ITEMS_TARGET, return_value=_EBB16_IXIA_ITEMS),
+            patch(_ROUTE_NEXT_HOP_STARTS_TARGET, return_value=_ROUTE_NEXT_HOP_STARTS),
+            patch(_EBB_ROUTE_HISTOGRAM_TARGET, return_value=_EBB_ROUTE_HISTOGRAM),
+            patch(_EBB_EXCLUSION_BLOCKS_TARGET, return_value=_EBB_EXCLUSION_BLOCKS),
+        ):
+            _get_bgp_ebb_full_scale_playbooks(
+                inventory,
+                BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                bound=_full_scale_bound(),
+                ebgp_prefix_count=EBB_FY26_SCALE.fa_routes_per_peer,
+                selected_tc7_playbooks=set(),
+                multipath_min_peers_to_stop=3,
+                multipath_max_peers_to_stop=7,
+            )
+
+        self.assertEqual(3, multipath_factory.call_args.kwargs["min_peers_to_stop"])
+        self.assertEqual(7, multipath_factory.call_args.kwargs["max_peers_to_stop"])
+        self.assertEqual(
+            _TEST_BGP_MON_PARENT_NETWORK,
+            multipath_factory.call_args.kwargs["bgp_mon_parent_network"],
+        )
+
+    def test_public_full_scale_factory_forwards_c09_peer_range_overrides(
         self,
     ) -> None:
         inventory = MagicMock()
         inventory.device_name = "dut.example.com"
+        inventory.basset_pool = "dne.test"
+        inventory.ixia_ports = [["Ethernet1"], ["Ethernet2"]]
         compiled = SimpleNamespace(
             endpoints=[],
             host_os_type_map={},
             setup_tasks=[],
             teardown_tasks=[],
             basic_port_configs=[],
+            basic_traffic_item_configs=[],
         )
         topology_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
-            "bgp_ebb_full_scale.ebb_full_scale_topology"
+            "bgp_ebb_full_scale.ebb_topology"
         )
         playbooks_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
             "bgp_ebb_full_scale._get_bgp_ebb_full_scale_playbooks"
         )
 
-        for selected, expected_churn, expected_ebgp_prefix_count in (
-            (None, True, 850),
-            (["bgp_ebb_attribute_churn_playbook"], True, 750),
-            (["bgp_ebb_route_storm_playbook"], False, 750),
-            (["bgp_ebb_route_registry_runtime_update_playbook"], False, 850),
+        with (
+            patch(playbooks_target, return_value=[]) as playbooks_factory,
+            patch(topology_target) as topology_factory,
+        ):
+            topology_factory.return_value.bind_to_inventory.return_value.compile.return_value = compiled
+            create_bgp_ebb_full_scale_test_config(
+                inventory,
+                name="test",
+                multipath_min_peers_to_stop=3,
+                multipath_max_peers_to_stop=7,
+            )
+
+        kwargs = playbooks_factory.call_args.kwargs
+        self.assertEqual(3, kwargs["multipath_min_peers_to_stop"])
+        self.assertEqual(7, kwargs["multipath_max_peers_to_stop"])
+
+    def test_full_scale_factory_keeps_attribute_churn_out_of_topology(
+        self,
+    ) -> None:
+        inventory = MagicMock()
+        inventory.device_name = "dut.example.com"
+        inventory.basset_pool = "dne.test"
+        compiled = SimpleNamespace(
+            endpoints=[],
+            host_os_type_map={},
+            setup_tasks=[],
+            teardown_tasks=[],
+            basic_port_configs=[],
+            basic_traffic_item_configs=[],
+        )
+        topology_target = (
+            "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+            "bgp_ebb_full_scale.ebb_topology"
+        )
+        playbooks_target = (
+            "neteng.test_infra.dne.taac.testconfigs.routing.factories."
+            "bgp_ebb_full_scale._get_bgp_ebb_full_scale_playbooks"
+        )
+
+        for selected, expected_ebgp_prefix_count, expected_shards in (
+            (None, 850, True),
+            (["bgp_ebb_attribute_churn_playbook"], 750, False),
+            (["bgp_ebb_route_storm_playbook"], 750, True),
+            (["bgp_ebb_route_registry_runtime_update_playbook"], 850, False),
         ):
             available_playbooks = []
             if selected:
@@ -575,13 +2799,16 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                     profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
                 )
 
-            self.assertEqual(
-                expected_churn,
-                topology_factory.call_args.kwargs["enable_attribute_churn"],
+            self.assertNotIn(
+                "enable_attribute_churn", topology_factory.call_args.kwargs
             )
             self.assertEqual(
                 expected_ebgp_prefix_count,
                 topology_factory.call_args.kwargs["ebgp_prefix_count"],
+            )
+            self.assertEqual(
+                expected_shards,
+                topology_factory.call_args.kwargs["route_storm_shards"],
             )
             self.assertIsNone(
                 topology_factory.call_args.kwargs["ebgp_static_prefix_count"]
@@ -600,10 +2827,11 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
             setup_tasks=[],
             teardown_tasks=[],
             basic_port_configs=[],
+            basic_traffic_item_configs=[],
         )
         topology_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
-            "bgp_ebb_full_scale.ebb_full_scale_topology"
+            "bgp_ebb_full_scale.ebb_topology"
         )
         playbooks_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
@@ -612,6 +2840,8 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
 
         for port_count, expected_auxiliary_observers in ((2, False), (3, True)):
             inventory = MagicMock()
+            inventory.device_name = "dut.example.com"
+            inventory.basset_pool = "dne.test"
             inventory.ixia_ports = [
                 [f"Ethernet{index}", f"1/{index}"] for index in range(1, port_count + 1)
             ]
@@ -634,6 +2864,50 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
                     topology_factory.call_args.kwargs["include_bgpmon"],
                 )
 
+    def test_nrqeb008_stage1_uses_default_port_assignment(self) -> None:
+        for config in (
+            NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
+            NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
+        ):
+            with self.subTest(config=config.name):
+                endpoint = next(
+                    endpoint
+                    for endpoint in config.endpoints
+                    if endpoint.name == "nrqeb008.ash6"
+                )
+                connections = endpoint.direct_ixia_connections
+                self.assertIsNotNone(connections)
+                assert connections is not None
+                self.assertCountEqual(
+                    [
+                        ("Ethernet3/35/1", "1/89"),
+                        ("Ethernet3/35/2", "1/90"),
+                        ("Ethernet3/35/3", "1/91"),
+                    ],
+                    [
+                        (connection.interface, connection.ixia_port)
+                        for connection in connections
+                    ],
+                )
+
+        route_storm = next(
+            playbook
+            for playbook in NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG.playbooks
+            if playbook.name == "bgp_ebb_route_storm_playbook"
+        )
+        payload = next(
+            payload
+            for payload in (
+                _step_payload(step)
+                for step in _sequential_steps(route_storm)
+                if step.step_params is not None
+                and step.step_params.json_params is not None
+            )
+            if payload.get("custom_step_name") == "bgp_route_storm"
+        )
+        self.assertEqual("Ethernet3/35/2", payload["ixia_interface_mimic_ibgp"])
+        self.assertNotIn("ixia_interfaces_mimic_ibgp", payload)
+
     def test_full_scale_factory_rejects_invalid_playbook_selections(self) -> None:
         inventory = MagicMock()
         available = [taac_types.Playbook(name=name) for name in ("first", "second")]
@@ -643,7 +2917,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         )
         topology_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
-            "bgp_ebb_full_scale.ebb_full_scale_topology"
+            "bgp_ebb_full_scale.ebb_topology"
         )
         topology = MagicMock()
         topology.bind_to_inventory.return_value = MagicMock()
@@ -678,12 +2952,14 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
     def test_full_scale_factory_preserves_requested_playbook_order(self) -> None:
         inventory = MagicMock()
         inventory.device_name = "dut.example.com"
+        inventory.basset_pool = "dne.test"
         compiled = SimpleNamespace(
             endpoints=[],
             host_os_type_map={},
             setup_tasks=[],
             teardown_tasks=[],
             basic_port_configs=[],
+            basic_traffic_item_configs=[],
         )
         available = [
             taac_types.Playbook(name=name) for name in ("first", "second", "third")
@@ -694,7 +2970,7 @@ class BgpAttributeChurnPlaybookTest(unittest.TestCase):
         )
         topology_target = (
             "neteng.test_infra.dne.taac.testconfigs.routing.factories."
-            "bgp_ebb_full_scale.ebb_full_scale_topology"
+            "bgp_ebb_full_scale.ebb_topology"
         )
 
         with (

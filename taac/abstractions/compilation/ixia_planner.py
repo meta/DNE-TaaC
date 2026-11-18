@@ -11,7 +11,6 @@ from taac.abstractions.compilation.legacy_ixia_identity import (
     LegacyIxiaAdvertisementIdentity,
     LegacyIxiaGroupIdentity,
     LegacyIxiaIdentitySidecar,
-    LegacyIxiaPortIdentity,
     LegacyIxiaSessionIdentity,
 )
 from taac.abstractions.compilation.model import (
@@ -26,13 +25,16 @@ from taac.abstractions.compilation.model import (
     IxiaNextHopMode,
     IxiaNextHopPlan,
     IxiaPeerPrefixDistribution,
+    IxiaPeerPrefixExclusionBlock,
     IxiaPlan,
     IxiaPortPlan,
     IxiaPrefixWindowPlan,
     IxiaRouteAttributeDistribution,
     IxiaRouteAttributePoolPlan,
+    IxiaRouteScaleMode,
     IxiaSelfNextHopRealization,
     IxiaStandardCommunityPlan,
+    IxiaTrafficFlowPlan,
     ResourceId,
 )
 from taac.abstractions.compilation.resource_ids import (
@@ -43,9 +45,13 @@ from taac.abstractions.compilation.resource_ids import (
     ixia_device_group_resource_id,
     ixia_port_resource_id,
     ixia_session_resource_id,
+    ixia_traffic_flow_resource_id,
     link_resource_id,
 )
-from taac.abstractions.ixia_semantics import IxiaBgpCapability
+from taac.abstractions.ixia_semantics import (
+    IxiaBgpCapability,
+    IxiaEndpointPortLabelStyle,
+)
 from taac.abstractions.routing_semantics import PeerRelationship
 from taac.abstractions.topology.attributes import (
     RouteAttributePool,
@@ -58,11 +64,15 @@ from taac.abstractions.topology.model import (
     BoundTopology,
     EndpointSpec,
     IxiaBgpSessionIntent,
-    IxiaEndpointPortLabelStyle,
     ResolvedPeer,
     ResolvedPrefixAdvertisementLike,
+    TrafficFlowSpec,
 )
-from taac.abstractions.topology.prefix import NextHopIntent
+from taac.abstractions.topology.prefix import (
+    NextHopIntent,
+    PeerPrefixDistribution,
+    RouteScaleMode,
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +82,10 @@ class IxiaPlanningResult:
 
     def __post_init__(self) -> None:
         self.legacy_identity.validate(self.plan.iter_resource_ids())
+
+
+class UnsupportedTrafficFlowIntentError(ValueError):
+    pass
 
 
 @dataclass
@@ -86,6 +100,7 @@ class _IxiaPortAccumulator:
     ixia_port: str
     physical_inventory_index: int
     reuse_group: str | None
+    endpoint_label_style: IxiaEndpointPortLabelStyle
     link_ids: list[ResourceId]
 
     def add(
@@ -96,6 +111,10 @@ class _IxiaPortAccumulator:
         assignment = device_group.port_assignment
         if assignment is None:
             raise ValueError("IXIA port accumulation requires a bound assignment")
+        if assignment.endpoint_label_style is not self.endpoint_label_style:
+            raise ValueError(
+                f"IXIA port {self.resource_id} has conflicting endpoint label styles"
+            )
         actual = (
             endpoint_resource_id(endpoints.dut.name),
             endpoint_resource_id(endpoints.traffic.name),
@@ -138,6 +157,7 @@ class _IxiaPortAccumulator:
             ixia_port=self.ixia_port,
             physical_inventory_index=self.physical_inventory_index,
             reuse_group=self.reuse_group,
+            endpoint_label_style=self.endpoint_label_style,
         )
 
 
@@ -241,6 +261,9 @@ def plan_ixia(
                     hold_timer_s=bgp_behavior.hold_timer_s,
                     keepalive_timer_s=bgp_behavior.keepalive_timer_s,
                     enable_graceful_restart=bgp_behavior.enable_graceful_restart,
+                    tcp_window_size_bytes=(
+                        device_group.slow_peer_tcp_window_size_bytes
+                    ),
                 )
             )
             _append_identity(
@@ -281,11 +304,15 @@ def plan_ixia(
         device_groups=tuple(device_groups),
         bgp_sessions=tuple(sessions),
         advertisements=tuple(advertisements),
+        traffic_flows=_traffic_flow_plans(
+            bound,
+            tuple(device_groups),
+            tuple(advertisements),
+        ),
     )
     return IxiaPlanningResult(
         plan=plan,
         legacy_identity=LegacyIxiaIdentitySidecar(
-            port_identities=_legacy_port_identities(bound, plan),
             group_identities=tuple(group_identities),
             session_identities=tuple(session_identities),
             advertisement_identities=tuple(advertisement_identities),
@@ -293,36 +320,116 @@ def plan_ixia(
     )
 
 
-def _legacy_port_identities(
+def _traffic_flow_plans(
     bound: BoundTopology,
-    plan: IxiaPlan,
-) -> tuple[LegacyIxiaPortIdentity, ...]:
-    styles_by_port_id: dict[ResourceId, IxiaEndpointPortLabelStyle] = {}
-    for device_group in bound.device_groups:
-        assignment = device_group.port_assignment
-        if assignment is None:
-            continue
-        port_id = ixia_port_resource_id(assignment.logical_role)
-        existing = styles_by_port_id.setdefault(
-            port_id,
-            assignment.endpoint_label_style,
-        )
-        if existing is not assignment.endpoint_label_style:
-            raise ValueError(
-                f"IXIA port {port_id} has conflicting endpoint label styles"
-            )
-    return tuple(
-        LegacyIxiaPortIdentity(
-            resource_id=port.resource_id,
-            endpoint_ixia_port_label=(
-                f"{port.chassis_identifier}:{port.ixia_port}"
-                if styles_by_port_id[port.resource_id]
-                is IxiaEndpointPortLabelStyle.CHASSIS_PORT
-                else port.dut_interface
-            ),
-        )
-        for port in plan.ports
+    device_groups: tuple[IxiaDeviceGroupPlan, ...],
+    advertisements: tuple[IxiaAdvertisementPlan, ...],
+) -> tuple[IxiaTrafficFlowPlan, ...]:
+    flows = (
+        *bound.logical_topology.traffic_flows,
+        *(
+            flow
+            for group in bound.logical_topology.device_groups
+            for flow in group.traffic_flows
+        ),
     )
+    seen_names: set[str] = set()
+    for flow in flows:
+        if flow.name in seen_names:
+            raise UnsupportedTrafficFlowIntentError(
+                f"duplicate IXIA traffic-flow name {flow.name!r}"
+            )
+        seen_names.add(flow.name)
+    return tuple(
+        _traffic_flow_plan(flow, device_groups, advertisements) for flow in flows
+    )
+
+
+def _traffic_flow_plan(
+    flow: TrafficFlowSpec,
+    device_groups: tuple[IxiaDeviceGroupPlan, ...],
+    advertisements: tuple[IxiaAdvertisementPlan, ...],
+) -> IxiaTrafficFlowPlan:
+    if flow.dst_prefix_pool is not None:
+        raise UnsupportedTrafficFlowIntentError(
+            f"traffic flow {flow.name!r} uses dst_prefix_pool; DICE IXIA "
+            "lowering currently requires an unambiguous dst_dg"
+        )
+    if flow.dst_dg is None:
+        raise UnsupportedTrafficFlowIntentError(
+            f"traffic flow {flow.name!r} has no destination device group"
+        )
+    source = _single_traffic_flow_group(flow.name, flow.src_dg, device_groups)
+    destination_group = _single_traffic_flow_group(
+        flow.name,
+        flow.dst_dg,
+        device_groups,
+    )
+    destination_advertisement = _single_traffic_flow_advertisement(
+        flow.name,
+        flow.dst_dg,
+        destination_group,
+        advertisements,
+    )
+    if flow.rate_bps is not None:
+        raise UnsupportedTrafficFlowIntentError(
+            f"traffic flow {flow.name!r} uses bit-rate pacing, which is not supported"
+        )
+    if flow.rate_percent is None:
+        raise UnsupportedTrafficFlowIntentError(
+            f"traffic flow {flow.name!r} requires an explicit percentage rate"
+        )
+    return IxiaTrafficFlowPlan(
+        resource_id=ixia_traffic_flow_resource_id(flow.name),
+        logical_name=flow.name,
+        source_device_group_id=source.resource_id,
+        destination_advertisement_id=destination_advertisement.resource_id,
+        afi=source.afi,
+        traffic_profile=flow.traffic_profile,
+        rate_percent=flow.rate_percent,
+        rate_bps=flow.rate_bps,
+        frame_size_bytes=flow.frame_size_bytes,
+        bidirectional=flow.bidirectional,
+        enabled=flow.enabled,
+    )
+
+
+def _single_traffic_flow_advertisement(
+    flow_name: str,
+    logical_group_name: str,
+    group: IxiaDeviceGroupPlan,
+    advertisements: tuple[IxiaAdvertisementPlan, ...],
+) -> IxiaAdvertisementPlan:
+    matches = tuple(
+        advertisement
+        for advertisement in advertisements
+        if advertisement.device_group_id == group.resource_id
+    )
+    if len(matches) != 1:
+        raise UnsupportedTrafficFlowIntentError(
+            f"traffic flow {flow_name!r} device group {logical_group_name!r} must "
+            "resolve to exactly one IXIA advertisement; found "
+            f"{len(matches)}"
+        )
+    return matches[0]
+
+
+def _single_traffic_flow_group(
+    flow_name: str,
+    logical_group_name: str,
+    device_groups: tuple[IxiaDeviceGroupPlan, ...],
+) -> IxiaDeviceGroupPlan:
+    matches = tuple(
+        group
+        for group in device_groups
+        if group.resource_id.path[0] == logical_group_name
+    )
+    if len(matches) != 1:
+        raise UnsupportedTrafficFlowIntentError(
+            f"traffic flow {flow_name!r} device group {logical_group_name!r} "
+            f"must resolve to exactly one IXIA instance; found {len(matches)}"
+        )
+    return matches[0]
 
 
 def _ixia_port_plans(
@@ -346,6 +453,7 @@ def _ixia_port_plans(
                 ixia_port=assignment.ixia_port,
                 physical_inventory_index=assignment.physical_inventory_index,
                 reuse_group=assignment.reuse_group,
+                endpoint_label_style=assignment.endpoint_label_style,
                 link_ids=[],
             )
             accumulators[assignment.logical_role] = accumulator
@@ -459,6 +567,18 @@ def _advertisement_plan(
             f"{membership_start_index} is outside its {len(prefixes)} "
             "materialized prefixes"
         )
+    if spec.peer_prefix_activation is not None:
+        if (
+            allocation.peer_distribution is not PeerPrefixDistribution.SHARED
+            or allocation.route_scale_mode is not RouteScaleMode.FLAT
+        ):
+            raise ValueError(
+                "IXIA peer-prefix activation requires flat shared route geometry"
+            )
+        spec.peer_prefix_activation.validate_geometry(
+            peer_count=len(instance.peers),
+            prefixes_per_peer=allocation.prefixes_per_peer,
+        )
     return IxiaAdvertisementPlan(
         resource_id=advertisement_id,
         device_group_id=device_group_id,
@@ -480,12 +600,26 @@ def _advertisement_plan(
                 allocation.peer_distribution.value
             ),
             network_group_index=allocation.network_group_index,
+            route_scale_mode=IxiaRouteScaleMode(allocation.route_scale_mode.value),
         ),
         next_hop=_next_hop_plan(spec.next_hop, device_group.afi),
         attributes=_scalar_attributes(spec.attributes),
         route_attributes=_route_attribute_plan(spec.route_attributes),
         policy_communities=(
             tuple(policy.communities) if isinstance(policy, BgpPolicy) else ()
+        ),
+        requires_route_mutation=spec.requires_route_mutation,
+        peer_prefix_exclusion_blocks=(
+            tuple(
+                IxiaPeerPrefixExclusionBlock(
+                    prefix_start_index=block.prefix_start_index,
+                    prefix_count=block.prefix_count,
+                    peer_indices=block.peer_indices,
+                )
+                for block in spec.peer_prefix_activation.exclusion_blocks
+            )
+            if spec.peer_prefix_activation is not None
+            else ()
         ),
     )
 

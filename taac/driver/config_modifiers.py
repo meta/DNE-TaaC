@@ -1,0 +1,944 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+# pyre-unsafe
+
+"""
+OSS-safe BGP config modifiers for FBOSS devices.
+
+Soft-drain and undrain a device without any Meta-internal dependency -- no
+LocalDrainer, no config_selector, no COOP. The only primitive we rely on is the
+launch convention: bgpd reads ``--config /dev/shm/fboss/bgpcpp_startup_config``,
+which is a symlink.
+
+A drain is therefore three things:
+
+1. Update the ``/dev/shm/fboss`` drain markers.
+2. Repoint the startup-config symlink at the corresponding config file.
+3. Restart bgpd.
+
+Both config files (live and soft-drain) must already exist on the device.
+``setup_base_configs`` produces them: it reads the device's current BGP config,
+replaces whatever policies it had with three generalized propagate policies,
+points every peer group and peer at them, and writes back a live copy and a
+soft-drain copy that differ only in their egress policy and drain state.
+Drain/undrain then just selects between those two files.
+
+Call these from a TAAC step or task with the device's driver::
+
+    # step: Step.setUp already populated self.driver
+    await setup_base_configs(self.driver)
+    await drain_device(self.driver)
+
+    # task: build one from the hostname
+    driver = await async_get_device_driver(hostname)
+    await drain_device(driver)
+"""
+
+import json
+import logging
+import re
+import shlex
+import typing as t
+
+# Both of these imports resolve in OSS as well as internally. The module path is
+# the thrift's `namespace py3`, not its location on disk, which is why
+# bgp_policy.thrift -- at configerator/structs/neteng/bgp_policy/thrift/ -- is
+# imported from ...neteng.robotron. github/thrift/CMakeLists.txt already
+# generates both bindings under exactly these namespaces, from the copies
+# mirrored into public meta/fboss via neteng/fboss/bgp/public_tld/.
+#
+# @manual=//configerator/structs/neteng/fboss/bgp:bgp_config-python-types
+# The pin is Buck-only (OSS builds with CMake): that OSS mirror is also a Buck
+# target, bgp_config_oss-python-types, which emits the same Python module.
+# autodeps picks the mirror, and having both in one binary is a module
+# collision -- the same pin every other TAAC and COOP call site carries.
+from configerator.structs.neteng.fboss.bgp.bgp_config.thrift_types import (
+    BgpConfig,
+    BgpNetwork,
+    BgpPeer,
+    PeerGroup,
+)
+from configerator.structs.neteng.robotron.bgp_policy.thrift_types import (
+    BgpPolicies,
+    BgpPolicyAction,
+    BgpPolicyActionType,
+    BgpPolicyAtomicMatch,
+    BgpPolicyAtomicMatchType,
+    BgpPolicyMatch,
+    BgpPolicyStatement,
+    BgpPolicyTerm,
+    CommunityAction,
+    CommunityActionType,
+    CommunityList,
+    DrainState,
+    FlowControlAction,
+    LocalPreference,
+)
+from taac.driver.abstract_switch import AbstractSwitch
+from taac.driver.driver_constants import FbossSystemctlServiceName
+from taac.utils.oss_taac_lib_utils import (
+    oss_bgpd_config_install_enabled,
+)
+from thrift.python.serializer import deserialize, Protocol, serialize
+from thrift.python.types import StructOrUnion
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+# Peer groups and peers carry the same pair of policy-name fields and are
+# retargeted identically; the TypeVar keeps _retarget from widening either one
+# into a union at its call sites.
+_PolicyHolder = t.TypeVar("_PolicyHolder", PeerGroup, BgpPeer)
+_Config = t.TypeVar("_Config", bound=StructOrUnion)
+
+
+# Drain markers and the bgpd startup-config symlink. Mirrors the layout in
+# neteng/fboss/config_selector/fboss_config_selector.py so a device that does run
+# the internal selector stays consistent with what we do here.
+#
+# This is not our choice of location: bgpd is launched with
+# --config /dev/shm/fboss/bgpcpp_startup_config, so the path is a fixed FBOSS
+# on-device contract we interoperate with rather than a scratch area we picked.
+# patternlint-disable-next-line no-dev-shm-usage
+FBOSS_DRAIN_DIR: str = "/dev/shm/fboss"
+STARTUP_CONFIG_SYMLINK: str = f"{FBOSS_DRAIN_DIR}/bgpcpp_startup_config"
+# Staging name for the atomic symlink swap, matching the selector's own
+# ".{daemon}_startup_config" convention.
+_HIDDEN_STARTUP_CONFIG_SYMLINK: str = f"{FBOSS_DRAIN_DIR}/.bgpcpp_startup_config"
+
+MARKER_UNDRAINED: str = f"{FBOSS_DRAIN_DIR}/UNDRAINED"
+MARKER_SOFT_DRAINED: str = f"{FBOSS_DRAIN_DIR}/SOFT_DRAINED"
+
+COOP_DIR: str = "/etc/coop"
+LIVE_CONFIG_PATH: str = f"{COOP_DIR}/bgpcpp.conf"
+SOFTDRAIN_CONFIG_PATH: str = f"{COOP_DIR}/bgpcpp_softdrain.conf"
+AGENT_CONFIG_PATH: str = f"{COOP_DIR}/agent.conf"
+# Where the undrained config is parked while a drain is installed over the path
+# bgpd reads. Only used on images that read a real file rather than the startup
+# symlink -- see `_async_resolve_bgpd_config_path`.
+PREDRAIN_CONFIG_PATH: str = f"{COOP_DIR}/bgpcpp.predrain.conf"
+
+_UNDRAIN: str = "undrain"
+_SOFT_DRAIN: str = "soft-drain"
+_BASE_CONFIG_SETUP: str = "set up base configs for"
+
+# The two communities that carry drain state between devices. A drained device
+# tags what it advertises with DRAIN instead of LIVE; every device depreferences
+# DRAIN-tagged routes on ingress. Values match the fleet-wide meanings in
+# neteng/fboss/bgp/if/bgp_route_types.thrift, so a TAAC-configured device and a
+# COOP-configured neighbour agree on what a drain looks like.
+COMMUNITY_LIVE: str = "65446:30"
+COMMUNITY_DRAIN: str = "65446:10"
+
+# Local preferences the ingress policy assigns. The gap only has to be wide
+# enough that any LIVE path beats any DRAIN path; these mirror the values used
+# for the same purpose internally.
+LOCAL_PREF_LIVE: int = 90
+LOCAL_PREF_DRAIN: int = 25
+
+POLICY_PROPAGATE_IN: str = "PROPAGATE_EVERYTHING_IN"
+POLICY_PROPAGATE_OUT: str = "PROPAGATE_EVERYTHING_OUT"
+POLICY_PROPAGATE_OUT_DRAIN: str = "PROPAGATE_EVERYTHING_OUT_DRAIN"
+
+_POLICY_VERSION: str = "1"
+
+# Emitted by the file-existence probe. `test -f` alone communicates via exit code,
+# which does not survive every driver transport, so echo a sentinel instead.
+_FILE_EXISTS_SENTINEL: str = "__FILE_EXISTS__"
+
+
+class ConfigModifierError(Exception):
+    """A drain/undrain precondition failed, or the transition did not take effect."""
+
+
+def _fboss_switch_cls() -> type:
+    """Resolve FbossSwitch lazily.
+
+    Imported inside a function rather than at module scope because drain/undrain
+    *are* now exposed as driver methods: ``FbossSwitch.async_onbox_drain_device``
+    calls into this module, so fboss_switch_lib depends on config_modifiers_lib
+    and the reverse dep cannot be declared -- Buck rejects the cycle. Hence the
+    suppression below: pyre resolves imports through the Buck source database and
+    cannot see a dep that is deliberately absent.
+
+    Safe regardless of the missing dep. Anything that reaches this guard is
+    holding an FbossSwitch, so the module is already in sys.modules by the time
+    the import runs.
+    """
+    # pyre-ignore[21]: see above -- declaring this dep would create a Buck cycle.
+    from taac.driver.fboss_switch import FbossSwitch
+
+    return FbossSwitch
+
+
+def _assert_fboss_device(switch: AbstractSwitch, state_name: str) -> None:
+    """Reject drivers whose devices do not use the FBOSS bgpd launch convention.
+
+    Everything here -- the ``/dev/shm/fboss`` markers, the ``/etc/coop/bgpcpp*``
+    configs, ``systemctl restart bgpd`` -- is specific to a device running FBOSS
+    bgpcpp under systemd. On an Arista or Cisco driver these commands are
+    meaningless, and without this check the failure surfaces as a confusing shell
+    error partway through instead of a clear rejection up front.
+
+    ``FbossSwitchInternal`` subclasses ``FbossSwitch``, so internal runs pass.
+    ``AristaFbossSwitch`` deliberately does not: it subclasses ``AristaSwitch``
+    and drives bgpcpp through /mnt/flash + run_bgpcpp.sh under Arista daemon
+    control, so none of the paths below apply to it.
+    """
+    if not isinstance(switch, _fboss_switch_cls()):
+        raise ConfigModifierError(
+            f"Cannot {state_name} {switch.hostname}: {type(switch).__name__} is not "
+            "an FbossSwitch. Drain/undrain drives the FBOSS bgpd launch convention "
+            "(/dev/shm/fboss markers, /etc/coop/bgpcpp* configs, systemctl bgpd), "
+            "which does not apply to this device."
+        )
+
+
+async def async_file_exists(switch: AbstractSwitch, path: str) -> bool:
+    """Check for a regular file using only the AbstractSwitch API.
+
+    ``FbossSwitch.async_check_if_file_exists`` would be the obvious call, but it
+    is not on ``AbstractSwitch`` -- and steps and tasks hold their driver as an
+    ``AbstractSwitch``, so depending on it would push a type-ignore onto every
+    call site. The shell probe below is what the internal driver mixin falls back
+    to for the same reason: ``test -f`` reports through its exit code, which does
+    not survive every transport, so echo a sentinel and look for that instead.
+    """
+    output = await switch.async_run_cmd_on_shell(
+        f"test -f {path} && echo {_FILE_EXISTS_SENTINEL} || true"
+    )
+    return _FILE_EXISTS_SENTINEL in (output or "")
+
+
+async def async_is_device_drained(switch: AbstractSwitch) -> bool:
+    """Whether a drain from ``drain_device`` is in effect.
+
+    The markers are kept in step on every image, and an image whose bgpd reads
+    a real file also has the undrained config parked while drained.
+    """
+    return await async_file_exists(
+        switch, MARKER_SOFT_DRAINED
+    ) or await async_file_exists(switch, PREDRAIN_CONFIG_PATH)
+
+
+async def async_read_bgp_config(switch: AbstractSwitch, path: str) -> BgpConfig:
+    return deserialize_config(
+        BgpConfig, await switch.async_read_file(path), f"{switch.hostname}:{path}"
+    )
+
+
+async def _async_resolve_bgpd_config_path(switch: AbstractSwitch) -> str:
+    """The config path bgpd is actually launched with.
+
+    The drain is a selection, so it only takes effect on the file the daemon
+    opens. Meta's unit points ``--config`` at ``STARTUP_CONFIG_SYMLINK`` and a
+    config_selector re-derives that symlink at ExecStartPre; an OSS image ships
+    neither, and points ``--config`` straight at a real file. Repointing the
+    symlink there installs nothing, the restart reloads the same config, and the
+    readback still passes because it reads the symlink we just wrote -- a drain
+    that reports success and changed nothing.
+
+    Read rather than assumed, so each image gets the mechanism it can honour.
+    Raises instead of guessing: a drain that cannot tell which file it has to
+    replace cannot tell whether it worked.
+    """
+    unit = FbossSystemctlServiceName.BGP.value
+    out = await switch.async_run_cmd_on_shell(
+        f"systemctl cat {unit} 2>/dev/null | "
+        r"grep -oE '[-][-]config[= ]+[^ \\]+' | head -1"
+    )
+    match = re.search(r"--config[= ]+(\S+)", out or "")
+    if not match:
+        raise ConfigModifierError(
+            f"Cannot read the --config path from the {unit} unit on "
+            f"{switch.hostname}, so there is no way to tell which file a drain "
+            "has to replace. Draining blind would report success without "
+            "changing what bgpd serves."
+        )
+    # An ExecStart may quote the path; the quotes are not part of it.
+    return match.group(1).strip("'\"")
+
+
+async def _async_install_config(
+    switch: AbstractSwitch, source: str, dest: str, state_name: str
+) -> None:
+    """Copy ``source`` over ``dest`` and verify it landed.
+
+    ``cp -a`` rather than a rename: dest is the path bgpd opens, and replacing
+    the inode under a running daemon is what the atomic-symlink dance exists to
+    avoid. The content is compared afterwards because a short write here is a
+    drained device still serving live routes.
+    """
+    switch.logger.info(
+        f"[{state_name}] {switch.hostname}: installing {source} at {dest}"
+    )
+    src, dst = shlex.quote(source), shlex.quote(dest)
+    await switch.async_run_cmd_on_shell(f"cp -a {src} {dst}")
+    out = await switch.async_run_cmd_on_shell(
+        f"cmp -s {src} {dst} && echo MATCH || echo DIFFER"
+    )
+    if "MATCH" not in (out or ""):
+        raise ConfigModifierError(
+            f"{state_name} of {switch.hostname} did not take effect: {dest} does "
+            f"not match {source} after the copy."
+        )
+
+
+async def _verify_startup_config(
+    switch: AbstractSwitch, expected_config: str, state_name: str
+) -> None:
+    """Confirm the startup-config symlink still points where we put it.
+
+    On a device that runs the internal ``config_selector`` at bgpd's
+    ``ExecStartPre``, the selector re-derives this symlink from the drain markers
+    on every restart. It forces the undrained config when the device reports as
+    non-drainable, which would silently undo a drain. Reading the link back after
+    the restart turns that into a loud failure instead of a test that quietly
+    measured nothing.
+    """
+    # Plain readlink, not readlink -f: we want the literal target we set, and the
+    # coop config paths can themselves be symlinks that -f would resolve through
+    # (fboss2's config session keeps /etc/coop/bgpcpp.conf pointing into
+    # bgpcpp/bgpcpp.conf).
+    actual = await switch.async_run_cmd_on_shell(f"readlink {STARTUP_CONFIG_SYMLINK}")
+    actual = (actual or "").strip()
+
+    if actual != expected_config:
+        raise ConfigModifierError(
+            f"{state_name} of {switch.hostname} did not take effect: "
+            f"{STARTUP_CONFIG_SYMLINK} points at {actual or '<nothing>'}, expected "
+            f"{expected_config}. If an on-device config_selector runs at bgpd "
+            "ExecStartPre, it may have re-derived the symlink from the drain "
+            "markers -- check whether this device reports as drainable."
+        )
+
+
+async def drain_device(switch: AbstractSwitch, restart_bgp: bool = True) -> None:
+    """Soft-drain a device: advertise DRAIN-tagged routes instead of LIVE.
+
+    Routes are re-tagged, never withdrawn, so the drained path stays a viable
+    backup while neighbours depreference it.
+
+    Args:
+        switch: driver for the device to drain.
+        restart_bgp: restart bgpd so the new config takes effect. Pass False to
+            batch several changes and restart once at the end -- until bgpd is
+            restarted the device is still running its previous config.
+
+    Raises:
+        ConfigModifierError: the soft-drain config is missing, or the symlink did
+            not survive the restart (see ``_verify_startup_config``).
+    """
+    await _apply_drain_state(
+        switch,
+        target_marker=MARKER_SOFT_DRAINED,
+        opposite_marker=MARKER_UNDRAINED,
+        target_config=SOFTDRAIN_CONFIG_PATH,
+        state_name=_SOFT_DRAIN,
+        restart_bgp=restart_bgp,
+    )
+
+
+async def undrain_device(switch: AbstractSwitch, restart_bgp: bool = True) -> None:
+    """Undrain a device: return to advertising LIVE-tagged routes.
+
+    Args:
+        switch: driver for the device to undrain.
+        restart_bgp: restart bgpd so the new config takes effect.
+
+    Raises:
+        ConfigModifierError: the live config is missing, or the symlink did not
+            survive the restart.
+    """
+    await _apply_drain_state(
+        switch,
+        target_marker=MARKER_UNDRAINED,
+        opposite_marker=MARKER_SOFT_DRAINED,
+        target_config=LIVE_CONFIG_PATH,
+        state_name=_UNDRAIN,
+        restart_bgp=restart_bgp,
+    )
+
+
+async def _apply_drain_state(
+    switch: AbstractSwitch,
+    *,
+    target_marker: str,
+    opposite_marker: str,
+    target_config: str,
+    state_name: str,
+    restart_bgp: bool,
+) -> None:
+    """Shared drain/undrain worker. The two directions differ only in arguments.
+
+    Keyword-only (the bare ``*``) because four of the five arguments are plain
+    strings and two of them are near-identical marker paths -- a positional call
+    that transposed target_marker and opposite_marker would produce a "drain"
+    that silently leaves the device live.
+    """
+    hostname = switch.hostname
+    _assert_fboss_device(switch, state_name)
+
+    if not await async_file_exists(switch, target_config):
+        raise ConfigModifierError(
+            f"Cannot {state_name} {hostname}: BGP config {target_config} is missing. "
+            "Generate the base configs first -- drain/undrain only selects between "
+            "configs that already exist on the device."
+        )
+
+    # Order matters and is not merely defensive: the selector resolves markers as
+    # UNDRAINED > WARM_DRAINED > SOFT_DRAINED > DRAINED, so leaving UNDRAINED in
+    # place while adding SOFT_DRAINED would silently keep the device live. Removing
+    # the opposite marker and setting the target in one invocation also avoids a
+    # window where both or neither marker exists.
+    switch.logger.info(
+        f"[{state_name}] {hostname}: clearing {opposite_marker}, setting {target_marker}"
+    )
+    await switch.async_run_cmd_on_shell(
+        f"rm -f {opposite_marker} && touch {target_marker}"
+    )
+
+    # Symlink into a staging name, then rename over the real one. rename(2) is
+    # atomic, so bgpd can never observe a missing or half-written symlink -- this
+    # is the same symlink_to()-then-rename() idiom fboss_config_selector.py uses.
+    # `ln -sf` alone would not do: it unlinks the destination before recreating it.
+    #
+    # -n on the ln so an existing symlink-to-directory is replaced rather than
+    # dereferenced (without it, ln would create the link *inside* that directory),
+    # and -T on the mv for the same reason.
+    switch.logger.info(
+        f"[{state_name}] {hostname}: pointing {STARTUP_CONFIG_SYMLINK} at {target_config}"
+    )
+    await switch.async_run_cmd_on_shell(
+        f"ln -sfn {target_config} {_HIDDEN_STARTUP_CONFIG_SYMLINK} && "
+        f"mv -Tf {_HIDDEN_STARTUP_CONFIG_SYMLINK} {STARTUP_CONFIG_SYMLINK}"
+    )
+
+    # An image whose bgpd opens a real file never looks at that symlink, so the
+    # selection has to be made by content: park the undrained config and copy the
+    # target over the path bgpd reads. The symlink and markers are still kept in
+    # step above, so a device that later gains a config_selector resolves to the
+    # same state.
+    bgpd_config = (
+        await _async_resolve_bgpd_config_path(switch)
+        if oss_bgpd_config_install_enabled()
+        else STARTUP_CONFIG_SYMLINK
+    )
+    installed_from = target_config
+    if bgpd_config != STARTUP_CONFIG_SYMLINK:
+        if target_config == LIVE_CONFIG_PATH:
+            # Undraining: the live path currently holds the drain config, so the
+            # undrained content comes from the parked copy rather than from
+            # itself. Nothing parked means no drain is installed -- the live
+            # config is already what bgpd should serve, and setup_base_configs
+            # ends with an undrain for exactly that reason.
+            if not await async_file_exists(switch, PREDRAIN_CONFIG_PATH):
+                switch.logger.info(
+                    f"[{state_name}] {hostname}: no parked config at "
+                    f"{PREDRAIN_CONFIG_PATH}; {bgpd_config} is already undrained"
+                )
+                installed_from = None
+            else:
+                installed_from = PREDRAIN_CONFIG_PATH
+        else:
+            # Draining: park the undrained config once. Once, because a second
+            # drain would otherwise park the drained one and undrain to it.
+            await switch.async_run_cmd_on_shell(
+                f"[ -f {PREDRAIN_CONFIG_PATH} ] || "
+                f"cp -a {shlex.quote(bgpd_config)} {PREDRAIN_CONFIG_PATH}"
+            )
+
+        if installed_from is not None:
+            await _async_install_config(switch, installed_from, bgpd_config, state_name)
+
+    if restart_bgp:
+        switch.logger.info(f"[{state_name}] {hostname}: restarting bgpd")
+        await switch.async_restart_service(FbossSystemctlServiceName.BGP)
+
+    await _verify_startup_config(switch, target_config, state_name)
+
+    # Only after a successful undrain, so a failure between the copy and here
+    # leaves the parked config in place to recover from.
+    if bgpd_config != STARTUP_CONFIG_SYMLINK and target_config == LIVE_CONFIG_PATH:
+        await switch.async_run_cmd_on_shell(f"rm -f {PREDRAIN_CONFIG_PATH}")
+
+
+# ---------------------------------------------------------------------------
+# Policy construction
+#
+# Only the fields bgpd actually reads are populated. bgp_policy.thrift carries
+# a "modern" mirror for several of them -- policy_matches for
+# policy_match_entries, community_list for communities_filter, action_type for
+# type -- but bgpd's policy engine reads the older set exclusively
+# (neteng/fboss/bgp/cpp/policy/PolicyTerm.cpp). Populating both would double the
+# size of an already large config and let the two copies drift.
+# ---------------------------------------------------------------------------
+
+
+def _always_match() -> BgpPolicyMatch:
+    """A match that every prefix satisfies.
+
+    An empty ``match_entries`` would behave identically -- bgpd treats a term
+    with no conditions as matching everything -- but the explicit ALWAYS atom
+    says "catch-all" rather than "someone forgot to fill this in".
+    """
+    return BgpPolicyMatch(
+        match_entries=[BgpPolicyAtomicMatch(type=BgpPolicyAtomicMatchType.ALWAYS)]
+    )
+
+
+def _community_match(name: str, community: str) -> BgpPolicyMatch:
+    """Match prefixes carrying ``community``.
+
+    ``communities_filter`` is mandatory for a COMMUNITY_LIST match and its
+    community list must be non-empty: bgpd dereferences it unconditionally and
+    throws ``The attribute "communities" is empty`` otherwise
+    (PolicyMatch.cpp CommunityMatch).
+    """
+    return BgpPolicyMatch(
+        match_entries=[
+            BgpPolicyAtomicMatch(
+                type=BgpPolicyAtomicMatchType.COMMUNITY_LIST,
+                communities_filter=CommunityList(name=name, communities=[community]),
+            )
+        ]
+    )
+
+
+def _set_local_pref_action(local_pref: int) -> BgpPolicyAction:
+    return BgpPolicyAction(
+        type=BgpPolicyActionType.SET_LOCAL_PREF,
+        set_local_pref=LocalPreference(local_pref=local_pref),
+    )
+
+
+def _community_action(
+    community: str, action_type: CommunityActionType
+) -> BgpPolicyAction:
+    """Add or remove ``community`` on advertisement.
+
+    Add/remove is ``CommunityAction.action_type`` (ADD/SET/REMOVE), not the
+    ``BgpPolicyAction.action_type`` field one directory up in the struct -- that
+    one is only read for the ExtCommunity path.
+    """
+    return BgpPolicyAction(
+        type=BgpPolicyActionType.COMMUNITY_LIST,
+        community_action=CommunityAction(
+            communities=[community], action_type=action_type
+        ),
+    )
+
+
+def build_propagate_policies() -> tuple[BgpPolicyStatement, ...]:
+    """Build the three policies every TAAC-managed peer group points at.
+
+    ``PROPAGATE_EVERYTHING_IN``
+        Accept everything, but depreference anything a drained device sent us.
+        The DRAIN term must come first: ``PROPAGATE_EVERYTHING_OUT`` only adds
+        LIVE, it does not strip DRAIN, so a route learned from a drained device
+        and re-advertised by a healthy one carries *both* communities. Evaluated
+        in this order it lands on LOCAL_PREF_DRAIN, which is the point -- drain
+        depreference propagates along the path rather than stopping at the first
+        healthy hop.
+
+    ``PROPAGATE_EVERYTHING_OUT``
+        Advertise everything, tagged LIVE.
+
+    ``PROPAGATE_EVERYTHING_OUT_DRAIN``
+        Advertise everything, tagged DRAIN and with LIVE stripped. Routes are
+        re-tagged, never withdrawn, so the drained device stays a usable backup.
+
+    No term needs an explicit PERMIT action: a term that matches permits by
+    default (PolicyTerm.cpp, "0 is fine as we default to permit"), and
+    ``term_miss_action`` already defaults to NEXT_TERM.
+    """
+    return (
+        BgpPolicyStatement(
+            name=POLICY_PROPAGATE_IN,
+            description="TAAC: accept everything; depreference DRAIN-tagged routes",
+            policy_version=_POLICY_VERSION,
+            result=FlowControlAction.ACCEPT,
+            policy_entries=[
+                BgpPolicyTerm(
+                    name="TERM_MATCH_DRAIN",
+                    description=(f"DRAIN community -> local-pref {LOCAL_PREF_DRAIN}"),
+                    policy_match_entries=_community_match(
+                        "COMM_LIST_DRAIN", COMMUNITY_DRAIN
+                    ),
+                    policy_action_entries=[_set_local_pref_action(LOCAL_PREF_DRAIN)],
+                ),
+                BgpPolicyTerm(
+                    name="TERM_DEFAULT_LIVE",
+                    description=f"Everything else -> local-pref {LOCAL_PREF_LIVE}",
+                    policy_match_entries=_always_match(),
+                    policy_action_entries=[_set_local_pref_action(LOCAL_PREF_LIVE)],
+                ),
+            ],
+        ),
+        BgpPolicyStatement(
+            name=POLICY_PROPAGATE_OUT,
+            description="TAAC: advertise everything, tag LIVE",
+            policy_version=_POLICY_VERSION,
+            result=FlowControlAction.ACCEPT,
+            policy_entries=[
+                BgpPolicyTerm(
+                    name="TERM_TAG_LIVE",
+                    description="Tag every advertised prefix LIVE",
+                    policy_match_entries=_always_match(),
+                    policy_action_entries=[
+                        _community_action(COMMUNITY_LIVE, CommunityActionType.ADD)
+                    ],
+                )
+            ],
+        ),
+        BgpPolicyStatement(
+            name=POLICY_PROPAGATE_OUT_DRAIN,
+            description="TAAC: advertise everything, strip LIVE, tag DRAIN",
+            policy_version=_POLICY_VERSION,
+            result=FlowControlAction.ACCEPT,
+            policy_entries=[
+                BgpPolicyTerm(
+                    name="TERM_TAG_DRAIN",
+                    description="Replace LIVE with DRAIN on every advertised prefix",
+                    policy_match_entries=_always_match(),
+                    # Order is load-bearing and is set by list position, not by
+                    # sequence_number, which bgpd does not read: actions of the
+                    # same type are applied in the order configured. REMOVE must
+                    # precede ADD or a prefix that already carries LIVE keeps it
+                    # and ends up advertised as both live and drained.
+                    policy_action_entries=[
+                        _community_action(COMMUNITY_LIVE, CommunityActionType.REMOVE),
+                        _community_action(COMMUNITY_DRAIN, CommunityActionType.ADD),
+                    ],
+                )
+            ],
+        ),
+    )
+
+
+# Built once at import and reused for every device and both config copies.
+# thrift-python copies a struct when it goes into a container rather than
+# aliasing it, and the structs are immutable either way, so no caller can reach
+# back and disturb this value -- no defensive copying needed.
+PROPAGATE_POLICIES: tuple[BgpPolicyStatement, ...] = build_propagate_policies()
+
+
+# ---------------------------------------------------------------------------
+# Config transforms
+#
+# All pure: they take a BgpConfig and return a new one. thrift-python structs
+# are immutable, so calling an instance with keyword arguments returns a
+# modified copy and the caller's config is never touched.
+# ---------------------------------------------------------------------------
+
+
+def _retarget(target: _PolicyHolder, egress_policy: str) -> _PolicyHolder:
+    """Point one peer group or peer at the propagate policies.
+
+    Shared by both so the pairing is stated once: ingress is always
+    PROPAGATE_EVERYTHING_IN, and only egress distinguishes live from drained.
+    """
+    return target(
+        ingress_policy_name=POLICY_PROPAGATE_IN, egress_policy_name=egress_policy
+    )
+
+
+def _clear_policy(network: BgpNetwork) -> BgpNetwork:
+    return network(policy_name=None)
+
+
+def _reset_policies(config: BgpConfig, keep_existing: bool = False) -> BgpConfig:
+    """Install the three propagate policies.
+
+    By default the whole ``BgpPolicies`` container is replaced, not just the
+    statements: the auxiliary lists (community lists, as-path lists, prefix
+    lists) only existed to serve the policies being removed, and our three
+    define their communities inline. ``obj_uuid`` is carried over because it
+    identifies the container itself rather than anything in it.
+
+    With ``keep_existing`` (the scoped mode) the propagate policies are
+    appended instead, so peer groups left un-retargeted keep resolving their
+    original policies.
+    """
+    existing = config.policies
+    kept = list(existing.bgp_policy_statements) if (keep_existing and existing) else []
+    kept_names = {p.name for p in kept}
+    added = [p for p in PROPAGATE_POLICIES if p.name not in kept_names]
+    logger.info(
+        f"{'Keeping' if keep_existing else 'Replacing'} "
+        f"{len(existing.bgp_policy_statements) if existing else 0} policy "
+        f"statement(s); adding {len(added)} propagate policies"
+    )
+    if keep_existing and existing:
+        return config(policies=existing(bgp_policy_statements=kept + added))
+    return config(
+        policies=BgpPolicies(
+            bgp_policy_statements=kept + added,
+            obj_uuid=existing.obj_uuid if existing else None,
+        )
+    )
+
+
+def _retarget_peer_groups(
+    config: BgpConfig, egress_policy: str, peer_group_regex: t.Optional[str] = None
+) -> BgpConfig:
+    """Point peer groups at the propagate policies.
+
+    By default every one, with no role resolution: a soft-drain is a
+    whole-device operation, so a peer group left on its original policy would
+    keep advertising LIVE while the rest of the device drains.
+
+    ``peer_group_regex`` scopes the retarget to matching group names, for a DUT
+    wired into a live fabric where retargeting the fabric-facing groups would
+    advertise everything into it (unscoped, that crash-looped fboss_sw_agent on
+    a 2-RSW-2-FSW pod). Scoped, the drain is only observable on the matched
+    groups.
+    """
+    peer_groups = config.peer_groups
+    if not peer_groups:
+        logger.warning("Config has no peer groups to retarget")
+        return config
+
+    match = re.compile(peer_group_regex).search if peer_group_regex else None
+    picked = [g for g in peer_groups if match is None or match(g.name or "")]
+    logger.info(
+        f"Retargeting {len(picked)}/{len(peer_groups)} peer group(s) to "
+        f"({POLICY_PROPAGATE_IN}, {egress_policy})"
+    )
+    return config(
+        peer_groups=[
+            _retarget(g, egress_policy) if g in picked else g for g in peer_groups
+        ]
+    )
+
+
+def _retarget_peers(
+    config: BgpConfig, egress_policy: str, peer_group_regex: t.Optional[str] = None
+) -> BgpConfig:
+    """Point peers at the propagate policies.
+
+    Peer-level policy names override the peer group's, so a peer still naming a
+    policy we just deleted would both dangle and escape the drain. With
+    ``peer_group_regex``, only peers of matching groups are touched -- the
+    others keep their (still present) original policies.
+    """
+    peers = config.peers
+    if not peers:
+        return config
+
+    match = re.compile(peer_group_regex).search if peer_group_regex else None
+    picked = [p for p in peers if match is None or match(p.peer_group_name or "")]
+    logger.info(
+        f"Retargeting {len(picked)}/{len(peers)} peer(s) to egress {egress_policy}"
+    )
+    return config(
+        peers=[_retarget(p, egress_policy) if p in picked else p for p in peers]
+    )
+
+
+def _clear_network_policies(config: BgpConfig) -> BgpConfig:
+    """Drop policy references from originated networks.
+
+    These are origination policies, and unlike propagation they have no live and
+    drain variant -- there is nothing correct to repoint them at once the
+    original policies are gone, so the reference is cleared rather than left
+    dangling. This does change the attributes of originated routes, which is why
+    the count is logged.
+    """
+    cleared = sum(
+        1
+        for network in list(config.networks4) + list(config.networks6)
+        if network.policy_name
+    )
+    if not cleared:
+        return config
+
+    logger.info(f"Clearing policy_name from {cleared} originated network(s)")
+    return config(
+        networks4=[_clear_policy(network) for network in config.networks4],
+        networks6=[_clear_policy(network) for network in config.networks6],
+    )
+
+
+def _set_drain_state(config: BgpConfig, drain_state: DrainState) -> BgpConfig:
+    """Record the config's drain state.
+
+    Declarative only -- bgpd's policy engine never reads it, and drain behaviour
+    comes entirely from which egress policy the peer groups name. It is set so
+    that a drain-state query on the device reports the truth, which makes it
+    usable as a test assertion.
+    """
+    return config(drain_state=drain_state)
+
+
+def _generate_variant(
+    base: BgpConfig,
+    egress_policy: str,
+    drain_state: DrainState,
+    peer_group_regex: t.Optional[str] = None,
+) -> BgpConfig:
+    """Build one of the two config variants from the shared base.
+
+    Both variants go through this, so the live and drain copies cannot drift
+    into differing by anything other than these two arguments.
+    """
+    config = _retarget_peer_groups(base, egress_policy, peer_group_regex)
+    config = _retarget_peers(config, egress_policy, peer_group_regex)
+    return _set_drain_state(config, drain_state)
+
+
+def generate_base_configs(
+    config: BgpConfig, peer_group_regex: t.Optional[str] = None
+) -> tuple[BgpConfig, BgpConfig]:
+    """Derive the live and soft-drain configs from a device's current config.
+
+    The two outputs are identical except for the egress policy every peer group
+    and peer names, and the declared drain state. Policies themselves are
+    byte-identical in both, which is what makes drain a file swap rather than a
+    config rebuild.
+
+    Args:
+        config: the device's current BGP config. Not modified.
+        peer_group_regex: scope the transform to peer groups (and their peers)
+            whose name matches. Original policies and network policy references
+            are then kept, so unmatched groups keep working. Default: every
+            group, with the policy section replaced wholesale.
+
+    Returns:
+        ``(live_config, soft_drain_config)``.
+    """
+    scoped = peer_group_regex is not None
+    base = _reset_policies(config, keep_existing=scoped)
+    if not scoped:
+        base = _clear_network_policies(base)
+    return (
+        _generate_variant(
+            base, POLICY_PROPAGATE_OUT, DrainState.UNDRAINED, peer_group_regex
+        ),
+        _generate_variant(
+            base,
+            POLICY_PROPAGATE_OUT_DRAIN,
+            DrainState.SOFT_DRAINED,
+            peer_group_regex,
+        ),
+    )
+
+
+def deserialize_config(
+    config_type: type[_Config], raw_config: str, source: str
+) -> _Config:
+    """Parse a daemon config file: bgpd's ``BgpConfig`` or wedge_agent's ``AgentConfig``.
+
+    Protocol.JSON is SimpleJSON, which is what both daemons read and write
+    (SimpleJSONSerializer in bgpd's Config.cpp / ConfigManager.cpp and in
+    fboss/agent/AgentConfig.cpp). Protocol.COMPACT_JSON would parse and serialize
+    using field ids instead of names and would not round-trip against them.
+
+    Raises:
+        ConfigModifierError: ``raw_config`` is not a parseable ``config_type`` --
+            including a file truncated on its way off the device.
+    """
+    try:
+        return deserialize(config_type, raw_config.encode(), protocol=Protocol.JSON)
+    except Exception as exc:
+        raise ConfigModifierError(
+            f"{source} is not a parseable {config_type.__name__} ({exc})."
+        ) from exc
+
+
+def serialize_config(config: StructOrUnion) -> str:
+    """Serialize a config as indented JSON, newline-terminated.
+
+    thrift's SimpleJSON writer emits the whole document on a single line. At the
+    ~19 KB a real config runs to, that makes the file useless to read on the
+    box: `cat` gives one unbroken line and `diff` reports the whole file as
+    changed for a one-field edit. COOP's own configs are indented, so matching
+    that keeps what we write looking like what the device already has.
+
+    Re-indenting through `json` is a formatting change only -- the parsed
+    document is identical, key order is preserved (dicts keep insertion order
+    and `sort_keys` is off), and bgpd's SimpleJSON reader ignores whitespace
+    between tokens. `ensure_ascii=False` so a non-ASCII peer description
+    survives as itself instead of being escaped to \\uXXXX.
+    """
+    compact = serialize(config, protocol=Protocol.JSON).decode()
+    return json.dumps(json.loads(compact), indent=2, ensure_ascii=False) + "\n"
+
+
+async def async_write_configs(
+    switch: AbstractSwitch, configs: t.Mapping[str, StructOrUnion]
+) -> None:
+    """Write several configs to the device, keyed by destination path.
+
+    Every config is serialized before any file is written, so one that fails to
+    serialize cannot leave the device with only part of the set updated. Each file
+    is then replaced atomically on its own; there is no cross-file transaction, so
+    restart the daemons only after this returns.
+    """
+    contents = {path: serialize_config(config) for path, config in configs.items()}
+    for path, text in contents.items():
+        # pyre-ignore[16]: FbossSwitch-only; callers have checked the device type.
+        await switch.async_write_file_on_device(text, path)
+
+
+async def setup_base_configs(
+    switch: AbstractSwitch,
+    restart_bgp: bool = True,
+    peer_group_regex: t.Optional[str] = None,
+) -> None:
+    """Generate both BGP configs on a device and leave it undrained.
+
+    Reads the device's live config, rewrites its policies into the three
+    generalized propagate policies, and writes back a live copy and a soft-drain
+    copy. Run this once before any drain/undrain: those only ever select between
+    the two files this produces.
+
+    Note that the live config is written back to the same path it was read from,
+    replacing it. On a device where COOP manages ``/etc/coop/bgpcpp.conf``, COOP
+    may re-materialize its own version later and undo this.
+
+    Args:
+        switch: driver for the device to configure.
+        restart_bgp: restart bgpd so the new live config takes effect. Pass
+            False to stage the files without disturbing a running session.
+
+    Raises:
+        ConfigModifierError: the device has no live config to read, or it could
+            not be parsed.
+    """
+    hostname = switch.hostname
+    _assert_fboss_device(switch, _BASE_CONFIG_SETUP)
+
+    if not await async_file_exists(switch, LIVE_CONFIG_PATH):
+        raise ConfigModifierError(
+            f"Cannot {_BASE_CONFIG_SETUP} {hostname}: {LIVE_CONFIG_PATH} is missing. "
+            "The device must already be running a BGP config -- this generates the "
+            "drain variants of an existing config, it does not create one."
+        )
+
+    switch.logger.info(f"{hostname}: reading BGP config from {LIVE_CONFIG_PATH}")
+    raw_config = await switch.async_read_file(LIVE_CONFIG_PATH)
+    config = deserialize_config(
+        BgpConfig,
+        raw_config,
+        f"Cannot {_BASE_CONFIG_SETUP} {hostname}: {LIVE_CONFIG_PATH}",
+    )
+
+    live_config, drain_config = generate_base_configs(config, peer_group_regex)
+
+    if oss_bgpd_config_install_enabled():
+        # The configs written below are the new truth. A config parked by an
+        # earlier drain (a run torn down while drained, or a drain interrupted
+        # after parking) would otherwise be installed by the undrain below.
+        await switch.async_run_cmd_on_shell(f"rm -f {PREDRAIN_CONFIG_PATH}")
+
+    switch.logger.info(
+        f"{hostname}: writing {LIVE_CONFIG_PATH} and {SOFTDRAIN_CONFIG_PATH}"
+    )
+    await async_write_configs(
+        switch, {LIVE_CONFIG_PATH: live_config, SOFTDRAIN_CONFIG_PATH: drain_config}
+    )
+
+    # Leave the device in a known state rather than wherever its markers happened
+    # to point: the symlink may still reference a config that no longer exists.
+    await undrain_device(switch, restart_bgp=restart_bgp)

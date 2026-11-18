@@ -2,11 +2,17 @@
 
 # pyre-unsafe
 
+from taac.testconfigs.fpf.fpf_gar_class_a import (
+    TEST_CONFIG as FPF_GAR_CLASS_A,
+)
+from taac.testconfigs.fpf.fpf_gar_class_b_c import (
+    TEST_CONFIG as FPF_GAR_CLASS_B_C,
+)
+from taac.testconfigs.fpf.fpf_gar_class_d import (
+    TEST_CONFIG as FPF_GAR_CLASS_D,
+)
 from taac.testconfigs.fpf.fpf_shared_injection_suite import (
     TEST_CONFIG as FPF_SHARED_INJECTION_SUITE,
-)
-from taac.testconfigs.fpf.fpf_stress_test_config import (
-    TEST_CONFIG as FPF_STRESS_TEST_CONFIG,
 )
 from taac.testconfigs.fpf.fpf_tc04_wedge_agent_warmboot import (
     TEST_CONFIG as FPF_TC04_WEDGE_AGENT_WARMBOOT,
@@ -38,35 +44,11 @@ from taac.testconfigs.fpf.fpf_tc19_device_drain import (
 from taac.testconfigs.fpf.fpf_tc21_prod_prefix_drain_link import (
     TEST_CONFIG as FPF_TC21_PROD_PREFIX_DRAIN_LINK,
 )
-from taac.testconfigs.fpf.fpf_tc22_prod_prefix_drain_device import (
-    TEST_CONFIG as FPF_TC22_PROD_PREFIX_DRAIN_DEVICE,
-)
-from taac.testconfigs.fpf.fpf_tc23_bgp_restart import (
-    TEST_CONFIG as FPF_TC23_BGP_RESTART,
-)
-from taac.testconfigs.fpf.fpf_tc24_fsdb_restart import (
-    TEST_CONFIG as FPF_TC24_FSDB_RESTART,
-)
-from taac.testconfigs.fpf.fpf_tc25_wedge_agent_restart import (
-    TEST_CONFIG as FPF_TC25_WEDGE_AGENT_RESTART,
-)
 from taac.testconfigs.fpf.fpf_tc26_qsfp_service_restart import (
     TEST_CONFIG as FPF_TC26_QSFP_SERVICE_RESTART,
 )
-from taac.testconfigs.fpf.fpf_tc27_agent_coldboot import (
-    TEST_CONFIG as FPF_TC27_AGENT_COLDBOOT,
-)
-from taac.testconfigs.fpf.fpf_tc28_fsdb_kill import (
-    TEST_CONFIG as FPF_TC28_FSDB_KILL,
-)
-from taac.testconfigs.fpf.fpf_tc29_fsdb_gr_stop30_reenable import (
-    TEST_CONFIG as FPF_TC29_FSDB_GR_STOP30_REENABLE,
-)
-from taac.testconfigs.fpf.fpf_tc30_fsdb_gr_stop180_no_reenable import (
-    TEST_CONFIG as FPF_TC30_FSDB_GR_STOP180_NO_REENABLE,
-)
-from taac.testconfigs.fpf.fpf_tc31_fsdb_enable_recover import (
-    TEST_CONFIG as FPF_TC31_FSDB_ENABLE_RECOVER,
+from taac.testconfigs.fpf.fpf_tc29b_fsdb_gr_remote_withdraw import (
+    TEST_CONFIG as FPF_TC29B_FSDB_GR_REMOTE_WITHDRAW,
 )
 from taac.testconfigs.fpf.fpf_tc32_downlink_flaps import (
     TEST_CONFIG as FPF_TC32_DOWNLINK_FLAPS,
@@ -83,6 +65,9 @@ from taac.testconfigs.fpf.fpf_tc36_stsw_all_connections_down import (
 from taac.testconfigs.fpf.fpf_tc37_nic_side_link_flap import (
     TEST_CONFIG as FPF_TC37_NIC_SIDE_LINK_FLAP,
 )
+from taac.testconfigs.fpf.fpf_tc37b_nic_side_continuous_flap import (
+    TEST_CONFIG as FPF_TC37B_NIC_SIDE_CONTINUOUS_FLAP,
+)
 from taac.testconfigs.fpf.fpf_tc38_persistent_ndp_clear import (
     TEST_CONFIG as FPF_TC38_PERSISTENT_NDP_CLEAR,
 )
@@ -91,9 +76,6 @@ from taac.testconfigs.fpf.fpf_tc39_fsdb_kill_5min import (
 )
 from taac.testconfigs.fpf.fpf_tc40_cont_interface_flaps import (
     TEST_CONFIG as FPF_TC40_CONT_INTERFACE_FLAPS,
-)
-from taac.testconfigs.fpf.fpf_tc41_longevity_pristine import (
-    TEST_CONFIG as FPF_TC41_LONGEVITY_PRISTINE,
 )
 from taac.testconfigs.fpf.fpf_tc42_cont_flaps_wedge_restart import (
     TEST_CONFIG as FPF_TC42_CONT_FLAPS_WEDGE_RESTART,
@@ -134,10 +116,21 @@ from taac.testconfigs.fpf.fpf_tc54_stsw_device_drain import (
 from taac.testconfigs.fpf.fpf_tc55_gtsw_device_reboot import (
     TEST_CONFIG as FPF_TC55_GTSW_DEVICE_REBOOT,
 )
+from taac.testconfigs.fpf.fpf_tc56_cont_flaps_qsfp_restart import (
+    TEST_CONFIG as FPF_TC56_CONT_FLAPS_QSFP_RESTART,
+)
+from taac.testconfigs.fpf.fpf_tc57_cont_flaps_qsfp_crash import (
+    TEST_CONFIG as FPF_TC57_CONT_FLAPS_QSFP_CRASH,
+)
+from taac.testconfigs.fpf.fpf_tc58_multi_fboss_process_kill_15s_5min import (
+    TEST_CONFIG as FPF_TC58_MULTI_FBOSS_PROCESS_KILL_15S_5MIN,
+)
 
 __all__ = [
+    "FPF_GAR_CLASS_A",
+    "FPF_GAR_CLASS_B_C",
+    "FPF_GAR_CLASS_D",
     "FPF_SHARED_INJECTION_SUITE",
-    "FPF_STRESS_TEST_CONFIG",
     "FPF_TC04_WEDGE_AGENT_WARMBOOT",
     "FPF_TC05_BGP_GR_WITHIN_WINDOW",
     "FPF_TC06_BGP_GR_BEYOND_WINDOW",
@@ -148,25 +141,17 @@ __all__ = [
     "FPF_TC17_LINK_DRAIN",
     "FPF_TC19_DEVICE_DRAIN",
     "FPF_TC21_PROD_PREFIX_DRAIN_LINK",
-    "FPF_TC22_PROD_PREFIX_DRAIN_DEVICE",
-    "FPF_TC23_BGP_RESTART",
-    "FPF_TC24_FSDB_RESTART",
-    "FPF_TC25_WEDGE_AGENT_RESTART",
     "FPF_TC26_QSFP_SERVICE_RESTART",
-    "FPF_TC27_AGENT_COLDBOOT",
-    "FPF_TC28_FSDB_KILL",
-    "FPF_TC29_FSDB_GR_STOP30_REENABLE",
-    "FPF_TC30_FSDB_GR_STOP180_NO_REENABLE",
-    "FPF_TC31_FSDB_ENABLE_RECOVER",
+    "FPF_TC29B_FSDB_GR_REMOTE_WITHDRAW",
     "FPF_TC32_DOWNLINK_FLAPS",
     "FPF_TC33_GTSW_STSW_LINKS_DOWN",
     "FPF_TC35_STSW_UNDRAIN_REINJECT",
     "FPF_TC36_STSW_ALL_CONNECTIONS_DOWN",
     "FPF_TC37_NIC_SIDE_LINK_FLAP",
+    "FPF_TC37B_NIC_SIDE_CONTINUOUS_FLAP",
     "FPF_TC38_PERSISTENT_NDP_CLEAR",
     "FPF_TC39_FSDB_KILL_5MIN",
     "FPF_TC40_CONT_INTERFACE_FLAPS",
-    "FPF_TC41_LONGEVITY_PRISTINE",
     "FPF_TC42_CONT_FLAPS_WEDGE_RESTART",
     "FPF_TC43_CONT_FLAPS_BGP_RESTART",
     "FPF_TC44_CONT_FLAPS_FSDB_RESTART",
@@ -180,4 +165,7 @@ __all__ = [
     "FPF_TC52_HRT_RESTART",
     "FPF_TC54_STSW_DEVICE_DRAIN",
     "FPF_TC55_GTSW_DEVICE_REBOOT",
+    "FPF_TC56_CONT_FLAPS_QSFP_RESTART",
+    "FPF_TC57_CONT_FLAPS_QSFP_CRASH",
+    "FPF_TC58_MULTI_FBOSS_PROCESS_KILL_15S_5MIN",
 ]

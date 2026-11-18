@@ -25,9 +25,24 @@ unchanged from the pre-Wave-3B source; Wave 3C-3E will split them further.
 from __future__ import annotations
 
 import json
+import typing as t
 
 from ixia.ixia import types as ixia_types
-from taac.abstractions.physical_inventory import PhysicalInventory
+
+if t.TYPE_CHECKING:
+    # ``taac.abstractions`` is Meta-internal and is not shipped to OSS, but the
+    # only thing this module needs from it is the ``PhysicalInventory`` name for
+    # the annotation on ``create_bgp_dc_chronos_node_test_config``. ``from
+    # __future__ import annotations`` above makes annotations lazy strings, so
+    # the name is never resolved at runtime and the guard costs nothing in Meta
+    # mode. Importing it eagerly made this module — and therefore every config
+    # that imports it, e.g. ``wedge800_npi_test_config`` — unimportable under
+    # TAAC_OSS with ``No module named 'taac.abstractions'``. The sibling entry
+    # point ``build_bgp_dc_test_config`` takes plain kwargs and never touches
+    # the type, so OSS callers are unaffected.
+    from taac.abstractions.physical_inventory import (
+        PhysicalInventory,
+    )
 from taac.health_checks.healthcheck_definitions import (
     create_core_dumps_snapshot_check,
 )
@@ -54,6 +69,15 @@ from taac.testconfigs.routing.util.bgp_dc_tc_checks import (
 )
 from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.types import TestConfig
+
+
+# Playbooks that enable the UPLINK_BGP_INDUCED_ECMP_2 IXIA device group. The DUT
+# peers for that group exist only when one of them is selected: a configured
+# peer that never establishes keeps bgpd waiting the full EoR timer after an
+# ungraceful restart.
+_INDUCED_ECMP_2_PLAYBOOKS = frozenset(
+    {"test_ecmp_member_overload_limit", "test_ecmp_group_overload_limit"}
+)
 
 
 # =============================================================================
@@ -183,6 +207,7 @@ def build_bgp_dc_test_config(
     v4_downlink_prefix="101",
     v6_downlink_prefix="3000",
     ecmp_member_limit=11500,
+    stress_static_routes=True,
     additional_setup_tasks=None,
     allow_all_v4_policies=False,
     uplink_bgp_peer_type=None,
@@ -196,6 +221,8 @@ def build_bgp_dc_test_config(
     wedge_agent_restart_no_of_interations=None,
     convergence_wait_timeout=None,
     convergence_wait_interval=None,
+    bgp_hardening_timing_profile=None,
+    include_extended_bgp_hardening_playbooks=False,
 ):
     """Build the full conveyor test configuration for a BGP++ Chronos node.
 
@@ -239,6 +266,9 @@ def build_bgp_dc_test_config(
         playbooks = [
             playbook for playbook in playbooks if playbook.name in playbooks_selected
         ]
+    configure_induced_ecmp_2_peers = any(
+        playbook.name in _INDUCED_ECMP_2_PLAYBOOKS for playbook in playbooks
+    )
 
     ixia_downlink_source_ipv6 = f"{ixia_downlink_ic_parent_network_v6}::11"
 
@@ -524,13 +554,22 @@ def build_bgp_dc_test_config(
                     ),
                 ]
             ),
-            create_add_stress_static_routes_task(
-                hostname=device_name,
-                max_ecmp_group=ecmp_group_limit,
-                max_ecmp_members=ecmp_member_limit,
-                nh_prefix_1=f"{ixia_uplink_good_ndp_network}::/80",
-                lb_prefix_agg="6000:ab::/32",
-                device_group_count=good_ndp_entries_uplink,
+            # generate_prefix_nh_list_map caps each group at
+            # device_group_count // 4 members, so a platform with few uplink
+            # NDP nexthops cannot reach ecmp_member_limit; let it opt out.
+            *(
+                [
+                    create_add_stress_static_routes_task(
+                        hostname=device_name,
+                        max_ecmp_group=ecmp_group_limit,
+                        max_ecmp_members=ecmp_member_limit,
+                        nh_prefix_1=f"{ixia_uplink_good_ndp_network}::/80",
+                        lb_prefix_agg="6000:ab::/32",
+                        device_group_count=good_ndp_entries_uplink,
+                    )
+                ]
+                if stress_static_routes
+                else []
             ),
             create_configure_parallel_bgp_peers_task(
                 hostname=device_name,
@@ -636,18 +675,24 @@ def build_bgp_dc_test_config(
                                 "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::401",
                                 "gateway_increment_ip": "0:0:0:0::2",
                             },
-                            {
-                                "starting_ip": f"{ixia_uplink_ic_parent_network_v6}::500",
-                                "increment_ip": "0:0:0:0::2",
-                                "prefix_length": 127,
-                                "description": "Uplink IPv6 Peers - for BGP Induced ECMP - 2",
-                                "peer_group_name": peergroup_uplink_mimic_v6,
-                                "num_sessions": bgp_induced_ecmp_group_count,
-                                "remote_as_4_byte": remote_uplink_as_4byte,
-                                "remote_as_4_byte_step": 0,
-                                "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::501",
-                                "gateway_increment_ip": "0:0:0:0::2",
-                            },
+                            *(
+                                [
+                                    {
+                                        "starting_ip": f"{ixia_uplink_ic_parent_network_v6}::500",
+                                        "increment_ip": "0:0:0:0::2",
+                                        "prefix_length": 127,
+                                        "description": "Uplink IPv6 Peers - for BGP Induced ECMP - 2",
+                                        "peer_group_name": peergroup_uplink_mimic_v6,
+                                        "num_sessions": bgp_induced_ecmp_group_count,
+                                        "remote_as_4_byte": remote_uplink_as_4byte,
+                                        "remote_as_4_byte_step": 0,
+                                        "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::501",
+                                        "gateway_increment_ip": "0:0:0:0::2",
+                                    }
+                                ]
+                                if configure_induced_ecmp_2_peers
+                                else []
+                            ),
                             {
                                 "starting_ip": f"{ixia_uplink_ic_parent_network_v4}.0",
                                 "increment_ip": "0.0.0.2",

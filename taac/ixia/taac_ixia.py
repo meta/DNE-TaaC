@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
 import ipaddress
+import logging
 import os
 import threading
 import time
@@ -11,21 +12,35 @@ from threading import Thread
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
 from ixia.ixia import types as ixia_types
+from ixnetwork_restpy.assistants.statistics.row import Row as IxnStatRow
 from ixnetwork_restpy.assistants.statistics.statviewassistant import (
     StatViewAssistant as IxnStatViewAssistant,
 )
 from ixnetwork_restpy.files import Files
+from taac.abstractions.ixia_semantics import (
+    validate_ixia_peer_prefix_exclusion_ranges,
+)
 from taac.ixia.abstract_traffic_generator import (
     AbstractTrafficGenerator,
 )
-from taac.ixia.ixia import Ixia
+from taac.ixia.ixia import (  # oss-rewrite (force ShipIt re-export to taac.* root)
+    Ixia,
+    IxiaOperationTimeoutError,
+    IxiaSetupError,
+)
+from taac.ixia.ixia_tracer import TEARDOWN_PHASE
 from taac.utils.oss_taac_lib_utils import (  # oss-rewrite (force ShipIt re-export to taac.* root)
     none_throws,
     retryable,
 )
-from uhd_restpy.assistants.statistics.statviewassistant import (
-    StatViewAssistant as UhdStatViewAssistant,
-)
+
+if TAAC_OSS:
+    # UHD is unsupported in OSS mode and uhd_restpy is not distributed there.
+    UhdStatViewAssistant = IxnStatViewAssistant
+else:
+    from uhd_restpy.assistants.statistics.statviewassistant import (
+        StatViewAssistant as UhdStatViewAssistant,
+    )
 
 StatViewAssistant = t.Union[IxnStatViewAssistant, UhdStatViewAssistant]
 
@@ -39,12 +54,11 @@ StatViewAssistant = t.Union[IxnStatViewAssistant, UhdStatViewAssistant]
 # cpu_queue runs at the very first postcheck's IxiaPacketLossHealthCheck on
 # a busy chassis.
 #
-# Default remains 2s for back-compat with existing TestConfigs that rely on
-# per-stage Scuba telemetry freshness. Override via env
-# `TAAC_IXIA_SAMPLE_INTERVAL_S` to raise the cadence on a per-run basis;
-# set to `0` to disable the periodic sampler entirely (foreground HC stat
-# reads still work via the direct-snapshot fallback in `get_latest_stats`).
-_DEFAULT_SAMPLE_INTERVAL_FALLBACK_S = 2
+# Disable periodic sampling by default so it cannot contend with foreground
+# health-check snapshots. TestConfigs that need per-stage Scuba telemetry can
+# opt in via `TAAC_IXIA_SAMPLE_INTERVAL_S`; foreground health-check stat reads
+# continue through the direct-snapshot fallback in `get_latest_stats`.
+_DEFAULT_SAMPLE_INTERVAL_FALLBACK_S = 0
 try:
     DEFAULT_SAMPLE_RATE = int(
         os.environ.get(
@@ -60,6 +74,7 @@ VIEW_TO_IDENTIFIER: t.Dict[str, str] = {
 }
 
 TRAFFIC_ITEM_VIEW = "Traffic Item Statistics"
+FLOW_STATISTICS_VIEW = "Flow Statistics"
 
 PTP_DRILL_DOWN_VIEW = "PTP Drill Down"
 
@@ -70,8 +85,20 @@ PTP_PROTOCOL = "Protocol"
 PTP_DEVICE_NUM = "Device#"
 PTP_OFFSET_NS = "Offset [ns]"
 
+_DIRECT_STATS_LOCK_TIMEOUT_MAX_S = 30
+_CONFIG_FILE_REMOVE_MAX_ATTEMPTS = 3
+_CONFIG_FILE_REMOVE_RETRY_DELAY_SECONDS = 1.0
+
+logger: logging.Logger = logging.getLogger(__name__)
+
 
 class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
+    _traffic_preparation_pending: bool = False
+    _deferred_traffic_generation_complete: bool = False
+    _traffic_start_pending: bool = False
+    _traffic_view_readiness_pending: bool = False
+    _pending_traffic_regexes: t.Optional[t.List[str]] = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         Thread.__init__(self, daemon=True)
@@ -79,15 +106,26 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         self.captured_stats = defaultdict(dict)
         self.captured_stats_traffic = defaultdict(dict)
         self.captured_ptp_drill_down_stats = defaultdict(dict)
+        self._latest_packet_loss_sample_time: t.Dict[str, float] = defaultdict(float)
+        self._latest_traffic_rate_sample_time: t.Dict[str, float] = defaultdict(float)
         self.sample_time: int = DEFAULT_SAMPLE_RATE
         self.test_case_uuid: t.Optional[str] = None
         self.paused = False
         self._in_flight = False
+        self._traffic_preparation_pending = False
+        self._deferred_traffic_generation_complete = False
+        self._traffic_start_pending = False
+        self._traffic_view_readiness_pending = False
+        self._pending_traffic_regexes = None
         self.saved_configs = {}
-        self._snapshot_lock = threading.Lock()
 
         self.traffic_item_view_assistant = None
         self.ptp_drill_down_view_assistant = None
+
+        # Baseline of the cumulative Port Statistics fault counters, snapshotted
+        # by IxiaPortStatsHealthCheck so later runs compare deltas — faults
+        # accrued while links trained during setup must not fail postchecks.
+        self.port_fault_baseline: t.Optional[t.Dict[str, t.Dict[str, float]]] = None
 
         # Per-view StatViewAssistant cache. Created lazily by
         # get_or_create_stat_view(); reused across HC invocations so we pay the
@@ -129,9 +167,9 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         - `timeout` is honored ONLY on the first call for a given view_name.
           Subsequent callers receive the cached assistant constructed with the
           original timeout. If you need a different timeout, invalidate first.
-        - Concurrent first-time accesses to DIFFERENT views proceed in parallel
-          (each view has its own construction lock); only same-view first-time
-          accesses serialize.
+        - Per-view locks deduplicate construction. The session snapshot lock
+          serializes first-time construction across view names because IXIA uses
+          one snapshot resource for the session.
 
         Use this instead of `StatViewAssistant(self.ixnetwork, view_name)` from
         any code path that runs more than once per test (HCs, periodic tasks,
@@ -155,7 +193,8 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             stat_view_cls = (
                 UhdStatViewAssistant if self.is_uhd_chassis else IxnStatViewAssistant
             )
-            assistant = stat_view_cls(self.ixnetwork, view_name, Timeout=timeout)
+            with self.stat_view_snapshot():
+                assistant = stat_view_cls(self.ixnetwork, view_name, Timeout=timeout)
             with self._stat_view_index_lock:
                 self._stat_view_cache[view_name] = assistant
             return assistant
@@ -174,6 +213,16 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             else:
                 self._stat_view_cache.pop(view_name, None)
 
+    def clear_traffic_stats(self, wait_for_refresh: bool = True) -> None:
+        super().clear_traffic_stats(wait_for_refresh)
+        # The parent skips the clear when there are no traffic items.
+        if self.has_traffic_items():
+            # The clear zeroes the port fault counters too, so zero is now the
+            # true baseline. Keeping the pre-clear one would clamp every fault
+            # since to a zero delta: IxiaPacketLossHealthCheck clears at the end
+            # of the precheck, after the baseline is taken.
+            self.port_fault_baseline = {}
+
     @retryable(sleep_time=2, num_tries=100, print_ex=True)
     def start_capturing(self, sample_time: int):
         """
@@ -188,7 +237,7 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                     self._in_flight = True
                     timestamp = int(time.time())
                     uuid = none_throws(self.test_case_uuid)
-                    with self._snapshot_lock:
+                    with self.stat_view_snapshot():
                         # Capture traffic rate statistics
                         self._capture_traffic_rate_stats(
                             self.traffic_item_view_assistant, uuid, timestamp
@@ -220,6 +269,7 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             latest_stats_traffic = self.get_traffic_rate_statistics(view_assistant)
             self.captured_stats_traffic[uuid][timestamp] = latest_stats_traffic
             self.captured_stats_traffic[uuid]["latest"] = latest_stats_traffic
+            self._latest_traffic_rate_sample_time[uuid] = time.time()
         except Exception as e:
             self.logger.debug(
                 f"Encountered error when capturing traffic rate statistics: {e}"
@@ -240,6 +290,7 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             latest_stats = self.get_packet_loss_statistics(view_assistant)
             self.captured_stats[uuid][timestamp] = latest_stats
             self.captured_stats[uuid]["latest"] = latest_stats
+            self._latest_packet_loss_sample_time[uuid] = time.time()
         except Exception as e:
             self.logger.debug(
                 f"Encountered error when capturing packet loss statistics: {e}"
@@ -268,37 +319,138 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 f"Encountered error when capturing PTP drill down statistics: {e}"
             )
 
-    @retryable(sleep_time=2, num_tries=100)
+    # No retry: this runs under `stat_view_snapshot`, so retrying here holds the
+    # chassis snapshot lock while the very error being retried
+    # ("...already in progress") is caused by snapshot contention — a retry
+    # storm that prolongs it. The sampler's next tick is the retry; the
+    # foreground caller (`get_latest_stats`) retries at its own level.
     def get_packet_loss_statistics(
         self,
         view: StatViewAssistant,
     ) -> t.List:
-        stats = []
-        view_name = view._ViewName
-        for row in view.Rows:
-            stat = {}
-            stat["identifier"] = row[VIEW_TO_IDENTIFIER[view_name]]
-            if "Packet Loss Duration (ms)" in row.Columns:
-                raw = row["Packet Loss Duration (ms)"]
-                stat["packet_loss_duration"] = float(raw) if raw != "" else 0.0
-            if "Loss %" in row.Columns:
-                raw = row["Loss %"]
-                stat["packet_loss_percentage"] = float(raw) if raw != "" else 0.0
-            if "Frames Delta" in row.Columns:
-                raw = row["Frames Delta"]
-                stat["frame_delta"] = float(raw) if raw != "" else 0.0
-            stat["view"] = view_name
-            stats.append(stat)
-        return stats
+        with self.stat_view_snapshot():
+            return self._get_packet_loss_statistics_unlocked(view)
 
-    @retryable(sleep_time=2, num_tries=100)
-    def get_traffic_rate_statistics(
+    def _get_packet_loss_statistics_unlocked(
         self,
         view: StatViewAssistant,
     ) -> t.List:
         stats = []
         view_name = view._ViewName
-        for row in view.Rows:
+        for row in self._get_stat_view_rows(view):
+            stats.append(
+                self._packet_loss_stat(
+                    view_name,
+                    row,
+                )
+            )
+        return stats
+
+    def _get_stat_view_rows(self, view: StatViewAssistant) -> t.Any:
+        try:
+            return view.Rows
+        except Exception as error:
+            if "Snapshot DefaultSnapshotSettings already in progress" not in str(error):
+                raise
+            self.logger.warning(
+                f"IXIA CSV snapshot is busy for '{view._ViewName}'; "
+                "reading the live statistics pages directly"
+            )
+            return self._get_raw_stat_view_rows(view)
+
+    @staticmethod
+    def _get_raw_stat_view_rows(view: StatViewAssistant) -> IxnStatRow:
+        raw_view = t.cast(t.Any, view)._View
+        data = raw_view.Data
+        if not data.IsReady:
+            raise IxiaSetupError(
+                f"IXIA statistics view '{view._ViewName}' is not ready"
+            )
+        columns = list(data.ColumnCaptions)
+        rows = []
+        for page_number in range(1, max(1, int(data.TotalPages)) + 1):
+            data.CurrentPage = page_number
+            for raw_row in data.PageValues or []:
+                values = (
+                    raw_row[0]
+                    if len(raw_row) == 1 and isinstance(raw_row[0], list)
+                    else raw_row
+                )
+                rows.append(list(values))
+        return IxnStatRow(raw_view.Caption, columns, rows)
+
+    @staticmethod
+    def _packet_loss_stat(
+        view_name: str,
+        row: t.Any,
+    ) -> t.Dict[str, object]:
+        column_names = set(row.Columns)
+        identifier_column = VIEW_TO_IDENTIFIER[view_name]
+        stat: t.Dict[str, object] = {
+            "identifier": row[identifier_column],
+            "view": view_name,
+        }
+        numeric_columns = {
+            "Packet Loss Duration (ms)": "packet_loss_duration",
+            "Loss %": "packet_loss_percentage",
+            "Frames Delta": "frame_delta",
+        }
+        for column, key in numeric_columns.items():
+            if column in column_names:
+                raw = row[column]
+                stat[key] = float(t.cast(t.Any, raw)) if raw != "" else 0.0
+        return stat
+
+    def get_flow_packet_loss_statistics(self) -> t.List[t.Dict[str, object]]:
+        """Return cumulative loss per tracked flow from "Flow Statistics".
+
+        Each row is one traffic item and destination address when the item
+        tracks by destination; the caller diffs readings to attribute loss.
+        """
+        view = self.get_or_create_stat_view(FLOW_STATISTICS_VIEW, timeout=120)
+        stats: t.List[t.Dict[str, object]] = []
+        with self.stat_view_snapshot():
+            for row in self._get_stat_view_rows(view):
+                # IPv4 and IPv6 items share the view, so each row carries both
+                # destination columns and only its own family's is populated.
+                destination = next(
+                    (
+                        row[column]
+                        for column in row.Columns
+                        if column.endswith("Destination Address") and row[column]
+                    ),
+                    None,
+                )
+                if destination is None:
+                    continue
+                stats.append(
+                    {
+                        "traffic_item": row["Traffic Item"],
+                        "destination": destination,
+                        "frame_delta": float(row["Frames Delta"] or 0),
+                        "packet_loss_duration": float(
+                            row["Packet Loss Duration (ms)"] or 0
+                        ),
+                    }
+                )
+        return stats
+
+    # No retry — sampler-only; the next tick is the retry. See
+    # `get_packet_loss_statistics`.
+    def get_traffic_rate_statistics(
+        self,
+        view: StatViewAssistant,
+    ) -> t.List:
+        with self.stat_view_snapshot():
+            return self._get_traffic_rate_statistics_unlocked(view)
+
+    def _get_traffic_rate_statistics_unlocked(
+        self,
+        view: StatViewAssistant,
+    ) -> t.List:
+        stats = []
+        view_name = view._ViewName
+        for row in self._get_stat_view_rows(view):
             stat = {}
             stat["identifier"] = row[VIEW_TO_IDENTIFIER[view_name]]
             if "Tx Rate (Mbps)" in row.Columns:
@@ -309,19 +461,21 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             stats.append(stat)
         return stats
 
-    @retryable(sleep_time=2, num_tries=100)
+    # No retry — sampler-only; the next tick is the retry. See
+    # `get_packet_loss_statistics`.
     def get_ptp_drill_down_statistics(
         self, ptp_drill_down_view: StatViewAssistant
     ) -> t.Dict:
         ptp_stats = {}
-        for row in ptp_drill_down_view.Rows:
-            id = f"{row[PTP_PROTOCOL]}_{row[PTP_DEVICE_NUM]}"
-            stat = {
-                "clock_role": row[PTP_CONFIGURED_ROLE],
-                "offset_ns": int(row[PTP_OFFSET_NS]),
-                "ptp_state": row[PTP_STATE],
-            }
-            ptp_stats[id] = stat
+        with self.stat_view_snapshot():
+            for row in ptp_drill_down_view.Rows:
+                id = f"{row[PTP_PROTOCOL]}_{row[PTP_DEVICE_NUM]}"
+                stat = {
+                    "clock_role": row[PTP_CONFIGURED_ROLE],
+                    "offset_ns": int(row[PTP_OFFSET_NS]),
+                    "ptp_state": row[PTP_STATE],
+                }
+                ptp_stats[id] = stat
         return ptp_stats
 
     def log_to_scuba_ixia_packet_loss(self, test_case_uuid: str) -> None:
@@ -365,7 +519,6 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             except Exception as ex:
                 self.logger.error(f"Error logging result to scuba: {ex}")
 
-    @retryable(sleep_time=2, num_tries=3)
     def get_latest_stats(
         self,
         max_timeout_sec: int = 180,
@@ -377,35 +530,114 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             max_timeout_sec (int, optional): Maximum timeout in seconds. Defaults to 120.
             since_time (float, optional): If provided, only return stats with a timestamp >= since_time.
         """
+        test_case_uuid = none_throws(self.test_case_uuid)
         timeout_time = time.time() + max_timeout_sec
-        packet_loss_stats = self.captured_stats[self.test_case_uuid]
-        try:
-            # Short-circuit when the background sampler is disabled
-            # (sample_time=0 → self.capturing never gets set). The cached
-            # stats will never refresh, so don't waste max_timeout_sec waiting.
-            if not self.capturing:
-                raise Exception("Periodic sampler disabled; using direct snapshot")
+        packet_loss_stats = self.captured_stats[test_case_uuid]
+        if self.capturing:
             while not (
-                packet_loss_stats and next(reversed(packet_loss_stats)) > since_time
+                packet_loss_stats
+                and self._latest_packet_loss_sample_time.get(test_case_uuid, 0)
+                > since_time
             ):
                 if time.time() > timeout_time:
-                    raise Exception("Timeout waiting for stats")
+                    self.logger.warning(
+                        "Background IXIA packet-loss statistics did not refresh "
+                        f"within {max_timeout_sec}s; falling back to a direct read"
+                    )
+                    break
                 time.sleep(0.1)
-            return packet_loss_stats["latest"]
-        except Exception:
-            # Acquire lock to serialize with the background capture thread's
-            # TakeCsvSnapshot calls. The IXIA chassis only allows one snapshot
-            # at a time ("Snapshot DefaultSnapshotSettings already in progress").
-            # Use a timeout to avoid blocking the asyncio event loop indefinitely.
-            if not self._snapshot_lock.acquire(timeout=600):
-                self.logger.warning(
-                    "Timed out waiting for IXIA snapshot lock, proceeding without lock"
+            else:
+                return packet_loss_stats["latest"]
+
+        traffic_item_view_assistant = self.traffic_item_view_assistant
+        if traffic_item_view_assistant is None:
+            raise IxiaSetupError("IXIA traffic-item statistics view is not initialized")
+        lock_timeout_sec = max(
+            1, min(max_timeout_sec, _DIRECT_STATS_LOCK_TIMEOUT_MAX_S)
+        )
+        try:
+            with self.stat_view_snapshot(timeout_seconds=lock_timeout_sec):
+                return self._get_packet_loss_statistics_unlocked(
+                    traffic_item_view_assistant
                 )
-                return self.get_packet_loss_statistics(self.traffic_item_view_assistant)
-            try:
-                return self.get_packet_loss_statistics(self.traffic_item_view_assistant)
-            finally:
-                self._snapshot_lock.release()
+        except IxiaOperationTimeoutError as error:
+            if self.capturing:
+                raise
+            self.logger.warning(
+                "Timed out waiting for the IXIA snapshot lock; proceeding "
+                f"with the best-effort unlocked packet-loss read: {error}"
+            )
+            return self._get_packet_loss_statistics_unlocked(
+                traffic_item_view_assistant
+            )
+
+    def log_benchmark_rate_report(
+        self,
+        traffic_item_name: str,
+        frame_size_bytes: int,
+        directions: int = 2,
+    ) -> None:
+        """Log a normalized throughput report for one benchmark traffic item.
+
+        IXIA's Traffic Item Statistics ``Tx/Rx Rate (Mbps)`` count L2 frame
+        bits summed over every flow of the item — for the default
+        bidirectional snake item, both directions — so the raw numbers can
+        exceed the port's physical rate and never reach it at small frame
+        sizes. This normalizes to per-direction L2 Gbps and pps, and reports
+        forwarded %% as Rx/Tx (dimensionless, so it is immune to the L1/L2
+        overhead accounting). Report-only: raises nothing on zero traffic,
+        it just logs what it saw.
+
+        Args:
+            traffic_item_name: Traffic item to report (stats identifier).
+            frame_size_bytes: The item's fixed frame size (for pps).
+            directions: Flow directions summed in the item's stats (2 for the
+                default bidirectional item, 1 for unidirectional).
+        """
+        try:
+            if self.capturing:
+                stats = self.get_latest_stats_traffic()
+            else:
+                # Sampler disabled (TAAC_IXIA_SAMPLE_INTERVAL_S=0): the stats
+                # cache never fills and get_latest_stats_traffic would burn
+                # its timeout then raise. Take a direct snapshot instead; no
+                # lock needed since no background thread competes for it.
+                stats = self.get_traffic_rate_statistics(
+                    self.traffic_item_view_assistant
+                )
+        except Exception:
+            self.logger.warning(
+                f"[BENCHMARK] {traffic_item_name}: failed to read traffic "
+                "stats — no throughput report",
+                exc_info=True,
+            )
+            return
+        for stat in stats:
+            if stat.get("identifier") != traffic_item_name:
+                continue
+            tx_mbps = float(stat.get("Tx Rate") or 0.0)
+            rx_mbps = float(stat.get("Rx Rate") or 0.0)
+            directions = max(directions, 1)
+            tx_gbps_dir = tx_mbps / 1000.0 / directions
+            rx_gbps_dir = rx_mbps / 1000.0 / directions
+            rx_mpps_dir = (
+                rx_mbps * 1e6 / (frame_size_bytes * 8) / directions / 1e6
+                if frame_size_bytes > 0
+                else 0.0
+            )
+            forwarded_pct = (rx_mbps / tx_mbps * 100.0) if tx_mbps > 0 else 0.0
+            self.logger.warning(
+                f"[BENCHMARK] {traffic_item_name}: forwarded "
+                f"{forwarded_pct:.1f}% of offered | per direction: "
+                f"offered {tx_gbps_dir:.1f} Gbps L2, forwarded "
+                f"{rx_gbps_dir:.1f} Gbps L2 (~{rx_mpps_dir:.0f} Mpps) "
+                f"at {frame_size_bytes}B frames"
+            )
+            return
+        self.logger.warning(
+            f"[BENCHMARK] {traffic_item_name}: no traffic stats row found — "
+            "no throughput report"
+        )
 
     def get_latest_stats_traffic(
         self,
@@ -418,15 +650,46 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             max_timeout_sec (int, optional): Maximum timeout in seconds. Defaults to 120.
             since_time (float, optional): If provided, only return stats with a timestamp >= since_time.
         """
+        test_case_uuid = none_throws(self.test_case_uuid)
         timeout_time = time.time() + max_timeout_sec
-        traffic_rate_stats = self.captured_stats_traffic[self.test_case_uuid]
-        while not (
-            traffic_rate_stats and next(reversed(traffic_rate_stats)) > since_time
-        ):
-            if time.time() > timeout_time:
-                raise Exception("Timeout waiting for stats")
-            time.sleep(0.1)
-        return self.captured_stats_traffic[self.test_case_uuid]["latest"]
+        traffic_rate_stats = self.captured_stats_traffic[test_case_uuid]
+        if self.capturing:
+            while not (
+                traffic_rate_stats
+                and self._latest_traffic_rate_sample_time.get(test_case_uuid, 0)
+                > since_time
+            ):
+                if time.time() > timeout_time:
+                    self.logger.warning(
+                        "Background IXIA traffic-rate statistics did not refresh "
+                        f"within {max_timeout_sec}s; falling back to a direct read"
+                    )
+                    break
+                time.sleep(0.1)
+            else:
+                return traffic_rate_stats["latest"]
+
+        traffic_item_view_assistant = self.traffic_item_view_assistant
+        if traffic_item_view_assistant is None:
+            raise IxiaSetupError("IXIA traffic-item statistics view is not initialized")
+        lock_timeout_sec = max(
+            1, min(max_timeout_sec, _DIRECT_STATS_LOCK_TIMEOUT_MAX_S)
+        )
+        try:
+            with self.stat_view_snapshot(timeout_seconds=lock_timeout_sec):
+                return self._get_traffic_rate_statistics_unlocked(
+                    traffic_item_view_assistant
+                )
+        except IxiaOperationTimeoutError as error:
+            if self.capturing:
+                raise
+            self.logger.warning(
+                "Timed out waiting for the IXIA snapshot lock; proceeding "
+                f"with the best-effort unlocked traffic-rate read: {error}"
+            )
+            return self._get_traffic_rate_statistics_unlocked(
+                traffic_item_view_assistant
+            )
 
     def run(self):
         # sample_time=0 disables the background periodic sampler entirely.
@@ -445,11 +708,29 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         self.capturing = True
         self.start_capturing(self.sample_time)
 
-    def export_json_config(self) -> str:
-        json_config = self.session.Ixnetwork.ResourceManager.ExportConfig(
-            ["/descendant-or-self::*"],
-            False,
-            "json",
+    def export_json_config(self, *, baseline_invocation_id: str | None = None) -> str:
+        log_context = (
+            f" (invocation_id={baseline_invocation_id})"
+            if baseline_invocation_id is not None
+            else ""
+        )
+        started = time.monotonic()
+        self.logger.info(f"[IXIA CONFIG] Export started{log_context}")
+        try:
+            json_config = self.session.Ixnetwork.ResourceManager.ExportConfig(
+                ["/descendant-or-self::*"],
+                False,
+                "json",
+            )
+        except Exception:
+            self.logger.exception(
+                f"[IXIA CONFIG] Export failed after "
+                f"{time.monotonic() - started:.1f}s{log_context}"
+            )
+            raise
+        self.logger.info(
+            f"[IXIA CONFIG] Export completed in "
+            f"{time.monotonic() - started:.1f}s{log_context}"
         )
         return json_config
 
@@ -458,14 +739,51 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         json_config = self.export_json_config()
         self.saved_configs[self.test_case_uuid] = json_config
 
-    def import_json_config(self, json_config: str) -> None:
-        self.session.Ixnetwork.ResourceManager.ImportConfig(json_config, False)
-        self.start_and_verify_protocols()
-        self.enable_traffic()
-        self.start_traffic(regenerate_traffic_items=True)
-        time.sleep(5)
-        self.stop_traffic()
-        self.enable_traffic(enable=False)
+    def import_json_config(
+        self,
+        json_config: str,
+        *,
+        baseline_invocation_id: str | None = None,
+    ) -> None:
+        log_context = (
+            f" (invocation_id={baseline_invocation_id})"
+            if baseline_invocation_id is not None
+            else ""
+        )
+        import_started = time.monotonic()
+        self.logger.info(f"[IXIA CONFIG] Import started{log_context}")
+        try:
+            self.session.Ixnetwork.ResourceManager.ImportConfig(json_config, False)
+        except Exception:
+            self.logger.exception(
+                f"[IXIA CONFIG] Import failed after "
+                f"{time.monotonic() - import_started:.1f}s{log_context}"
+            )
+            raise
+        self.logger.info(
+            f"[IXIA CONFIG] Import completed in "
+            f"{time.monotonic() - import_started:.1f}s{log_context}"
+        )
+
+        activation_started = time.monotonic()
+        self.logger.info(f"[IXIA CONFIG] Post-import activation started{log_context}")
+        try:
+            self.start_and_verify_protocols()
+            self.enable_traffic()
+            self.start_traffic(regenerate_traffic_items=True)
+            time.sleep(5)
+            self.stop_traffic()
+            self.enable_traffic(enable=False)
+        except Exception:
+            self.logger.exception(
+                f"[IXIA CONFIG] Post-import activation failed after "
+                f"{time.monotonic() - activation_started:.1f}s{log_context}"
+            )
+            raise
+        self.logger.info(
+            f"[IXIA CONFIG] Post-import activation completed in "
+            f"{time.monotonic() - activation_started:.1f}s{log_context}"
+        )
 
     def import_saved_config(self) -> None:
         self.logger.info(f"Importing saved ixia config for {self.test_case_uuid}")
@@ -483,21 +801,19 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         significantly reducing IXIA setup time.
 
         Args:
-            config_path: Full path on chassis where to save the config
-                         (e.g., "/root/taac_configs/bag002_snc1.ixncfg")
+            config_path: Logical server-side path. RestPy stores its basename
+                in the API server's common file store.
 
         Returns:
             True if save was successful, False otherwise
         """
         try:
             self.logger.info(f"Saving IXIA config to chassis: {config_path}")
-            # `SaveConfig(Arg1)` expects a `Files` handle, not a raw string.
-            # Passing a bare string causes IxNetwork to fall back to its default
-            # storage location with just the basename — the directory part of
-            # our absolute path is silently dropped. Wrap with
-            # `Files(path, local_file=False)` so the server treats the value
-            # as an absolute server-side write target.
-            self.session.Ixnetwork.SaveConfig(Files(config_path, local_file=False))
+            # RestPy serializes a `Files` handle as its basename and stores it
+            # in the API server's common file store. Normalize explicitly so
+            # save, load, and removal always address the same server-side file.
+            remote_filename = os.path.basename(config_path)
+            self.session.Ixnetwork.SaveConfig(Files(remote_filename, local_file=False))
             self.logger.info(f"Successfully saved IXIA config: {config_path}")
             return True
         except Exception as e:
@@ -512,21 +828,19 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         setting up IXIA from scratch (~1-2 min vs ~10-15 min).
 
         Args:
-            config_path: Full path on chassis to load config from
-                         (e.g., "/root/taac_configs/bag002_snc1.ixncfg")
+            config_path: Logical server-side path. RestPy loads its basename
+                from the API server's common file store.
 
         Returns:
-            True if load was successful, False otherwise (fallback to full setup)
+            True only after the config is loaded, ports are assigned, and
+            protocols are started and verified; False otherwise.
         """
         try:
             self.logger.info(
                 f"Attempting to load IXIA config from chassis: {config_path}"
             )
-            # `LoadConfig(Arg1)` expects a `Files` handle — see SaveConfig
-            # comment above. `local_file=False` tells the server to read from
-            # the exact absolute path provided (not upload from client + load
-            # from server default).
-            self.session.Ixnetwork.LoadConfig(Files(config_path, local_file=False))
+            remote_filename = os.path.basename(config_path)
+            self.session.Ixnetwork.LoadConfig(Files(remote_filename, local_file=False))
             self.logger.info(f"Successfully loaded IXIA config: {config_path}")
 
             # LoadConfig restores vport definitions and their `location`
@@ -538,14 +852,43 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             # e2e 2026-06-05 when Tier 2 LoadConfig succeeded but protocol
             # start failed.
             self.session.Ixnetwork.AssignPorts(True)
+            try:
+                self.rehydrate_vport_indices(none_throws(self.ixia_config).port_configs)
+            except IxiaSetupError as e:
+                self.logger.warning(
+                    "Cached IXIA topology is incompatible with the requested "
+                    f"declarative config: {e}. Rejecting the cache hit so the "
+                    "caller can rebuild from scratch."
+                )
+                return False
             self.start_and_verify_protocols()
             return True
         except Exception as e:
-            self.logger.info(
-                f"Could not load IXIA config from {config_path}: {e}. "
-                "Will fall back to full setup."
-            )
+            self.logger.info(f"Could not load IXIA config from {config_path}: {e}")
             return False
+
+    def remove_config_from_chassis(self, config_path: str) -> bool:
+        """Remove an IXIA configuration saved in the API server file store."""
+        remote_filename = os.path.basename(config_path)
+        for attempt in range(1, _CONFIG_FILE_REMOVE_MAX_ATTEMPTS + 1):
+            try:
+                self.logger.info(f"Removing IXIA config from chassis: {config_path}")
+                self.session.Session.RemoveFile(remote_filename=remote_filename)
+                self.logger.info(f"Successfully removed IXIA config: {config_path}")
+                return True
+            except Exception as error:
+                if attempt == _CONFIG_FILE_REMOVE_MAX_ATTEMPTS:
+                    self.logger.error(
+                        f"Failed to remove IXIA config from chassis after "
+                        f"{attempt} attempts: {error}"
+                    )
+                    return False
+                self.logger.warning(
+                    f"Failed to remove IXIA config from chassis on attempt "
+                    f"{attempt}/{_CONFIG_FILE_REMOVE_MAX_ATTEMPTS}: {error}; retrying"
+                )
+                time.sleep(_CONFIG_FILE_REMOVE_RETRY_DELAY_SECONDS)
+        return False
 
     def enable_protocol(self, enable: bool = True) -> None:
         if enable:
@@ -557,7 +900,10 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
 
     def wait_for_view_assistants_ready(self):
         self.traffic_item_view_assistant = self._get_traffic_item_view()
-        self.ptp_drill_down_view_assistant = self._get_ptp_drill_down_view()
+        if self.ixia_config is not None and self.ixia_config.ptp_configs:
+            self.ptp_drill_down_view_assistant = self._get_ptp_drill_down_view()
+        else:
+            self.ptp_drill_down_view_assistant = None
 
     @retryable(sleep_time=5, num_tries=2)
     def _get_ptp_drill_down_view(
@@ -567,20 +913,23 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             UhdStatViewAssistant if self.is_uhd_chassis else IxnStatViewAssistant
         )
         ptp_enabled = False
-        protocols_summary = StatViewAssistant(self.ixnetwork, "Protocols Summary")
-        for row in protocols_summary.Rows:
-            if row["Protocol Type"] == "PTP":
-                self.logger.info("PTP is enabled in the ixia setup")
-                ptp_enabled = True
-                break
+        with self.stat_view_snapshot():
+            protocols_summary = StatViewAssistant(self.ixnetwork, "Protocols Summary")
+            for row in protocols_summary.Rows:
+                if row["Protocol Type"] == "PTP":
+                    self.logger.info("PTP is enabled in the ixia setup")
+                    ptp_enabled = True
+                    break
         if not ptp_enabled:
             self.logger.debug("PTP is not enabled in the ixia setup")
             return
         try:
-            _view = self.ixnetwork.Statistics.View.find(Caption=PTP_DRILL_DOWN_VIEW)
-            _view.Refresh()
-            view = StatViewAssistant(self.ixnetwork, PTP_DRILL_DOWN_VIEW, Timeout=60)
-            return view
+            with self.stat_view_snapshot():
+                _view = self.ixnetwork.Statistics.View.find(Caption=PTP_DRILL_DOWN_VIEW)
+                _view.Refresh()
+                return StatViewAssistant(
+                    self.ixnetwork, PTP_DRILL_DOWN_VIEW, Timeout=60
+                )
         except Exception as e:
             if "has no data available" in str(e):
                 raise e
@@ -588,9 +937,6 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
 
     @retryable(sleep_time=5, num_tries=2)
     def _get_traffic_item_view(self) -> t.Optional[StatViewAssistant]:
-        StatViewAssistant = (
-            UhdStatViewAssistant if self.is_uhd_chassis else IxnStatViewAssistant
-        )
         all_traffic_items = self.get_traffic_items()
         enabled_traffic_items = [
             traffic_item for traffic_item in all_traffic_items if traffic_item.Enabled
@@ -614,10 +960,7 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             )
             return
         try:
-            traffic_item_view = StatViewAssistant(
-                self.ixnetwork, TRAFFIC_ITEM_VIEW, Timeout=60
-            )
-            return traffic_item_view
+            return self.get_or_create_stat_view(TRAFFIC_ITEM_VIEW, timeout=60)
         except Exception as e:
             self.logger.error(f"Error getting traffic item views: {e}")
             raise e
@@ -817,10 +1160,117 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 values.append(address_at(index))
         return values
 
+    @staticmethod
+    def _formulaic_active_values(
+        mutation: t.Dict[str, t.Any],
+        *,
+        flatten_prefix_pool: bool,
+    ) -> t.Optional[t.List[bool]]:
+        if "inactive_peer_prefix_blocks" not in mutation:
+            return None
+        blocks = mutation["inactive_peer_prefix_blocks"]
+        if not isinstance(blocks, list):
+            raise ValueError("inactive_peer_prefix_blocks must be a list")
+        if not flatten_prefix_pool:
+            raise ValueError(
+                "inactive_peer_prefix_blocks requires flat prefix geometry"
+            )
+        if mutation["prefix"]["distribution"] != "shared":
+            raise ValueError(
+                "inactive_peer_prefix_blocks requires shared prefix distribution"
+            )
+
+        peer_count = mutation["peer_count"]
+        prefixes_per_peer = mutation["prefixes_per_peer"]
+        if not blocks:
+            return [True] * (peer_count * prefixes_per_peer)
+        ranges = []
+        validated_blocks = []
+        for block_index, block in enumerate(blocks):
+            validated_block = TaacIxia._validate_formulaic_inactive_block(
+                block,
+                block_index=block_index,
+                peer_count=peer_count,
+                prefixes_per_peer=prefixes_per_peer,
+            )
+            prefix_start_index, prefix_end_index, _peer_indices = validated_block
+            ranges.append((prefix_start_index, prefix_end_index - prefix_start_index))
+            validated_blocks.append(validated_block)
+        validate_ixia_peer_prefix_exclusion_ranges(
+            tuple(ranges),
+            prefixes_per_peer=prefixes_per_peer,
+        )
+
+        active_values = [True] * (peer_count * prefixes_per_peer)
+        for prefix_start_index, prefix_end_index, peer_indices in validated_blocks:
+            for peer_index in peer_indices:
+                peer_offset = peer_index * prefixes_per_peer
+                for prefix_index in range(prefix_start_index, prefix_end_index):
+                    active_values[peer_offset + prefix_index] = False
+        return active_values
+
+    @staticmethod
+    def _validate_formulaic_inactive_block(
+        block: t.Any,
+        *,
+        block_index: int,
+        peer_count: int,
+        prefixes_per_peer: int,
+    ) -> t.Tuple[int, int, t.List[int]]:
+        if not isinstance(block, dict):
+            raise ValueError(
+                f"inactive peer-prefix block {block_index} must be an object"
+            )
+        prefix_start_index = block.get("prefix_start_index")
+        prefix_count = block.get("prefix_count")
+        peer_indices = block.get("peer_indices")
+        if type(prefix_start_index) is not int:
+            raise ValueError(
+                f"inactive peer-prefix block {block_index} has a non-integer "
+                "prefix_start_index"
+            )
+        if type(prefix_count) is not int or prefix_count <= 0:
+            raise ValueError(
+                f"inactive peer-prefix block {block_index} must have a positive "
+                "integer prefix_count"
+            )
+        prefix_end_index = prefix_start_index + prefix_count
+        if prefix_start_index < 0 or prefix_end_index > prefixes_per_peer:
+            raise ValueError(
+                f"inactive peer-prefix block {block_index} prefix range "
+                f"[{prefix_start_index}, {prefix_end_index}) is outside "
+                f"[0, {prefixes_per_peer})"
+            )
+        if not isinstance(peer_indices, list) or not peer_indices:
+            raise ValueError(
+                f"inactive peer-prefix block {block_index} must have nonempty "
+                "peer_indices"
+            )
+        if any(type(peer_index) is not int for peer_index in peer_indices):
+            raise ValueError(
+                f"inactive peer-prefix block {block_index} has a non-integer peer index"
+            )
+        if peer_indices != sorted(set(peer_indices)):
+            raise ValueError(
+                f"inactive peer-prefix block {block_index} peer_indices must be "
+                "sorted and unique"
+            )
+        if peer_indices[-1] >= peer_count or peer_indices[0] < 0:
+            raise ValueError(
+                f"inactive peer-prefix block {block_index} has a peer index outside "
+                f"[0, {peer_count})"
+            )
+        if len(peer_indices) >= peer_count:
+            raise ValueError(
+                f"inactive peer-prefix block {block_index} must leave at least "
+                "one active peer"
+            )
+        return prefix_start_index, prefix_end_index, peer_indices
+
     def _prepare_formulaic_bgp_routes(
         self,
         mutations: t.List[t.Dict[str, t.Any]],
-    ) -> t.List[t.Tuple[t.Any, t.Any, t.Any, t.Any]]:
+    ) -> t.List[t.Tuple[t.Any, t.Any, t.Any, t.Any, t.Any]]:
         prepared = []
         seen = set()
         for mutation in mutations:
@@ -902,7 +1352,13 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 key,
                 mutation.get("route_attributes"),
             )
-            prepared.append((mutation, shell, prefix_values, next_hop_values))
+            active_values = self._formulaic_active_values(
+                mutation,
+                flatten_prefix_pool=flatten_prefix_pool,
+            )
+            prepared.append(
+                (mutation, shell, prefix_values, next_hop_values, active_values)
+            )
         return prepared
 
     def _apply_formulaic_bgp_route(
@@ -989,57 +1445,319 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 )
             stopped.pop()
 
+    @staticmethod
+    def _formulaic_bgp_component_key(
+        component_name: str,
+        component: t.Any,
+    ) -> t.Tuple[str, str]:
+        href = getattr(component, "href", None)
+        if not isinstance(href, str) or not href:
+            raise RuntimeError(
+                f"formulaic BGP {component_name} lacks a stable IXIA href"
+            )
+        return component_name, href
+
+    @staticmethod
+    def _normalize_formulaic_active_value(value: object, *, index: int) -> bool:
+        """Decode RestPy's documented bool text; reject undocumented aliases."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "true":
+                return True
+            if normalized == "false":
+                return False
+        raise ValueError(f"unsupported IXIA boolean value at index {index}: {value!r}")
+
+    def _verify_formulaic_bgp_active_mask(
+        self,
+        mutation: t.Dict[str, t.Any],
+        active_values: t.List[bool],
+    ) -> t.Tuple[str, str, str]:
+        key = (
+            mutation["device_group_name"],
+            mutation["prefix_pool_name"],
+            mutation["afi"],
+        )
+        try:
+            fresh_route = self._find_formulaic_bgp_route_shell(*key)[3]
+            fresh_route.refresh()
+            raw_readback = list(fresh_route.Active.Values)
+            readback = [
+                self._normalize_formulaic_active_value(active, index=index)
+                for index, active in enumerate(raw_readback)
+            ]
+        except Exception as error:
+            raise RuntimeError(
+                f"formulaic BGP Active readback failed for {key!r}: {error!r}"
+            ) from error
+        if readback != active_values:
+            mismatch_index = next(
+                (
+                    index
+                    for index, (actual, expected) in enumerate(
+                        zip(readback, active_values)
+                    )
+                    if actual != expected
+                ),
+                min(len(readback), len(active_values)),
+            )
+            actual_value = (
+                raw_readback[mismatch_index]
+                if mismatch_index < len(raw_readback)
+                else "<missing>"
+            )
+            expected_value = (
+                active_values[mismatch_index]
+                if mismatch_index < len(active_values)
+                else "<missing>"
+            )
+            raise RuntimeError(
+                f"formulaic BGP Active readback mismatch for {key!r}: "
+                f"expected {len(active_values)} cells, got "
+                f"{len(readback)}; first mismatch at {mismatch_index}: "
+                f"expected {expected_value!r}, got {actual_value!r}"
+            )
+        return key
+
     def configure_formulaic_bgp_routes(
         self,
         mutations: t.List[t.Dict[str, t.Any]],
     ) -> None:
-        """Apply formulaic route intent using each mutation's requested geometry."""
+        """Apply formulaic route intent using each mutation's requested geometry.
+
+        After an Active-mask write, failed verification leaves only components
+        with unverified route keys stopped and quarantines the session.
+        """
+        with self.mutation_transaction():
+            self._configure_formulaic_bgp_routes_in_transaction(mutations)
+
+    def _configure_formulaic_bgp_routes_in_transaction(  # noqa: C901
+        self,
+        mutations: t.List[t.Dict[str, t.Any]],
+    ) -> None:
         prepared = self._prepare_formulaic_bgp_routes(mutations)
         if not prepared:
             return
 
+        component_keys_by_route_key: t.Dict[
+            t.Tuple[str, str, str],
+            t.Tuple[
+                t.Tuple[str, t.Union[str, int]],
+                t.Tuple[str, t.Union[str, int]],
+            ],
+        ] = {}
+        for mutation, shell, _prefixes, _next_hops, _active_values in prepared:
+            route_key = (
+                mutation["device_group_name"],
+                mutation["prefix_pool_name"],
+                mutation["afi"],
+            )
+            component_keys = []
+            for component_name, component in (
+                ("device group", shell[0]),
+                ("network group", shell[1]),
+            ):
+                component_key = self._formulaic_bgp_component_key(
+                    component_name,
+                    component,
+                )
+                component_keys.append(component_key)
+            component_keys_by_route_key[route_key] = (
+                component_keys[0],
+                component_keys[1],
+            )
         stopped = []
+        stopped_key_set = set()
+        pending_route_keys: t.Dict[
+            t.Tuple[str, t.Union[str, int]], t.Set[t.Tuple[str, str, str]]
+        ] = {}
         try:
             for (
                 _mutation,
                 (device_group, network_group, _pool, _route),
                 _prefix_values,
                 _next_hop_values,
+                _active_values,
             ) in prepared:
-                device_group.Stop()
-                stopped.append(("device group", device_group))
-                network_group.Stop()
-                stopped.append(("network group", network_group))
+                for component_name, component in (
+                    ("device group", device_group),
+                    ("network group", network_group),
+                ):
+                    component_key = self._formulaic_bgp_component_key(
+                        component_name,
+                        component,
+                    )
+                    if component_key in stopped_key_set:
+                        continue
+                    component.Stop()
+                    stopped.append((component_name, component))
+                    stopped_key_set.add(component_key)
 
-            for mutation, shell, prefix_values, next_hop_values in prepared:
+            for (
+                mutation,
+                shell,
+                prefix_values,
+                next_hop_values,
+                active_values,
+            ) in prepared:
                 self._apply_formulaic_bgp_route(
                     mutation,
                     shell,
                     prefix_values,
                     next_hop_values,
                 )
+                if active_values is not None:
+                    route_key = (
+                        mutation["device_group_name"],
+                        mutation["prefix_pool_name"],
+                        mutation["afi"],
+                    )
+                    for component_key in component_keys_by_route_key[route_key]:
+                        pending_route_keys.setdefault(component_key, set()).add(
+                            route_key
+                        )
+                    shell[3].Active.ValueList(active_values)
 
             self.apply_changes()
+            if pending_route_keys:
+                verification_errors = []
+                for mutation, _shell, _prefixes, _next_hops, active_values in prepared:
+                    if active_values is None:
+                        continue
+                    route_key = (
+                        mutation["device_group_name"],
+                        mutation["prefix_pool_name"],
+                        mutation["afi"],
+                    )
+                    try:
+                        self._verify_formulaic_bgp_active_mask(
+                            mutation,
+                            active_values,
+                        )
+                        for component_key in component_keys_by_route_key[route_key]:
+                            pending_route_keys[component_key].discard(route_key)
+                        inactive_count = sum(not active for active in active_values)
+                        operation_logger = getattr(self, "logger", None) or logger
+                        operation_logger.info(
+                            "Verified formulaic BGP Active mask for %r: "
+                            "%d active, %d inactive cells across %d peers and "
+                            "%d prefixes",
+                            route_key,
+                            len(active_values) - inactive_count,
+                            inactive_count,
+                            mutation["peer_count"],
+                            mutation["prefixes_per_peer"],
+                        )
+                    except Exception as error:
+                        error.add_note(
+                            f"formulaic BGP Active verification failed for "
+                            f"{route_key!r}"
+                        )
+                        verification_errors.append(error)
+                if len(verification_errors) == 1:
+                    raise verification_errors[0]
+                if verification_errors:
+                    raise ExceptionGroup(
+                        "formulaic BGP Active verification failed",
+                        verification_errors,
+                    )
             self._restart_formulaic_bgp_routes(stopped, best_effort=False)
-        except Exception:
-            self._restart_formulaic_bgp_routes(stopped, best_effort=True)
+        except Exception as error:
+            pending_component_keys = {
+                component_key
+                for component_key, route_keys in pending_route_keys.items()
+                if route_keys
+            }
+            if pending_component_keys:
+                restartable = [
+                    item
+                    for item in stopped
+                    if self._formulaic_bgp_component_key(*item)
+                    not in pending_component_keys
+                ]
+                retained = [
+                    item
+                    for item in stopped
+                    if self._formulaic_bgp_component_key(*item)
+                    in pending_component_keys
+                ]
+                retained_descriptions = []
+                for component_name, component in retained:
+                    component_key = self._formulaic_bgp_component_key(
+                        component_name,
+                        component,
+                    )
+                    retained_descriptions.append(
+                        f"{component_name} {component_key[1]!r} "
+                        f"for {sorted(pending_route_keys[component_key])!r}"
+                    )
+                retained_components = ", ".join(retained_descriptions)
+                reason = (
+                    "formulaic BGP Active mutation failed verification; "
+                    f"unverified route components remain stopped: {retained_components}"
+                )
+                # Quarantine is persistent session state checked by subsequent
+                # mutation transactions; retained components require explicit
+                # session recovery before any further programming can proceed.
+                self._quarantine_session(reason)
+                error.add_note(reason)
+                self._restart_formulaic_bgp_routes(
+                    restartable,
+                    best_effort=True,
+                )
+                operation_logger = getattr(self, "logger", None) or logger
+                for retained_description in retained_descriptions:
+                    operation_logger.error(
+                        "Formulaic BGP component retained stopped after session "
+                        "quarantine: %s",
+                        retained_description,
+                    )
+                operation_logger.exception(reason)
+            else:
+                self._restart_formulaic_bgp_routes(
+                    stopped,
+                    best_effort=True,
+                )
             raise
 
     # DLB hardening helpers used by its existing CSV injection workflows.
+    def _walk_device_groups(self, parent) -> t.Iterator[t.Any]:
+        """Yield every DeviceGroup under ``parent``, nested ones included.
+
+        Chained topologies put the route-bearing DeviceGroup *inside* the
+        NDP-bearing one, so a single-level ``topo.DeviceGroup.find()`` walk
+        never sees it and the pool lookup raises "No NetworkGroup named ..."
+        for a pool that is plainly in the session.
+        """
+        for dg in parent.DeviceGroup.find():
+            yield dg
+            yield from self._walk_device_groups(dg)
+
     def _find_dlb_ng_dg(self, pool_name: str):
         """Locate the named NetworkGroup, its parent DeviceGroup, its
         single Ipv6PrefixPool, and its BgpV6IPRouteProperty in the
         IxNetwork session.
 
+        Matches the NetworkGroup name first, then falls back to the
+        Ipv6PrefixPools name: IxNetwork renames auto-created children (it
+        appends a " 1" suffix), so the NG and its pool routinely disagree and
+        an NG-name-only match misses the pool the caller means.
+
         Returns (parent_dg, parent_ng, parent_pool, route_prop) or
         raises RuntimeError if no matching NG is found.
         """
+        seen: t.List[str] = []
         for topo in self.ixnetwork.Topology.find():
-            for dg in topo.DeviceGroup.find():
+            for dg in self._walk_device_groups(topo):
                 for ng in dg.NetworkGroup.find():
-                    if ng.Name != pool_name:
-                        continue
                     pool = next(iter(ng.Ipv6PrefixPools.find()), None)
+                    seen.append(ng.Name)
+                    if ng.Name != pool_name and not (
+                        pool is not None and pool.Name == pool_name
+                    ):
+                        continue
                     if pool is None:
                         raise RuntimeError(f"NG {pool_name!r} has no Ipv6PrefixPools")
                     rp = next(iter(pool.BgpV6IPRouteProperty.find()), None)
@@ -1048,7 +1766,20 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                             f"pool in NG {pool_name!r} has no BgpV6IPRouteProperty"
                         )
                     return dg, ng, pool, rp
-        raise RuntimeError(f"No NetworkGroup named {pool_name!r} found")
+        raise RuntimeError(
+            f"No NetworkGroup named {pool_name!r} found; session has "
+            f"{sorted(set(seen))!r}"
+        )
+
+    @staticmethod
+    def _safe_pool_name(pool_name: str) -> str:
+        """Filesystem-safe form of an IxNetwork pool name.
+
+        Live pool names carry spaces and '/' (e.g. ``vf_gpu /64 pool 1``).
+        Interpolated raw into the scratch path, the '/' reads as a directory
+        separator and open() fails with ENOENT on a directory nobody created.
+        """
+        return "".join(c if c.isalnum() or c in "-_." else "_" for c in pool_name)
 
     def _mutate_pool_config_only(
         self, csv_path: str, pool_name: str
@@ -1069,35 +1800,107 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
 
         prefixes_in_order: t.List[str] = []
         nhs_in_order: t.List[str] = []
+        plens_in_order: t.List[str] = []
+        counts_in_order: t.List[int] = []
+        steps_in_order: t.List[str] = []
         with open(csv_path) as f:
             reader = _csv.reader(f)
-            next(reader, None)
-            for row in reader:
-                if len(row) < 2:
+            header = next(reader, None)
+            if header is None:
+                raise ValueError(f"CSV {csv_path} is empty")
+            # Resolve columns by header NAME, never by position. The
+            # block-consolidated CSV inserts AddressCount/AddressStep between
+            # PrefixLength and the next hop, so positional row[0]/row[1] reads
+            # a prefix LENGTH as a next-hop address and every path is dropped.
+            cols = {name.strip().lower(): i for i, name in enumerate(header)}
+
+            def _col(*names: str) -> t.Optional[int]:
+                for n in names:
+                    if n in cols:
+                        return cols[n]
+                return None
+
+            i_addr = _col("address", "prefix")
+            i_nh = _col("ipv6 next hop", "next hop", "nexthop")
+            i_plen = _col("prefixlength", "prefix length")
+            i_count = _col("addresscount", "address count")
+            i_step = _col("addressstep", "address step")
+            if i_addr is None or i_nh is None:
+                raise ValueError(
+                    f"CSV {csv_path} header {header!r} lacks an 'Address' "
+                    "and/or 'Ipv6 Next Hop' column"
+                )
+            # Every per-row list must stay index-aligned with
+            # prefixes_in_order, because they are handed to IxNetwork as
+            # parallel ValueLists. A row long enough for Address and the next
+            # hop but SHORT of a later resolved column would otherwise append
+            # to some lists and not others, making PrefixLength shorter than
+            # the prefix list and silently shifting every subsequent mask.
+            # Reject such a row instead of mis-masking the injection.
+            required_len = (
+                max(i for i in (i_addr, i_nh, i_plen, i_count, i_step) if i is not None)
+                + 1
+            )
+            for row_number, row in enumerate(reader, start=2):
+                if not row or all(not cell.strip() for cell in row):
                     continue
-                prefixes_in_order.append(row[0])
-                nhs_in_order.append(row[1])
+                if len(row) < required_len:
+                    raise ValueError(
+                        f"CSV {csv_path} line {row_number} has {len(row)} "
+                        f"columns but header {header!r} needs at least "
+                        f"{required_len}; refusing to inject a row set whose "
+                        "per-column ValueLists would be misaligned"
+                    )
+                prefixes_in_order.append(row[i_addr].strip())
+                nhs_in_order.append(row[i_nh].strip())
+                if i_plen is not None:
+                    plens_in_order.append(row[i_plen].strip())
+                if i_count is not None:
+                    counts_in_order.append(int(row[i_count]))
+                if i_step is not None:
+                    steps_in_order.append(row[i_step].strip())
         total_rows = len(prefixes_in_order)
         if total_rows == 0:
             raise ValueError(f"CSV {csv_path} has no data rows")
         distinct_prefixes = len(dict.fromkeys(prefixes_in_order))
         w = total_rows // distinct_prefixes if distinct_prefixes else 0
+
+        # Block-consolidated CSV: one row stands for AddressCount prefixes.
+        # NumberOfAddresses is a pool-wide SCALAR (PrefixAddrStep is not), so
+        # rows disagreeing on the count would silently mis-expand.
+        block_count = 1
+        if counts_in_order:
+            uniq = set(counts_in_order)
+            if len(uniq) > 1:
+                raise ValueError(
+                    "Ipv6PrefixPools.NumberOfAddresses is pool-wide, so all "
+                    f"rows must share AddressCount; CSV {csv_path} mixes "
+                    f"{sorted(uniq)}. Split them into separate pools."
+                )
+            block_count = counts_in_order[0]
         self.logger.info(
             f"[_mutate_pool_config_only] {csv_path}: rows={total_rows} "
-            f"distinct_prefixes={distinct_prefixes} width={w}"
+            f"distinct_prefixes={distinct_prefixes} width={w} "
+            f"addresses_per_row={block_count} "
+            f"advertised_prefixes={distinct_prefixes * block_count}"
         )
 
         scratch_dir = "/tmp/taac_dlb_inject"
         _os.makedirs(scratch_dir, exist_ok=True)
-        prefix_col = _os.path.join(scratch_dir, f"_pfx_{pool_name}.csv")
-        nh_col = _os.path.join(scratch_dir, f"_nh_{pool_name}.csv")
+        safe_pool_name = self._safe_pool_name(pool_name)
+        prefix_col = _os.path.join(scratch_dir, f"_pfx_{safe_pool_name}.csv")
+        nh_col = _os.path.join(scratch_dir, f"_nh_{safe_pool_name}.csv")
         with open(prefix_col, "w") as f:
             f.write("\n".join(prefixes_in_order) + "\n")
         with open(nh_col, "w") as f:
             f.write("\n".join(nhs_in_order) + "\n")
 
         dg, ng, pool, route_prop = self._find_dlb_ng_dg(pool_name)
-        self.logger.info(f"[_mutate_pool_config_only] target dg={dg.Name} ng={ng.Name}")
+        dg_mult = max(1, int(getattr(dg, "Multiplier", 1) or 1))
+        self.logger.info(
+            f"[_mutate_pool_config_only] target dg={dg.Name} ng={ng.Name} "
+            f"dg.Multiplier={dg_mult} -> ng.Multiplier={total_rows // dg_mult}"
+        )
 
         MAX_STOP_RETRY = 4
         for attempt in range(MAX_STOP_RETRY):
@@ -1114,7 +1917,12 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                     f"ng.Stop() attempt {attempt + 1} failed (continuing): {e}"
                 )
             try:
-                ng.Multiplier = total_rows
+                # Rows are split across the DeviceGroup's own devices: the
+                # session materialises dg.Multiplier * ng.Multiplier route
+                # entries. Assigning total_rows here overshoots by exactly
+                # dg.Multiplier and the surplus entries take garbage values
+                # off the end of the ValueLists.
+                ng.Multiplier = max(1, total_rows // dg_mult)
                 break
             except Exception as e:
                 msg = str(e)
@@ -1129,12 +1937,42 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                     _time.sleep(3)
                     continue
                 raise
-        pool.NumberOfAddresses = 1
-        pool.PrefixLength.Single(64)
+        pool.NumberOfAddresses = block_count
+        if plens_in_order:
+            # PrefixLength is a Multivalue, so a mixed-mask set (e.g. /64
+            # VF-GPU plus /46 remote-L2) rides in one pool. Single(64) would
+            # silently re-mask every non-/64 row.
+            pool.PrefixLength.ValueList(plens_in_order)
+        else:
+            pool.PrefixLength.Single(64)
         pool.NetworkAddress.ValueList(prefix_col)
+        if steps_in_order:
+            # Numeric, in units of the prefix size -- PrefixAddrStep rejects
+            # an address literal with "Value <x> is not number".
+            pool.PrefixAddrStep.ValueList(steps_in_order)
         route_prop.Ipv6NextHop.ValueList(nh_col)
+        # Advertise the CSV's next hop verbatim; left on its default the route
+        # property substitutes the session's own local address and every
+        # prefix collapses onto a single path.
+        for attr_name, attr_value in (
+            ("NextHopType", "manual"),
+            ("NextHopIPType", "ipv6"),
+        ):
+            attr = getattr(route_prop, attr_name, None)
+            if attr is None:
+                continue
+            try:
+                attr.Single(attr_value)
+            except Exception as e:
+                self.logger.warning(
+                    f"route_prop.{attr_name}.Single({attr_value!r}) failed: {e}"
+                )
         route_prop.EnableAddPath.Single(True)
-        route_prop.MvNextHopCount.Single(w)
+        # ONE next hop per row. The add-path width comes from emitting w rows
+        # per prefix, each with its own AddPathId -- setting this to w instead
+        # makes IxNetwork expect w next hops *within* a row and advertise only
+        # the first, yielding 1 path per prefix instead of w.
+        route_prop.MvNextHopCount.Single(1)
         route_prop.AddPathId.ValueList([str(i + 1) for i in range(total_rows)])
         try:
             route_prop.Active.Single(True)
@@ -1316,6 +2154,105 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 self.logger.warning(f"ng.Stop() failed: {e}")
         self.logger.info(f"[toggle_dlb_pool_enabled] {pool_name} → enabled={enabled}")
 
+    def set_dlb_route_pools_active(
+        self,
+        pool_names: t.Sequence[str],
+        active: bool,
+        expected_route_cells: int,
+        settle_time_after_start: int = 10,
+    ) -> t.Dict[str, t.Dict[str, int]]:
+        """Atomically advertise or withdraw exact DLB BGP route pools.
+
+        Whole-DeviceGroup flaps conflate peer lifecycle with route lifecycle.
+        Case 18 needs the narrower operation: stop only the route-bearing
+        components, update each BGP route property's ``Active`` multivalue,
+        apply all pools once, and fail closed unless every expanded cell reads
+        back the requested value. Components restart only after verification.
+        """
+        self._validate_dlb_route_pool_toggle_args(
+            pool_names,
+            expected_route_cells,
+            settle_time_after_start,
+        )
+
+        shells = {
+            pool_name: self._find_dlb_ng_dg(pool_name) for pool_name in pool_names
+        }
+        for device_group, network_group, _pool, _route in shells.values():
+            device_group.Stop()
+            network_group.Stop()
+        for _device_group, _network_group, _pool, route in shells.values():
+            route.Active.Single(active)
+        self.apply_changes()
+
+        state: t.Dict[str, t.Dict[str, int]] = {}
+        for pool_name in pool_names:
+            route = self._find_dlb_ng_dg(pool_name)[3]
+            state[pool_name] = self._read_dlb_route_pool_active_state(
+                pool_name,
+                route,
+                active,
+                expected_route_cells,
+            )
+
+        for device_group, network_group, _pool, _route in shells.values():
+            network_group.Start()
+            device_group.Start()
+        if settle_time_after_start:
+            time.sleep(settle_time_after_start)
+        if active:
+            for device_group, _network_group, _pool, _route in shells.values():
+                self._send_arp_ns_on_device_group(device_group)
+        self.logger.info(
+            "Verified DLB route-pool Active state active=%s: %s", active, state
+        )
+        return state
+
+    @staticmethod
+    def _validate_dlb_route_pool_toggle_args(
+        pool_names: t.Sequence[str],
+        expected_route_cells: int,
+        settle_time_after_start: int,
+    ) -> None:
+        if not pool_names:
+            raise ValueError("pool_names must contain at least one exact pool name")
+        if len(set(pool_names)) != len(pool_names):
+            raise ValueError("pool_names must not contain duplicates")
+        if expected_route_cells <= 0:
+            raise ValueError("expected_route_cells must be positive")
+        if settle_time_after_start < 0:
+            raise ValueError("settle_time_after_start must be non-negative")
+
+    def _read_dlb_route_pool_active_state(
+        self,
+        pool_name: str,
+        route: t.Any,
+        active: bool,
+        expected_route_cells: int,
+    ) -> t.Dict[str, int]:
+        route.refresh()
+        values = list(route.Active.Values)
+        if len(values) != expected_route_cells:
+            raise RuntimeError(
+                f"DLB pool {pool_name!r} Active readback has {len(values)} "
+                f"cells; expected {expected_route_cells}"
+            )
+        mismatches = [
+            (index, value)
+            for index, value in enumerate(values)
+            if not self._enabled_readback_matches(value, active)
+        ]
+        if mismatches:
+            index, value = mismatches[0]
+            raise RuntimeError(
+                f"DLB pool {pool_name!r} Active readback mismatch at cell "
+                f"{index}: expected {active!r}, got {value!r}"
+            )
+        return {
+            "route_cells": len(values),
+            "active_cells": len(values) if active else 0,
+        }
+
     def configure_traffic_item(
         self,
         traffic_item_name: str,
@@ -1323,6 +2260,7 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         line_rate_type: t.Optional[ixia_types.RateType] = None,
         frame_size_setting: t.Optional[ixia_types.FrameSize] = None,
         qos_config: t.Optional[ixia_types.QoSConfig] = None,
+        transmission_control: t.Optional[ixia_types.TransmissionControl] = None,
     ) -> None:
         self.configure_traffic_items_on_the_fly(
             traffic_item_name,
@@ -1330,24 +2268,170 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             line_rate_type,
             frame_size_setting,
             qos_config,
+            transmission_control,
         )
         self.apply_traffic()
+
+    def get_port_configs(self) -> t.List[ixia_types.PortConfig]:
+        """Return the declarative thrift port configs (incl. L1/PFC maps)."""
+        if self.ixia_config is None:
+            return []
+        return list(self.ixia_config.port_configs or [])
+
+    def get_traffic_item_configs(self) -> t.List[ixia_types.TrafficItem]:
+        """Return the declarative thrift traffic-item configs."""
+        if self.ixia_config is None:
+            return []
+        return list(self.ixia_config.traffic_items or [])
+
+    def is_traffic_running(self) -> bool:
+        """Treat Keysight's statistics-start transition as running traffic.
+
+        On high-scale traffic, IxNetwork can report the global
+        ``IsTrafficRunning`` flag as false for several minutes while every
+        enabled item is already in ``startedWaitingForStats``. Retrying the
+        whole start path in that state re-applies and restarts the items,
+        preventing the statistics view from ever becoming ready.
+        """
+        if super().is_traffic_running():
+            return True
+        enabled_items = [item for item in self.get_traffic_items() if item.Enabled]
+        if enabled_items and all(
+            item.State in {"started", "startedWaitingForStats"}
+            for item in enabled_items
+        ):
+            self.logger.debug(
+                "Treating enabled IXIA traffic items in %s as running while "
+                "statistics initialize",
+                [item.State for item in enabled_items],
+            )
+            return True
+        return False
+
+    def apply_traffic(self) -> None:
+        """Serialize `Traffic.Apply()` against chassis CSV snapshots.
+
+        Apply tears down and rebuilds the stat views, and the chassis allows
+        exactly one CSV snapshot at a time. A snapshot taken while Apply is in
+        flight fails — and Apply always wins the collision, so nothing surfaces
+        at `start_traffic` time. The damage stays invisible (the sampler logs
+        capture failures at DEBUG and keeps its previous state) until a
+        foreground consumer needs stats, which is why it presented as a health
+        check failing minutes later.
+
+        Evidence (2026-08-12 run): all six "Args do not match signature" errors
+        fell inside an Apply window, and the three steps where `start_traffic`
+        early-returned without applying produced none.
+
+        Taking the session-wide `stat_view_snapshot` lock makes Apply and
+        snapshots mutually exclusive. Safe to nest: `_snapshot_lock` is an
+        `RLock`, so callers already holding it (e.g. via `prepare_traffic`)
+        re-enter rather than deadlock.
+        """
+        with self.stat_view_snapshot():
+            super().apply_traffic()
 
     def prepare_traffic(self) -> None:
         self.regenerate_traffic_items()
         self.apply_traffic()
         self.wait_for_view_assistants_ready()
 
+    def _complete_deferred_traffic_start(self) -> None:
+        self._traffic_preparation_pending = False
+        self._deferred_traffic_generation_complete = False
+        self._traffic_start_pending = False
+        self._traffic_view_readiness_pending = True
+        self._pending_traffic_regexes = None
+
+    def start_traffic(self, regenerate_traffic_items: bool = False) -> None:
+        if self._traffic_start_pending and self.is_traffic_running():
+            self._complete_deferred_traffic_start()
+        if (
+            self._traffic_view_readiness_pending
+            and not self._traffic_preparation_pending
+            and self.is_traffic_running()
+        ):
+            self.wait_for_view_assistants_ready()
+            self._traffic_view_readiness_pending = False
+            return
+        deferred = self._traffic_preparation_pending
+        if deferred and self.is_traffic_running():
+            self.logger.info(
+                "Stopping retained-session traffic before deferred regeneration"
+            )
+            self.stop_traffic()
+        if deferred and not self._traffic_start_pending:
+            # Generate temporary replacements before removing the retained,
+            # generated items that they supersede.
+            if not self._deferred_traffic_generation_complete:
+                self.regenerate_traffic_items()
+                self._deferred_traffic_generation_complete = True
+            self.finalize_deferred_traffic_item_replacements()
+            self.enable_traffic(
+                self._pending_traffic_regexes,
+                apply_changes=False,
+            )
+            # Enabling deferred items modifies their compiled traffic state.
+            # Regenerate after selection so Apply uses the selected flow groups.
+            self.regenerate_traffic_items()
+            self._traffic_start_pending = True
+        super().start_traffic(
+            regenerate_traffic_items=(
+                regenerate_traffic_items
+                and not deferred
+                and not self._traffic_start_pending
+            )
+        )
+        if self._traffic_start_pending:
+            if not self.is_traffic_running():
+                raise RuntimeError(
+                    "IXIA traffic did not start after deferred preparation; "
+                    "traffic start remains pending for retry"
+                )
+            self._complete_deferred_traffic_start()
+        if self._traffic_view_readiness_pending:
+            self.wait_for_view_assistants_ready()
+            self._traffic_view_readiness_pending = False
+
     def begin_test_case(self, test_case_uuid, traffic_regexes=None) -> None:
         self.test_case_uuid = test_case_uuid
-        self.enable_traffic(traffic_regexes)
-        self.prepare_traffic()
-        if not self.capturing:
-            self.start()
+        # The REST trace is cut here so the calls this test case drives land
+        # in their own slice, separate from setup and from its neighbours.
+        self.rotate_api_trace_phase(self._current_playbook_name or test_case_uuid)
+        if self._defer_traffic_preparation:
+            self._traffic_preparation_pending = True
+            self._deferred_traffic_generation_complete = False
+            self._traffic_start_pending = False
+            self._traffic_view_readiness_pending = False
+            self._pending_traffic_regexes = (
+                list(traffic_regexes) if traffic_regexes is not None else None
+            )
+            self.logger.info(
+                "Deferred routed traffic selection, generation, and apply until "
+                "the first post-setup traffic start"
+            )
         else:
-            self.paused = False
+            self._traffic_preparation_pending = False
+            self._deferred_traffic_generation_complete = False
+            self._traffic_start_pending = False
+            self._traffic_view_readiness_pending = False
+            self._pending_traffic_regexes = None
+            self.enable_traffic(traffic_regexes, apply_changes=False)
+            self.prepare_traffic()
+        if self.sample_time > 0:
+            if not self.capturing:
+                self.start()
+            else:
+                self.paused = False
+        else:
+            self.logger.info(
+                "TaacIxia periodic stat sampler DISABLED "
+                "(sample_time=0; using direct live statistics reads)"
+            )
+            self.capturing = False
 
     def end_test_case(self, traffic_regexes=None) -> None:
         self.paused = True
         self.log_to_scuba_ixia_packet_loss(none_throws(self.test_case_uuid))
         self.enable_traffic(traffic_regexes, enable=False)
+        self.rotate_api_trace_phase(TEARDOWN_PHASE)

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-# pyre-unsafe
 import asyncio
 import datetime
 import ipaddress
@@ -10,10 +9,12 @@ import logging
 import os
 import random
 import re
+import shlex
 import socket
 import time
 import typing
 import typing as t
+import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from enum import Enum
@@ -63,6 +64,13 @@ else:
 import neteng.fboss.bgp_thrift.types as fboss_bgp_thrift_types
 import neteng.fboss.fsdb.types as fsdb_types
 import pexpect
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
@@ -70,10 +78,35 @@ if not TAAC_OSS:
     from fboss.fb_thrift_clients import FbossAgentClient
 
 
-from neteng.fboss.bgp.client.canonical_rib_py3 import (
-    get_rib_entries,
-    get_rib_subprefixes,
-)
+try:
+    from neteng.fboss.bgp.client.canonical_rib_py3 import (
+        get_rib_entries,
+        get_rib_subprefixes,
+    )
+except ModuleNotFoundError as exc:
+    _canonical_rib_module = "neteng.fboss.bgp.client.canonical_rib_py3"
+    if not TAAC_OSS or not (
+        exc.name == _canonical_rib_module
+        or _canonical_rib_module.startswith(f"{exc.name}.")
+    ):
+        raise
+    # The neteng.fboss.bgp subpackage (canonical_rib_py3) is generated only
+    # in Meta-internal builds; the OSS thrift build does not produce it. Keep
+    # the driver module importable in OSS by deferring the failure to call
+    # time — only the RIB-dump helpers below actually need it.
+    async def get_rib_entries(*_args, **_kwargs):
+        raise NotImplementedError(
+            "neteng.fboss.bgp.client.canonical_rib_py3 is unavailable in this "
+            "build; get_rib_entries is not supported."
+        )
+
+    async def get_rib_subprefixes(*_args, **_kwargs):
+        raise NotImplementedError(
+            "neteng.fboss.bgp.client.canonical_rib_py3 is unavailable in this "
+            "build; get_rib_subprefixes is not supported."
+        )
+
+
 from neteng.fboss.bgp_attr.types import TBgpAfi, TIpPrefix
 from neteng.fboss.bgp_route_types.types import TBgpPath, TRibEntry
 from neteng.fboss.bgp_thrift.clients import TBgpService
@@ -84,10 +117,27 @@ from neteng.fboss.bgp_thrift.types import (
     TGetUpdateGroupInfoResponse,
     TOriginatedRoute,
 )
+
+# This response type is absent from the OSS fboss thrift-defs build (drift vs
+# Meta-internal). It is used only as a local-variable annotation below, so an
+# inert placeholder keeps the driver importable without masking unrelated
+# import failures from this generated module.
+if not TAAC_OSS:
+    TGetUpdateGroupSummariesResponse = (
+        fboss_bgp_thrift_types.TGetUpdateGroupSummariesResponse
+    )
+else:
+    TGetUpdateGroupSummariesResponse = getattr(
+        fboss_bgp_thrift_types,
+        "TGetUpdateGroupSummariesResponse",
+        type("TGetUpdateGroupSummariesResponse", (), {}),
+    )
+
 from neteng.fboss.ctrl.clients import FbossCtrl
 from neteng.fboss.ctrl.types import (
     AggregatePortThrift,
     ArpEntryThrift,
+    BootType,
     DsfSessionThrift,
     FabricEndpoint,
     HwObjectType,
@@ -115,9 +165,39 @@ from neteng.fboss.switch_config.types import DsfNode
 from neteng.fboss.transceiver import thrift_types as transceiver_types
 from neteng.fboss.transceiver.thrift_types import ReadRequest, TransceiverIOParameters
 
+if not TAAC_OSS:
+    from neteng.fboss.bgp.client.canonical_rib_py3 import (
+        get_rib_entries,
+        get_rib_subprefixes,
+    )
+    from neteng.fboss.bgp_thrift.types import TGetUpdateGroupSummariesResponse
+else:
+
+    async def get_rib_entries(
+        client: TBgpService,
+        afi: TBgpAfi,
+        *,
+        rpc_options: t.Any = None,
+    ) -> t.List[TRibEntry]:
+        return list(await client.getRibEntries(afi, rpc_options=rpc_options))
+
+    async def get_rib_subprefixes(
+        client: TBgpService,
+        prefix: str,
+        *,
+        rpc_options: t.Any = None,
+    ) -> t.List[TRibEntry]:
+        return list(await client.getRibSubprefixes(prefix, rpc_options=rpc_options))
+
 # =============================================================================
 # TAAC / DNE (OSS-compatible)
 # =============================================================================
+from taac.constants import (  # oss-rewrite (force ShipIt re-export to taac.* root)
+    FBOSS_COLD_BOOT_ONCE_FILE,
+    FBOSS_COLD_BOOT_ONCE_GLOBS,
+    FBOSS_SPLIT_HW_COLD_BOOT_ONCE_FILE_FMT,
+    FBOSS_SPLIT_SW_COLD_BOOT_ONCE_FILE,
+)
 from taac.driver.abstract_switch import (
     AbstractSwitch,
     TestingException,
@@ -134,12 +214,15 @@ from taac.driver.driver_constants import (
     CoreDumpFiles,
     DEFAULT_AGENT_REMOTE_PORT,
     DEFAULT_THRIFT_TIMEOUT,
+    describe_interface_state,
     DeviceDrainState,
     EcmpGroup,
     EGRESS_PKT_RATE_KEY,
     EGRESS_RATE_KEY,
     FBOSS_CRITICAL_CORE_DUMPS,
     FBOSS_CRITICAL_CORE_NON_SELECTOR,
+    FbossOsType,
+    FBOSS_SYSTEMCTL_SERVICE_NAME_MAP,
     FbossSystemctlServiceName,
     FSDB_PORT,
     HW_AGENT_BASE_PORT,
@@ -148,6 +231,7 @@ from taac.driver.driver_constants import (
     InterfaceEventState,
     InterfaceFlapMethod,
     InterfaceInfo,
+    InterfaceState,
     NextHopAttributes,
     OPENR_FIB_AGENT_PORT,
     OPENR_THRIFT_CALL_TIMEOUT,
@@ -178,30 +262,46 @@ from taac.utils.common import (
     async_everpaste_str,
     create_everpaste_fburl,
 )
+from taac.utils import meta_internal_bridge_client
 from taac.utils.oss_driver_utils import AsyncSSHClient
 from taac.utils.oss_taac_lib_utils import (
     async_memoize_timed,
     async_retryable,
     await_sync,
     none_throws,
+    oss_agent_restart_paths_enabled,
+    oss_config_patcher_enabled,
     retryable,
     to_fb_fqdn,
     to_fb_uqdn,
 )
+from taac.test_as_a_config import types as taac_types
 
 if not TAAC_OSS:
     from openr.py.openr.cli.utils.commands import OpenrCtrlCmd
     from openr.py.openr.clients.openr_client import get_openr_ctrl_cpp_client
+    from openr.thrift.KvStore import thrift_types as kv_store_types
     from openr.thrift.KvStore.thrift_types import KeyDumpParams
     from openr.thrift.OpenrCtrl.thrift_types import (
         AdjacenciesFilter,
         AdvertisedRouteFilter,
         ReceivedRouteFilter,
     )
-    from openr.thrift.Platform.types import FibClient
+    from openr.thrift.Platform.thrift_types import FibClient
     from openr.thrift.Types.thrift_types import AdjacencyDatabase
 from thrift.py3.exceptions import Error as ThriftError
 from thrift.python.exceptions import Error as ThriftPythonError
+
+
+def _is_fboss_method_rate_limit(error: BaseException) -> bool:
+    return isinstance(error, (ThriftError, ThriftPythonError)) and any(
+        signature in str(error)
+        for signature in (
+            "ThriftMethoRateLimit",
+            "ThriftMethodRateLimit",
+            "reject thrift methd due to rate limit:",
+        )
+    )
 
 
 def fb_gethostbyname(hostname: str) -> str:
@@ -237,6 +337,22 @@ class MnpuNotEnabled(Exception):
     pass
 
 
+def _to_interface_state(port_status: PortStatus) -> InterfaceState:
+    # PortStatus.present is deprecated in ctrl.thrift, so transceiver presence
+    # is read off transceiverIdx instead.
+    return InterfaceState(
+        oper_up=port_status.up,
+        admin_enabled=port_status.enabled,
+        speed_mbps=port_status.speedMbps,
+        profile_id=port_status.profileID,
+        has_transceiver=port_status.transceiverIdx is not None,
+    )
+
+
+def _interface_drain_patcher_name(interface: str) -> str:
+    return f"interface-drain-{interface}"
+
+
 class FbossSwitch(AbstractSwitch):
     def __init__(
         self,
@@ -248,6 +364,7 @@ class FbossSwitch(AbstractSwitch):
     ) -> None:
         super().__init__(hostname, logger)
         self._client_provider = client_provider
+        self._native_netos_wedge_agent_units: Optional[Tuple[str, ...]] = None
 
     def _get_fboss_agent_client(self) -> ContextManager[Any]:
         """
@@ -419,7 +536,7 @@ class FbossSwitch(AbstractSwitch):
                     )
                     dump_transceiver_i2c_log_list.append(dump_transceiver_i2c_log)
                     self.logger.info(f"{dump_transceiver_i2c_log=}")
-                return dump_transceiver_i2c_log
+                return dump_transceiver_i2c_log_list
         except Exception as ex:
             raise QsfpThriftException(
                 f"Error occured during a thrift call for dumpTransceiverI2cLog {ex}"
@@ -461,8 +578,8 @@ class FbossSwitch(AbstractSwitch):
         Reloads the agent config and ensure the wedge_agent is stable and
         converged (CONFIGURED state)
         """
-        with self._get_fboss_agent_client() as agent_client:
-            agent_client.reloadConfig()
+        async with self.async_agent_client as agent_client:
+            await agent_client.reloadConfig()
             self.logger.info(
                 f"Successfully reloaded the agent config on {self.hostname} "
             )
@@ -476,13 +593,13 @@ class FbossSwitch(AbstractSwitch):
         to agent warmboot
         """
         try:
-            with self._get_fboss_agent_client() as agent_client:
-                agent_client.reloadConfig()
+            async with self.async_agent_client as agent_client:
+                await agent_client.reloadConfig()
                 self.logger.info(
                     f"Successfully reloaded the agent config on {self.hostname} "
                 )
         except Exception:
-            self.async_restart_service(FbossSystemctlServiceName.AGENT)
+            await self.async_restart_service(FbossSystemctlServiceName.AGENT)
         await self.async_wait_for_agent_state_configured()
 
     @async_retryable(retries=30, sleep_time=6, exceptions=(Exception,))
@@ -542,7 +659,6 @@ class FbossSwitch(AbstractSwitch):
         self, aggregated_interface_name: str
     ) -> bool:
         all_aggregated_port_info = (
-            # pyre-ignore: currently it only supports fboss devices
             await self.async_get_all_aggregated_port_info()
         )
         for agg_port_info in all_aggregated_port_info:
@@ -637,6 +753,53 @@ class FbossSwitch(AbstractSwitch):
             if name in intf_map_result
         }
 
+    async def async_get_interfaces_state(
+        self, interface_names: List[str]
+    ) -> Dict[str, InterfaceState]:
+        """
+        Used to fetch the admin and operational state of the given interfaces
+        on FBOSS devices. An aggregated interface reports only its operational
+        state, since FBOSS exposes no admin state for one.
+        """
+        intf_map_result: Dict[
+            str, InterfaceInfo
+        ] = await self.async_get_all_interfaces_info()
+        aggregated_interfaces = {}
+        if any(name not in intf_map_result for name in interface_names):
+            aggregated_interfaces = (
+                await self.async_get_all_aggregated_interfaces()
+            )
+        interface_state_map: Dict[str, InterfaceState] = {}
+        ports_status_map = await self.async_get_port_status()
+        for interface_name in interface_names:
+            # If the interface is an aggregated interface then its operational
+            # status is checked
+            if aggregated_interfaces and interface_name in aggregated_interfaces:
+                interface_state_map[interface_name] = InterfaceState(
+                    oper_up=await self.async_get_aggregated_interface_status(
+                        interface_name
+                    )
+                )
+                continue
+
+            # Otherwise, both states of the unbundled physical port are read
+            port_vlan_id_res: InterfaceInfo = intf_map_result[interface_name]
+            port_id = port_vlan_id_res.port_id
+            if port_id not in ports_status_map:
+                raise InterfaceNotFoundError(
+                    f"Please check if the Port ID {port_id} exists on "
+                    f"{self.hostname} for interface {interface_name}"
+                )
+            interface_state_map[interface_name] = _to_interface_state(
+                ports_status_map[port_id]
+            )
+        for interface_name, interface_state in interface_state_map.items():
+            self.logger.info(
+                f"Interface {interface_name} on {self.hostname}: "
+                f"{describe_interface_state(interface_state)}"
+            )
+        return interface_state_map
+
     async def async_get_interfaces_status(
         self, interface_names: List[str], skip_logging: bool = False
     ) -> Dict[str, bool]:
@@ -645,43 +808,11 @@ class FbossSwitch(AbstractSwitch):
         devices. True is returned if the interface is UP and False will be
         returned for UP/DOWN or DOWN/DOWN state.
         """
-        oper_state = None
-        # agg_intf_map is a dict that has the mapping between aggregated interfaces
-        # and its member ports
-        aggregated_interfaces = await self.async_get_all_aggregated_interfaces()
-        intf_map_result: Dict[
-            str, InterfaceInfo
-        ] = await self.async_get_all_interfaces_info()
-        interface_status_map: Dict[str, bool] = {}
-        ports_status_map = await self.async_get_port_status()
-        for interface_name in interface_names:
-            # If the interface is an aggregated interface then its operational
-            # status is checked
-            if aggregated_interfaces and interface_name in aggregated_interfaces:
-                oper_state = await self.async_get_aggregated_interface_status(
-                    interface_name
-                )
-
-            # Otherwise, the operational status of the unbundled physical port
-            # is checked
-            else:
-                port_vlan_id_res: InterfaceInfo = intf_map_result[interface_name]
-                port_id = port_vlan_id_res.port_id
-                if port_id not in ports_status_map:
-                    raise InterfaceNotFoundError(
-                        f"Please check if the Port ID {port_id} exists on "
-                        f"{self.hostname} for interface {interface_name}"
-                    )
-                oper_state = ports_status_map[port_id].up
-            if oper_state:
-                self.logger.info(f"Interface {interface_name} on {self.hostname} is UP")
-                interface_status_map[interface_name] = True
-            else:
-                self.logger.info(
-                    f"Interface {interface_name} on {self.hostname} is DOWN"
-                )
-                interface_status_map[interface_name] = False
-        return interface_status_map
+        interface_state_map = await self.async_get_interfaces_state(interface_names)
+        return {
+            interface_name: interface_state.oper_up
+            for interface_name, interface_state in interface_state_map.items()
+        }
 
     async def async_get_interfaces_speed_in_Gbps(
         self,
@@ -1053,6 +1184,163 @@ class FbossSwitch(AbstractSwitch):
         )
         return True
 
+    # ----------------------------------------------------------------------
+    # COOP python-patcher contract.
+    #
+    # Meta mode registers patchers with the COOP agent (FbossSwitchInternal
+    # overrides these). OSS serves the same register/unregister/apply contract
+    # against the config files -- see oss_coop_patcher.py for the mechanism.
+    #
+    # oss_coop_patcher is imported per call: it needs the agent_config thrift
+    # bindings, and a module-level import would make every FbossSwitch import
+    # depend on them.
+    # ----------------------------------------------------------------------
+
+    def _require_oss_config_patcher(self) -> None:
+        """The OSS patcher is pure-OSS only (see ``oss_config_patcher_enabled``):
+        internal runs use COOP through FbossSwitchInternal, and the
+        TAAC_OSS_META_INTERNAL container targets COOP-managed Meta devices."""
+        if not oss_config_patcher_enabled():
+            raise NotImplementedError(
+                "COOP patcher operations are not available here. Use "
+                "FbossSwitchInternal for COOP-based patcher operations; the OSS "
+                "file-based patcher runs only under TAAC_OSS without "
+                "TAAC_OSS_META_INTERNAL."
+            )
+
+    async def async_register_python_patcher(
+        self,
+        config_name: str,
+        patcher_name: str,
+        py_func_name: str,
+        patcher_args: Dict[str, Any],
+        patcher_desc: str = "",
+        auto_remediate_failure: bool = False,
+    ) -> str:
+        """Add a patcher to the config's working copy; ``async_apply_patchers``
+        installs it. Returns the working copy's path, which lives under
+        ``$TAAC_OSS_PATCHER_DIR`` (see ``oss_coop_patcher.default_patcher_dir``).
+
+        The signature matches ``FbossSwitchInternalMixin``'s, which
+        ``FbossSwitchInternal`` inherits ahead of this one;
+        ``auto_remediate_failure`` has nothing to remediate here."""
+        self._require_oss_config_patcher()
+        from taac.driver import oss_coop_patcher
+
+        working_path = await oss_coop_patcher.async_register(
+            self,
+            oss_coop_patcher.OssPatcher(
+                name=patcher_name,
+                config_name=config_name,
+                py_func_name=py_func_name,
+                args=dict(patcher_args or {}),
+                desc=patcher_desc,
+            ),
+        )
+        self.logger.info(
+            f"[oss-patcher] registered {patcher_name} ({py_func_name}) "
+            f"on {self.hostname}:{config_name}"
+        )
+        return working_path
+
+    async def async_coop_list_patchers(
+        self, config_name: Optional[str] = None
+    ) -> List[Any]:
+        self._require_oss_config_patcher()
+        from taac.driver import oss_coop_patcher
+
+        return oss_coop_patcher.list_patchers(self.hostname, config_name or "agent")
+
+    async def async_coop_unregister_patchers(
+        self,
+        patcher_name: str,
+        config_name: Optional[str] = None,
+        auto_remediate_failure: bool = False,
+    ) -> None:
+        """Unregister a config patcher."""
+        self._require_oss_config_patcher()
+        from taac.driver import oss_coop_patcher
+
+        # Without a config_name, drop the name from every config holding it. An
+        # unknown name is a no-op: callers unregister defensively before adding.
+        config_names = (
+            [config_name]
+            if config_name is not None
+            else oss_coop_patcher.find_configs(self.hostname, patcher_name)
+        )
+        for name in config_names:
+            if await oss_coop_patcher.async_unregister(self, name, patcher_name):
+                self.logger.info(
+                    f"[oss-patcher] unregistered {patcher_name} on "
+                    f"{self.hostname}:{name}"
+                )
+
+    async def async_apply_patchers(
+        self,
+        apply_patcher_method: Optional[Any] = None,
+        coldboot: bool = False,
+        restart_services: bool = True,
+        **kwargs,
+    ) -> None:
+        """Install every changed config, then activate per ``apply_patcher_method``
+        (a ``taac_types.ApplyPatcherMethod``) or cold-boot the agent.
+        ``restart_services=False`` installs without activating, for a caller
+        that reloads or restarts the agent itself."""
+        self._require_oss_config_patcher()
+        from taac.driver import oss_coop_patcher
+
+        await oss_coop_patcher.async_apply(
+            self, apply_patcher_method, coldboot, activate=restart_services
+        )
+
+    async def async_change_speed_patcher(
+        self,
+        intf_names: List[str],
+        desired_speed: str,
+        profile_id: str,
+        patcher_name: str,
+        patcher_desc: str = "",
+    ) -> str:
+        """Register COOP's ``change_speed`` patcher on the agent config for
+        ``intf_names``; ``desired_speed`` and ``profile_id`` are PortSpeed and
+        PortProfileID names. Returns the patcher name. The signature matches
+        ``FbossSwitchInternalMixin``'s."""
+        self._require_oss_config_patcher()
+        await self.async_register_python_patcher(
+            "agent",
+            patcher_name,
+            "change_speed",
+            {
+                "intfs": ",".join(intf_names),
+                "speed": desired_speed,
+                "profile_id": profile_id,
+            },
+            patcher_desc,
+        )
+        return patcher_name
+
+    async def async_unregister_python_patcher(
+        self, patcher_name: str, config_name: str
+    ) -> None:
+        """Unregister one patcher from ``config_name``; the signature matches
+        ``FbossSwitchInternalMixin``'s."""
+        self._require_oss_config_patcher()
+        await self.async_coop_unregister_patchers(patcher_name, config_name)
+
+    async def async_get_platform_mapping(self) -> Any:
+        """The agent's platform mapping (ports, their supported profiles and the
+        ports each profile subsumes)."""
+        async with self.async_agent_client as client:
+            return await client.getPlatformMapping()
+
+    async def async_restore_patched_configs(self) -> None:
+        """Drop every patcher, put each baseline left on the box back, and
+        warmboot the agent / restart bgpd for what was restored (teardown)."""
+        self._require_oss_config_patcher()
+        from taac.driver import oss_coop_patcher
+
+        await oss_coop_patcher.async_restore_baselines(self)
+
     async def async_register_patcher_to_shut_ports_persistently(
         self, patcher_name: str, interfaces: List[str], additional_desc=None
     ) -> None:
@@ -1076,18 +1364,27 @@ class FbossSwitch(AbstractSwitch):
         patcher_desc: str = "",
         is_patcher_name_uuid_needed: bool = True,
     ) -> str:
-        raise NotImplementedError(
-            "Static route patcher not available in OSS mode. "
-            "Use FbossSwitchInternal for COOP-based patcher operations."
+        """Register COOP's ``add_static_routes`` agent patcher and reload the
+        agent config, as ``FbossSwitchInternalMixin`` does. The routes live in
+        the agent config, so later applies keep them and teardown's unregister
+        withdraws them. Returns the patcher name."""
+        self._require_oss_config_patcher()
+        if is_patcher_name_uuid_needed:
+            patcher_name += uuid.uuid4().hex
+        await self.async_register_python_patcher(
+            "agent",
+            patcher_name,
+            "add_static_routes",
+            {
+                prefix: json.dumps(next_hops)
+                for prefix, next_hops in prefix_to_next_hops_map.items()
+            },
+            patcher_desc,
         )
-
-    async def async_coop_unregister_patchers(
-        self, patcher_name: str, config_name: Optional[str] = None
-    ) -> None:
-        raise NotImplementedError(
-            "COOP patcher operations not available in OSS mode. "
-            "Use FbossSwitchInternal for COOP-based patcher operations."
+        await self.async_apply_patchers(
+            apply_patcher_method=taac_types.ApplyPatcherMethod.AGENT_RELOAD
         )
+        return patcher_name
 
     async def async_get_ip_route(
         self, ip: str, print_interfaces: bool = True
@@ -1203,7 +1500,11 @@ class FbossSwitch(AbstractSwitch):
 
         return (v4_addr, v6_addr)
 
-    @async_retryable(retries=3, sleep_time=10, exceptions=(ThriftError,))
+    @async_retryable(
+        retries=3,
+        sleep_time=10,
+        exceptions=(ThriftError, ThriftPythonError),
+    )
     async def get_specific_interface_info(self, interface: str) -> PortInfoThrift:
         """
         Provides portInfo details for a particular interface on the host.
@@ -1216,6 +1517,8 @@ class FbossSwitch(AbstractSwitch):
         try:
             async with self.async_agent_client as client:
                 return await client.getPortInfo(port_id)
+        except (ThriftError, ThriftPythonError):
+            raise
         except Exception as ex:
             raise Exception(
                 f"Thrift error on {self.hostname} calling getPortInfo: {ex}"
@@ -1244,7 +1547,10 @@ class FbossSwitch(AbstractSwitch):
         if is_multi_switch:
             match service_name:
                 case FbossSystemctlServiceName.AGENT.value:
-                    command = "pkill -9 -f fboss_"
+                    # The units run with KillMode=process and their main
+                    # process is agent_executor_runner, so --kill-who=main
+                    # orphans the agent binaries; kill the binaries instead.
+                    command = "pkill -9 -x fboss_sw_agent; pkill -9 -x fboss_hw_agent"
                 case FbossSystemctlServiceName.FBOSS_HW_AGENT_0.value:
                     command = 'pkill -9 -f "fboss_hw_agent .* --switchIndex 0"'
                 case FbossSystemctlServiceName.FBOSS_HW_AGENT_1.value:
@@ -1627,8 +1933,12 @@ class FbossSwitch(AbstractSwitch):
         """
         rib_entries = []
         async with await self._get_bgp_client() as bgp_client:
-            rib_entries.extend(await get_rib_entries(bgp_client, TBgpAfi.AFI_IPV6))
-            rib_entries.extend(await get_rib_entries(bgp_client, TBgpAfi.AFI_IPV4))
+            for afi in (TBgpAfi.AFI_IPV6, TBgpAfi.AFI_IPV4):
+                if TAAC_OSS:
+                    # canonical_rib_py3 is Meta-internal; the thrift RPC is not.
+                    rib_entries.extend(await bgp_client.getRibEntries(afi))
+                else:
+                    rib_entries.extend(await get_rib_entries(bgp_client, afi))
         return rib_entries
 
     @async_retryable(retries=3, sleep_time=1, exceptions=(Exception,))
@@ -1686,7 +1996,7 @@ class FbossSwitch(AbstractSwitch):
             bgp_sessions = await client.getBgpSessions()
             for session in bgp_sessions:
                 await client.startSession(peer=session.peer_addr)
-            time.sleep(1)
+            await asyncio.sleep(1)
             return (
                 True
                 if await self.async_count_established_bgp_sessions() != 0
@@ -1877,10 +2187,25 @@ class FbossSwitch(AbstractSwitch):
     async def async_get_update_group_info(
         self, group_id: t.Optional[int] = None
     ) -> TGetUpdateGroupInfoResponse:
-        """Get BGP++ Update Group info (the API behind ``show bgpcpp update-group``)."""
-        request = TGetUpdateGroupInfoRequest(group_id=group_id)
+        """Get one update-group detail, or enumerate and retrieve all details."""
         async with await self._get_bgp_client() as bgp_client:
-            return await bgp_client.getUpdateGroupInfo(request)
+            if group_id is not None:
+                request = TGetUpdateGroupInfoRequest(group_id=group_id)
+                return await bgp_client.getUpdateGroupInfo(request)
+
+            summaries: TGetUpdateGroupSummariesResponse = (
+                await bgp_client.getUpdateGroupSummaries()
+            )
+            update_groups = []
+            for summary in summaries.update_groups:
+                request = TGetUpdateGroupInfoRequest(group_id=summary.group_id)
+                response = await bgp_client.getUpdateGroupInfo(request)
+                update_groups.extend(response.update_groups)
+
+            return TGetUpdateGroupInfoResponse(
+                update_groups=update_groups,
+                enable_update_group=summaries.enable_update_group,
+            )
 
     @async_retryable(
         retries=30,
@@ -2000,9 +2325,72 @@ class FbossSwitch(AbstractSwitch):
 
         return interface_bgp_session_state_map
 
-    async def async_create_cold_boot_file(self) -> None:
-        cmd: str = "touch /dev/shm/fboss/warm_boot/cold_boot_once_0 && "
-        await self.async_run_cmd_on_shell(cmd)
+    async def async_create_cold_boot_file(
+        self, service: Optional[Service] = None
+    ) -> None:
+        """Force the next agent start to cold boot (see the paired remove).
+
+        Outside pure OSS (see ``oss_agent_restart_paths_enabled``) this only
+        writes ``cold_boot_once_0``, which the Meta-internal agent wrapper
+        honours on monolithic and split-agent DUTs alike.
+
+        In pure OSS a split-agent DUT needs a flag per agent: no OSS agent
+        reads the monolithic ``cold_boot_once_<idx>``, so writing only that
+        leaves the "cold" boot warm. See FBOSS_COLD_BOOT_ONCE_FILE in
+        taac/constants.py.
+
+        Args:
+            service: Pure OSS only. A single split agent (``fboss_sw_agent`` /
+                ``fboss_hw_agent@<N>``) gets only its own flag: one written for
+                an agent that is not restarted lingers and cold boots its next,
+                unrelated, warm restart. Anything else -- ``None`` or
+                ``Service.AGENT`` -- gets the flag for every agent.
+        """
+        if not oss_agent_restart_paths_enabled():
+            await self.async_run_cmd_on_shell(f"touch {FBOSS_COLD_BOOT_ONCE_FILE}")
+            return
+        flag_files = await self._async_cold_boot_flag_files(service)
+        await self.async_run_cmd_on_shell(f"touch {' '.join(flag_files)}")
+
+    async def _async_cold_boot_flag_files(
+        self, service: Optional[Service] = None
+    ) -> List[str]:
+        if service is not None:
+            if service.value == FbossSystemctlServiceName.FBOSS_SW_AGENT.value:
+                return [FBOSS_SPLIT_SW_COLD_BOOT_ONCE_FILE]
+            for switch_index, hw_agent in self.HW_AGENT_SERVICE_BY_INDEX.items():
+                if service.value == hw_agent.value:
+                    return [
+                        FBOSS_SPLIT_HW_COLD_BOOT_ONCE_FILE_FMT.format(
+                            switch_index=switch_index
+                        )
+                    ]
+        try:
+            # Try to get hw agent switch indices. Success means multi-switch.
+            # Enumerated rather than assumed to be index 0: a hw agent whose flag
+            # is missing warm boots while the rest of the box cold boots, which is
+            # a worse state to debug than either a clean cold or a clean warm boot.
+            switch_indices = await self.async_get_hw_agent_switch_indices()
+            return [FBOSS_SPLIT_SW_COLD_BOOT_ONCE_FILE] + [
+                FBOSS_SPLIT_HW_COLD_BOOT_ONCE_FILE_FMT.format(switch_index=switch_index)
+                for switch_index in switch_indices
+            ]
+        except Exception:
+            # Either monolithic DUT or agent is unreachable. Fall back to
+            # monolithic flag. Globbing on remove still works either way.
+            return [FBOSS_COLD_BOOT_ONCE_FILE]
+
+    async def async_remove_cold_boot_file(self) -> None:
+        """Clear the one-shot cold-boot flags, for every switch index.
+
+        The agents do not reliably delete their flag after honouring it, and
+        /dev/shm survives every restart until the box reboots.
+
+        Globbed rather than enumerated so this still works with the agent
+        down -- there is no thrift to ask for the NPU count then, and a clear
+        that needs a healthy agent is useless exactly when it is most needed.
+        """
+        await self.async_delete_file(" ".join(FBOSS_COLD_BOOT_ONCE_GLOBS))
 
     async def _async_get_port_id_from_interface_name(self, interface_name: str) -> int:
         """
@@ -2130,7 +2518,10 @@ class FbossSwitch(AbstractSwitch):
         Raises:
             EmptyOutputReturnError: If the command fails or returns empty output
         """
-        systemctl_cmd = f"systemctl show {service} -p MainPID | awk -F= '{{print $2}}'"
+        service_name = await self.async_get_systemctl_service_name(service)
+        systemctl_cmd = (
+            f"systemctl show {service_name} -p MainPID | awk -F= '{{print $2}}'"
+        )
         cmd_output = await self.async_run_cmd_on_shell(systemctl_cmd)
 
         if not cmd_output or not cmd_output.strip():
@@ -2524,7 +2915,23 @@ class FbossSwitch(AbstractSwitch):
             HwObjectType.NEXT_HOP_GROUP,
             HwObjectType.ROUTE_ENTRY,
         ]
-        if await self.async_is_mnpu():
+        # sw_agent serves listHwObjects only when monolithic; split agents
+        # reject it and the hw agent answers instead. A thrift stress burst
+        # calls this 10k times concurrently, so they share one run-mode probe;
+        # a failed probe fails them all once and the next call probes again.
+        loop = asyncio.get_running_loop()
+        probe = self.__dict__.get("_hw_objects_probe")
+        if probe is None or probe.get_loop() is not loop:
+            probe = self._hw_objects_probe = loop.create_task(
+                self.async_is_multi_switch()
+            )
+        try:
+            multi_switch = await asyncio.shield(probe)
+        except Exception:
+            if self.__dict__.get("_hw_objects_probe") is probe:
+                self._hw_objects_probe = None
+            raise
+        if multi_switch:
             async with await self.get_hw_agent_client(switch_index=0) as client:
                 hw_objects = await client.listHwObjects(
                     hw_object_type_list, cached=False
@@ -3084,13 +3491,31 @@ class FbossSwitch(AbstractSwitch):
 
     async def async_get_switch_run_state(self) -> SwitchRunState:
         """
-        Request agent run state
+        Request fresh agent run state, retrying explicit Thrift rate limits.
         Returns:
             SwitchRunState
         """
         self.logger.debug("Fetching agent_state")
-        async with self.async_agent_client as client:
-            return await client.getSwitchRunState()
+
+        async def read_state() -> SwitchRunState:
+            async with self.async_agent_client as client:
+                return await client.getSwitchRunState()
+
+        def log_retry(state: RetryCallState) -> None:
+            assert state.outcome is not None and state.next_action is not None
+            self.logger.warning(
+                f"getSwitchRunState on {self.hostname} rate limited on "
+                f"attempt {state.attempt_number}/4; retrying in "
+                f"{state.next_action.sleep:.2f}s: {state.outcome.exception()}"
+            )
+
+        return await AsyncRetrying(
+            retry=retry_if_exception(_is_fboss_method_rate_limit),
+            stop=stop_after_attempt(4),
+            wait=wait_exponential_jitter(initial=1, max=4.1, jitter=0.1),
+            before_sleep=log_retry,
+            reraise=True,
+        )(read_state)
 
     @async_retryable(retries=3, sleep_time=5, exceptions=(Exception,))
     async def async_get_all_port_info(self) -> Dict[int, PortInfoThrift]:
@@ -3179,6 +3604,8 @@ class FbossSwitch(AbstractSwitch):
         block: bool = True,
         return_on_msg: t.Optional[str] = None,
         *args,
+        ssh_port: int = 22,
+        username: t.Optional[str] = None,
         **kwargs,
     ) -> str:
         """
@@ -3187,27 +3614,90 @@ class FbossSwitch(AbstractSwitch):
         OSS implementation uses asyncssh from oss_driver_utils.
         The internal mixin overrides this with Meta's AsyncSSHClient/ParamikoClient.
         """
-        ssh_port = 22
-
         self.logger.debug(f"Running cmd {cmd} on {self.hostname}")
 
-        # Pass username=None so AsyncSSHClient falls back to TAAC_SSH_USER
-        # (default "root"); password is similarly picked up from
-        # TAAC_SSH_PASSWORD when set. See oss_driver_utils for the
-        # supported env vars.
-        async with AsyncSSHClient(
-            self.hostname, port=ssh_port, username=None
-        ) as client:
-            result = await client.async_run(
-                cmd=cmd,
+        if TAAC_OSS and meta_internal_bridge_client.bridge_enabled():
+            result = await meta_internal_bridge_client.ssh_exec(
+                hostname=self.hostname,
+                command=cmd,
                 timeout_sec=timeout,
-                print_stdout=print_stdout,
                 block=block,
                 return_on_msg=return_on_msg,
+                port=ssh_port,
+                username=username,
             )
+            if print_stdout and result.stdout:
+                self.logger.info(result.stdout)
+        else:
+            # Pass username=None so AsyncSSHClient falls back to TAAC_SSH_USER
+            # (default "root"); password is similarly picked up from
+            # TAAC_SSH_PASSWORD when set. See oss_driver_utils for the
+            # supported env vars.
+            async with AsyncSSHClient(
+                self.hostname, port=ssh_port, username=username
+            ) as client:
+                result = await client.async_run(
+                    cmd=cmd,
+                    timeout_sec=timeout,
+                    print_stdout=print_stdout,
+                    block=block,
+                    return_on_msg=return_on_msg,
+                )
 
         # pyrefly: ignore [bad-return]
         return result.stdout if result else None
+
+    async def async_write_file_on_device(
+        self, contents: str, remote_path: str, create_parent_dir: bool = True
+    ) -> None:
+        """Write ``contents`` to ``remote_path`` on this device.
+
+        Use this whenever generated text has to land in the device's active
+        FBOSS namespace.
+
+        The write is atomic at the destination (staged sibling + rename), so a
+        daemon reading ``remote_path`` concurrently sees either the old file or
+        the new one, never a partial write.
+
+        Args:
+            contents: file body, written byte-for-byte with no newline translation.
+            remote_path: absolute destination path on the device.
+            create_parent_dir: mkdir -p the parent first. Turn off if the parent
+                is known to exist and you want the write to fail loudly if not.
+        """
+        if create_parent_dir:
+            parent = os.path.dirname(remote_path)
+            if parent:
+                await self.async_run_cmd_on_shell(
+                    f"mkdir -p -- {shlex.quote(parent)}"
+                )
+
+        self.logger.info(
+            f"Writing {len(contents)} bytes to {self.hostname}:{remote_path}"
+        )
+        async with AsyncSSHClient(self.hostname, port=22, username=None) as client:
+            await client.async_write_file(contents, remote_path)
+
+    async def async_copy_file_to_device(
+        self, local_path: str, remote_path: str, create_parent_dir: bool = True
+    ) -> None:
+        """Copy a local file to ``remote_path`` on this device.
+
+        Same atomicity guarantee as ``async_write_file_on_device``; use this when
+        the payload is already a file rather than a string in memory.
+        """
+        if create_parent_dir:
+            parent = os.path.dirname(remote_path)
+            if parent:
+                await self.async_run_cmd_on_shell(
+                    f"mkdir -p -- {shlex.quote(parent)}"
+                )
+
+        self.logger.info(
+            f"Copying {local_path} to {self.hostname}:{remote_path}"
+        )
+        async with AsyncSSHClient(self.hostname, port=22, username=None) as client:
+            await client.async_put_file(local_path, remote_path)
 
     async def async_create_dir_if_not_exists(self, file_path: str) -> None:
         from taac.utils.oss_driver_utils import (
@@ -3257,7 +3747,8 @@ class FbossSwitch(AbstractSwitch):
         Returns:
             Dictionary {"Type":"simple", "Restart:"always"}
         """
-        cmd = f"systemctl show {service.value} --no-page"
+        service_name = await self.async_get_systemctl_service_name(service)
+        cmd = f"systemctl show {service_name} --no-page"
         output = await self.async_run_cmd_on_shell(cmd)
         result: Dict[str, str] = {}
         for line in output.split("\n"):
@@ -3388,7 +3879,6 @@ class FbossSwitch(AbstractSwitch):
         )
 
     @is_dne_test_device
-    @async_retryable(retries=2, sleep_time=10, exceptions=(Exception,))
     async def async_restart_service(
         self,
         service: Service,
@@ -3397,9 +3887,37 @@ class FbossSwitch(AbstractSwitch):
         """
         Restart service and validate restart process by comparing service uptime
         before and after restart
+
+        Every service, ``wedge_agent`` and the split agent units included, is
+        restarted with ``systemctl restart <unit>``. The one exception is a
+        ``Service.AGENT`` restart in pure OSS (see
+        ``oss_agent_restart_paths_enabled``): OSS images have no monolithic
+        ``wedge_agent`` unit, so it is always fanned out to the split agents
+        (``fboss_sw_agent`` + ``fboss_hw_agent@<N>``) in warmboot-safe order.
+
         Args:
             service: service to restart
         """
+        if (
+            oss_agent_restart_paths_enabled()
+            and service.value == FbossSystemctlServiceName.AGENT.value
+        ):
+            # Not gated on async_is_multi_switch(): it returns False whenever
+            # the agent is unreachable, which would fall through to a
+            # `systemctl restart wedge_agent` that cannot succeed here.
+            #
+            # Deliberately not wrapped in @async_retryable: a warm boot that
+            # loses its state (async_assert_hw_agent_stable raising) must
+            # surface as a failure. Retrying would restart from an already
+            # cold-booted hw agent, which reliably "succeeds" and hides the
+            # very regression this orchestration exists to catch.
+            await self.async_restart_split_agents()
+            return
+
+        await self._async_restart_single_service(service)
+
+    @async_retryable(retries=2, sleep_time=10, exceptions=(Exception,))
+    async def _async_restart_single_service(self, service: Service) -> None:
         self.logger.debug(
             f"Checking the uptime of service {service.value} before restarting it"
         )
@@ -3410,7 +3928,8 @@ class FbossSwitch(AbstractSwitch):
         self.logger.debug(
             f"Attempting to perform {service.value} restart on {self.hostname}..."
         )
-        cmd = f"systemctl restart {service.value}"
+        service_name = await self.async_get_systemctl_service_name(service)
+        cmd = f"systemctl restart {service_name}"
         await self.async_run_cmd_on_shell(cmd)
 
         self.logger.debug(
@@ -3421,10 +3940,330 @@ class FbossSwitch(AbstractSwitch):
         )
 
         # Verifying service restart based on service uptime
-        assert service_start_time_after_restart > service_start_time_before_restart
+        assert (
+            service_start_time_after_restart > service_start_time_before_restart
+        )
         self.logger.debug(
             f"Successfully restarted service {service.value} on {self.hostname} "
         )
+
+    async def async_wait_for_service_exit(
+        self,
+        service: Service,
+        timeout: int = 120,
+        interval: int = 2,
+    ) -> None:
+        """Block until ``service`` is no longer running.
+
+        ``systemctl stop`` can return while the unit is still
+        ``deactivating``, so poll ActiveState rather than trusting the
+        stop command to be a barrier.
+        """
+        end_time = time.time() + timeout
+        status = None
+        while time.time() < end_time:
+            status = await self.async_get_service_status(service)
+            if status in (
+                SystemctlServiceStatus.INACTIVE,
+                SystemctlServiceStatus.FAILED,
+            ):
+                if status == SystemctlServiceStatus.FAILED:
+                    self.logger.warning(
+                        f"Service {service.value} on {self.hostname} exited "
+                        "FAILED rather than INACTIVE -- it may not have shut "
+                        "down cleanly, so any warm boot state it owed is "
+                        "likely lost"
+                    )
+                else:
+                    self.logger.debug(
+                        f"Service {service.value} fully exited on {self.hostname} "
+                        f"(status {status.name})"
+                    )
+                return
+            await asyncio.sleep(interval)
+        raise Exception(
+            f"Service {service.value} did not fully exit within {timeout}s on "
+            f"{self.hostname} (last status "
+            f"{status.name if status else 'unknown'})"
+        )
+
+    # A hw agent answering thrift has already survived SDK init and the warm
+    # boot restore. CONFIGURED is deliberately not required: in split-agent
+    # FBOSS the sw agent is what programs the hw agent, so demanding
+    # CONFIGURED before the sw agent starts would never be satisfied.
+    HW_AGENT_READY_STATES: t.ClassVar[frozenset] = frozenset(
+        {
+            SwitchRunState.INITIALIZED,
+            SwitchRunState.CONFIGURED,
+            SwitchRunState.FIB_SYNCED,
+        }
+    )
+
+    async def async_get_service_main_pid(self, service: Service) -> int:
+        """PID of the unit's main process, 0 when it is not running.
+
+        Used instead of ``NRestarts`` to tell one instance from another:
+        systemd RESETS ``NRestarts`` on a manual ``systemctl start``, so a
+        baseline taken before the stop goes 1 -> 0 -> 1 across a
+        crash-restart and compares equal -- hiding the crash entirely.
+        """
+        return await self.async_get_single_systemd_service_counter_as_int(
+            service, "MainPID"
+        )
+
+    async def async_wait_for_hw_agent_ready(
+        self,
+        switch_index: int = 0,
+        timeout: int = 300,
+        interval: int = 5,
+    ) -> int:
+        """Block until the HW agent is up and serving thrift; return its PID.
+
+        The PID lets callers tell the instance they started apart from a
+        systemd-spawned replacement, which cold-boots rather than warm-boots.
+        """
+        hw_agent = self.HW_AGENT_SERVICE_BY_INDEX[switch_index]
+        end_time = time.time() + timeout
+        last_state = None
+        tracked_pid = 0
+        while time.time() < end_time:
+            pid = await self.async_get_service_main_pid(hw_agent)
+            if pid and not tracked_pid:
+                tracked_pid = pid
+            elif tracked_pid and pid != tracked_pid:
+                raise Exception(
+                    f"HW agent on {self.hostname} died while coming up "
+                    f"(pid {tracked_pid} -> {pid or 'gone'}); the warm boot "
+                    f"state it restored is gone"
+                )
+            if tracked_pid:
+                try:
+                    async with await self.get_hw_agent_client(
+                        switch_index=switch_index
+                    ) as client:
+                        last_state = await client.getHwSwitchRunState()
+                except RuntimeError:
+                    # Misconfiguration (e.g. no client_provider) -- will never
+                    # resolve by polling, so fail fast instead of spinning for
+                    # the full timeout.
+                    raise
+                except Exception:
+                    # Not listening yet -- keep polling until the deadline.
+                    last_state = None
+                if last_state in self.HW_AGENT_READY_STATES:
+                    self.logger.debug(
+                        f"HW agent on {self.hostname} ready (pid {tracked_pid}, "
+                        f"run state {last_state})"
+                    )
+                    return tracked_pid
+            await asyncio.sleep(interval)
+        raise Exception(
+            f"HW agent on {self.hostname} did not become ready within "
+            f"{timeout}s (last run state {last_state}, "
+            f"pid {tracked_pid or 'none'})"
+        )
+
+    async def async_assert_hw_agent_stable(
+        self,
+        tracked_pid: int,
+        switch_index: int = 0,
+        timeout: int = 120,
+        interval: int = 5,
+    ) -> None:
+        """Fail if the HW agent is replaced while the SW agent pushes state.
+
+        Where a warm boot state mismatch surfaces: the HW agent aborts in
+        ``SaiStore::checkUnexpectedUnclaimedWarmbootHandles`` once the SW
+        agent applies initial state. Without this the restart looks clean and
+        only the playbook's post-checks notice, as an unexplained all-ports-down.
+
+        Polls until the SW agent reports CONFIGURED (the point the risky
+        state push is known to be over) instead of a fixed sleep -- a fixed
+        window either wastes time on a fast box or ends before a slow one
+        finishes pushing state.
+        """
+        hw_agent = self.HW_AGENT_SERVICE_BY_INDEX[switch_index]
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            pid = await self.async_get_service_main_pid(hw_agent)
+            if pid != tracked_pid:
+                raise Exception(
+                    f"HW agent {switch_index} on {self.hostname} crashed after "
+                    f"the SW agent started (pid {tracked_pid} -> "
+                    f"{pid or 'gone'}); systemd restarted it into a COLD boot, "
+                    "so the warm boot did not hold"
+                )
+            if await self.async_is_agent_configured():
+                self.logger.debug(
+                    f"HW agent {switch_index} on {self.hostname} stable "
+                    f"(pid {tracked_pid}) through SW agent reaching CONFIGURED"
+                )
+                return
+            await asyncio.sleep(interval)
+        raise Exception(
+            f"SW agent on {self.hostname} did not reach CONFIGURED within "
+            f"{timeout}s after starting; cannot confirm the HW agent "
+            f"(pid {tracked_pid}) survived the warm boot state push"
+        )
+
+    HW_AGENT_SERVICE_BY_INDEX: t.ClassVar[Dict[int, Service]] = {
+        0: FbossSystemctlServiceName.FBOSS_HW_AGENT_0,
+        1: FbossSystemctlServiceName.FBOSS_HW_AGENT_1,
+    }
+
+    async def async_get_hw_agent_switch_indices(self) -> List[int]:
+        """NPU indices this DUT actually has, read off the running agent.
+
+        ``hwIndexToRunState`` is populated by the sw agent for every live
+        NPU (already used the same way in ``async_is_agent_configured``), so
+        this reflects real hardware instead of a hardcoded/env-configured
+        guess that silently drifts from the DUT it runs against.
+        """
+        multi_switch_state = await self.async_get_multi_switch_run_state()
+        # Keyed by SwitchID despite the thrift comment saying SwitchIndex
+        # (MultiHwSwitchHandler::getHwSwitchRunStates). The cold-boot flags and
+        # the fboss_hw_agent@<N> units are keyed by switch index, and the two
+        # differ on platforms whose switch IDs do not start at 0.
+        switch_ids = sorted(multi_switch_state.hwIndexToRunState.keys())
+        if not switch_ids:
+            raise Exception(
+                f"{self.hostname} reports multi-switch enabled but "
+                "hwIndexToRunState is empty -- cannot determine NPU count"
+            )
+        async with self.async_agent_client as client:
+            switch_infos = await client.getSwitchIdToSwitchInfo()
+        missing = [sid for sid in switch_ids if sid not in switch_infos]
+        if missing:
+            raise Exception(
+                f"{self.hostname} has no SwitchInfo for switch ID(s) {missing}; "
+                "cannot map them to hw agent switch indices"
+            )
+        return sorted(int(switch_infos[sid].switchIndex) for sid in switch_ids)
+
+    async def async_restart_split_agents(
+        self,
+        exit_timeout: int = 120,
+        hw_ready_timeout: int = 300,
+        hw_settle_timeout: int = 120,
+    ) -> None:
+        """Restart the split agents in warmboot-safe order.
+
+        A warmboot needs the sw agent down before any hw agent goes down,
+        and every hw agent back up before the sw agent reconnects to them:
+
+            stop sw -> await exit -> stop all hw -> await exit
+            -> start all hw -> await all hw ready -> start sw
+
+        Two independent ``systemctl restart`` calls do not give that
+        ordering -- the sw agent is back up and reconnecting while a hw
+        agent is still being torn down, so the warm boot state handoff is
+        lost. On a multi-NPU DUT this has to cover every NPU: leaving one
+        hw agent running across the sw agent restart reintroduces the same
+        ordering bug for that NPU alone.
+        """
+        sw_agent = FbossSystemctlServiceName.FBOSS_SW_AGENT
+        switch_indices = await self.async_get_hw_agent_switch_indices()
+        hw_agents = [self.HW_AGENT_SERVICE_BY_INDEX[i] for i in switch_indices]
+        all_services = [sw_agent] + hw_agents
+        # Read before anything starts: an agent consumes its flag at startup.
+        cold_boot_flags = await self._async_present_cold_boot_flags()
+
+        # Only the sw agent needs a before/after uptime check: each hw
+        # agent's pid is tracked continuously from its own start through
+        # async_assert_hw_agent_stable, which is a strictly stronger
+        # guarantee than "monotonic start time increased".
+        sw_agent_start_time_before_restart = (
+            await self.async_get_service_monotonic_start_time(sw_agent)
+        )
+
+        for svc in all_services:
+            self.logger.debug(f"Stopping {svc.value} on {self.hostname}...")
+            await self.async_run_cmd_on_shell(f"systemctl stop {svc.value}")
+            await self.async_wait_for_service_exit(svc, timeout=exit_timeout)
+
+        # Every hw agent has to be up and serving before the sw agent starts:
+        # all units are Type=simple, so `systemctl start` returns at
+        # fork/exec and gives no ordering of its own.
+        tracked_pids: Dict[int, int] = {}
+        for switch_index, hw_agent in zip(switch_indices, hw_agents):
+            self.logger.debug(f"Starting {hw_agent.value} on {self.hostname}...")
+            await self.async_run_cmd_on_shell(f"systemctl start {hw_agent.value}")
+            tracked_pids[switch_index] = await self.async_wait_for_hw_agent_ready(
+                switch_index=switch_index,
+                timeout=hw_ready_timeout,
+            )
+
+        self.logger.debug(f"Starting {sw_agent.value} on {self.hostname}...")
+        await self.async_run_cmd_on_shell(f"systemctl start {sw_agent.value}")
+        for switch_index in switch_indices:
+            await self.async_assert_hw_agent_stable(
+                tracked_pids[switch_index],
+                switch_index=switch_index,
+                timeout=hw_settle_timeout,
+            )
+
+        # Verifying sw agent restart based on service uptime
+        sw_agent_start_time_after_restart = (
+            await self.async_get_service_monotonic_start_time(sw_agent)
+        )
+        assert (
+            sw_agent_start_time_after_restart > sw_agent_start_time_before_restart
+        ), (
+            f"Service {sw_agent.value} did not restart on {self.hostname}: "
+            f"monotonic start time {sw_agent_start_time_after_restart} <= "
+            f"{sw_agent_start_time_before_restart}"
+        )
+        await self._async_assert_warm_booted(switch_indices, cold_boot_flags)
+        for svc in all_services:
+            self.logger.debug(
+                f"Successfully restarted service {svc.value} on {self.hostname} "
+            )
+
+    async def _async_present_cold_boot_flags(self) -> t.Set[str]:
+        output = await self.async_run_cmd_on_shell(
+            f"ls -1d {' '.join(FBOSS_COLD_BOOT_ONCE_GLOBS)} 2>/dev/null || true"
+        )
+        return {line.strip() for line in output.splitlines() if line.strip()}
+
+    async def _async_assert_warm_booted(
+        self, switch_indices: List[int], cold_boot_flags: t.Set[str]
+    ) -> None:
+        """Fail if an agent that had no cold-boot flag came back cold anyway.
+
+        Run state cannot tell the two apart: an agent that lost its warm boot
+        state -- e.g. one that exited FAILED -- cold boots and still reaches a
+        healthy run state, so only the reported boot type catches it.
+        """
+        not_warm = []
+        # Prefix match: the sw agent also honours a legacy `sw_cold_boot_once_0`.
+        if not any(
+            flag.startswith(FBOSS_SPLIT_SW_COLD_BOOT_ONCE_FILE)
+            for flag in cold_boot_flags
+        ):
+            async with self.async_agent_client as client:
+                boot_type = await client.getBootType()
+            if boot_type != BootType.WARM_BOOT:
+                not_warm.append(
+                    f"{FbossSystemctlServiceName.FBOSS_SW_AGENT.value}={boot_type.name}"
+                )
+        for switch_index in switch_indices:
+            flag = FBOSS_SPLIT_HW_COLD_BOOT_ONCE_FILE_FMT.format(
+                switch_index=switch_index
+            )
+            if flag in cold_boot_flags:
+                continue
+            async with await self.get_hw_agent_client(
+                switch_index=switch_index
+            ) as client:
+                boot_type = await client.getBootType()
+            if boot_type != BootType.WARM_BOOT:
+                hw_agent = self.HW_AGENT_SERVICE_BY_INDEX[switch_index]
+                not_warm.append(f"{hw_agent.value}={boot_type.name}")
+        if not_warm:
+            raise Exception(
+                f"Warm boot did not hold on {self.hostname}: {', '.join(not_warm)} "
+                "with no cold-boot flag set"
+            )
 
     @is_dne_test_device
     @async_retryable(retries=2, sleep_time=10, exceptions=(Exception,))
@@ -3432,15 +4271,69 @@ class FbossSwitch(AbstractSwitch):
         self,
         service: Service,
         agents: Optional[List[str]] = None,
+        accept_failed_if_process_absent: bool = False,
     ) -> None:
-        cmd: str = f"systemctl stop {service.value}"
+        """Stop a service and verify the resulting systemd state.
+
+        Intentional outage tests may opt in to accepting ``FAILED`` because
+        some services retain that unit state after their process exits. The
+        opt-in remains fail-closed: both ``INACTIVE`` and ``FAILED`` require
+        systemd ``MainPID=0`` before the stop is considered complete.
+        """
+
+        async def intentional_stop_complete(
+            counters: Optional[Dict[str, str]] = None,
+            *,
+            fail_on_live_process: bool = False,
+        ) -> bool:
+            if counters is None:
+                counters = await self.async_get_systemd_service_counters(service)
+            status = await self.async_get_service_status(service, counters)
+            if status not in {
+                SystemctlServiceStatus.INACTIVE,
+                SystemctlServiceStatus.FAILED,
+            }:
+                return False
+            main_pid = await self.async_get_single_systemd_service_counter_as_int(
+                service, "MainPID", counters
+            )
+            if main_pid != 0:
+                if fail_on_live_process:
+                    raise RuntimeError(
+                        f"Service {service.value} is {status.name} but process "
+                        f"MainPID={main_pid} is still present"
+                    )
+                return False
+            return True
+
+        if accept_failed_if_process_absent and await intentional_stop_complete():
+            self.logger.info(
+                f"Service {service.value} is already non-active with no live "
+                "process; not issuing a duplicate stop"
+            )
+            return
+
+        service_name = await self.async_get_systemctl_service_name(service)
+        cmd: str = f"systemctl stop {service_name}"
         self.logger.info(f"Attempting to stop {service.value} on {self.hostname}...")
         await self.async_run_cmd_on_shell(cmd)
-        # verifying if the service is now inactive
-        status = await self.async_get_service_status(service)
-        assert status == SystemctlServiceStatus.INACTIVE
+        service_counters = await self.async_get_systemd_service_counters(service)
+        status = await self.async_get_service_status(service, service_counters)
+        if accept_failed_if_process_absent:
+            if not await intentional_stop_complete(
+                service_counters, fail_on_live_process=True
+            ):
+                raise RuntimeError(
+                    f"Intentional stop of {service.value} left service in "
+                    f"{status.name}; expected INACTIVE, or FAILED with MainPID=0"
+                )
+        elif status != SystemctlServiceStatus.INACTIVE:
+            raise RuntimeError(
+                f"Service {service.value} did not reach INACTIVE after stop; "
+                f"observed {status.name}"
+            )
         self.logger.info(
-            f"Successfully verified that the {service.name} is now inactive on {self.hostname}"
+            f"Successfully verified that {service.name} is stopped on {self.hostname}"
         )
 
     @is_dne_test_device
@@ -3450,7 +4343,8 @@ class FbossSwitch(AbstractSwitch):
         service: Service,
         agents: Optional[List[str]] = None,
     ) -> None:
-        cmd: str = f"systemctl start {service.value}"
+        service_name = await self.async_get_systemctl_service_name(service)
+        cmd: str = f"systemctl start {service_name}"
         self.logger.info(f"Attempting to start {service.value} on {self.hostname}...")
         await self.async_run_cmd_on_shell(cmd)
         # verifying if the service is now active
@@ -3479,7 +4373,7 @@ class FbossSwitch(AbstractSwitch):
         )
         await self.async_create_dir_if_not_exists(file_path)
 
-        cmd = f"""echo '{content}' > {file_location}"""
+        cmd = f"printf %s {shlex.quote(content)} > {shlex.quote(file_location)}"
         await self.async_run_cmd_on_shell(cmd)
 
     @async_retryable(
@@ -3497,7 +4391,7 @@ class FbossSwitch(AbstractSwitch):
             Returns: None if the file exists else raises SshCommandError exceptiion
         """
         try:
-            cmd = f"cat {file_location}"
+            cmd = f"cat -- {shlex.quote(file_location)}"
             output: str = await self.async_run_cmd_on_shell(cmd)
             self.logger.debug(
                 f"Verified if file is present at {file_location} on {self.hostname}"
@@ -3508,6 +4402,61 @@ class FbossSwitch(AbstractSwitch):
                 f"While verfiying {file_location} on {self.hostname}, exception was raised: {ex}"
             )
             raise ex
+
+    async def async_read_log_file(
+        self,
+        log_file_path: str,
+        *,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        grep_pattern: Optional[str] = None,
+        tail_lines: Optional[int] = None,
+        utc_offset_seconds: Optional[int] = None,
+    ) -> str:
+        """Read a Classic/NSPAWN FBOSS log with optional remote filtering.
+
+        The time window is matched against the device's wall-clock stamps.
+        Pass the device's UTC offset (seconds east of UTC) as
+        utc_offset_seconds; without it the host's local zone is assumed,
+        which only works when the host and device share a zone.
+        """
+        if start_time is None and grep_pattern is None and tail_lines is None:
+            return await self.async_read_file(log_file_path)
+
+        command = f"cat {shlex.quote(log_file_path)}"
+        if start_time is not None:
+            stop_time = end_time if end_time is not None else int(time.time())
+            formatted_times = []
+            first_minute = start_time - (start_time % 60)
+            last_minute = stop_time - (stop_time % 60)
+            for timestamp in range(first_minute, last_minute + 1, 60):
+                local_time = (
+                    time.localtime(timestamp)
+                    if utc_offset_seconds is None
+                    else time.gmtime(timestamp + utc_offset_seconds)
+                )
+                # FBOSS files contain both syslog-style timestamps
+                # ("Sep 23 19:03") and glog prefixes ("I0923 19:03").
+                formatted_times.extend(
+                    [
+                        time.strftime("%b %e %H:%M", local_time),
+                        f"[IWEF]{time.strftime('%m%d %H:%M', local_time)}",
+                    ]
+                )
+            time_pattern = "(" + "|".join(formatted_times) + ")"
+            command += f" | grep -Eia {shlex.quote(time_pattern)}"
+        if grep_pattern is not None:
+            command += f" | grep -Eia {shlex.quote(grep_pattern)}"
+        if tail_lines is not None:
+            command += f" | tail -n {tail_lines}"
+        return await self.async_run_cmd_on_shell(command)
+
+    async def async_get_log_source_command(
+        self, log_file_path: str, start_time: Optional[str] = None
+    ) -> str:
+        """Return a shell command that streams an FBOSS log to stdout."""
+        decompressor = "zstdcat" if log_file_path.endswith(".zst") else "zcat -f"
+        return f"{decompressor} {shlex.quote(log_file_path)}"
 
     async def async_delete_file(self, file_location: str) -> None:
         """
@@ -3553,6 +4502,60 @@ class FbossSwitch(AbstractSwitch):
         )
         return on_box_drain_state
 
+    async def async_onbox_drain_device(self) -> None:
+        """Drain the whole device on-box, without any Meta-internal service.
+
+        **In OSS this is a SOFT drain.** Internally the same method name is a
+        hard drain -- ``fboss_local_drainer drain``, which brings the data plane
+        down -- but OSS has no local drainer service to ask, and the mechanism
+        available here (swapping which BGP config bgpd loads) re-tags routes
+        rather than withdrawing them. Traffic keeps flowing over this device
+        until neighbours prefer someone else. A test that drains and then
+        expects the link to go down will behave differently in the two
+        environments, so it should assert on route preference, not on loss.
+
+        ``async_onbox_softdrain_device`` is the same call under the name that
+        matches the behaviour; both exist so a caller can say what it means.
+
+        Only reachable in OSS in practice: ``driver_factory`` hands out
+        ``FbossSwitchInternal`` internally, and ``FbossSwitchInternalMixin``
+        precedes ``FbossSwitch`` in its MRO, so the internal (hard) drain wins
+        there. There is deliberately no TAAC_OSS guard here -- the on-device
+        validation scripts build a bare ``FbossSwitch`` from a devserver with
+        TAAC_OSS unset, and a guard would break exactly the path used to test
+        this.
+        """
+        self.logger.warning(
+            f"{self.hostname}: OSS device drain is a SOFT drain -- routes are "
+            "re-tagged DRAIN rather than withdrawn and the data plane stays up. "
+            "Internally this same call is a hard drain."
+        )
+        await self.async_onbox_softdrain_device()
+
+    async def async_onbox_softdrain_device(self) -> None:
+        """Soft-drain the whole device: advertise DRAIN-tagged routes, not LIVE.
+
+        Points bgpd at the soft-drain config and restarts it. Both configs must
+        already exist -- ``config_modifiers.setup_base_configs`` generates them.
+        """
+        # Imported here rather than at module scope: config_modifiers resolves
+        # FbossSwitch for its own guard, so a module-level import either way
+        # would be a cycle.
+        from taac.driver.config_modifiers import drain_device
+
+        await drain_device(self)
+
+    async def async_onbox_undrain_device(self) -> None:
+        """Undrain the whole device: return to advertising LIVE-tagged routes.
+
+        Reverses ``async_onbox_drain_device`` / ``async_onbox_softdrain_device``.
+        It does not reverse a per-interface drain -- see
+        ``async_undrain_interface`` for that.
+        """
+        from taac.driver.config_modifiers import undrain_device
+
+        await undrain_device(self)
+
     async def async_softdrain_interface(self, interface: str, task_id: int = 0) -> None:
         """
         Soft-drain a single interface on this FBOSS switch via the on-box
@@ -3568,6 +4571,9 @@ class FbossSwitch(AbstractSwitch):
             task_id: Optional task identifier passed through to the
                 local drainer (default 0, matching the CLI default).
         """
+        if oss_config_patcher_enabled():
+            await self._async_oss_set_interfaces_drained([interface], drain=True)
+            return
         self.logger.info(
             f"Softdraining interface '{interface}' on {self.hostname} "
             f"(task_id={task_id})"
@@ -3576,6 +4582,47 @@ class FbossSwitch(AbstractSwitch):
             await client.softdrain_interface(interface, task_id)
         self.logger.info(
             f"Softdrain of interface '{interface}' on {self.hostname} completed"
+        )
+
+    async def async_drain_interfaces(
+        self, interfaces: List[str], task_id: int = 0
+    ) -> None:
+        """Hard-drain several interfaces in one local-drainer request."""
+        if oss_config_patcher_enabled():
+            raise NotImplementedError(
+                "Hard interface drain is not available in OSS: it needs a deny "
+                "policy per peer group, which the OSS configs do not carry. Use "
+                "a soft drain (async_softdrain_interfaces)."
+            )
+        self.logger.info(
+            f"Draining interfaces {interfaces} on {self.hostname} "
+            f"(task_id={task_id})"
+        )
+        async with self.get_async_local_drainer_client() as client:
+            await client.drain_interfaces(interfaces, task_id)
+        self.logger.info(
+            f"Drain of interfaces {interfaces} on {self.hostname} completed"
+        )
+
+    async def async_softdrain_interfaces(
+        self, interfaces: List[str], task_id: int = 0
+    ) -> None:
+        """Soft-drain several interfaces in one local-drainer request.
+
+        The bulk API applies all interface policy changes before restarting
+        BGP, avoiding one BGP restart per interface.
+        """
+        if oss_config_patcher_enabled():
+            await self._async_oss_set_interfaces_drained(interfaces, drain=True)
+            return
+        self.logger.info(
+            f"Softdraining interfaces {interfaces} on {self.hostname} "
+            f"(task_id={task_id})"
+        )
+        async with self.get_async_local_drainer_client() as client:
+            await client.softdrain_interfaces(interfaces, task_id)
+        self.logger.info(
+            f"Softdrain of interfaces {interfaces} on {self.hostname} completed"
         )
 
     async def async_undrain_interface(self, interface: str) -> None:
@@ -3590,12 +4637,170 @@ class FbossSwitch(AbstractSwitch):
         Args:
             interface: FBOSS interface name (e.g. "eth1/33/5").
         """
+        if oss_config_patcher_enabled():
+            await self._async_oss_set_interfaces_drained([interface], drain=False)
+            return
         self.logger.info(f"Undraining interface '{interface}' on {self.hostname}")
         async with self.get_async_local_drainer_client() as client:
             await client.undrain_interface(interface)
         self.logger.info(
             f"Undrain of interface '{interface}' on {self.hostname} completed"
         )
+
+    async def async_undrain_interfaces(self, interfaces: List[str]) -> None:
+        """Undrain several interfaces in one local-drainer request.
+
+        The bulk API applies all interface policy changes before restarting
+        BGP, avoiding one BGP restart per interface.
+        """
+        if oss_config_patcher_enabled():
+            await self._async_oss_set_interfaces_drained(interfaces, drain=False)
+            return
+        self.logger.info(f"Undraining interfaces {interfaces} on {self.hostname}")
+        async with self.get_async_local_drainer_client() as client:
+            await client.undrain_interfaces(interfaces)
+        self.logger.info(
+            f"Undrain of interfaces {interfaces} on {self.hostname} completed"
+        )
+
+    # ----------------------------------------------------------------------
+    # OSS interface drain: COOP drains an interface by registering a
+    # persistent ``interface-drain-<iface>`` bgpcpp patcher
+    # (interface_drain_router); OSS registers the same patcher with the OSS
+    # backend, so it survives other patcher changes and teardown removes it.
+    # ----------------------------------------------------------------------
+
+    async def _async_oss_set_interfaces_drained(
+        self, interfaces: List[str], drain: bool
+    ) -> None:
+        """Soft-drain or undrain ``interfaces`` on the live BGP config.
+
+        Only the live config: the soft-drain config drains every session
+        already, and a device drain parks the live config and an undrain puts
+        it back, so a drained interface stays drained across them. Refused
+        while the device is drained, since the live config is then not what
+        bgpd serves. One apply for the batch, so bgpd restarts once.
+        """
+        from neteng.test_infra.dne.taac.driver import config_modifiers, oss_coop_patcher
+
+        action = "drain" if drain else "undrain"
+        if await config_modifiers.async_is_device_drained(self):
+            raise config_modifiers.ConfigModifierError(
+                f"Cannot {action} {interfaces} on {self.hostname}: the device is "
+                "drained. Interface drain edits the live BGP config only; "
+                "undrain the device first."
+            )
+        registered = {
+            p.name for p in oss_coop_patcher.list_patchers(self.hostname, "bgpcpp")
+        }
+        names = {i: _interface_drain_patcher_name(i) for i in interfaces}
+        todo = [i for i in interfaces if (names[i] in registered) != drain]
+        for interface in sorted(set(interfaces) - set(todo)):
+            self.logger.info(
+                f"[oss-drain] {interface} on {self.hostname} is already "
+                f"{'drained' if drain else 'undrained'}"
+            )
+        if not todo:
+            return
+
+        if drain:
+            await self._async_oss_register_interface_drains(todo, names)
+        else:
+            for interface in todo:
+                await oss_coop_patcher.async_unregister(self, "bgpcpp", names[interface])
+        await self.async_apply_patchers()
+        await self._async_verify_interfaces_drained(todo, drain)
+        self.logger.info(f"[oss-drain] {action}ed {todo} on {self.hostname}")
+
+    async def _async_oss_register_interface_drains(
+        self, interfaces: List[str], names: Dict[str, str]
+    ) -> None:
+        """Register a drain patcher per interface, all or none: one the patcher
+        refuses unregisters those this call already added."""
+        from taac.driver import oss_coop_patcher
+
+        networks = {i: await self._async_interface_networks(i) for i in interfaces}
+        added: List[str] = []
+        try:
+            for interface in interfaces:
+                await self.async_register_python_patcher(
+                    "bgpcpp",
+                    names[interface],
+                    "drain_interface",
+                    {
+                        "interface_name": interface,
+                        "networks": json.dumps(networks[interface]),
+                    },
+                    f"Soft-draining {interface}",
+                )
+                added.append(names[interface])
+        except Exception:
+            for name in added:
+                await oss_coop_patcher.async_unregister(self, "bgpcpp", name)
+            raise
+
+    async def _async_interface_networks(self, interface: str) -> List[str]:
+        """The subnets of the L3 interface the port ``interface`` routes
+        through: its VLAN's, or its own for a port interface.
+
+        Link-local addresses are skipped: every interface has one, so they
+        would match peers on other links. A VLAN shared with other ports is
+        refused, since draining its subnet would drain their sessions too.
+        """
+        ports = await self.async_get_all_port_info()
+        port = next((p for p in ports.values() if p.name == interface), None)
+        if port is None:
+            raise InterfaceNotFoundError(
+                f"{interface} is not a port on {self.hostname}"
+            )
+        vlans = set(port.vlans or [])
+        networks: List[str] = []
+        for intf in (await self.async_get_all_interfaces()).values():
+            if intf.vlanId in vlans:
+                sharing = sorted(
+                    p.name
+                    for p in ports.values()
+                    if p.name != interface and intf.vlanId in (p.vlans or [])
+                )
+                if sharing:
+                    raise InvalidInputError(
+                        f"{interface} shares VLAN {intf.vlanId} "
+                        f"({intf.interfaceName}) with {sharing} on "
+                        f"{self.hostname}; draining its subnet would drain "
+                        "their sessions too"
+                    )
+            # By name: the agent client returns thrift-py3 or thrift-python
+            # types depending on the client provider.
+            elif intf.interfaceType.name != "PORT" or intf.portId != port.portId:
+                continue
+            for prefix in intf.address:
+                ip = ipaddress.ip_address(prefix.ip.addr)
+                if not ip.is_link_local:
+                    networks.append(
+                        str(ipaddress.ip_interface(f"{ip}/{prefix.prefixLength}").network)
+                    )
+        if not networks:
+            raise InvalidInputError(
+                f"{interface} on {self.hostname} has no routed address to find "
+                "BGP sessions on"
+            )
+        return networks
+
+    async def _async_verify_interfaces_drained(
+        self, interfaces: List[str], drained: bool
+    ) -> None:
+        """Read the live config back: ``drained_interfaces`` is the OSS record
+        of an interface drain, as PortInfo.isDrained is the local drainer's."""
+        from taac.driver import config_modifiers
+
+        path = config_modifiers.LIVE_CONFIG_PATH
+        config = await config_modifiers.async_read_bgp_config(self, path)
+        wrong = [i for i in interfaces if (i in config.drained_interfaces) != drained]
+        if wrong:
+            raise config_modifiers.ConfigModifierError(
+                f"{path} on {self.hostname} does not record {wrong} as "
+                f"{'drained' if drained else 'undrained'} after the apply"
+            )
 
     @memoize_on_app_overload()
     async def async_get_interface_detail(self, vlan_id) -> InterfaceDetail:
@@ -4546,8 +5751,7 @@ class FbossSwitch(AbstractSwitch):
     async def async_get_all_interface_names(
         self,
     ) -> List[str]:
-        async with self.async_agent_client as client:
-            port_info_result = await client.getAllPortInfo()
+        port_info_result = await self.async_get_all_port_info()
         return [port_info.name for port_info in port_info_result.values()]
 
     @memoize_on_app_overload()
@@ -4570,12 +5774,35 @@ class FbossSwitch(AbstractSwitch):
         async with self.async_agent_client as client:
             return await client.getMultiSwitchRunState()
 
+    async def async_get_fboss_os_type(self) -> FbossOsType:
+        """Return the FBOSS host OS type.
+
+        The OSS driver supports classic FBOSS only. The internal driver
+        overrides this method with live, on-device NetOS detection.
+        """
+        return FbossOsType.CLASSIC
+
+    async def async_get_systemctl_service_name(
+        self,
+        service: Union[Service, str],
+    ) -> str:
+        """Return the systemd unit name for a service on this FBOSS OS."""
+        if isinstance(service, str):
+            try:
+                service = FbossSystemctlServiceName(service)
+            except ValueError:
+                return service
+        if not isinstance(service, FbossSystemctlServiceName):
+            return service.value
+        os_type = await self.async_get_fboss_os_type()
+        return FBOSS_SYSTEMCTL_SERVICE_NAME_MAP[os_type][service]
+
     async def async_is_netos(self) -> bool:
         """
         Check if the device runs NetOS.
-        OSS default: returns False. Internal mixin overrides with NetWhoAmI check.
+        OSS defaults to classic FBOSS. The internal mixin detects NetOS locally.
         """
-        return False
+        return await self.async_get_fboss_os_type() is not FbossOsType.CLASSIC
 
     async def async_is_mnpu(self, check_smc_tiers: bool = False) -> bool:
         # TODO: Implement for OSS. Requires detecting multi-NPU configuration
@@ -4599,13 +5826,18 @@ class FbossSwitch(AbstractSwitch):
         self.logger.info(
             f"Waiting for agent to reach configured state on {self.hostname}"
         )
-        end_time = time.time() + timeout
-        while time.time() < end_time:
+        deadline = time.monotonic() + timeout
+        while True:
             if await self.async_is_agent_configured():
+                self.logger.info(
+                    f"Agent has reached configured state on {self.hostname}"
+                )
                 return
-            await asyncio.sleep(interval)
-        self.logger.info(f"Agent has reached configured state on {self.hostname}")
-        raise Exception(
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(interval, remaining))
+        raise TimeoutError(
             f"Agent did not reach configured state within {timeout} seconds on {self.hostname}"
         )
 
@@ -4779,7 +6011,9 @@ class FbossSwitch(AbstractSwitch):
         subcmd = "enable" if enable else "disable"
         tasks = []
         for interface in interfaces:
-            cmd = f"fboss2 set port {interface} state {subcmd}"
+            # -y is required: fboss2 refuses a port-state change when stdin/stderr
+            # is not a TTY, which is always the case over the driver's shell.
+            cmd = f"fboss2 set port {interface} state {subcmd} -y"
             tasks.append(self.async_run_cmd_on_shell(cmd))
         await asyncio.gather(*tasks)
 
@@ -5090,6 +6324,51 @@ class FbossSwitch(AbstractSwitch):
         )
         return result
 
+    async def async_get_openr_kvstore_keyvals(
+        self,
+        keys: Sequence[str],
+        area: str = "0",
+    ) -> "kv_store_types.Publication":
+        """Return complete Values for exact KvStore keys in one area."""
+        if TAAC_OSS:
+            raise NotImplementedError(
+                "OpenR KvStore operations require Meta-internal OpenR infrastructure."
+            )
+        async with get_openr_ctrl_cpp_client(to_fb_fqdn(self.hostname)) as client:
+            return await client.getKvStoreKeyValsArea(list(keys), area)
+
+    async def async_get_openr_kvstore_keys(self) -> Dict[str, List[str]]:
+        """
+        Returns every Open/R KvStore key name, grouped by area.
+        Thrift equivalent of ``breeze kvstore keys``.
+
+        Uses ``getKvStoreHashFilteredArea``, which returns key metadata without
+        the serialized values. That matters at scale: a 4k-key BBF topology is
+        ~25 MB of values but only ~200 KB of key names, and the large
+        ``adj:`` databases are ~51 KB each.
+
+        Returns a dict mapping area -> sorted list of key names.
+        """
+        if TAAC_OSS:
+            raise NotImplementedError(
+                "OpenR KvStore operations require Meta-internal OpenR infrastructure. "
+                "Not available in OSS mode."
+            )
+        result: Dict[str, List[str]] = {}
+        async with get_openr_ctrl_cpp_client(to_fb_fqdn(self.hostname)) as client:
+            config = await client.getRunningConfigThrift()
+            areas: Set[str] = {a.area_id for a in config.areas}
+            for area in areas:
+                publication = await client.getKvStoreHashFilteredArea(
+                    KeyDumpParams(), area
+                )
+                result[area] = sorted(publication.keyVals.keys())
+        self.logger.info(
+            f"{self.hostname}: kvstore key counts per area: "
+            f"{ {area: len(keys) for area, keys in result.items()} }"
+        )
+        return result
+
     async def async_get_openr_kvstore_kv_signature(self) -> Dict[str, str]:
         """
         Returns a SHA-256 hash of the KvStore per area.  All switches in
@@ -5309,10 +6588,11 @@ class FbossSwitch(AbstractSwitch):
             "links": links,
         }
 
-    async def async_get_openr_monitor_counters(self) -> Mapping[str, int]:
+    async def async_get_openr_monitor_counters(
+        self, counter_names: Optional[Sequence[str]] = None
+    ) -> Mapping[str, int]:
         """
-        Returns Open/R runtime counters (memory, CPU, SPF time, flood
-        rate, etc.) via fb303.
+        Returns Open/R runtime counters, narrowed to ``counter_names`` when given.
         Thrift equivalent of ``breeze monitor counters``.
         """
         if TAAC_OSS:
@@ -5321,11 +6601,27 @@ class FbossSwitch(AbstractSwitch):
                 "Not available in OSS mode."
             )
         async with get_openr_ctrl_cpp_client(to_fb_fqdn(self.hostname)) as client:
-            counters = await client.getCounters()
+            if counter_names is None:
+                counters = await client.getCounters()
+            else:
+                counters = await client.getSelectedCounters(list(counter_names))
         self.logger.info(
             f"{self.hostname}: retrieved {len(counters)} monitor counter(s)"
         )
         return counters
+
+    async def async_reset_openr_recv_to_advertise_max(self) -> None:
+        """Reset Open/R's maximum receive-to-advertise convergence counter."""
+        if TAAC_OSS:
+            raise NotImplementedError(
+                "OpenR reset operations require Meta-internal OpenR infrastructure. "
+                "Not available in OSS mode."
+            )
+        async with get_openr_ctrl_cpp_client(to_fb_fqdn(self.hostname)) as client:
+            await client.resetRecvToAdvertiseMax()
+        self.logger.info(
+            f"{self.hostname}: reset kvstore.recv_to_advertise_max_ms"
+        )
 
     # =========================================================================
     # Open/R Thrift Action Methods (write operations)

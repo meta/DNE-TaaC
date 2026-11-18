@@ -12,6 +12,10 @@ recovery race.
 import json
 import unittest
 
+from taac.abstractions.topologies.ebb_full_scale import (
+    EBB_OPENR_INJECTED_START_IPV4S_IXIA03,
+    EBB_OPENR_INJECTED_START_IPV6S_IXIA03,
+)
 from taac.testconfigs.routing.util.bgp_ebb_health_checks import (
     create_standard_postchecks,
     create_standard_prechecks,
@@ -147,5 +151,117 @@ class CommonHealthChecksHardwareCapacityTest(unittest.TestCase):
         self.assertFalse(any(c.check_id == self.PRECHECK_ID for c in checks))
 
 
+class CommonHealthChecksCpuLoadAverageTest(unittest.TestCase):
+    PRECHECK_ID = "startup_cpu_load_average_baseline"
+
+    def test_cpu_load_average_precheck_is_enabled_by_default(self):
+        checks = create_standard_prechecks(
+            peergroup_ibgp_v6="EB-EB-V6",
+            peergroup_ibgp_v4="EB-EB-V4",
+        )
+
+        self.assertEqual(1, sum(c.check_id == self.PRECHECK_ID for c in checks))
+
+    def test_cpu_load_average_precheck_can_be_omitted(self):
+        checks = create_standard_prechecks(
+            peergroup_ibgp_v6="EB-EB-V6",
+            peergroup_ibgp_v4="EB-EB-V4",
+            check_cpu_load_average=False,
+        )
+
+        self.assertFalse(any(c.check_id == self.PRECHECK_ID for c in checks))
+
+
+class CommonHealthChecksIbgpPnhTest(unittest.TestCase):
+    PRECHECK_ID = "startup_ibgp_pnh_verification"
+
+    def test_pnh_precheck_uses_bound_openr_route_ranges(self):
+        start_ipv4s = EBB_OPENR_INJECTED_START_IPV4S_IXIA03[:2]
+        start_ipv6s = EBB_OPENR_INJECTED_START_IPV6S_IXIA03[:2]
+
+        checks = create_standard_prechecks(
+            peergroup_ibgp_v6="EB-EB-V6",
+            peergroup_ibgp_v4="EB-EB-V4",
+            check_ibgp_pnh=True,
+            ibgp_pnh_start_ipv4s=start_ipv4s,
+            ibgp_pnh_start_ipv6s=start_ipv6s,
+        )
+
+        params = _json_params(_find_check(checks, self.PRECHECK_ID))
+        self.assertEqual(list(start_ipv4s), params["start_ipv4s"])
+        self.assertEqual(list(start_ipv6s), params["start_ipv6s"])
+
+    def test_pnh_precheck_preserves_legacy_defaults_for_direct_callers(self):
+        checks = create_standard_prechecks(
+            peergroup_ibgp_v6="EB-EB-V6",
+            peergroup_ibgp_v4="EB-EB-V4",
+            check_ibgp_pnh=True,
+        )
+
+        params = _json_params(_find_check(checks, self.PRECHECK_ID))
+        self.assertNotIn("start_ipv4s", params)
+        self.assertNotIn("start_ipv6s", params)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class IbgpPnhInjectionScalePropagationTest(unittest.TestCase):
+    """The readiness check must describe the population setup injected.
+
+    The check previously received only the range starts and fell back to the
+    runtime's own defaults of 63 nodes at stride 2. Those happen to equal the
+    FY26 scale, so FY26 validated the right population by coincidence of two
+    independent defaults rather than by construction. Count and stride now
+    travel with the starts from the one resolved plan, which removes the
+    coincidence and makes any non-FY26 scale -- FY27, or any override --
+    validate the population its own setup injected instead of silently
+    checking 63.
+    """
+
+    def _pnh_payload(self, **kwargs):
+        prechecks = create_standard_prechecks(
+            peergroup_ibgp_v6="EB-EB-V6",
+            peergroup_ibgp_v4="EB-EB-V4",
+            check_ibgp_pnh=True,
+            ibgp_pnh_start_ipv4s=EBB_OPENR_INJECTED_START_IPV4S_IXIA03,
+            ibgp_pnh_start_ipv6s=EBB_OPENR_INJECTED_START_IPV6S_IXIA03,
+            **kwargs,
+        )
+        check = _find_check(prechecks, "startup_ibgp_pnh_verification")
+        return json.loads(check.check_params.json_params)
+
+    def test_fy26_scale_reaches_the_readiness_check(self) -> None:
+        payload = self._pnh_payload(ibgp_pnh_count=63, ibgp_pnh_step=2)
+
+        self.assertEqual(63, payload["count"])
+        self.assertEqual(2, payload["step"])
+        self.assertEqual(
+            list(EBB_OPENR_INJECTED_START_IPV4S_IXIA03), payload["start_ipv4s"]
+        )
+        self.assertEqual(
+            list(EBB_OPENR_INJECTED_START_IPV6S_IXIA03), payload["start_ipv6s"]
+        )
+
+    def test_fy27_scale_reaches_the_readiness_check(self) -> None:
+        payload = self._pnh_payload(ibgp_pnh_count=80, ibgp_pnh_step=2)
+
+        self.assertEqual(80, payload["count"])
+        self.assertEqual(2, payload["step"])
+
+    def test_omitted_scale_serializes_the_legacy_payload(self) -> None:
+        """A caller with no resolved plan emits exactly what it used to."""
+        payload = self._pnh_payload()
+
+        self.assertNotIn("count", payload)
+        self.assertNotIn("step", payload)
+        self.assertEqual(
+            {
+                "expected_openr_metric",
+                "expected_openr_ad",
+                "start_ipv4s",
+                "start_ipv6s",
+            },
+            set(payload),
+        )

@@ -2,122 +2,66 @@
 # pyre-unsafe
 """Physical inventories for routing EBB testbeds.
 
-This module holds the ``PhysicalInventory`` artifacts for the ASH6 BAG
-conveyor pair-of-pairs (``bag010 / bag011 / bag012 / bag013``), the
-historical SNC1 BAG (``bag002``), the EB0x lab boxes, the per-developer
-``bgp.eb.test.ash6`` box, and the SNC1 Arista ``jsw002``.
+§1 Purpose
+==========
+Framework-owned inventories for the ASH6 NRQ EBB Conveyor fleet, including
+the single-DUT IxANVL conformance rig (``nrqeb010``), ancillary EB0x lab
+devices, the historical SNC1 BAG, the per-developer EBB box, and the SNC1
+Arista device.
 
-The topology figures and naming conventions below describe the ASH6-
-specific wiring. The general OpenR-standalone mode contract (approach,
-component wiring, single-ownership invariant) lives in
-``abstractions/README.md §4 OpenR standalone mode`` — see §6.
+§2 IXIA chassis inventory
+========================
+``IXIA03_ASH6`` (``2401:db00:2066:3036::3003``) is primary for NRQEB006
+through NRQEB009. ``IXIA11_ASH6`` (``2401:db00:2066:303b::3001``) is their
+secondary wiring profile and remains primary for the EB0x lab devices.
+``bag002.snc1`` uses the SNC1 ``ares1-my24520014`` chassis.
 
-──────────────────────────────────────────────────────────────────────────
- §1  Purpose
-──────────────────────────────────────────────────────────────────────────
-Framework-owned ``PhysicalInventory`` instances for the routing EBB
-testbeds. New OpenR-standalone BAG onboarding follows the recipe in the
-sibling ``README.md`` — do not clone this file's shape ad-hoc.
+§3 Figure A — ASH6 NRQ physical topology
+=========================================
+::
 
-──────────────────────────────────────────────────────────────────────────
- §2  IXIA chassis inventory
-──────────────────────────────────────────────────────────────────────────
-    Chassis            Address                            Use
-    ─────────────────  ─────────────────────────────────  ─────────────────
-    IXIA11_ASH6        2401:db00:2066:303b::3001          Primary chassis
-                                                          for ALL ASH6 BAGs
-                                                          and EB0x lab boxes
-    IXIA03_ASH6        2401:db00:2066:3036::3003          Secondary fallback
-                                                          for ALL ASH6 BAGs
-    ares1-my24520014   (SNC1 chassis, non-IPv6 handle)    Primary for bag002.snc1
+    IXIA03_ASH6 (primary)                 IXIA11_ASH6 (secondary)
+    1/{81..84} -- Eth3/35/{1..4} nrqeb006  9/{1..4}  -- Eth3/36/{1..4}
+    1/{85..88} -- Eth3/35/{1..4} nrqeb007  9/{5..8}  -- Eth3/36/{1..4}
+    1/{89..92} -- Eth3/35/{1..4} nrqeb008  10/{1..4} -- Eth3/36/{1..4}
+    1/{93..96} -- Eth3/35/{1..4} nrqeb009  10/{5..8} -- Eth3/36/{1..4}
 
-──────────────────────────────────────────────────────────────────────────
- §3  Figure A — full ASH6 physical topology
-──────────────────────────────────────────────────────────────────────────
-BAG002_SNC1 is not shown; it sits in a different datacenter (SNC1) on a
-different IXIA chassis and does not participate in the OpenR-standalone
-mesh.
+    Conformance-only single DUT (no OpenR pair, no secondary chassis):
+    7/{2..4} -- Eth3/36/{2..4} nrqeb010  (IXIA11; DIface-0/1/2 in that order;
+    lane 1 carries no light, per LLDP)
 
-    IXIA11_ASH6 (primary)                  IXIA03_ASH6 (secondary)
-    ─────────────────────                  ───────────────────────
-    7/{1..4} ── Eth3/36/{1..4} bag010       1/{49..52} ── Eth3/35/{1..4} bag010
-    7/{5..8} ── Eth3/36/{1..4} bag011       1/{53..56} ── Eth3/35/{1..4} bag011
-    8/{1..4} ── Eth3/36/{1..4} bag012       1/{57..60} ── Eth3/35/{1..4} bag012
-    8/{5..8} ── Eth3/36/{1..4} bag013       1/{61..64} ── Eth3/35/{1..4} bag013
+    nrqeb006 Eth3/1/1 -- Eth3/1/1 nrqeb007   po100306 owner link
+    nrqeb006 Eth3/2/1 -- Eth3/2/1 nrqeb007   po100307 owner link
+    nrqeb008 Eth3/1/1 -- Eth3/1/1 nrqeb009   po100308 owner link
+    nrqeb008 Eth3/2/1 -- Eth3/2/1 nrqeb009   po100309 owner link
 
-            BAG cross-cables
-            ────────────────
-            ┌─────────────┐  ┌─────────────┐
-            │   bag010    │  │   bag011    │
-            │ owns        │  │ owns        │
-            │ po100310    │  │ po100311    │
-            │             │  │             │
-            │ Eth3/1/1 ●──┼──┼──● Eth3/1/1 │      po100310 members
-            │ Eth3/2/1 ●──┼──┼──● Eth3/2/1 │      po100311 members
-            └─────────────┘  └─────────────┘
+§4 Figure B — ownership-pair zoom
+=================================
+Each NRQ pair has two physical cross-links. The lower-numbered DUT owns the
+first port-channel and is helper for the second; the higher-numbered DUT owns
+the second and is helper for the first. Each owner runs standalone OpenR and
+injects only its own synthetic KvStore adjacency state.
 
-            ┌─────────────┐  ┌─────────────┐
-            │   bag012    │  │   bag013    │
-            │ owns        │  │ owns        │
-            │ po100312    │  │ po100313    │
-            │             │  │             │
-            │ Eth3/1/1 ●──┼──┼──● Eth3/1/1 │      po100312 members
-            │ Eth3/2/1 ●──┼──┼──● Eth3/2/1 │      po100313 members
-            └─────────────┘  └─────────────┘
+§5 Naming convention
+====================
+``port_channel_id = 1003NN`` maps to the owner whose hostname ends in ``NN``:
+``po100306`` through ``po100309`` map to ``nrqeb006`` through ``nrqeb009``.
 
-──────────────────────────────────────────────────────────────────────────
- §4  Figure B — ownership-pair zoom (bag010 ↔ bag011)
-──────────────────────────────────────────────────────────────────────────
-The bag012 ↔ bag013 pair is isomorphic (member interfaces + PC IDs shift
-by 2).
-
-   bag010 (OpenR daemon standalone)          bag011 (OpenR daemon standalone)
-   ┌──────────────────────┐                  ┌──────────────────────┐
-   │  owner of po100310   │                  │  owner of po100311   │
-   │  Eth3/1/1 ●──────────┼── phys cable ────┼──────● Eth3/1/1      │  po100310 members
-   │  Eth3/2/1 ●──────────┼── phys cable ────┼──────● Eth3/2/1      │  po100311 members
-   │  (Eth3/2/1 is only a │                  │  (Eth3/1/1 is only a │
-   │   helper member for  │                  │   helper member for  │
-   │   bag011's po100311) │                  │   bag010's po100310) │
-   └──────────────────────┘                  └──────────────────────┘
-       ▲                                          ▲
-       │ fake adj:node.bag010.<plane>.<i>         │ fake adj:node.bag011.<plane>.<i>
-       │ KvStore keys next-hop → po100310         │ KvStore keys next-hop → po100311
-
-Each DUT runs a real OpenR daemon with a zero-peer config; adjacencies
-are injected via Thrift with ``ttl = int(-(1 << 31))``. See
-``abstractions/README.md §4 OpenR standalone mode`` for the full
-approach and component call-chain.
-
-──────────────────────────────────────────────────────────────────────────
- §5  Naming convention
-──────────────────────────────────────────────────────────────────────────
-``port_channel_id = 1003NN  ⇔  owner hostname = bag0NN.ash6``
-
-``NN`` is the two-digit token equal to the last two digits of the owner's
-``bag0NN`` hostname:
-
-    po100310 → bag010        po100312 → bag012
-    po100311 → bag011        po100313 → bag013
-
-──────────────────────────────────────────────────────────────────────────
- §6  See also
-──────────────────────────────────────────────────────────────────────────
-- ``abstractions/README.md §4 OpenR standalone mode`` for the framework
-  contract (approach, runtime behavior, component wiring, invariants,
-  and enforcement).
-- Sibling ``README.md`` for the file-shape template and the "New
-  OpenR-standalone BAG onboarding" recipe.
-- ``abstractions/topology/model.py:OpenRStandaloneLink`` for the class
-  definition and ``__post_init__`` invariant enforcement.
+§6 See also
+==========
+See ``abstractions/README.md §4 OpenR standalone mode`` for the framework
+contract and this package's ``README.md`` for the inventory authoring rules.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import typing as t
 
+from taac.abstractions.physical_interface_semantics import (
+    PhysicalInterfaceProfile,
+    PhysicalLinkRate,
+)
 from taac.abstractions.physical_inventory.physical_inventory import (
     PhysicalInventory,
 )
@@ -125,6 +69,9 @@ from taac.abstractions.routing_semantics import NetworkRole
 from taac.abstractions.topology import (
     OpenRStandaloneEndpoint,
     OpenRStandaloneLink,
+)
+from taac.utils.lab_device_credentials import (
+    get_lab_device_password,
 )
 from taac.test_as_a_config.types import MockDeviceInfo
 
@@ -141,6 +88,9 @@ def _ebb_peer_groups() -> dict[str, str]:
 # ─── Shared constants ─────────────────────────────────────────────────────
 
 _EBB_BGPCPP_PATH = "taac/ebb_ci_cd_configs/ebb_full_scale_bgpcpp_config"
+_EBB_PHYSICAL_INTERFACE_PROFILE = PhysicalInterfaceProfile(
+    rate=PhysicalLinkRate(aggregate_gbps=100, lane_count=2)
+)
 IXIA03_ASH6 = "2401:db00:2066:3036::3003"
 IXIA11_ASH6 = "2401:db00:2066:303b::3001"
 
@@ -149,7 +99,7 @@ IXIA11_ASH6 = "2401:db00:2066:303b::3001"
 # These produce the ``host_driver_args`` / ``oss_mock_device_data`` payloads that
 # the retired ``util/bgp_ebb_lab_wiring._lab_device_wiring`` helper used to
 # synthesize at factory-call time. Byte-identical outputs preserved: password
-# read via ``os.environ.get(env_var, "dnepit")`` (env-var lookup runs at
+# read via ``get_lab_device_password(env_var)`` (env-var lookup runs at
 # PhysicalInventory construction/module-import time; TAAC test processes do
 # not mutate the password env var after import).
 
@@ -158,12 +108,11 @@ def _lab_host_driver_args(
     device_name: str,
     *,
     password_env: str = "TAAC_EBB_LAB_DEVICE_PASSWORD",
-    password_default: str = "dnepit",  # pragma: allowlist secret
     extra_kwargs: dict[str, t.Any] | None = None,
 ) -> dict[str, str]:
     driver_kwargs: dict[str, t.Any] = {
         "username": "admin",
-        "password": os.environ.get(password_env, password_default),
+        "password": get_lab_device_password(password_env),
     }
     if extra_kwargs:
         driver_kwargs.update(extra_kwargs)
@@ -194,189 +143,216 @@ def _lab_oss_mock_device_data(
     return {device_name: MockDeviceInfo(**mock_kwargs)}
 
 
-# ─── bag010 ↔ bag011 OpenR-standalone pair (see Figure B in module docstring) ───
+# ─── nrqeb006 ↔ nrqeb007 OpenR-standalone pair ───────────────────────────
 
-_BAG010_OPENR_LINK = OpenRStandaloneLink(
-    port_channel_id=100310,
+_NRQEB006_OPENR_LINK = OpenRStandaloneLink(
+    port_channel_id=100306,
     owner=OpenRStandaloneEndpoint(
-        hostname="bag010.ash6",
+        hostname="nrqeb006.ash6",
         member_interface="Ethernet3/1/1",
-        ipv4_cidr="10.217.10.10/31",
-        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3100/127",
-        link_local_cidr="fe80::100:310:0/64",
+        ipv4_cidr="10.217.6.6/31",
+        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3060/127",
+        link_local_cidr="fe80::100:306:0/64",
     ),
     helper=OpenRStandaloneEndpoint(
-        hostname="bag011.ash6",
+        hostname="nrqeb007.ash6",
         member_interface="Ethernet3/1/1",
-        ipv4_cidr="10.217.10.11/31",
-        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3101/127",
-        link_local_cidr="fe80::100:310:1/64",
+        ipv4_cidr="10.217.6.7/31",
+        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3061/127",
+        link_local_cidr="fe80::100:306:1/64",
     ),
+    speed="400g",
 )
 
-BAG010_ASH6 = PhysicalInventory(
-    device_name="bag010.ash6",
+NRQEB006_ASH6 = PhysicalInventory(
+    device_name="nrqeb006.ash6",
+    basset_pool="routing.qual",
     network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     usage=frozenset({"cicd", "qual"}),
-    primary_ixia_chassis_ip=IXIA11_ASH6,
-    secondary_ixia_chassis_ip=IXIA03_ASH6,
+    primary_ixia_chassis_ip=IXIA03_ASH6,
+    secondary_ixia_chassis_ip=IXIA11_ASH6,
     ixia_ports=[
-        ("Ethernet3/36/1", "7/1"),
+        ("Ethernet3/35/1", "1/81"),
+        ("Ethernet3/35/2", "1/82"),
+        ("Ethernet3/35/3", "1/83"),
+        ("Ethernet3/35/4", "1/84"),
+    ],
+    secondary_ixia_ports=[
+        ("Ethernet3/36/1", "9/1"),
+        ("Ethernet3/36/2", "9/2"),
+        ("Ethernet3/36/3", "9/3"),
+        ("Ethernet3/36/4", "9/4"),
+    ],
+    dut_bgp_as=65006,
+    bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
+    openr_configerator_path="taac/ebb_ci_cd_configs/nrqeb006_ash6_openr_config",
+    openr_standalone_link=_NRQEB006_OPENR_LINK,
+    peer_groups=_ebb_peer_groups(),
+)
+
+_NRQEB007_OPENR_LINK = OpenRStandaloneLink(
+    port_channel_id=100307,
+    owner=OpenRStandaloneEndpoint(
+        hostname="nrqeb007.ash6",
+        member_interface="Ethernet3/2/1",
+        ipv4_cidr="10.217.7.7/31",
+        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3071/127",
+        link_local_cidr="fe80::100:307:1/64",
+    ),
+    helper=OpenRStandaloneEndpoint(
+        hostname="nrqeb006.ash6",
+        member_interface="Ethernet3/2/1",
+        ipv4_cidr="10.217.7.6/31",
+        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3070/127",
+        link_local_cidr="fe80::100:307:0/64",
+    ),
+    speed="400g",
+)
+
+NRQEB007_ASH6 = PhysicalInventory(
+    device_name="nrqeb007.ash6",
+    basset_pool="routing.qual",
+    network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
+    usage=frozenset({"cicd", "qual"}),
+    primary_ixia_chassis_ip=IXIA03_ASH6,
+    secondary_ixia_chassis_ip=IXIA11_ASH6,
+    ixia_ports=[
+        ("Ethernet3/35/1", "1/85"),
+        ("Ethernet3/35/2", "1/86"),
+        ("Ethernet3/35/3", "1/87"),
+        ("Ethernet3/35/4", "1/88"),
+    ],
+    secondary_ixia_ports=[
+        ("Ethernet3/36/1", "9/5"),
+        ("Ethernet3/36/2", "9/6"),
+        ("Ethernet3/36/3", "9/7"),
+        ("Ethernet3/36/4", "9/8"),
+    ],
+    dut_bgp_as=65007,
+    bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
+    openr_configerator_path="taac/ebb_ci_cd_configs/nrqeb007_ash6_openr_config",
+    openr_standalone_link=_NRQEB007_OPENR_LINK,
+    peer_groups=_ebb_peer_groups(),
+)
+
+
+# ─── nrqeb008 ↔ nrqeb009 OpenR-standalone pair ───────────────────────────
+
+_NRQEB008_OPENR_LINK = OpenRStandaloneLink(
+    port_channel_id=100308,
+    owner=OpenRStandaloneEndpoint(
+        hostname="nrqeb008.ash6",
+        member_interface="Ethernet3/1/1",
+        ipv4_cidr="10.217.8.8/31",
+        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3080/127",
+        link_local_cidr="fe80::100:308:0/64",
+    ),
+    helper=OpenRStandaloneEndpoint(
+        hostname="nrqeb009.ash6",
+        member_interface="Ethernet3/1/1",
+        ipv4_cidr="10.217.8.9/31",
+        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3081/127",
+        link_local_cidr="fe80::100:308:1/64",
+    ),
+    speed="400g",
+)
+
+NRQEB008_ASH6 = PhysicalInventory(
+    device_name="nrqeb008.ash6",
+    basset_pool="routing.qual",
+    network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
+    usage=frozenset({"cicd", "qual"}),
+    primary_ixia_chassis_ip=IXIA03_ASH6,
+    secondary_ixia_chassis_ip=IXIA11_ASH6,
+    ixia_ports=[
+        ("Ethernet3/35/1", "1/89"),
+        ("Ethernet3/35/2", "1/90"),
+        ("Ethernet3/35/3", "1/91"),
+        ("Ethernet3/35/4", "1/92"),
+    ],
+    secondary_ixia_ports=[
+        ("Ethernet3/36/1", "10/1"),
+        ("Ethernet3/36/2", "10/2"),
+        ("Ethernet3/36/3", "10/3"),
+        ("Ethernet3/36/4", "10/4"),
+    ],
+    dut_bgp_as=65008,
+    bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
+    openr_configerator_path="taac/ebb_ci_cd_configs/nrqeb008_ash6_openr_config",
+    openr_standalone_link=_NRQEB008_OPENR_LINK,
+    peer_groups=_ebb_peer_groups(),
+)
+
+_NRQEB009_OPENR_LINK = OpenRStandaloneLink(
+    port_channel_id=100309,
+    owner=OpenRStandaloneEndpoint(
+        hostname="nrqeb009.ash6",
+        member_interface="Ethernet3/2/1",
+        ipv4_cidr="10.217.9.9/31",
+        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3091/127",
+        link_local_cidr="fe80::100:309:1/64",
+    ),
+    helper=OpenRStandaloneEndpoint(
+        hostname="nrqeb008.ash6",
+        member_interface="Ethernet3/2/1",
+        ipv4_cidr="10.217.9.8/31",
+        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3090/127",
+        link_local_cidr="fe80::100:309:0/64",
+    ),
+    speed="400g",
+)
+
+NRQEB009_ASH6 = PhysicalInventory(
+    device_name="nrqeb009.ash6",
+    basset_pool="routing.qual",
+    network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
+    usage=frozenset({"cicd", "qual"}),
+    primary_ixia_chassis_ip=IXIA03_ASH6,
+    secondary_ixia_chassis_ip=IXIA11_ASH6,
+    ixia_ports=[
+        ("Ethernet3/35/1", "1/93"),
+        ("Ethernet3/35/2", "1/94"),
+        ("Ethernet3/35/3", "1/95"),
+        ("Ethernet3/35/4", "1/96"),
+    ],
+    secondary_ixia_ports=[
+        ("Ethernet3/36/1", "10/5"),
+        ("Ethernet3/36/2", "10/6"),
+        ("Ethernet3/36/3", "10/7"),
+        ("Ethernet3/36/4", "10/8"),
+    ],
+    dut_bgp_as=65009,
+    bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
+    openr_configerator_path="taac/ebb_ci_cd_configs/nrqeb009_ash6_openr_config",
+    openr_standalone_link=_NRQEB009_OPENR_LINK,
+    peer_groups=_ebb_peer_groups(),
+)
+
+
+# ─── NRQEB010 — IxANVL conformance single DUT ────────────────────────────
+# Conformance-only: three IXIA11 links in DIface order, no OpenR pair and
+# no secondary chassis. The DUT and IxANVL configs both resolve from this
+# record, as they do from EB03_LAB_ASH6. The BGP AS is the one the
+# conformance configs apply; NRQ devices are reached through FCR, so no
+# lab login fields are set. Lane 1 (7/1) carries no light, so the rig
+# uses lanes 2-4; lane order, not the lane numbers, decides DIface-N.
+NRQEB010_ASH6 = PhysicalInventory(
+    device_name="nrqeb010.ash6",
+    network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
+    usage=frozenset({"qual"}),
+    primary_ixia_chassis_ip=IXIA11_ASH6,
+    ixia_ports=[
         ("Ethernet3/36/2", "7/2"),
         ("Ethernet3/36/3", "7/3"),
         ("Ethernet3/36/4", "7/4"),
     ],
-    secondary_ixia_ports=[
-        ("Ethernet3/35/1", "1/49"),
-        ("Ethernet3/35/2", "1/50"),
-        ("Ethernet3/35/3", "1/51"),
-        ("Ethernet3/35/4", "1/52"),
-    ],
-    dut_bgp_as=65010,
+    dut_bgp_as=64981,
     bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
-    openr_configerator_path="taac/ebb_ci_cd_configs/bag010_ash6_openr_config",
-    openr_standalone_link=_BAG010_OPENR_LINK,
-    peer_groups=_ebb_peer_groups(),
-)
-
-_BAG011_OPENR_LINK = OpenRStandaloneLink(
-    port_channel_id=100311,
-    owner=OpenRStandaloneEndpoint(
-        hostname="bag011.ash6",
-        member_interface="Ethernet3/2/1",
-        ipv4_cidr="10.217.11.11/31",
-        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3111/127",
-        link_local_cidr="fe80::100:311:1/64",
-    ),
-    helper=OpenRStandaloneEndpoint(
-        hostname="bag010.ash6",
-        member_interface="Ethernet3/2/1",
-        ipv4_cidr="10.217.11.10/31",
-        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3110/127",
-        link_local_cidr="fe80::100:311:0/64",
-    ),
-)
-
-BAG011_ASH6 = PhysicalInventory(
-    device_name="bag011.ash6",
-    network_role=NetworkRole.EB,
-    usage=frozenset({"cicd", "qual"}),
-    primary_ixia_chassis_ip=IXIA11_ASH6,
-    secondary_ixia_chassis_ip=IXIA03_ASH6,
-    ixia_ports=[
-        ("Ethernet3/36/1", "7/5"),
-        ("Ethernet3/36/2", "7/6"),
-        ("Ethernet3/36/3", "7/7"),
-        ("Ethernet3/36/4", "7/8"),
-    ],
-    secondary_ixia_ports=[
-        ("Ethernet3/35/1", "1/53"),
-        ("Ethernet3/35/2", "1/54"),
-        ("Ethernet3/35/3", "1/55"),
-        ("Ethernet3/35/4", "1/56"),
-    ],
-    # NOTE: preserved verbatim from the legacy bag011_ash6_test_config.py
-    # which stored the DUT's local BGP AS in a variable named
-    # ``BAG012_EOS_BGP_AS = 65011``. The literal 65011 is bag011's AS; the
-    # legacy variable name was a copy-paste artifact.
-    dut_bgp_as=65011,
-    bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
-    openr_configerator_path="taac/ebb_ci_cd_configs/bag011_ash6_openr_config",
-    openr_standalone_link=_BAG011_OPENR_LINK,
-    peer_groups=_ebb_peer_groups(),
-)
-
-
-# ─── bag012 ↔ bag013 OpenR-standalone pair (isomorphic to Figure B) ───
-
-_BAG012_OPENR_LINK = OpenRStandaloneLink(
-    port_channel_id=100312,
-    owner=OpenRStandaloneEndpoint(
-        hostname="bag012.ash6",
-        member_interface="Ethernet3/1/1",
-        ipv4_cidr="10.217.12.12/31",
-        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3120/127",
-        link_local_cidr="fe80::100:312:0/64",
-    ),
-    helper=OpenRStandaloneEndpoint(
-        hostname="bag013.ash6",
-        member_interface="Ethernet3/1/1",
-        ipv4_cidr="10.217.12.13/31",
-        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3121/127",
-        link_local_cidr="fe80::100:312:1/64",
-    ),
-)
-
-BAG012_ASH6 = PhysicalInventory(
-    device_name="bag012.ash6",
-    network_role=NetworkRole.EB,
-    usage=frozenset({"cicd", "qual"}),
-    primary_ixia_chassis_ip=IXIA11_ASH6,
-    secondary_ixia_chassis_ip=IXIA03_ASH6,
-    ixia_ports=[
-        ("Ethernet3/36/1", "8/1"),
-        ("Ethernet3/36/2", "8/2"),
-        ("Ethernet3/36/3", "8/3"),
-        ("Ethernet3/36/4", "8/4"),
-    ],
-    secondary_ixia_ports=[
-        ("Ethernet3/35/1", "1/57"),
-        ("Ethernet3/35/2", "1/58"),
-        ("Ethernet3/35/3", "1/59"),
-        ("Ethernet3/35/4", "1/60"),
-    ],
-    dut_bgp_as=65012,
-    # bag012 is the only bag physical_inventory that pins ``router_id`` explicitly
-    # (bag010/bag011/bag013 all rely on the device-default BGP router-id).
-    # Preserved verbatim from the legacy bag012 config for golden-manifest identity.
-    router_id="10.163.28.11",
-    bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
-    openr_configerator_path="taac/ebb_ci_cd_configs/bag012_ash6_openr_config",
-    openr_standalone_link=_BAG012_OPENR_LINK,
-    peer_groups=_ebb_peer_groups(),
-)
-
-_BAG013_OPENR_LINK = OpenRStandaloneLink(
-    port_channel_id=100313,
-    owner=OpenRStandaloneEndpoint(
-        hostname="bag013.ash6",
-        member_interface="Ethernet3/2/1",
-        ipv4_cidr="10.217.13.13/31",
-        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3131/127",
-        link_local_cidr="fe80::100:313:1/64",
-    ),
-    helper=OpenRStandaloneEndpoint(
-        hostname="bag012.ash6",
-        member_interface="Ethernet3/2/1",
-        ipv4_cidr="10.217.13.12/31",
-        ipv6_cidr="2620:0:1cff:dead:bef1:100:13:3130/127",
-        link_local_cidr="fe80::100:313:0/64",
-    ),
-)
-
-BAG013_ASH6 = PhysicalInventory(
-    device_name="bag013.ash6",
-    network_role=NetworkRole.EB,
-    usage=frozenset({"cicd", "qual"}),
-    primary_ixia_chassis_ip=IXIA11_ASH6,
-    secondary_ixia_chassis_ip=IXIA03_ASH6,
-    ixia_ports=[
-        ("Ethernet3/36/1", "8/5"),
-        ("Ethernet3/36/2", "8/6"),
-        ("Ethernet3/36/3", "8/7"),
-        ("Ethernet3/36/4", "8/8"),
-    ],
-    secondary_ixia_ports=[
-        ("Ethernet3/35/1", "1/61"),
-        ("Ethernet3/35/2", "1/62"),
-        ("Ethernet3/35/3", "1/63"),
-        ("Ethernet3/35/4", "1/64"),
-    ],
-    dut_bgp_as=65013,
-    # No ``router_id`` — device-default (same as bag010/bag011; see BAG012_ASH6 note).
-    bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
-    openr_configerator_path="taac/ebb_ci_cd_configs/bag013_ash6_openr_config",
-    openr_standalone_link=_BAG013_OPENR_LINK,
     peer_groups=_ebb_peer_groups(),
 )
 
@@ -386,6 +362,7 @@ BAG013_ASH6 = PhysicalInventory(
 BAG002_SNC1 = PhysicalInventory(
     device_name="bag002.snc1",
     network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     usage=frozenset({"qual"}),
     primary_ixia_chassis_ip="ares1-my24520014",
     ixia_ports=[
@@ -407,6 +384,7 @@ EB01_LAB_ASH6 = PhysicalInventory(
     usage=frozenset({"qual"}),
     device_name="eb01.lab.ash6",
     network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     primary_ixia_chassis_ip=IXIA11_ASH6,
     ixia_ports=[
         ("Ethernet3/1/3", "5/7"),
@@ -425,7 +403,6 @@ EB01_LAB_ASH6 = PhysicalInventory(
         # these keys inline (Wave 2 candidate: fold into the promoted
         # ``host_driver_args`` / ``oss_mock_device_data`` fields).
         "lab_admin_username": "admin",
-        "lab_admin_password_default": "dnepit",  # pragma: allowlist secret
         "mock_device_hardware": "ARISTA_7516",
         "mock_device_role": "EB",
         "mock_device_asic": "JERICHO",
@@ -441,6 +418,7 @@ EB02_LAB_ASH6 = PhysicalInventory(
     usage=frozenset({"qual"}),
     device_name="eb02.lab.ash6",
     network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     primary_ixia_chassis_ip=IXIA11_ASH6,
     ixia_ports=[
         ("Ethernet3/1/3", "6/2"),
@@ -458,7 +436,6 @@ EB02_LAB_ASH6 = PhysicalInventory(
         # these keys inline (Wave 2 candidate: fold into the promoted
         # ``host_driver_args`` / ``oss_mock_device_data`` fields).
         "lab_admin_username": "admin",
-        "lab_admin_password_default": "dnepit",  # pragma: allowlist secret
         "mock_device_hardware": "ARISTA_7516",
         "mock_device_role": "EB",
         "mock_device_asic": "JERICHO",
@@ -474,11 +451,12 @@ EB03_LAB_ASH6 = PhysicalInventory(
     usage=frozenset({"qual"}),
     device_name="eb03.lab.ash6",
     network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     primary_ixia_chassis_ip=IXIA11_ASH6,
     ixia_ports=[
-        ("Ethernet3/1/3", "6/5"),
-        ("Ethernet3/1/5", "6/6"),
-        ("Ethernet3/36/1", "2/8"),
+        ("Ethernet3/1/2", "6/5"),
+        ("Ethernet3/36/3", "11/2"),
+        ("Ethernet3/36/1", "11/1"),
     ],
     dut_bgp_as=64981,
     bgpcpp_configerator_path=_EBB_BGPCPP_PATH,
@@ -492,7 +470,6 @@ EB03_LAB_ASH6 = PhysicalInventory(
         # these keys inline (Wave 2 candidate: fold into the promoted
         # ``host_driver_args`` / ``oss_mock_device_data`` fields).
         "lab_admin_username": "admin",
-        "lab_admin_password_default": "dnepit",  # pragma: allowlist secret
         "mock_device_hardware": "ARISTA_7516",
         "mock_device_role": "EB",
         "mock_device_asic": "JERICHO",
@@ -508,6 +485,7 @@ EB04_LAB_ASH6 = PhysicalInventory(
     usage=frozenset({"qual"}),
     device_name="eb04.lab.ash6",
     network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     primary_ixia_chassis_ip=IXIA11_ASH6,
     ixia_ports=[
         ("Ethernet3/1/1", "6/7"),
@@ -527,7 +505,6 @@ EB04_LAB_ASH6 = PhysicalInventory(
         # these keys inline (Wave 2 candidate: fold into the promoted
         # ``host_driver_args`` / ``oss_mock_device_data`` fields).
         "lab_admin_username": "admin",
-        "lab_admin_password_default": "dnepit",  # pragma: allowlist secret
         "mock_device_hardware": "ARISTA_7516",
         "mock_device_role": "EB",
         "mock_device_asic": "JERICHO",
@@ -541,13 +518,14 @@ EB04_LAB_ASH6 = PhysicalInventory(
 
 # ─── Dev-only EB test device ──────────────────────────────────────────────
 # ``bgp.eb.test.ash6`` is a per-developer BGP++ test switch — a lab box like
-# the eb0x boxes above, but with an extra ``bgp_ip`` host-driver kwarg
-# (thrift-over-IPv6 to a non-loopback address). Only used by the queue-memory
+# the eb0x boxes above, but with IPv6 endpoint overrides because its regular
+# loopback is not reachable from devservers. Only used by the queue-memory
 # monitor testconfig.
 EB_TEST_DEVICE = PhysicalInventory(
     usage=frozenset({"qual"}),
     device_name="bgp.eb.test.ash6",
     network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     primary_ixia_chassis_ip=IXIA11_ASH6,
     ixia_ports=[
         ("Ethernet3/1/5", "5/3"),
@@ -570,11 +548,11 @@ EB_TEST_DEVICE = PhysicalInventory(
     ),
     peer_groups=_ebb_peer_groups(),
     extras={
+        "eapi_endpoint": "2401:db00:2066:304a::1001",
         # Retained for ``factories/bgp_update_group.py`` which still reads
         # these keys inline (Wave 2 candidate: fold into the promoted
         # ``host_driver_args`` / ``oss_mock_device_data`` fields).
         "lab_admin_username": "admin",
-        "lab_admin_password_default": "dnepit",  # pragma: allowlist secret
         "host_driver_extra_kwargs": {
             "bgp_ip": "2401:db00:2066:304a::1001",
         },
@@ -600,6 +578,7 @@ JSW002_M001_SNC1 = PhysicalInventory(
     usage=frozenset({"adhoc"}),
     device_name="jsw002.m001.snc1",
     network_role=NetworkRole.EB,
+    default_physical_interface_profile=_EBB_PHYSICAL_INTERFACE_PROFILE,
     primary_ixia_chassis_ip="",
     dut_bgp_as=64981,
     bgpcpp_configerator_path=_EBB_BGPCPP_PATH,

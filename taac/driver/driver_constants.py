@@ -8,8 +8,9 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, FrozenSet, List, Optional, Union
 
+from taac.utils.fboss_ports import fboss_thrift_port
 from neteng.test_infra.ixia.ixnetwork_restpy.ixia_config_thrift import (
     types as ixia_config_types,
 )
@@ -325,6 +326,7 @@ NET_AI_DSF = "netcastle.lab.dsf"
 NET_AI_LAB_SMC_TIER = "networkai.test"
 NET_AI_LAB_REGRESSION_SMC_TIER = "networkai.test.regression"
 FBOSS_LAB_SMC_TIER = "netcastle.lab.fboss"
+FBOSS_DSF_LAB_SMC_TIER = "netcastle.lab.fboss.dsf"
 
 SYSTEM_DATE_THRESHOLD = 300
 
@@ -501,8 +503,10 @@ FBOSS_COOP_TIER: str = "fboss.coop"
 GALAXY_WEDGE_RE_PATTERN = re.compile(
     r"(^fsw[\d]{3})(-[fl]{1}c[\d]{3})(.p[\d]{3}.f[\d]{2}.[a-z]{3}[\d])", re.IGNORECASE
 )
-DEFAULT_AGENT_REMOTE_PORT = 5909
-DEFAULT_QSFP_PORT = 5910
+# Client-side ports: resolved to the migrated port (legacy + 50) on On-Demand
+# hosts, which drop egress to the VNC range 5900-5910. See utils/fboss_ports.py.
+DEFAULT_AGENT_REMOTE_PORT = fboss_thrift_port(5909)
+DEFAULT_QSFP_PORT = fboss_thrift_port(5910)
 
 FBOSS_AGENT_TIER: str = "fboss.agent"
 
@@ -516,7 +520,7 @@ ALLOWED_FBOSS_AGENTS = ["bgpd", "coop", "qsfp_service", "wedge_agent"]
 
 AGENT_CONFIG_PATCHER_NAME = "agent"
 
-BGP_CONFIG_PATCHER_NAME = "bgp"
+BGP_CONFIG_PATCHER_NAME = "bgpcpp"
 
 # A method in https://fburl.com/diffusion/316gf9z6
 CHANGE_PORT_ADMIN_PATCHER_METHOD_NAME = "change_port_admin_state"
@@ -622,7 +626,11 @@ class AristaAgentStatus(Enum):
     INACTIVE = 1
 
 
-# FIB Agent Port used by openr client
+# FIB Agent Port used by openr client.
+# Deliberately NOT routed through fboss_thrift_port(): this value is written into
+# Open/R's config on the switch (see fboss_switch.py, openr_options.fib_agent_port)
+# and is dialled by Open/R on the device itself, so where TAAC happens to be
+# running is irrelevant to it.
 OPENR_FIB_AGENT_PORT = 5909
 OPENR_FIB_AGENT_MTLS_PORT = 5912
 BGP_FIB_AGENT_MTLS_PORT = 5913
@@ -694,6 +702,12 @@ class OtherSystemctlServiceName(Enum):
     RSYSLOG = "rsyslog"
 
 
+class FbossOsType(Enum):
+    CLASSIC = "classic_os"
+    NETOS_NSPAWN = "nspawn_netos"
+    NETOS_NATIVE = "native_netos"
+
+
 class FbossSystemctlServiceName(Enum):
     AGENT = "wedge_agent"
     BGP = "bgpd"
@@ -707,6 +721,50 @@ class FbossSystemctlServiceName(Enum):
     FBOSS_HW_AGENT_0 = "fboss_hw_agent@0"
     FBOSS_HW_AGENT_1 = "fboss_hw_agent@1"
     COOP = "coop"
+
+
+FBOSS_SYSTEMCTL_SERVICE_NAME_MAP: Dict[
+    FbossOsType, Dict[FbossSystemctlServiceName, str]
+] = {
+    FbossOsType.CLASSIC: {
+        service: service.value for service in FbossSystemctlServiceName
+    },
+    FbossOsType.NETOS_NSPAWN: {
+        service: service.value for service in FbossSystemctlServiceName
+    },
+    FbossOsType.NETOS_NATIVE: {
+        **{service: service.value for service in FbossSystemctlServiceName},
+        FbossSystemctlServiceName.AGENT: (
+            "netos.service.fboss_wedge_agent_{vendor}_{index}"
+        ),
+        FbossSystemctlServiceName.BGP: "netos.service.fboss_bgp",
+        FbossSystemctlServiceName.QSFP: "netos.service.fboss_qsfp_service",
+        FbossSystemctlServiceName.OPENR: "netos.service.openr",
+        FbossSystemctlServiceName.FBOSS_SW_AGENT: ("netos.service.fboss_sw_agent"),
+        FbossSystemctlServiceName.FSDB: "netos.service.fboss_fsdb",
+        FbossSystemctlServiceName.FBOSS_HW_AGENT_0: (
+            "netos.service.fboss_wedge_agent_{vendor}_0"
+        ),
+        FbossSystemctlServiceName.FBOSS_HW_AGENT_1: (
+            "netos.service.fboss_wedge_agent_{vendor}_1"
+        ),
+        FbossSystemctlServiceName.COOP: "netos.service.fboss_coop",
+    },
+}
+
+# Classic and NSPAWN expose these as files. Native NetOS emits the same service
+# logs through journald, so the internal driver uses this basename mapping to
+# select the corresponding native systemd unit.
+FBOSS_LOG_FILE_TO_SERVICE: Dict[str, FbossSystemctlServiceName] = {
+    "wedge_agent.log": FbossSystemctlServiceName.AGENT,
+    "bgpd.log": FbossSystemctlServiceName.BGP,
+    "bgp.log": FbossSystemctlServiceName.BGP,
+    "qsfp_service.log": FbossSystemctlServiceName.QSFP,
+    "openr.log": FbossSystemctlServiceName.OPENR,
+    "fboss_sw_agent.log": FbossSystemctlServiceName.FBOSS_SW_AGENT,
+    "fsdb.log": FbossSystemctlServiceName.FSDB,
+    "coop.log": FbossSystemctlServiceName.COOP,
+}
 
 
 class ModuleType(Enum):
@@ -1131,6 +1189,73 @@ class InterfaceInfo:
     vlan_id: int
 
 
+@dataclass(frozen=True)
+class InterfaceState:
+    """
+    Admin (configured) and operational (observed link) state of an interface.
+
+    admin_enabled is None when the state is genuinely not observable rather
+    than when it is False: aggregated interfaces have no admin state of their
+    own, and drivers other than FBOSS only report the operational state.
+    """
+
+    oper_up: bool
+    admin_enabled: Optional[bool] = None
+    speed_mbps: Optional[int] = None
+    profile_id: Optional[str] = None
+    has_transceiver: Optional[bool] = None
+
+
+def describe_interface_state(state: InterfaceState) -> str:
+    """
+    Render an InterfaceState for a log line or an assertion message so that a
+    down interface can be attributed to the device or to the far end.
+    """
+    fields = [
+        f"admin={_admin_state_name(state.admin_enabled)}",
+        f"oper={'up' if state.oper_up else 'down'}",
+    ]
+    if state.speed_mbps:
+        fields.append(f"speed={state.speed_mbps}Mbps")
+    if state.profile_id:
+        fields.append(f"profile={state.profile_id}")
+    if state.has_transceiver is not None:
+        fields.append(f"transceiver={'present' if state.has_transceiver else 'absent'}")
+    described = " ".join(fields)
+    if state.oper_up:
+        return described
+    return f"{described}. {_describe_down_interface_cause(state)}"
+
+
+def _admin_state_name(admin_enabled: Optional[bool]) -> str:
+    if admin_enabled is None:
+        return "unknown"
+    return "enabled" if admin_enabled else "disabled"
+
+
+def _describe_down_interface_cause(state: InterfaceState) -> str:
+    if state.admin_enabled is None:
+        return (
+            "Admin state is not reported for this kind of interface, so the "
+            "cause cannot be attributed to a side; check its member ports."
+        )
+    if not state.admin_enabled:
+        return (
+            "The device never enabled the port, so it cannot link up whatever "
+            "the far end does; check the device configuration, for example a "
+            "COOP config that failed to activate."
+        )
+    if state.has_transceiver is False:
+        return (
+            "The device has the port enabled but reports no transceiver; check "
+            "that the optic is seated."
+        )
+    return (
+        "The device has the port enabled, so the device side is configured; "
+        "check the far end, the cable and the optics."
+    )
+
+
 def create_fadu_route_attribute_policy(
     WT_1: int,
     WT_2: int,
@@ -1257,4 +1382,40 @@ class UpdateSwitchOption(Enum):
     LOGGING_CONFIG = "logging_config"
 
 
-FSDB_PORT: int = 5908
+class ProdLikeEnvOption(Enum):
+    """Individually selectable phases of a prod-like environment setup.
+
+    Passing none of these runs every phase (a full native->prod-like setup).
+    Passing a subset runs only those phases, which is only allowed on a switch
+    that is already prod-like -- see ProdLikeEnvHandler.setup_prod_like_env.
+    """
+
+    # fbpkg.fetch wedge_agent + qsfp_service and enable their systemd units
+    BINARIES = "binaries"
+    # Push the agent and QSFP configs, with the local mutations applied
+    CONFIGS = "configs"
+    # Verify the SAI SDK ships in the package and install the native SDK kmod
+    SDK = "sdk"
+    # Fetch the transceiver firmware images qsfp_service upgrades optics with
+    OPTICS_FIRMWARE = "optics_firmware"
+    # rsyslog + logrotate for the agent/qsfp logs
+    LOGGING = "logging"
+    # Stop services before the mutating phases, start + health check after
+    SERVICES = "services"
+
+
+# Phases that change what the agent or qsfp_service would run with. None of
+# them take effect until a restart, so selecting any of them also selects
+# SERVICES unless the caller opts out with skip_services. LOGGING is
+# deliberately absent: it restarts rsyslog, not the agent.
+PROD_LIKE_MUTATING_OPTIONS: FrozenSet[ProdLikeEnvOption] = frozenset(
+    {
+        ProdLikeEnvOption.BINARIES,
+        ProdLikeEnvOption.CONFIGS,
+        ProdLikeEnvOption.SDK,
+        ProdLikeEnvOption.OPTICS_FIRMWARE,
+    }
+)
+
+
+FSDB_PORT: int = fboss_thrift_port(5908)

@@ -72,6 +72,26 @@ from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.types import Service, TestConfig
 
 
+def _select_2_ixia_hardening_playbooks(
+    playbooks: list[taac_types.Playbook],
+    playbooks_selected: list[str] | None,
+) -> list[taac_types.Playbook]:
+    """Return requested hardening playbooks in caller-specified order."""
+    if playbooks_selected is None:
+        return playbooks
+
+    playbooks_by_name = {playbook.name: playbook for playbook in playbooks}
+    unknown_names = [
+        name for name in playbooks_selected if name not in playbooks_by_name
+    ]
+    if unknown_names:
+        raise ValueError(
+            "Unknown 2-IXIA hardening playbook selections: "
+            f"{unknown_names}; available: {sorted(playbooks_by_name)}"
+        )
+    return [playbooks_by_name[name] for name in playbooks_selected]
+
+
 def get_fauu_eb_peer_group_tasks(device_name):
     """
     Returns the common FAUU EB peer group configuration tasks for devices with "uu" in the name.
@@ -395,6 +415,7 @@ def get_bgp_peer_config_tasks(
     route_map_downlink_egress,
     ecmp_group_overflow_prefix,
     v6_uplink_prefix,
+    v6_downlink_prefix=None,
 ):
     """
     Returns the list of BGP peer configuration tasks that were originally part of list b in
@@ -681,6 +702,26 @@ def get_bgp_peer_config_tasks(
                     "out_stmt_name": "RANDOM",
                 },
             ),
+            *(
+                [
+                    create_coop_register_patcher_task(
+                        hostname=device_name,
+                        config_names=[
+                            "bgpcpp",
+                            "bgpcpp_softdrain",
+                        ],
+                        patcher_name=f"add_bgp_policy_match_prefix_to_propagate_routes_{route_map_downlink_ingress}_downlink",
+                        py_func_name="add_bgp_policy_match_prefix_to_propagate_routes",
+                        patcher_args={
+                            "matching_prefix": f"{v6_downlink_prefix}::/16",
+                            "in_stmt_name": route_map_downlink_ingress,
+                            "out_stmt_name": "RANDOM",
+                        },
+                    )
+                ]
+                if v6_downlink_prefix is not None
+                else []
+            ),
             create_wait_for_bgp_convergence_task(hostnames=[device_name]),
             create_coop_register_patcher_task(
                 hostname=device_name,
@@ -729,6 +770,46 @@ def get_bgp_peer_config_tasks(
         ]
     )
     return tasks
+
+
+_DUAL_ENDED_INTERFACE_FLAP_PLAYBOOK = "test_flap_half_uplinks_dut_and_half_nbr"
+
+
+def _validate_neighbor_interface_flap_params(
+    *,
+    playbooks_selected,
+    neighbor_dut_name,
+    neighbor_dut_interfaces_to_flap,
+    neighbor_interfaces_to_flap,
+) -> None:
+    requested = (
+        playbooks_selected is not None
+        and _DUAL_ENDED_INTERFACE_FLAP_PLAYBOOK in playbooks_selected
+    )
+    neighbor_args = (
+        neighbor_dut_name,
+        neighbor_dut_interfaces_to_flap,
+        neighbor_interfaces_to_flap,
+    )
+    if requested and not all(neighbor_args):
+        raise ValueError(
+            f"{_DUAL_ENDED_INTERFACE_FLAP_PLAYBOOK} requires neighbor_dut_name, "
+            "neighbor_dut_interfaces_to_flap, and neighbor_interfaces_to_flap"
+        )
+    if any(neighbor_args) and not all(neighbor_args):
+        raise ValueError(
+            "Remote interface-flap configuration must provide "
+            "neighbor_dut_name, neighbor_dut_interfaces_to_flap, and "
+            "neighbor_interfaces_to_flap together"
+        )
+    if neighbor_dut_interfaces_to_flap and (
+        len(neighbor_dut_interfaces_to_flap) != len(neighbor_interfaces_to_flap)
+    ):
+        raise ValueError(
+            "DUT and neighbor LLDP port-pair lists must have equal length, got "
+            f"{len(neighbor_dut_interfaces_to_flap)} DUT vs "
+            f"{len(neighbor_interfaces_to_flap)} neighbor interfaces"
+        )
 
 
 def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
@@ -799,6 +880,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
     wedge_agent_restart_no_of_interations=1,
     direct_ixia_connections=None,
     basset_pool=None,
+    ixia_protocol_verification_timeout=1200,
     ecmp_group_overflow_prefix="7000",  # 7000:1:f::/64
     v6_uplink_prefix="6000",
     v6_session_flapping_prefix="6000",
@@ -806,23 +888,53 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
     v4_uplink_prefix="102",
     v4_downlink_prefix="101",
     v6_downlink_prefix="3000",
+    propagate_v6_downlink_prefix=False,
+    include_v4_directional_traffic=True,
     ecmp_member_limit=11500,
     ecmp_member_test_member_limit=11950,
     ecmp_member_test_group_limit=1300,
+    # Next-hops for the ECMP stress groups; defaults to good_ndp_entries_uplink.
+    # Must satisfy max_group * min(36, count // 4) >= max_members --
+    # generate_prefix_nh_list_map asserts on the total.
+    ecmp_nh_device_group_count=None,
     uplink_interfaces_to_flap=None,
-    nbr_device_name=None,
-    nbr_interfaces_to_flap=None,
+    qsfp_uplink_interfaces_to_flap=None,
+    neighbor_dut_name=None,
+    neighbor_dut_interfaces_to_flap=None,
+    neighbor_interfaces_to_flap=None,
+    add_nbr_endpoint=True,
     uplink_flap_iterations=50,
     uplink_flap_interval_s=30,
     uplink_flap_settle_s=30,
+    uplink_flap_batch_size=2,
+    # The TC-level precheck reads CUMULATIVE IXIA counters. Setup's trial
+    # traffic runs every traffic item at once before BGP/routes converge, so
+    # those counters already show 100% loss by the time the precheck samples
+    # them -- the precheck then fails before the playbook has run at all.
+    # Clearing first makes the precheck measure the converged steady state, and
+    # makes the POSTcheck measure exactly the playbook's own window. Defaults
+    # False to leave existing callers untouched.
+    precheck_packet_loss_clear_stats=False,
+    # Passed through to the *_overload_with_agent_churn playbooks; None keeps
+    # each creator's own default (300 s period, 1800 s, 3 flaps, 2 coldboots).
+    churn_restart_period_s=None,
+    churn_restart_duration_s=None,
+    churn_flap_iterations=None,
+    churn_coldboot_iterations=None,
     include_bgp_longevity_playbooks=False,
+    playbooks_selected=None,
     bgp_longevity_prefix_pool_regex=".*",
     bgp_longevity_local_pref_cycles=30,
+    bgp_longevity_local_pref_churn_interval_s=60,
     bgp_longevity_bgpd_crash_iterations=5,
+    bgp_longevity_bgpd_crash_recovery_wait_s=120,
     bgp_longevity_ndp_device_group_regex="D3",
     bgp_longevity_ndp_uptime_s=900,
     bgp_longevity_ndp_downtime_s=120,
     bgp_longevity_ndp_total_duration_s=3600,
+    bgp_longevity_ndp_cycles=None,
+    # Replaces the bare BGP_CONVERGENCE_CHECK on the service-restart playbooks.
+    bgp_convergence_check=None,
 ):
     """Build the BGP/FBOSS platform-hardening conveyor TestConfig for two IXIA chassis.
 
@@ -871,22 +983,51 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         ecmp_group_overflow_prefix / v6_uplink_prefix / v4_session_flapping_prefix /
         v6_prefix_flapping_prefix / v4_uplink_prefix / v4_downlink_prefix /
         v6_downlink_prefix: Prefix string roots used to construct test prefixes.
+        propagate_v6_downlink_prefix: Add the downlink traffic prefix to the
+            downlink ingress policy for bidirectional traffic.
+        include_v4_directional_traffic: Include IPv4 directional traffic in
+            traffic checks and flap-stage validation.
         ecmp_member_limit / ecmp_member_test_member_limit / ecmp_member_test_group_limit:
             ECMP member sizing parameters for the dedicated ECMP test phase.
         uplink_interfaces_to_flap: DUT uplink ports for the UCMP-disabled port-flap
             playbooks (TC1 single / TC2 N/2 / TC3 N-1). Left unset on callers that
             do not want those playbooks, which keeps their playbook list unchanged.
-        nbr_device_name / nbr_interfaces_to_flap: Neighbor hostname and its
-            index-aligned far-end ports, enabling the TC4 DUT+NBR simultaneous
-            flap. ``nbr_interfaces_to_flap[i]`` must be the far end of
-            ``uplink_interfaces_to_flap[i]``.
+        neighbor_dut_name: Explicit control-only neighbor endpoint used by the
+            TC4 dual-ended flap. It has no IXIA ports or traffic endpoint.
+        neighbor_dut_interfaces_to_flap / neighbor_interfaces_to_flap:
+            Index-aligned DUT and neighbor port lists obtained from
+            bidirectional LLDP discovery for ``neighbor_dut_name``.
+        add_nbr_endpoint: With the nbr args set, also add the neighbour as a
+            non-DUT Endpoint (default; required internally). OSS callers may
+            pass False: the flap step resolves the neighbour's driver from
+            device_info.csv by ``device_name`` and the nbr leg skips
+            port-state verification, so nothing else needs the Endpoint.
+        churn_restart_period_s / churn_restart_duration_s / churn_flap_iterations /
+            churn_coldboot_iterations: agent-churn playbook knobs; None = creator default.
+        qsfp_uplink_interfaces_to_flap: Optional interface subset for the
+            QSFP low-power and TX-disable cases. Defaults to the full uplink
+            list so existing callers retain their current behavior.
         uplink_flap_iterations / uplink_flap_interval_s / uplink_flap_settle_s:
             Flap cycles per playbook, seconds between interface operations, and
             the post-recovery settle window before the zero-loss assertion.
+        uplink_flap_batch_size: Maximum simultaneous Thrift port-state RPCs for
+            the N/2 and N-1 flap playbooks.
 
     Returns:
         TestConfig: The two-IXIA-chassis hardening conveyor TestConfig.
     """
+    _validate_neighbor_interface_flap_params(
+        playbooks_selected=playbooks_selected,
+        neighbor_dut_name=neighbor_dut_name,
+        neighbor_dut_interfaces_to_flap=neighbor_dut_interfaces_to_flap,
+        neighbor_interfaces_to_flap=neighbor_interfaces_to_flap,
+    )
+    neighbor_args = (
+        neighbor_dut_name,
+        neighbor_dut_interfaces_to_flap,
+        neighbor_interfaces_to_flap,
+    )
+
     ptp_configs = [
         ixia_types.PTPConfig(
             server_endpoint=ixia_types.PTPEndpoint(
@@ -904,6 +1045,14 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         ),
     ]
 
+    directional_traffic_items = [
+        f"{device_name.upper()}_V6_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK"
+    ]
+    if include_v4_directional_traffic:
+        directional_traffic_items.append(
+            f"{device_name.upper()}_V4_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK"
+        )
+
     # TestConfig-level checks moved to playbook level
     _tc_prechecks = [
         create_ixia_packet_loss_check(
@@ -916,14 +1065,12 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     expect_packet_loss=True,
                 ),
                 hc_types.PacketLossThreshold(
-                    names=[
-                        "V6_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                        "V4_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                    ],
+                    names=directional_traffic_items,
                     str_value="0.1",
                     expect_packet_loss=False,
                 ),
             ],
+            clear_traffic_stats=precheck_packet_loss_clear_stats,
         ),
         create_prefix_limit_check(prefix_limit=prefix_limit),
         create_memory_utilization_check(
@@ -942,10 +1089,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     expect_packet_loss=True,
                 ),
                 hc_types.PacketLossThreshold(
-                    names=[
-                        "V6_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                        "V4_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                    ],
+                    names=directional_traffic_items,
                     # todo (change this)
                     expect_packet_loss=False,
                 ),
@@ -979,9 +1123,41 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
     # while the ports are down (tolerant, so a clean ECMP re-hash does not fail
     # it); stats are then cleared so the up-stage check can assert zero loss on
     # the recovered path alone.
-    _uplink_flap_traffic_items = [
-        "V6_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-        "V4_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
+    _uplink_flap_traffic_items = directional_traffic_items
+    # The check applies a zero-loss default to every item it is not told
+    # about, and these two NDP items are lossy by design (see _tc_prechecks).
+    _flap_skip_items = ["GOOD_BUT_LOSSY_NDP_TRAFFIC", "LOSSY_ROGUE_NDP_TRAFFIC"]
+    _flap_prechecks = [
+        create_ixia_packet_loss_check(
+            thresholds=[
+                hc_types.PacketLossThreshold(
+                    names=_uplink_flap_traffic_items,
+                    str_value="0.1",
+                    expect_packet_loss=False,
+                ),
+            ],
+        ),
+        create_prefix_limit_check(prefix_limit=prefix_limit),
+        create_memory_utilization_check(
+            threshold=10 * (1024**3), start_time_jq_var="test_case_start_time"
+        ),
+    ]
+    _flap_postchecks = [
+        create_device_core_dumps_check(),
+        create_ixia_packet_loss_check(
+            thresholds=[
+                hc_types.PacketLossThreshold(
+                    names=_uplink_flap_traffic_items,
+                    expect_packet_loss=False,
+                ),
+            ],
+        ),
+        create_prefix_limit_check(prefix_limit=prefix_limit),
+        create_unclean_exit_check(),
+        create_cpu_utilization_check(
+            threshold=400.0, start_time_jq_var="test_case_start_time"
+        ),
+        create_service_restart_check(),
     ]
     _flap_down_stage_checks = [
         create_ixia_packet_loss_check(
@@ -993,6 +1169,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                 ),
             ],
             clear_traffic_stats=False,
+            skip_traffic_items=_flap_skip_items,
         ),
     ]
     _flap_up_stage_checks = [
@@ -1005,6 +1182,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                 ),
             ],
             clear_traffic_stats=False,
+            skip_traffic_items=_flap_skip_items,
         ),
     ]
     _flap_playbook_kwargs = {
@@ -1013,10 +1191,16 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         "post_enable_settle_s": uplink_flap_settle_s,
         "down_stage_checks": _flap_down_stage_checks,
         "up_stage_checks": _flap_up_stage_checks,
-        "prechecks": _tc_prechecks,
-        "postchecks": _tc_postchecks,
+        "prechecks": _flap_prechecks,
+        "postchecks": _flap_postchecks,
         "snapshot_checks": _tc_snapshot_checks,
+        "traffic_items_to_start": _uplink_flap_traffic_items,
     }
+    _qsfp_uplink_interfaces_to_flap = (
+        uplink_interfaces_to_flap
+        if qsfp_uplink_interfaces_to_flap is None
+        else qsfp_uplink_interfaces_to_flap
+    )
     _uplink_flap_playbooks = []
     if uplink_interfaces_to_flap:
         _uplink_flap_playbooks.append(
@@ -1030,35 +1214,37 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
             [
                 create_ucmp_disabled_half_uplinks_flap_playbook(
                     uplink_interfaces_to_flap=uplink_interfaces_to_flap,
+                    interface_batch_size=uplink_flap_batch_size,
                     **_flap_playbook_kwargs,
                 ),
                 create_ucmp_disabled_n_minus_1_uplinks_flap_playbook(
                     uplink_interfaces_to_flap=uplink_interfaces_to_flap,
+                    interface_batch_size=uplink_flap_batch_size,
                     **_flap_playbook_kwargs,
                 ),
                 # Same N-1 shape driven through the optics instead of the ASIC,
                 # so the three flap mechanisms are comparable on one port set.
                 create_ucmp_disabled_n_minus_1_uplinks_flap_playbook(
-                    uplink_interfaces_to_flap=uplink_interfaces_to_flap,
+                    uplink_interfaces_to_flap=_qsfp_uplink_interfaces_to_flap,
                     interface_flap_method=taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_UTIL_POWER,
                     playbook_name="test_flap_n_minus_1_uplink_ports_qsfp_low_power",
                     **_flap_playbook_kwargs,
                 ),
                 create_ucmp_disabled_n_minus_1_uplinks_flap_playbook(
-                    uplink_interfaces_to_flap=uplink_interfaces_to_flap,
+                    uplink_interfaces_to_flap=_qsfp_uplink_interfaces_to_flap,
                     interface_flap_method=taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_UTIL_TX,
                     playbook_name="test_flap_n_minus_1_uplink_ports_qsfp_tx_disable",
                     **_flap_playbook_kwargs,
                 ),
             ]
         )
-        if nbr_device_name and nbr_interfaces_to_flap:
+        if all(neighbor_args):
             _uplink_flap_playbooks.append(
                 create_ucmp_disabled_dut_and_nbr_uplink_flap_playbook(
                     dut_device_name=device_name,
-                    nbr_device_name=nbr_device_name,
-                    uplink_interfaces_to_flap=uplink_interfaces_to_flap,
-                    nbr_interfaces_to_flap=nbr_interfaces_to_flap,
+                    neighbor_dut_name=neighbor_dut_name,
+                    uplink_interfaces_to_flap=neighbor_dut_interfaces_to_flap,
+                    neighbor_interfaces_to_flap=neighbor_interfaces_to_flap,
                     **_flap_playbook_kwargs,
                 )
             )
@@ -1069,12 +1255,14 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
             create_bgp_longevity_local_pref_churn_playbook(
                 prefix_pool_regex=bgp_longevity_prefix_pool_regex,
                 cycles=bgp_longevity_local_pref_cycles,
+                churn_interval_s=bgp_longevity_local_pref_churn_interval_s,
                 prechecks=_tc_prechecks,
                 postchecks=_tc_postchecks,
                 snapshot_checks=_tc_snapshot_checks,
             ),
             create_bgp_longevity_bgpd_crash_playbook(
                 iterations=bgp_longevity_bgpd_crash_iterations,
+                recovery_wait_s=bgp_longevity_bgpd_crash_recovery_wait_s,
                 prechecks=_tc_prechecks,
                 postchecks=_tc_postchecks,
                 snapshot_checks=_tc_snapshot_checks,
@@ -1084,23 +1272,35 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                 uptime_s=bgp_longevity_ndp_uptime_s,
                 downtime_s=bgp_longevity_ndp_downtime_s,
                 total_duration_s=bgp_longevity_ndp_total_duration_s,
+                cycles=bgp_longevity_ndp_cycles,
                 prechecks=_tc_prechecks,
                 postchecks=_tc_postchecks,
                 snapshot_checks=_tc_snapshot_checks,
             ),
         ]
 
-    # TC4 drives thrift flaps on the neighbor, so it needs its own Endpoint for
-    # the runner to build a driver for it.
+    # TC4 drives thrift flaps on the neighbor, which internally requires its
+    # own Endpoint; OSS callers can opt out (see add_nbr_endpoint docstring).
     _nbr_endpoints = (
-        [taac_types.Endpoint(name=nbr_device_name)]
-        if nbr_device_name and nbr_interfaces_to_flap and uplink_interfaces_to_flap
+        [taac_types.Endpoint(name=neighbor_dut_name)]
+        if all(neighbor_args) and add_nbr_endpoint
         else []
     )
 
-    return TestConfig(
+    churn_kwargs = {
+        k: v
+        for k, v in {
+            "restart_period_s": churn_restart_period_s,
+            "restart_duration_s": churn_restart_duration_s,
+            "flap_iterations": churn_flap_iterations,
+            "coldboot_iterations": churn_coldboot_iterations,
+        }.items()
+        if v is not None
+    }
+
+    test_config = TestConfig(
         name=test_config_name,
-        ixia_protocol_verification_timeout=1200,  # todo remove this (should be 300)
+        ixia_protocol_verification_timeout=ixia_protocol_verification_timeout,
         skip_ixia_protocol_verification=True,
         basset_pool=basset_pool,
         ptp_configs=ptp_configs,
@@ -1175,6 +1375,9 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
             route_map_downlink_egress=route_map_downlink_egress,
             ecmp_group_overflow_prefix=ecmp_group_overflow_prefix,
             v6_uplink_prefix=v6_uplink_prefix,
+            v6_downlink_prefix=(
+                v6_downlink_prefix if propagate_v6_downlink_prefix else None
+            ),
         )
         + [
             # Task(
@@ -2162,6 +2365,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                 prechecks=_tc_prechecks,
                 snapshot_checks=_tc_snapshot_checks,
                 extra_postchecks=_tc_postchecks_agent_restart,
+                **churn_kwargs,
             ),
             create_hardening_of_ndp_overload_10x_with_table_clear_playbook(
                 device_name=device_name,
@@ -2184,6 +2388,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                 prechecks=_tc_prechecks,
                 snapshot_checks=_tc_snapshot_checks,
                 extra_postchecks=_tc_postchecks_agent_restart,
+                **churn_kwargs,
             ),
             create_hardening_of_arp_overload_10x_with_table_clear_playbook(
                 device_name=device_name,
@@ -2208,6 +2413,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                 prechecks=_tc_prechecks,
                 snapshot_checks=_tc_snapshot_checks,
                 extra_postchecks=_tc_postchecks_agent_restart,
+                **churn_kwargs,
             ),
             build_2_ixia_hardening_playbook(
                 name="test_agent_warmboot",
@@ -2226,11 +2432,17 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    create_bgp_convergence_check(),
+                    bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": ["103.0.0.0/8", "6000:1::/32"]
-                        }
+                            "parent_prefixes_to_ignore": [
+                                "103.0.0.0/8",
+                                "6000:1::/32",
+                            ]
+                        },
+                        # bgpd re-syncs the FIB for ~2-3 min after a restart.
+                        retry_count=6,
+                        retry_delay_seconds=30,
                     ),
                 ]
                 + _tc_postchecks,
@@ -2250,11 +2462,19 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    create_bgp_convergence_check(),
+                    # The TC-level check would flag the restart this playbook performs.
+                    create_service_restart_check(expected_restarted_services=["bgpd"]),
+                    bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": ["103.0.0.0/8", "6000:1::/32"]
-                        }
+                            "parent_prefixes_to_ignore": [
+                                "103.0.0.0/8",
+                                "6000:1::/32",
+                            ]
+                        },
+                        # bgpd re-syncs the FIB for ~2-3 min after a restart.
+                        retry_count=6,
+                        retry_delay_seconds=30,
                     ),
                 ]
                 + _tc_postchecks,
@@ -2286,10 +2506,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                                 expect_packet_loss=True,
                             ),
                             hc_types.PacketLossThreshold(
-                                names=[
-                                    "V6_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                                    "V4_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                                ],
+                                names=directional_traffic_items,
                                 expect_packet_loss=False,
                             ),
                         ],
@@ -2338,10 +2555,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                                 expect_packet_loss=True,
                             ),
                             hc_types.PacketLossThreshold(
-                                names=[
-                                    "V6_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                                    "V4_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                                ],
+                                names=directional_traffic_items,
                                 expect_packet_loss=False,
                             ),
                         ],
@@ -2391,10 +2605,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                                 expect_packet_loss=True,
                             ),
                             hc_types.PacketLossThreshold(
-                                names=[
-                                    "V6_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                                    "V4_DIRECTIONAL_TRAFFIC_BETWEEN_DOWNLINK_AND_UPLINK",
-                                ],
+                                names=directional_traffic_items,
                                 expect_packet_loss=False,
                             ),
                         ],
@@ -2464,6 +2675,12 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                     create_ecmp_member_static_route_step(
                         max_ecmp_group=ecmp_group_limit,
+                        max_ecmp_members=ecmp_member_limit,
+                        nh_prefix_1=f"{ixia_uplink_good_ndp_network}::/80",
+                        lb_prefix_agg="6000:ab::/32",
+                        device_group_count=(
+                            ecmp_nh_device_group_count or good_ndp_entries_uplink
+                        ),
                         description=None,
                     ),
                 ],
@@ -2481,6 +2698,13 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                             ),
                             create_ecmp_member_static_route_step(
                                 max_ecmp_group=ecmp_member_test_group_limit,
+                                max_ecmp_members=ecmp_member_test_member_limit,
+                                nh_prefix_1=f"{ixia_uplink_good_ndp_network}::/80",
+                                lb_prefix_agg="6000:ab::/32",
+                                device_group_count=(
+                                    ecmp_nh_device_group_count
+                                    or good_ndp_entries_uplink
+                                ),
                                 description=None,
                             ),
                             create_ixia_api_step(
@@ -2594,11 +2818,21 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    create_bgp_convergence_check(),
+                    # The TC-level check would flag the restart this playbook performs.
+                    create_service_restart_check(
+                        expected_restarted_services=["qsfp_service"]
+                    ),
+                    bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": ["103.0.0.0/8", "6000:1::/32"]
-                        }
+                            "parent_prefixes_to_ignore": [
+                                "103.0.0.0/8",
+                                "6000:1::/32",
+                            ]
+                        },
+                        # bgpd re-syncs the FIB for ~2-3 min after a restart.
+                        retry_count=6,
+                        retry_delay_seconds=30,
                     ),
                 ]
                 + _tc_postchecks,
@@ -2618,11 +2852,19 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    create_bgp_convergence_check(),
+                    # The TC-level check would flag the restart this playbook performs.
+                    create_service_restart_check(expected_restarted_services=["fsdb"]),
+                    bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": ["103.0.0.0/8", "6000:1::/32"]
-                        }
+                            "parent_prefixes_to_ignore": [
+                                "103.0.0.0/8",
+                                "6000:1::/32",
+                            ]
+                        },
+                        # bgpd re-syncs the FIB for ~2-3 min after a restart.
+                        retry_count=6,
+                        retry_delay_seconds=30,
                     ),
                 ]
                 + _tc_postchecks,
@@ -2630,6 +2872,11 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         ]
         + _uplink_flap_playbooks
         + _bgp_longevity_playbooks,
+    )
+    return test_config(
+        playbooks=_select_2_ixia_hardening_playbooks(
+            list(test_config.playbooks), playbooks_selected
+        )
     )
 
 

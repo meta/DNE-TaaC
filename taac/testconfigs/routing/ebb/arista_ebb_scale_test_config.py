@@ -9,6 +9,9 @@ multipath group oscillations, FAUU drain/undrain, cold start, and BGP restart
 stages. Used to longevity-test EBB BGP++ at production peer/route scale.
 """
 
+from taac.abstractions.topologies.ebb_full_scale import (
+    ebb_drained_prefix_descriptors,
+)
 from taac.constants import (
     BgpPlusPlusProfile,
     DEFAULT_LOCAL_LINK,
@@ -352,7 +355,7 @@ def test_config_for_bgp_plus_plus_on_ebb_arista_with_bgp_mon(
                 ),
                 postchecks=create_standard_postchecks(
                     postcheck_thresholds=postcheck_thresholds,
-                    expected_restarted_services=["Bgp"],
+                    expected_restarted_services=["Bgpcpp"],
                     restart_start_time_jq_var="daemon_restart_time",
                 ),
                 snapshot_checks=create_standard_snapshot_checks(),
@@ -413,7 +416,7 @@ def test_config_for_bgp_plus_plus_on_ebb_arista_with_bgp_mon(
                 ),
                 postchecks=create_standard_postchecks(
                     postcheck_thresholds=postcheck_thresholds,
-                    expected_restarted_services=["Bgp"],
+                    expected_restarted_services=["Bgpcpp"],
                     restart_start_time_jq_var="daemon_restart_time",
                 ),
                 snapshot_checks=create_standard_snapshot_checks(),
@@ -467,7 +470,7 @@ def test_config_for_bgp_plus_plus_on_ebb_arista_with_bgp_mon(
                 ),
                 postchecks=create_standard_postchecks(
                     postcheck_thresholds=postcheck_thresholds,
-                    expected_restarted_services=["Bgp"],
+                    expected_restarted_services=["Bgpcpp"],
                     restart_start_time_jq_var="daemon_restart_time",
                 ),
                 snapshot_checks=create_standard_snapshot_checks(),
@@ -505,7 +508,7 @@ def test_config_for_bgp_plus_plus_on_ebb_arista_with_bgp_mon(
                 postchecks=create_standard_postchecks(
                     postcheck_thresholds=postcheck_thresholds,
                     fail_on_eor_expired=False,
-                    expected_restarted_services=["Bgp"],
+                    expected_restarted_services=["Bgpcpp"],
                     restart_start_time_jq_var="daemon_restart_time",
                 ),
                 snapshot_checks=create_standard_snapshot_checks(),
@@ -1094,6 +1097,9 @@ def test_config_for_bgp_plus_plus_on_ebb_arista_with_bgp_mon(
                         tcp_dump_capture_interface_bgpmon=ixia_interface_mimic_bgp_mon,
                         tcp_dump_capture_interface_ibgp=ixia_interface_mimic_ibgp,
                         soak_time_seconds=300,
+                        drained_prefix_descriptors=ebb_drained_prefix_descriptors(
+                            96, prefix_pool_regex=".*EBGP.*"
+                        ),
                     )
                 ],
             ),
@@ -1194,7 +1200,7 @@ def test_config_for_bgp_plus_plus_on_ebb_arista_with_bgp_mon(
                 ),
                 postchecks=create_standard_postchecks(
                     postcheck_thresholds=postcheck_thresholds,
-                    expected_restarted_services=["Bgp"],
+                    expected_restarted_services=["Bgpcpp"],
                     restart_start_time_jq_var="daemon_restart_time",
                 ),
                 snapshot_checks=create_standard_snapshot_checks(),
@@ -1236,12 +1242,14 @@ def test_config_for_bgp_plus_plus_on_ebb_arista_with_bgp_mon(
                 cleanup_steps=create_multipath_group_oscillation_cleanup_steps(
                     ipv4_peer_regex=".*IPV4_EBGP$",
                     ipv6_peer_regex=".*IPV6_EBGP$",
-                    max_peers_to_restore=11,
+                    ipv4_session_count_to_restore=ebgp_peer_count_v4,
+                    ipv6_session_count_to_restore=ebgp_peer_count_v6,
                     expected_established_sessions=total_session_count,
                     convergence_wait_seconds=140,
                 ),
                 stages=[
                     create_multipath_group_oscillation_stage(
+                        hostname=device_name,
                         ipv4_peer_regex=".*IPV4_EBGP$",
                         ipv6_peer_regex=".*IPV6_EBGP$",
                         ipv4_session_count=ebgp_peer_count_v4,

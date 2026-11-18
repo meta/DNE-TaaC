@@ -1,0 +1,812 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# pyre-unsafe
+"""Steller Eagle / 100T air-cooled (ac100t) NPI test configs.
+
+Single home for all ac100t New Product Introduction (NPI) TestConfigs, built by
+instantiating the existing shared TAAC helper factories for each class of test.
+Every device-specific value comes from `ac100t_constants.py` (the one file to
+edit when the real hardware arrives), which encodes the M4062NHP 4-DUT + IXIA
+fanout topology: DUT1-DUT3 are Steller Eagle 100T units and DUT4 is a Wedge800
+acting as the CE.
+
+Classes of tests planned for ac100t (per the ac100t test plan):
+    - CPU queue tests: Generic (FE + BE)   <-- implemented below
+    - BGP Hardening tests                  (TODO -- constants already staged in
+      ac100t_constants.py; bind build_bgp_dc_test_config next)
+    - Snake tests                          <-- implemented below
+    - L2/NDP/ARP hardening tests           <-- implemented below
+    - Platform hardening tests             <-- implemented below
+    - Critical services tests              <-- implemented below
+    - System reboot tests                  <-- implemented below
+    - FE QoS scheduling and buffering      <-- implemented below
+    - Prefix profiling & overload tests    <-- implemented below
+    - Longevity tests                      <-- implemented below
+    - Thrift hardening tests               <-- implemented below
+    - Interface flaps                      <-- implemented below
+    - LAG (port-channel)                   <-- implemented below
+    - ECMP-only resource testing           <-- implemented below
+    - PTP tests                            (TODO -- deferred)
+    - Speed flip tests                     (TODO -- mostly not feasible in
+      OSS; feasible subset reuses existing speed_flip_test_configs.py)
+    - Multi-DUT classes from the topology doc (TODO -- constants staged):
+      the B->D / A->C / C->A traffic items, the DUT3 drain converging on DUT1,
+      and the QoS case (B + D routes -> A routes, 2x800G -> 1x800G). These need
+      a multi-device factory; the single-DUT factories below cannot express them.
+
+As each additional class is added, instantiate its existing helper here and
+register the resulting TestConfig constant (see cpu_queue section for the
+registration pattern).
+"""
+
+from ixia.ixia import types as ixia_types
+from taac.playbooks.dlb_ecmp_platform_constants import EcmpAsic
+from taac.playbooks.playbook_definitions import (
+    get_critical_services_single_box_playbooks,
+    get_drain_playbooks,
+)
+from taac.testconfigs.ai_bb.mp3n_prefix_profiling_ixia_config import (
+    build_prefix_profiling_profile,
+    create_device_test_configs,
+)
+from taac.testconfigs.fboss_solution_tests.fboss_bgp_and_platform_hardening_conveyor import (
+    test_config_for_bgp_and_fboss_platform_hardening_in_conveyor,
+)
+from taac.testconfigs.fboss_solution_tests.portchannel_test_config import (
+    IxiaPortSpec,
+    test_config_for_portchannel,
+)
+from taac.testconfigs.fboss_solution_tests.qos_scheduling_test_config import (
+    test_config_qos_scheduling,
+)
+from taac.testconfigs.fboss_solution_tests.test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor import (
+    test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor,
+)
+from taac.testconfigs.npi import (  # oss-rewrite-touch
+    ac100t_constants as ac100t,
+)
+from taac.testconfigs.npi.cpu_queue_test_config import (
+    create_npi_cpu_queue_test_config,
+)
+from taac.testconfigs.npi.ecmp_csvs.ecmp_nh_pools import (
+    AC100T_MAIN_ECMP_POOL,
+)
+from taac.testconfigs.npi.ecmp_only_resource_testing_config import (
+    test_config_for_ecmp_only_resource_testing,
+)
+from taac.testconfigs.npi.thrift_hardening_test_config import (
+    create_npi_thrift_hardening_test_config,
+)
+from taac.testconfigs.snake.test_test_config import (
+    gen_snake_test_config,
+)
+from taac.test_as_a_config import types as taac_types
+
+# ===========================================================================
+# CPU queue tests: Generic (FE + BE)
+# ===========================================================================
+# One combined FE+BE TestConfig. Cloned from the IcePack GTSW CPU-queue
+# reference (NPI_DVT_ICEPACK_GTSW__CPU_QUEUE_TEST_CONFIG). The factory builds
+# the full set of npi_cpu_* playbooks (LLDP / BGP-CP / DHCP / ICMP / NDP / ARP /
+# LACP / hop-limit / TTL / unresolved-NH / data-plane-DSCP ...) via
+# create_cpu_queue_playbooks() and injects the correct prechecks/postchecks/
+# snapshot checks via add_common_checks_to_cpu_queue_playbooks() -- i.e. the
+# "Playbook + healthchecks" usage from the ac100t test plan.
+#
+# This factory is SINGLE-DUT, so the CPU-queue class runs on one Steller Eagle
+# unit (DUT2) rather than the full 4-DUT topology -- DUT2 is the device the
+# topology doc frames its traffic items around. CPU queue indices are passed
+# explicitly (from ac100t_constants) so the factory skips its live netwhoami
+# lookup, which would otherwise raise: Steller Eagle has no netwhoami Hardware
+# enum value and no entry in get_cpu_queue_constants().
+AC100T_CPU_QUEUE_TEST_CONFIG = create_npi_cpu_queue_test_config(
+    test_config_name="AC100T_CPU_QUEUE_TEST_CONFIG",
+    device_name=ac100t.AC100T_CPU_QUEUE_DUT,
+    local_mac_address=ac100t.AC100T_CPU_QUEUE_LOCAL_MAC_ADDRESS,
+    ixia_downlink_interface=ac100t.AC100T_CPU_QUEUE_IXIA_DOWNLINK_INTERFACE,
+    ixia_uplink_interface=ac100t.AC100T_CPU_QUEUE_IXIA_UPLINK_INTERFACE,
+    ixia_rogue_interface=ac100t.AC100T_CPU_QUEUE_IXIA_ROGUE_INTERFACE,
+    peergroup_uplink_mimic_v6=ac100t.AC100T_PEERGROUP_UPLINK_MIMIC_V6,
+    peergroup_uplink_mimic_v4=ac100t.AC100T_PEERGROUP_UPLINK_MIMIC_V4,
+    peergroup_downlink_mimic_v6=ac100t.AC100T_PEERGROUP_DOWNLINK_MIMIC_V6,
+    peergroup_downlink_mimic_v4=ac100t.AC100T_PEERGROUP_DOWNLINK_MIMIC_V4,
+    peergroup_rogue_mimic_v6=ac100t.AC100T_PEERGROUP_ROGUE_MIMIC_V6,
+    peergroup_rogue_mimic_v4=ac100t.AC100T_PEERGROUP_ROGUE_MIMIC_V4,
+    route_map_uplink_ingress=ac100t.AC100T_ROUTE_MAP_UPLINK_INGRESS,
+    route_map_uplink_egress=ac100t.AC100T_ROUTE_MAP_UPLINK_EGRESS,
+    route_map_downlink_ingress=ac100t.AC100T_ROUTE_MAP_DOWNLINK_INGRESS,
+    route_map_downlink_egress=ac100t.AC100T_ROUTE_MAP_DOWNLINK_EGRESS,
+    route_map_rogue_ingress=ac100t.AC100T_ROUTE_MAP_ROGUE_INGRESS,
+    route_map_rogue_egress=ac100t.AC100T_ROUTE_MAP_ROGUE_EGRESS,
+    ixia_downlink_ic_parent_network_v6=ac100t.AC100T_IXIA_DOWNLINK_IC_PARENT_NETWORK_V6,
+    ixia_uplink_ic_parent_network_v6=ac100t.AC100T_IXIA_UPLINK_IC_PARENT_NETWORK_V6,
+    ixia_rogue_ic_parent_network_v6=ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6,
+    ixia_downlink_ic_parent_network_v4=ac100t.AC100T_IXIA_DOWNLINK_IC_PARENT_NETWORK_V4,
+    ixia_uplink_ic_parent_network_v4=ac100t.AC100T_IXIA_UPLINK_IC_PARENT_NETWORK_V4,
+    ixia_rogue_ic_parent_network_v4=ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V4,
+    unique_prefix_limit=ac100t.AC100T_UNIQUE_PREFIX_LIMIT,
+    per_peer_max_route_limit=ac100t.AC100T_PER_PEER_MAX_ROUTE_LIMIT,
+    downlink_peer_count=ac100t.AC100T_DOWNLINK_PEER_COUNT,
+    uplink_peer_count=ac100t.AC100T_UPLINK_PEER_COUNT,
+    rogue_peer_count=ac100t.AC100T_ROGUE_PEER_COUNT,
+    remote_uplink_as_4byte=ac100t.AC100T_REMOTE_UPLINK_AS_4BYTE,
+    remote_downlink_as_4byte=ac100t.AC100T_REMOTE_DOWNLINK_AS_4BYTE,
+    remote_as_4_byte_step=ac100t.AC100T_REMOTE_AS_4_BYTE_STEP,
+    remote_rogue_as_4byte=ac100t.AC100T_REMOTE_ROGUE_AS_4BYTE,
+    is_uplink_peer_confed=ac100t.AC100T_IS_UPLINK_PEER_CONFED,
+    is_downlink_peer_confed=ac100t.AC100T_IS_DOWNLINK_PEER_CONFED,
+    is_rogue_peer_confed=ac100t.AC100T_IS_ROGUE_PEER_CONFED,
+    ixia_downlink_prefix_count_v6=ac100t.AC100T_IXIA_DOWNLINK_PREFIX_COUNT_V6,
+    ixia_uplink_prefix_count_v6=ac100t.AC100T_IXIA_UPLINK_PREFIX_COUNT_V6,
+    ixia_rogue_prefix_count_v6=ac100t.AC100T_IXIA_ROGUE_PREFIX_COUNT_V6,
+    ixia_downlink_prefix_count_v4=ac100t.AC100T_IXIA_DOWNLINK_PREFIX_COUNT_V4,
+    ixia_uplink_prefix_count_v4=ac100t.AC100T_IXIA_UPLINK_PREFIX_COUNT_V4,
+    ixia_rogue_prefix_count_v4=ac100t.AC100T_IXIA_ROGUE_PREFIX_COUNT_V4,
+    ixia_downlink_communities=ac100t.AC100T_IXIA_DOWNLINK_COMMUNITIES,
+    ixia_uplink_communities=ac100t.AC100T_IXIA_UPLINK_COMMUNITIES,
+    uplink_peer_tag=ac100t.AC100T_UPLINK_PEER_TAG,
+    downlink_peer_tag=ac100t.AC100T_DOWNLINK_PEER_TAG,
+    # NOTE: the factory param names preserve a historical typo ("interations").
+    bgpd_restart_no_of_interations=ac100t.AC100T_BGPD_RESTART_NO_OF_ITERATIONS,
+    wedge_agent_restart_no_of_interations=ac100t.AC100T_WEDGE_AGENT_RESTART_NO_OF_ITERATIONS,
+    basset_pool=ac100t.AC100T_BASSET_POOL,
+    service_restart_services=ac100t.AC100T_SERVICE_RESTART_SERVICES,
+    # Explicit CPU-queue indices -> skip the netwhoami lookup for the stubbed DUT.
+    low_queue=ac100t.AC100T_CPU_LOW_QUEUE,
+    mid_queue=ac100t.AC100T_CPU_MID_QUEUE,
+    high_queue=ac100t.AC100T_CPU_HIGH_QUEUE,
+)
+
+
+# ===========================================================================
+# Shared hardening device scaffolding
+# ===========================================================================
+# The hardening factories share 59 required parameters; the ONLY one
+# test_config_for_bgp_and_fboss_platform_hardening_in_conveyor does not accept
+# is `ixia_rogue_interface`, which a build_bgp_dc_test_config call would pass
+# separately. Keeping the scaffolding here once means a new class is a playbook
+# selection rather than another ~58-line copy, and stops a device value
+# drifting between classes. AC100T_BGP_HARDENING_TEST_CONFIG should reuse this
+# dict when it is bound.
+#
+# These factories are SINGLE-DUT, so they run on the same Steller Eagle unit
+# the CPU-queue class uses (DUT2) rather than the full 4-DUT topology.
+# `ecmp_member_limit` is deliberately NOT in here: test_config_qos_scheduling
+# does not accept it, so it is passed at the call sites that do.
+_AC100T_HARDENING_PARAMS = {
+    "device_name": ac100t.AC100T_CPU_QUEUE_DUT,
+    "local_mac_address": ac100t.AC100T_CPU_QUEUE_LOCAL_MAC_ADDRESS,
+    "ixia_downlink_interface": ac100t.AC100T_CPU_QUEUE_IXIA_DOWNLINK_INTERFACE,
+    "ixia_uplink_interface": ac100t.AC100T_CPU_QUEUE_IXIA_UPLINK_INTERFACE,
+    "peergroup_uplink_mimic_v6": ac100t.AC100T_PEERGROUP_UPLINK_MIMIC_V6,
+    "peergroup_uplink_mimic_v4": ac100t.AC100T_PEERGROUP_UPLINK_MIMIC_V4,
+    "peergroup_downlink_mimic_v6": ac100t.AC100T_PEERGROUP_DOWNLINK_MIMIC_V6,
+    "peergroup_downlink_mimic_v4": ac100t.AC100T_PEERGROUP_DOWNLINK_MIMIC_V4,
+    "peergroup_rogue_mimic_v6": ac100t.AC100T_PEERGROUP_ROGUE_MIMIC_V6,
+    "peergroup_rogue_mimic_v4": ac100t.AC100T_PEERGROUP_ROGUE_MIMIC_V4,
+    "route_map_uplink_ingress": ac100t.AC100T_ROUTE_MAP_UPLINK_INGRESS,
+    "route_map_uplink_egress": ac100t.AC100T_ROUTE_MAP_UPLINK_EGRESS,
+    "route_map_downlink_ingress": ac100t.AC100T_ROUTE_MAP_DOWNLINK_INGRESS,
+    "route_map_downlink_egress": ac100t.AC100T_ROUTE_MAP_DOWNLINK_EGRESS,
+    "route_map_rogue_ingress": ac100t.AC100T_ROUTE_MAP_ROGUE_INGRESS,
+    "route_map_rogue_egress": ac100t.AC100T_ROUTE_MAP_ROGUE_EGRESS,
+    "ixia_downlink_ic_parent_network_v6": ac100t.AC100T_IXIA_DOWNLINK_IC_PARENT_NETWORK_V6,
+    "ixia_uplink_ic_parent_network_v6": ac100t.AC100T_IXIA_UPLINK_IC_PARENT_NETWORK_V6,
+    "ixia_rogue_ic_parent_network_v6": ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6,
+    "ixia_downlink_ic_parent_network_v4": ac100t.AC100T_IXIA_DOWNLINK_IC_PARENT_NETWORK_V4,
+    "ixia_uplink_ic_parent_network_v4": ac100t.AC100T_IXIA_UPLINK_IC_PARENT_NETWORK_V4,
+    "ixia_rogue_ic_parent_network_v4": ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V4,
+    "good_ndp_entry_network_v6": ac100t.AC100T_GOOD_NDP_ENTRY_NETWORK_V6,
+    "rogue_ndp_entry_network_v6": ac100t.AC100T_ROGUE_NDP_ENTRY_NETWORK_V6,
+    "good_arp_entry_network_v4": ac100t.AC100T_GOOD_ARP_ENTRY_NETWORK_V4,
+    "rogue_arp_entry_network_v4": ac100t.AC100T_ROGUE_ARP_ENTRY_NETWORK_V4,
+    "prefix_limit": ac100t.AC100T_BGP_PREFIX_LIMIT,
+    "per_peer_max_route_limit": ac100t.AC100T_PER_PEER_MAX_ROUTE_LIMIT,
+    "downlink_peer_count": ac100t.AC100T_DOWNLINK_PEER_COUNT,
+    "uplink_peer_count": ac100t.AC100T_UPLINK_PEER_COUNT,
+    "rogue_peer_count": ac100t.AC100T_ROGUE_PEER_COUNT,
+    "remote_downlink_as_4byte": ac100t.AC100T_REMOTE_DOWNLINK_AS_4BYTE,
+    "remote_uplink_as_4byte": ac100t.AC100T_REMOTE_UPLINK_AS_4BYTE,
+    "remote_rogue_as_4byte": ac100t.AC100T_REMOTE_ROGUE_AS_4BYTE,
+    "is_uplink_peer_confed": ac100t.AC100T_IS_UPLINK_PEER_CONFED,
+    "is_downlink_peer_confed": ac100t.AC100T_IS_DOWNLINK_PEER_CONFED,
+    "is_rogue_peer_confed": ac100t.AC100T_IS_ROGUE_PEER_CONFED,
+    "ixia_downlink_prefix_count_v6": ac100t.AC100T_IXIA_DOWNLINK_PREFIX_COUNT_V6,
+    "ixia_uplink_prefix_count_v6": ac100t.AC100T_IXIA_UPLINK_PREFIX_COUNT_V6,
+    "ixia_rogue_prefix_count_v6": ac100t.AC100T_IXIA_ROGUE_PREFIX_COUNT_V6,
+    "ixia_downlink_prefix_count_v4": ac100t.AC100T_IXIA_DOWNLINK_PREFIX_COUNT_V4,
+    "ixia_uplink_prefix_count_v4": ac100t.AC100T_IXIA_UPLINK_PREFIX_COUNT_V4,
+    "ixia_rogue_prefix_count_v4": ac100t.AC100T_IXIA_ROGUE_PREFIX_COUNT_V4,
+    "ixia_downlink_communities": ac100t.AC100T_IXIA_DOWNLINK_COMMUNITIES,
+    "ixia_uplink_communities": ac100t.AC100T_IXIA_UPLINK_COMMUNITIES,
+    "uplink_peer_tag": ac100t.AC100T_UPLINK_PEER_TAG,
+    "downlink_peer_tag": ac100t.AC100T_DOWNLINK_PEER_TAG,
+    "ecmp_group_limit": ac100t.AC100T_ECMP_GROUP_LIMIT,
+    "good_ndp_entries_uplink": ac100t.AC100T_GOOD_NDP_ENTRIES_UPLINK,
+    "good_ndp_entries_downlink": ac100t.AC100T_GOOD_NDP_ENTRIES_DOWNLINK,
+    "rogue_ndp_entries": ac100t.AC100T_ROGUE_NDP_ENTRIES,
+    "good_arp_entries": ac100t.AC100T_GOOD_ARP_ENTRIES,
+    "rogue_arp_entries": ac100t.AC100T_ROGUE_ARP_ENTRIES,
+    "good_mac_entry_count": ac100t.AC100T_GOOD_MAC_ENTRY_COUNT,
+    "rogue_mac_entry_count": ac100t.AC100T_ROGUE_MAC_ENTRY_COUNT,
+    "bgp_induced_ecmp_group_count": ac100t.AC100T_BGP_INDUCED_ECMP_GROUP_COUNT,
+    "ixia_uplink_good_ndp_network": ac100t.AC100T_IXIA_UPLINK_GOOD_NDP_NETWORK,
+    "ixia_downlink_good_ndp_network": ac100t.AC100T_IXIA_DOWNLINK_GOOD_NDP_NETWORK,
+    "basset_pool": ac100t.AC100T_BASSET_POOL,
+}
+
+
+# ===========================================================================
+# L2 / NDP / ARP hardening tests
+# ===========================================================================
+# The neighbour-table overload trio: each floods the DUT with rogue NDP / ARP /
+# MAC entries on top of a good-entry baseline and asserts the soft limit holds,
+# good entries survive, and traffic keeps forwarding.
+#
+# Built from the platform-hardening conveyor factory, NOT from
+# build_bgp_dc_test_config: the BGP-DC builder sets basic_traffic_item_configs=[]
+# ("runs setup + playbooks only, with no IXIA traffic generation"), and
+# test_hardening_of_mac_overload_entries drives
+# configure_traffic_item_src_mac_entry_count against a traffic-item regex, so it
+# has nothing to act on there. Every other BGP-DC caller excludes these three
+# playbooks for that reason. The conveyor factory owns its own copies of them
+# and builds the traffic items they need.
+AC100T_L2_NDP_ARP_HARDENING_TEST_CONFIG = (
+    test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
+        test_config_name="AC100T_L2_NDP_ARP_HARDENING_TEST_CONFIG",
+        **_AC100T_HARDENING_PARAMS,
+        ecmp_member_limit=ac100t.AC100T_ECMP_MEMBER_LIMIT,
+        playbooks_selected=[
+            # The base overload trio ...
+            "test_hardening_of_ndp_overload_entries",
+            "test_hardening_of_arp_overload_entries",
+            "test_hardening_of_mac_overload_entries",
+            # ... and the same three extended with the wedge_agent-churn and
+            # table-clear disruption tails (UTP L2M_002 / L2M_003 / L2M_005 /
+            # L2M_006 / L2M_009). L2M_008 (clear MAC table) is not implemented
+            # upstream: FBOSS exposes no MAC-flush CLI or thrift API.
+            "test_hardening_of_ndp_overload_with_agent_churn",
+            "test_hardening_of_ndp_overload_10x_with_table_clear",
+            "test_hardening_of_arp_overload_with_agent_churn",
+            "test_hardening_of_arp_overload_10x_with_table_clear",
+            "test_hardening_of_mac_overload_with_agent_churn",
+        ],
+    )
+)
+
+
+# ===========================================================================
+# Platform hardening tests
+# ===========================================================================
+# The process/service-lifecycle robustness slice of the platform-hardening
+# conveyor factory: every FBOSS service restarted, crashed, warmbooted and
+# coldbooted -- individually, in pairs, and in the QSFP-warmboot combinations --
+# plus the cgroup system-slice OOM-kill policy check. Each playbook carries the
+# factory's TC-level prechecks/postchecks, so the assertion is that the DUT
+# converges and traffic recovers after every disruption.
+#
+# Deliberately EXCLUDED from this class, though the same factory emits them:
+#   test_hardening_of_{ndp,arp,mac}_overload* -> the L2/NDP/ARP class (parent diff)
+#   test_ecmp_{group,member}_overload_limit   -> the DLB and ECMP hardening class
+#   test_cpu_high_priority_queue_overload     -> the CPU queue class
+#   test_bgp_malformed_packet_test            -> the BGP hardening class
+AC100T_PLATFORM_HARDENING_TEST_CONFIG = (
+    test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
+        test_config_name="AC100T_PLATFORM_HARDENING_TEST_CONFIG",
+        **_AC100T_HARDENING_PARAMS,
+        ecmp_member_limit=ac100t.AC100T_ECMP_MEMBER_LIMIT,
+        playbooks_selected=[
+            # cgroup / OOM policy
+            "test_cgroup_system_slice_oom_kill_policy",
+            # Single-service restart
+            "test_agent_warmboot",
+            "test_bgpd_restart",
+            "test_qsfp_service_restart",
+            "test_fsdb_restart",
+            "test_openr_restart",
+            "test_fboss_hw_agent_0_restart",
+            "test_fboss_sw_agent_warmboot",
+            # Single-service crash
+            "test_agent_crash",
+            "test_bgpd_crash",
+            "test_openr_crash",
+            "test_qsfp_service_crash",
+            "test_fsdb_crash",
+            "test_fboss_sw_agent_crash",
+            "test_fboss_hw_agent_0_crash",
+            # Cold boot
+            "test_agent_coldboot",
+            "test_fboss_hw_agent_0_coldboot",
+            # Concurrent / paired service churn
+            "test_fboss_sw_agent_and_hw_agent_0_restart",
+            "test_fboss_sw_agent_and_hw_agent_0_crash",
+            "test_bgpd_and_fsdb_restart",
+            "test_agent_and_bgpd_restart",
+            "test_agent_and_fsdb_restart",
+            "test_agent_and_qsfp_service_restart",
+            "test_fsdb_and_qsfp_service_restart",
+            "test_sw_agent_and_wedge_agent_restart",
+            "test_agent_warmboot_wedge_and_sw_agent",
+            # QSFP warmboot combinations
+            "test_qsfp_service_warmboot_and_reset",
+            "test_qsfp_service_warmboot_and_agent_coldboot",
+            "test_qsfp_service_warmboot_and_tx_flap",
+        ],
+    )
+)
+
+
+# ===========================================================================
+# Critical services tests
+# ===========================================================================
+# The 23 single-box critical-services cases run on DUT2 with five disruption
+# cycles per case. The shared builder keeps this package aligned with the FSW
+# qualification config while the hardening factory supplies the existing
+# AC100T topology, traffic, setup, and health checks.
+AC100T_CRITICAL_SERVICES_TEST_CONFIG = test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
+    test_config_name="AC100T_CRITICAL_SERVICES_TEST_CONFIG",
+    **_AC100T_HARDENING_PARAMS,
+    ecmp_member_limit=ac100t.AC100T_ECMP_MEMBER_LIMIT,
+    playbooks=get_critical_services_single_box_playbooks(
+        iteration=5,
+        ixia_rogue_ic_parent_network_v6=ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6,
+        ixia_rogue_ic_parent_network_v4=ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V4,
+    ),
+)
+
+
+# ===========================================================================
+# Interface flap tests (INTF_001..006)
+# ===========================================================================
+AC100T_INTERFACE_FLAP_TEST_CONFIG = (
+    test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
+        test_config_name="AC100T_INTERFACE_FLAP_TEST_CONFIG",
+        **{
+            key: value
+            for key, value in _AC100T_HARDENING_PARAMS.items()
+            if key != "peergroup_rogue_mimic_v4"
+        },
+        ecmp_member_limit=ac100t.AC100T_ECMP_MEMBER_LIMIT,
+        uplink_interfaces_to_flap=ac100t.AC100T_STSW_FLAP_PORTS,
+        neighbor_dut_name=ac100t.AC100T_INTERFACE_FLAP_NBR_DEVICE_NAME,
+        neighbor_dut_interfaces_to_flap=ac100t.AC100T_STSW_FLAP_PORTS,
+        neighbor_interfaces_to_flap=ac100t.AC100T_INTERFACE_FLAP_NBR_PORTS,
+        uplink_flap_iterations=50,
+        uplink_flap_interval_s=8,
+        playbooks_selected=[
+            "test_flap_1_uplink_port",
+            "test_flap_half_uplink_ports",
+            "test_flap_n_minus_1_uplink_ports",
+            "test_flap_half_uplinks_dut_and_half_nbr",
+            "test_flap_n_minus_1_uplink_ports_qsfp_low_power",
+            "test_flap_n_minus_1_uplink_ports_qsfp_tx_disable",
+        ],
+    )
+)
+
+
+# ===========================================================================
+# Drain tests (DRAN_003..004)
+# ===========================================================================
+AC100T_DRAIN_TEST_CONFIG = test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
+    test_config_name="AC100T_DRAIN_TEST_CONFIG",
+    **_AC100T_HARDENING_PARAMS,
+    ecmp_member_limit=ac100t.AC100T_ECMP_MEMBER_LIMIT,
+    playbooks=get_drain_playbooks(iteration=25),
+)
+
+
+# ===========================================================================
+# FE QoS scheduling and buffering
+# ===========================================================================
+# The full frontend QoS matrix from the centralized test_config_qos_scheduling
+# factory: 6 per-ClassOfService scheduling playbooks (NC / ICP / GOLD / SILVER
+# / BRONZE / NCNF) plus 26 buffering playbooks -- per-queue congestion, single
+# -queue congestion, every priority-vs-congested queue pair, and the
+# multi-queue combinations. 32 playbooks in total.
+#
+# "FE" (frontend, 6 ClassOfService queues) rather than the BE variant
+# (be_test_config_qos_scheduling, 4 DSF traffic classes): both w800 and ac100t
+# are frontend platforms.
+#
+# The congestion half is what makes this "and buffering" -- without the
+# congestion_* arguments the factory emits only the 6 scheduling playbooks.
+# Following the SSW-Elbert reference, congestion reuses the rogue IXIA port,
+# parent network and remote AS rather than requiring a fourth IXIA port.
+#
+# Shares the same 59 device parameters as the hardening factories, so it splats
+# the same scaffolding dict; it additionally takes `ixia_rogue_interface`,
+# which the conveyor factory does not accept and so is passed separately.
+AC100T_FE_QOS_TEST_CONFIG = test_config_qos_scheduling(
+    test_config_name="AC100T_FE_QOS_TEST_CONFIG",
+    **_AC100T_HARDENING_PARAMS,
+    ixia_rogue_interface=ac100t.AC100T_CPU_QUEUE_IXIA_ROGUE_INTERFACE,
+    # Congestion traffic rides the otherwise-idle rogue port.
+    ixia_congestion_interface=ac100t.AC100T_CPU_QUEUE_IXIA_ROGUE_INTERFACE,
+    ixia_congestion_ic_parent_network_v6=ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6,
+    congestion_peer_as_4byte=ac100t.AC100T_REMOTE_ROGUE_AS_4BYTE,
+    congestion_prefix_count_v6=ac100t.AC100T_CONGESTION_PREFIX_COUNT_V6,
+    congestion_prefix_start_v6=ac100t.AC100T_CONGESTION_PREFIX_START_V6,
+    is_congestion_peer_confed=ac100t.AC100T_IS_ROGUE_PEER_CONFED,
+)
+
+
+# ===========================================================================
+# Longevity tests (LONG_001)
+# ===========================================================================
+# The 72-hour traffic bake runs on one 800G loopback pair. The focused
+# allowlist keeps shorter soaks and disruptive snake cases out of this package.
+AC100T_LONGEVITY_TEST_CONFIG = gen_snake_test_config(
+    name="AC100T_LONGEVITY_TEST_CONFIG",
+    hostname=ac100t.AC100T_SNAKE_DEVICE_NAME,
+    basset_pool=ac100t.AC100T_STANDALONE_BASSET_POOL,
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source=f"{ac100t.AC100T_SNAKE_DEVICE_NAME}:{ac100t.AC100T_SNAKE_SOURCE_INTERFACE}",
+            destination=f"{ac100t.AC100T_SNAKE_DEVICE_NAME}:{ac100t.AC100T_SNAKE_DEST_INTERFACE}",
+            source_ip=ac100t.AC100T_SNAKE_SOURCE_IP,
+            destination_ip=ac100t.AC100T_SNAKE_DEST_IP,
+        ),
+    ],
+    line_rate=ac100t.AC100T_SNAKE_LINE_RATE,
+    traffic_item_name="AC100T_72HR_LONGEVITY_800G_IMIX",
+    frame_size_settings=ixia_types.FrameSize(
+        type=ixia_types.FrameSizeType.CUSTOM_IMIX,
+        imix_weight=ac100t.AC100T_SNAKE_IMIX_WEIGHT,
+    ),
+    playbooks_to_include=["test_72hr_longevity"],
+)
+
+
+# ===========================================================================
+# Thrift hardening tests (THFT_001..006)
+# ===========================================================================
+# Run the six requested cases on DUT2, using the same two-port BGP scaffolding
+# as the CPU-queue config: kitchen-sink thrift for one hour, a four-hour
+# thrift-stress + qsfp-flap baseline, and four one-hour service-restart
+# variants at a five-minute cadence. The Steller Eagle placeholder has no
+# netwhoami Hardware enum yet, so skip the live platform assertion.
+AC100T_THRIFT_HARDENING_TEST_CONFIG = create_npi_thrift_hardening_test_config(
+    test_config_name="AC100T_THRIFT_HARDENING_TEST_CONFIG",
+    device_name=ac100t.AC100T_CPU_QUEUE_DUT,
+    local_mac_address=ac100t.AC100T_CPU_QUEUE_LOCAL_MAC_ADDRESS,
+    ixia_downlink_interface=ac100t.AC100T_CPU_QUEUE_IXIA_DOWNLINK_INTERFACE,
+    ixia_uplink_interface=ac100t.AC100T_CPU_QUEUE_IXIA_UPLINK_INTERFACE,
+    peergroup_uplink_mimic_v6=ac100t.AC100T_PEERGROUP_UPLINK_MIMIC_V6,
+    peergroup_uplink_mimic_v4=ac100t.AC100T_PEERGROUP_UPLINK_MIMIC_V4,
+    peergroup_downlink_mimic_v6=ac100t.AC100T_PEERGROUP_DOWNLINK_MIMIC_V6,
+    peergroup_downlink_mimic_v4=ac100t.AC100T_PEERGROUP_DOWNLINK_MIMIC_V4,
+    route_map_uplink_ingress=ac100t.AC100T_ROUTE_MAP_UPLINK_INGRESS,
+    route_map_uplink_egress=ac100t.AC100T_ROUTE_MAP_UPLINK_EGRESS,
+    route_map_downlink_ingress=ac100t.AC100T_ROUTE_MAP_DOWNLINK_INGRESS,
+    route_map_downlink_egress=ac100t.AC100T_ROUTE_MAP_DOWNLINK_EGRESS,
+    ixia_downlink_ic_parent_network_v6=ac100t.AC100T_IXIA_DOWNLINK_IC_PARENT_NETWORK_V6,
+    ixia_uplink_ic_parent_network_v6=ac100t.AC100T_IXIA_UPLINK_IC_PARENT_NETWORK_V6,
+    ixia_downlink_ic_parent_network_v4=ac100t.AC100T_IXIA_DOWNLINK_IC_PARENT_NETWORK_V4,
+    ixia_uplink_ic_parent_network_v4=ac100t.AC100T_IXIA_UPLINK_IC_PARENT_NETWORK_V4,
+    unique_prefix_limit=ac100t.AC100T_UNIQUE_PREFIX_LIMIT,
+    per_peer_max_route_limit=ac100t.AC100T_PER_PEER_MAX_ROUTE_LIMIT,
+    downlink_peer_count=ac100t.AC100T_DOWNLINK_PEER_COUNT,
+    uplink_peer_count=ac100t.AC100T_UPLINK_PEER_COUNT,
+    remote_uplink_as_4byte=ac100t.AC100T_REMOTE_UPLINK_AS_4BYTE,
+    remote_downlink_as_4byte=ac100t.AC100T_REMOTE_DOWNLINK_AS_4BYTE,
+    remote_as_4_byte_step=ac100t.AC100T_REMOTE_AS_4_BYTE_STEP,
+    is_uplink_peer_confed=ac100t.AC100T_IS_UPLINK_PEER_CONFED,
+    is_downlink_peer_confed=ac100t.AC100T_IS_DOWNLINK_PEER_CONFED,
+    ixia_downlink_prefix_count_v6=ac100t.AC100T_IXIA_DOWNLINK_PREFIX_COUNT_V6,
+    ixia_uplink_prefix_count_v6=ac100t.AC100T_IXIA_UPLINK_PREFIX_COUNT_V6,
+    ixia_downlink_prefix_count_v4=ac100t.AC100T_IXIA_DOWNLINK_PREFIX_COUNT_V4,
+    ixia_uplink_prefix_count_v4=ac100t.AC100T_IXIA_UPLINK_PREFIX_COUNT_V4,
+    ixia_downlink_communities=ac100t.AC100T_IXIA_DOWNLINK_COMMUNITIES,
+    ixia_uplink_communities=ac100t.AC100T_IXIA_UPLINK_COMMUNITIES,
+    uplink_peer_tag=ac100t.AC100T_UPLINK_PEER_TAG,
+    downlink_peer_tag=ac100t.AC100T_DOWNLINK_PEER_TAG,
+    test_duration_s=4 * 60 * 60,
+    restart_test_duration_s=60 * 60,
+    restart_period_s=300,
+    include_kitchen_sink=True,
+    kitchen_sink_test_duration_s=60 * 60,
+    basset_pool=ac100t.AC100T_BASSET_POOL,
+    service_restart_services=ac100t.AC100T_SERVICE_RESTART_SERVICES,
+    skip_platform_assert=True,
+)
+
+
+# ===========================================================================
+# System reboot tests (REBT_001..003)
+# ===========================================================================
+# Reuse the 800G single-DUT snake topology because the reboot behavior is
+# independent of port speed. This dedicated package runs the three system,
+# BMC, and microserver reboot cases five times as required by the test plan.
+AC100T_SYSTEM_REBOOT_TEST_CONFIG = gen_snake_test_config(
+    name="AC100T_SYSTEM_REBOOT_TEST_CONFIG",
+    hostname=ac100t.AC100T_SNAKE_DEVICE_NAME,
+    basset_pool=ac100t.AC100T_STANDALONE_BASSET_POOL,
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source=f"{ac100t.AC100T_SNAKE_DEVICE_NAME}:{source_interface}",
+            destination=f"{ac100t.AC100T_SNAKE_DEVICE_NAME}:{destination_interface}",
+            source_ip=source_ip,
+            destination_ip=destination_ip,
+        )
+        for (
+            source_interface,
+            destination_interface,
+            source_ip,
+            destination_ip,
+        ) in ac100t.AC100T_SNAKE_800G_LOOPS
+    ],
+    line_rate=ac100t.AC100T_SNAKE_LINE_RATE,
+    traffic_item_name="AC100T_SYSTEM_REBOOT_800G_IMIX",
+    frame_size_settings=ixia_types.FrameSize(
+        type=ixia_types.FrameSizeType.CUSTOM_IMIX,
+        imix_weight=ac100t.AC100T_SNAKE_IMIX_WEIGHT,
+    ),
+    iteration=5,
+    playbooks_to_include=[
+        "test_snake_system_reboot_bmc_full",
+        "test_snake_system_reboot_bmc_microserver",
+        "test_snake_system_reboot_microserver",
+    ],
+)
+
+
+# ===========================================================================
+# Prefix profiling & overload tests
+# ===========================================================================
+# Three TestConfigs -- one per route distribution (contiguous / hybrid /
+# non-contiguous) -- from create_device_test_configs(). Each drives its
+# distribution into the DUT's FIB at /48, /64, /80 and /128, then warmboots,
+# restarts bgpd and coldboots under that load and measures reconvergence: 12
+# playbooks per config.
+#
+# The route scale is supplied as a per-hardware PrefixProfilingProfile rather
+# than read from the module's MP3N globals, so retuning AC100T is an edit to
+# ac100t_constants.py alone and cannot perturb the RTSW/GTSW configs that share
+# the factory. Only the counts and multipliers are hardware-specific; the
+# fixed-prefix / random-mask / prefix-step patterns that DEFINE each
+# distribution are inherited from the MP3N baseline.
+#
+# This class needs FOUR IXIA ports -- one per distribution plus a traffic
+# downlink -- rather than the uplink/downlink/rogue trio the hardening classes
+# share, so it does not reuse _AC100T_HARDENING_PARAMS.
+(
+    AC100T_PREFIX_PROFILING_CONTIGUOUS_TEST_CONFIG,
+    AC100T_PREFIX_PROFILING_HYBRID_TEST_CONFIG,
+    AC100T_PREFIX_PROFILING_NON_CONTIGUOUS_TEST_CONFIG,
+) = create_device_test_configs(
+    device_name=ac100t.AC100T_CPU_QUEUE_DUT,
+    remote_as=ac100t.AC100T_REMOTE_UPLINK_AS_4BYTE,
+    peer_group=ac100t.AC100T_PEERGROUP_UPLINK_MIMIC_V6,
+    contiguous=ac100t.AC100T_PREFIX_PROFILING_CONTIGUOUS_SPEC,
+    hybrid=ac100t.AC100T_PREFIX_PROFILING_HYBRID_SPEC,
+    non_contiguous=ac100t.AC100T_PREFIX_PROFILING_NON_CONTIGUOUS_SPEC,
+    downlink=ac100t.AC100T_PREFIX_PROFILING_DOWNLINK_SPEC,
+    mac_address=ac100t.AC100T_CPU_QUEUE_LOCAL_MAC_ADDRESS,
+    ingress_policy=ac100t.AC100T_PREFIX_PROFILING_INGRESS_POLICY,
+    egress_policy=ac100t.AC100T_PREFIX_PROFILING_EGRESS_POLICY,
+    patcher_suffix=ac100t.AC100T_PREFIX_PROFILING_PATCHER_SUFFIX,
+    config_name_prefix="AC100T_PREFIX_PROFILING",
+    basset_pool=ac100t.AC100T_BASSET_POOL,
+    profile=build_prefix_profiling_profile(
+        contiguous_scale=ac100t.AC100T_PREFIX_PROFILING_CONTIGUOUS_SCALE,
+        hybrid_scale=ac100t.AC100T_PREFIX_PROFILING_HYBRID_SCALE,
+        non_contiguous_scale=ac100t.AC100T_PREFIX_PROFILING_NON_CONTIGUOUS_SCALE,
+        prefix_limits=ac100t.AC100T_PREFIX_PROFILING_LIMITS,
+    ),
+)
+
+
+# ===========================================================================
+# Snake tests
+# ===========================================================================
+# Built from the snake/loopback standalone builder (gen_snake_test_config),
+# one TestConfig per speed grade in AC100T_SNAKE_PORT_SPEEDS_GBPS -- the shape
+# the reference MINIPACK3_STANDALONE_TEST_CONFIG_{400G,800G} configs use, so a
+# failure names the speed it happened at. Each config runs the full
+# gen_snake_playbooks suite (thrift/qsfp_util interface toggles, qsfp reset,
+# agent warmboot/coldboot/crash, qsfp_service and fsdb restart/crash, BMC and
+# microserver reboots) over the jumpered loops for that speed.
+#
+# Snake is single-DUT loopback, so this runs on one Steller Eagle unit rather
+# than the full 4-DUT topology. Snake builds the TestConfig without a
+# build-time netwhoami lookup (topology discovery is deferred to runtime), so
+# no stub bypass is needed.
+AC100T_SNAKE_800G_TEST_CONFIG = gen_snake_test_config(
+    name="AC100T_SNAKE_800G_TEST_CONFIG",
+    hostname=ac100t.AC100T_SNAKE_DEVICE_NAME,
+    basset_pool=ac100t.AC100T_STANDALONE_BASSET_POOL,
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source=f"{ac100t.AC100T_SNAKE_DEVICE_NAME}:{source_interface}",
+            destination=f"{ac100t.AC100T_SNAKE_DEVICE_NAME}:{destination_interface}",
+            source_ip=source_ip,
+            destination_ip=destination_ip,
+        )
+        for (
+            source_interface,
+            destination_interface,
+            source_ip,
+            destination_ip,
+        ) in ac100t.AC100T_SNAKE_800G_LOOPS
+    ],
+    line_rate=ac100t.AC100T_SNAKE_LINE_RATE,
+    traffic_item_name="AC100T_800G_IMIX",
+    frame_size_settings=ixia_types.FrameSize(
+        type=ixia_types.FrameSizeType.CUSTOM_IMIX,
+        imix_weight=ac100t.AC100T_SNAKE_IMIX_WEIGHT,
+    ),
+    iteration=ac100t.AC100T_SNAKE_ITERATION,
+)
+
+
+AC100T_SNAKE_400G_TEST_CONFIG = gen_snake_test_config(
+    name="AC100T_SNAKE_400G_TEST_CONFIG",
+    hostname=ac100t.AC100T_SNAKE_DEVICE_NAME,
+    basset_pool=ac100t.AC100T_STANDALONE_BASSET_POOL,
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source=f"{ac100t.AC100T_SNAKE_DEVICE_NAME}:{source_interface}",
+            destination=f"{ac100t.AC100T_SNAKE_DEVICE_NAME}:{destination_interface}",
+            source_ip=source_ip,
+            destination_ip=destination_ip,
+        )
+        for (
+            source_interface,
+            destination_interface,
+            source_ip,
+            destination_ip,
+        ) in ac100t.AC100T_SNAKE_400G_LOOPS
+    ],
+    line_rate=ac100t.AC100T_SNAKE_LINE_RATE,
+    traffic_item_name="AC100T_400G_IMIX",
+    frame_size_settings=ixia_types.FrameSize(
+        type=ixia_types.FrameSizeType.CUSTOM_IMIX,
+        imix_weight=ac100t.AC100T_SNAKE_IMIX_WEIGHT,
+    ),
+    iteration=ac100t.AC100T_SNAKE_ITERATION,
+)
+
+
+# ===========================================================================
+# ECMP-only resource testing
+# ===========================================================================
+# 2-port ECMP group/member table stress, no DLB exercised, on the CPU-queue DUT
+# (DUT2): its uplink fanout port is a pure L3 traffic source and its rogue port
+# carries the Main (in-budget) + Rouge (overflow) eBGP sessions plus the
+# NDP-supporting next-hop group. Single-DUT, so the 4-DUT topology is not used.
+#
+# Device scaffolding comes from `ac100t_constants.py` like every other class
+# here -- the uplink/rogue pair and their parent networks are the same ones
+# `_AC100T_HARDENING_PARAMS` uses, so a device value cannot drift between
+# classes.
+#
+# ALL SIZING IS A PLACEHOLDER -- the DUTs are not in the lab, and
+# `EcmpAsic.AC100T` currently carries Tomahawk4's ECMP ceilings, so every
+# group/member count this config asserts is meaningless until it is retuned.
+# TODO(ac100t): once the DUTs are racked and cabled, update together:
+#   1. ac100t_constants.py                 -- hostname / ports / networks / ASN
+#   2. ecmp_csvs/ecmp_nh_pools.py          -- AC100T_MAIN_ECMP_POOL nh_network + size
+#                                             (nh_network must equal
+#                                             AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6)
+#   3. playbooks/dlb_ecmp_platform_constants.py -- ECMP_RESOURCE_PROFILES[EcmpAsic.AC100T]
+AC100T_ECMP_ONLY_RESOURCE_TEST_CONFIG = test_config_for_ecmp_only_resource_testing(
+    test_config_name="AC100T_ECMP_ONLY_RESOURCE_TEST_CONFIG",
+    device_name=ac100t.AC100T_CPU_QUEUE_DUT,
+    ixia_source_interface=ac100t.AC100T_CPU_QUEUE_IXIA_UPLINK_INTERFACE,
+    ixia_rogue_interface=ac100t.AC100T_CPU_QUEUE_IXIA_ROGUE_INTERFACE,
+    # The factory CREATES this peer group, so it is a dedicated AddPath group
+    # rather than one of the mimic peer groups the hardening classes reuse.
+    peergroup_uplink_mimic_v6="PEERGROUP_AC100T_IXIA_V6",
+    peer_group_description="eBGP peering from Steller Eagle 100T to IXIA, IPv6 sessions",
+    configure_vlans_patcher_name="configure_ac100t_ixia_rif_ips",
+    ixia_source_ic_parent_network_v6=ac100t.AC100T_IXIA_UPLINK_IC_PARENT_NETWORK_V6,
+    ixia_rogue_ic_parent_network_v6=ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6,
+    # The rogue port's ::a is the DUT RIF, ::b/::c the Main/Rouge peers, so the
+    # NDP-supporting next-hop pool starts clear of them at ::a001.
+    ixia_nexthop_supporting_ndp_network=f"{ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6}::a001",
+    ixia_nexthop_supporting_ndp_gateway=f"{ac100t.AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6}::a",
+    remote_uplink_as_4byte=ac100t.AC100T_REMOTE_UPLINK_AS_4BYTE,
+    is_uplink_peer_confed=ac100t.AC100T_IS_UPLINK_PEER_CONFED,
+    prefix_limit=ac100t.AC100T_BGP_PREFIX_LIMIT,
+    basset_pool=ac100t.AC100T_BASSET_POOL,
+    # TODO(ac100t): PLACEHOLDER ASIC DATA. `ECMP_RESOURCE_PROFILES[AC100T]` in
+    # playbooks/dlb_ecmp_platform_constants.py is a verbatim copy of Tomahawk4 --
+    # replace it with the real Steller Eagle ECMP ceilings (group/member limits,
+    # widths, Rouge multiplier, NDP pool) before trusting any count this config
+    # asserts.
+    asic=EcmpAsic.AC100T,
+    # TODO(ac100t): PLACEHOLDER POOL. `AC100T_MAIN_ECMP_POOL` in
+    # ecmp_csvs/ecmp_nh_pools.py carries a documentation-range `nh_network` and
+    # a `size` copied from the TH4 profile. Update it with the ASIC profile
+    # above -- `size` must equal that profile's `max_unique_next_hops` or the
+    # factory raises, and `nh_network` must equal
+    # AC100T_IXIA_ROGUE_IC_PARENT_NETWORK_V6.
+    pool=AC100T_MAIN_ECMP_POOL,
+    # Minimal Main NetworkGroup shell. Every playbook overwrites it via
+    # `apply_pool_mutations` before traffic, and 1/1 avoids the IxNetwork commit
+    # failure the 100/group_util_width default hit on Elbert.
+    baseline_network_group_multiplier=1,
+    baseline_ecmp_width=1,
+)
+
+
+# ===========================================================================
+# LAG (port-channel) tests (LAG_001..021)
+# ===========================================================================
+# The full LAG suite from test_config_for_portchannel: baseline, longevity,
+# all-link and variable-minlink flaps (incl. warmboot/coldboot), cross flaps
+# and mismatched minlink. Every device value is a placeholder until the LAG
+# testbed is decided (see the LAG section of ac100t_constants.py); the IXIA
+# address ranges below are documentation ranges.
+AC100T_LAG_TEST_CONFIG = test_config_for_portchannel(
+    test_config_name="AC100T_LAG_TEST_CONFIG",
+    ixia_chassis_ip=ac100t.AC100T_LAG_IXIA_CHASSIS_IP,
+    uplink_device=ac100t.AC100T_LAG_UPLINK_DEVICE_NAME,
+    uplink_role=ac100t.AC100T_LAG_UPLINK_ROLE,
+    uplink_ixia_ports=[
+        IxiaPortSpec(
+            interface=ac100t.AC100T_LAG_UPLINK_IXIA_INTERFACE,
+            chassis_port=ac100t.AC100T_LAG_UPLINK_IXIA_CHASSIS_PORT,
+            v6_session_count=8,
+            v4_session_count=8,
+            bgp_v6_starting_ip="2001:db8:0:1c01::0",
+            bgp_v6_gateway_ip="2001:db8:0:1c01::1",
+            bgp_v4_starting_ip="198.51.100.0",
+            bgp_v4_gateway_ip="198.51.100.1",
+            v6_prefix_count=25000,
+            v6_starting_prefixes="2001:db8:1000::",
+            v4_prefix_count=25000,
+            v4_starting_prefixes="198.18.0.0",
+        )
+    ],
+    downlink_device=ac100t.AC100T_LAG_DOWNLINK_DEVICE_NAME,
+    downlink_role=ac100t.AC100T_LAG_DOWNLINK_ROLE,
+    downlink_ixia_ports=[
+        IxiaPortSpec(
+            interface=ac100t.AC100T_LAG_DOWNLINK_IXIA_INTERFACE,
+            chassis_port=ac100t.AC100T_LAG_DOWNLINK_IXIA_CHASSIS_PORT,
+            v6_session_count=8,
+            v4_session_count=8,
+            bgp_v6_starting_ip="2001:db8:0:1c02::0",
+            bgp_v6_gateway_ip="2001:db8:0:1c02::1",
+            bgp_v4_starting_ip="198.51.100.128",
+            bgp_v4_gateway_ip="198.51.100.129",
+            v6_prefix_count=5000,
+            v6_starting_prefixes="2001:db8:2000::",
+            v4_prefix_count=5000,
+            v4_starting_prefixes="198.19.0.0",
+        )
+    ],
+    uplink_portchannel_name=ac100t.AC100T_LAG_UPLINK_PORTCHANNEL_NAME,
+    downlink_portchannel_name=ac100t.AC100T_LAG_DOWNLINK_PORTCHANNEL_NAME,
+    uplink_portchannel_links=ac100t.AC100T_LAG_UPLINK_PORTCHANNEL_LINKS,
+    downlink_portchannel_links=ac100t.AC100T_LAG_DOWNLINK_PORTCHANNEL_LINKS,
+)
+
+
+# ===========================================================================
+# Registry
+# ===========================================================================
+# The ONE symbol the central registry (testconfigs/internal/__init__.py and
+# internal/all.py, which spreads it into INTERNAL_TEST_CONFIGS) imports from
+# this module. Append new ac100t TestConfigs here as each test class is bound,
+# so adding a config never requires touching the registry files again.
+AC100T_TEST_CONFIGS = [
+    AC100T_CPU_QUEUE_TEST_CONFIG,
+    AC100T_CRITICAL_SERVICES_TEST_CONFIG,
+    AC100T_DRAIN_TEST_CONFIG,
+    AC100T_INTERFACE_FLAP_TEST_CONFIG,
+    AC100T_L2_NDP_ARP_HARDENING_TEST_CONFIG,
+    AC100T_LAG_TEST_CONFIG,
+    AC100T_FE_QOS_TEST_CONFIG,
+    AC100T_PREFIX_PROFILING_CONTIGUOUS_TEST_CONFIG,
+    AC100T_PREFIX_PROFILING_HYBRID_TEST_CONFIG,
+    AC100T_PREFIX_PROFILING_NON_CONTIGUOUS_TEST_CONFIG,
+    AC100T_LONGEVITY_TEST_CONFIG,
+    AC100T_THRIFT_HARDENING_TEST_CONFIG,
+    AC100T_PLATFORM_HARDENING_TEST_CONFIG,
+    AC100T_SYSTEM_REBOOT_TEST_CONFIG,
+    AC100T_SNAKE_800G_TEST_CONFIG,
+    AC100T_SNAKE_400G_TEST_CONFIG,
+    AC100T_ECMP_ONLY_RESOURCE_TEST_CONFIG,
+]

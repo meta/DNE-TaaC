@@ -1,5 +1,4 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-# pyre-unsafe
 """BGPCPP-on-EBB characteristic/measurement workflow factories.
 
 EBB-topology measurement tests (update-packing, constant-attribute storage,
@@ -31,14 +30,32 @@ factories stay in ``playbook_definitions.py``.
 See ``fbcode/neteng/test_infra/routing_qualification/docs/taac/TESTCONFIGS.md``.
 """
 
-import os
+import ipaddress
+import json
+import typing as t
+from collections.abc import Sequence
 from dataclasses import replace
 
 from ixia.ixia import types as ixia_types
+from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
+    build_cleanup_materialized_policy_evaluation_files_cmd,
+    build_materialize_missing_bgpcpp_startup_cmd,
+    build_materialize_missing_lab_thrift_acl_files_cmd,
+    POLICY_EVALUATION_BGPCPP_STARTUP_FLAGS,
+)
+from taac.abstractions.compiler import (
+    build_eos_bgpcpp_characteristic_setup_tasks,
+    build_eos_bgpcpp_characteristic_teardown_tasks,
+    build_eos_bgpcpp_peer_plan,
+)
 from taac.abstractions.eos_bgpcpp_setup_tasks import (
     openr_mode_for_bgpcpp_profile,
 )
 from taac.abstractions.physical_inventory import PhysicalInventory
+from taac.abstractions.physical_inventory.routing_ebb_testbed import (
+    IXIA03_ASH6,
+    IXIA11_ASH6,
+)
 from taac.abstractions.topologies.bounded_ecmp import (
     BOUNDED_ECMP,
     BOUNDED_ECMP_AS_NUMBERS,
@@ -46,14 +63,27 @@ from taac.abstractions.topologies.bounded_ecmp import (
     BOUNDED_ECMP_PEER_GROUPS,
     BOUNDED_ECMP_PORT_MAP,
 )
+from taac.abstractions.topologies.constant_attribute_storage import (
+    CONSTANT_ATTRIBUTE_STORAGE,
+    CONSTANT_ATTRIBUTE_STORAGE_AS_NUMBERS,
+    CONSTANT_ATTRIBUTE_STORAGE_PEER_GROUPS,
+    CONSTANT_ATTRIBUTE_STORAGE_PORT_MAP,
+)
 from taac.abstractions.topologies.egress_peer_scale import (
     EGRESS_PEER_SCALE,
     EGRESS_PEER_SCALE_AS_NUMBERS,
     EGRESS_PEER_SCALE_PARENT_NETWORKS,
+    EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
     EGRESS_PEER_SCALE_PEER_GROUPS,
     EGRESS_PEER_SCALE_PORT_MAP,
     EGRESS_PEER_SCALE_PREFIX_COUNT,
     EGRESS_PEER_SCALE_SWEEP_PEER_COUNTS,
+)
+from taac.abstractions.topologies.ingress_peer_scale import (
+    INGRESS_PEER_SCALE,
+    INGRESS_PEER_SCALE_AS_NUMBERS,
+    INGRESS_PEER_SCALE_PEER_GROUPS,
+    INGRESS_PEER_SCALE_PORT_MAP,
 )
 from taac.abstractions.topologies.ipv6_update_packing import (
     IPV6_UPDATE_PACKING,
@@ -62,7 +92,31 @@ from taac.abstractions.topologies.ipv6_update_packing import (
     IPV6_UPDATE_PACKING_PEER_GROUPS,
     IPV6_UPDATE_PACKING_PORT_MAP,
 )
+from taac.abstractions.topologies.route_churn_scale import (
+    ROUTE_CHURN_SCALE,
+    ROUTE_CHURN_SCALE_AS_NUMBERS,
+    ROUTE_CHURN_SCALE_PEER_GROUPS,
+    ROUTE_CHURN_SCALE_PORT_MAP,
+)
+from taac.abstractions.topologies.separable_policy_evaluation import (
+    SEPARABLE_POLICY_EVALUATION,
+    SEPARABLE_POLICY_EVALUATION_AS_NUMBERS,
+    SEPARABLE_POLICY_EVALUATION_PARENT_NETWORKS,
+    SEPARABLE_POLICY_EVALUATION_PARENT_NETWORKS_IXIA03,
+    SEPARABLE_POLICY_EVALUATION_PEER_GROUPS,
+    SEPARABLE_POLICY_EVALUATION_PORT_MAP,
+    SEPARABLE_POLICY_EVALUATION_SWEEP,
+)
+from taac.abstractions.topologies.transient_memory_route_scale import (
+    TRANSIENT_MEMORY_ROUTE_SCALE,
+    TRANSIENT_MEMORY_ROUTE_SCALE_AS_NUMBERS,
+    TRANSIENT_MEMORY_ROUTE_SCALE_PEER_GROUPS,
+    TRANSIENT_MEMORY_ROUTE_SCALE_PORT_MAP,
+)
 from taac.abstractions.topology import (
+    BgpPeerGroup,
+    BoundDeviceGroup,
+    BoundTopology,
     OpenRMode,
     RoutingDeviceConfig,
 )
@@ -80,12 +134,15 @@ from taac.playbooks.playbook_definitions import (
     build_case8_playbook,
     create_test_computational_load_for_bgp_plus_plus_playbook,
     create_test_constant_attribute_storage_playbook,
-    create_transient_memory_ingress_peer_scale_playbook,
 )
 from taac.playbooks.routing.bgp_ebb_playbooks import (
+    get_bgp_ebb_bounded_ecmp_sc9_playbook,
     get_bgp_ebb_bounded_ecmp_sets_playbook,
     get_bgp_ebb_constant_attribute_storage_playbook,
     get_bgp_ebb_queue_memory_monitoring_playbook,
+    get_bgp_ebb_separable_policy_evaluation_playbook,
+    get_bgp_ebb_transient_memory_peer_scale_playbook,
+    get_bgp_ebb_transient_memory_route_scale_playbook,
     get_bgp_ebb_update_packing_playbook,
 )
 from taac.routing.ebb.arista_bgp_plus_plus_performance_scaling_tests.attribute_pool_generator import (
@@ -109,7 +166,6 @@ from taac.task_definitions import (
     create_coop_apply_patchers_task,
     create_coop_register_patcher_task,
     create_coop_unregister_patchers_task,
-    create_interface_ip_configuration_task,
     create_replace_bgp_peers_task,
     create_run_commands_on_shell_task,
     create_scp_file_template_task,
@@ -131,7 +187,6 @@ from taac.testconfigs.routing.util.bgp_ebb_constants import (
     IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
     IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
     IXIA_IPV4_START_OFFSET,
-    IXIA_IPV6_START_OFFSET,
     PEERGROUP_EBGP_V4,
     PEERGROUP_EBGP_V6,
     PEERGROUP_IBGP_V4,
@@ -141,9 +196,16 @@ from taac.testconfigs.routing.util.bgp_ebb_periodic_tasks import (
     create_standard_periodic_tasks,
 )
 from taac.testconfigs.routing.util.bgp_ebb_setup_tasks import (
-    build_per_iteration_factory_ingress_v4_capable,
     build_per_iteration_factory_v4_capable,
     get_update_packing_setup_tasks,
+    insert_gateway_resolution_gate,
+)
+from taac.utils.gate_catalog import (
+    SC4_STABLE_SAMPLE_WINDOW_SECONDS,
+)
+from taac.utils.gate_control import GATE_MODE_BLOCKING
+from taac.utils.lab_device_credentials import (
+    get_lab_device_password,
 )
 from taac.test_as_a_config import types as taac_types
 from taac.test_as_a_config.types import (
@@ -159,6 +221,342 @@ from taac.test_as_a_config.types import (
     Task,
     TestConfig,
 )
+
+
+_EGRESS_PEER_SCALE_PARENT_NETWORKS_BY_CHASSIS = {
+    IXIA11_ASH6: EGRESS_PEER_SCALE_PARENT_NETWORKS,
+    IXIA03_ASH6: EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
+}
+
+_POLICY_EVALUATION_PARENT_NETWORKS_BY_CHASSIS = {
+    IXIA11_ASH6: SEPARABLE_POLICY_EVALUATION_PARENT_NETWORKS,
+    IXIA03_ASH6: SEPARABLE_POLICY_EVALUATION_PARENT_NETWORKS_IXIA03,
+}
+
+
+class _PolicyEvaluationAutomationContract(t.NamedTuple):
+    """Runtime handles derived from one bound policy-evaluation topology."""
+
+    ebgp_interface: str
+    prefix_pool_names_by_afi: t.Mapping[str, str]
+    peer_group_names_by_afi: t.Mapping[str, str]
+    peer_counts_by_afi: t.Mapping[str, int]
+    peer_configs_by_afi: t.Mapping[str, t.Mapping[str, t.Any]]
+    prefix_capacity: int
+    local_as_4_byte: int
+    enable_update_group: bool
+
+
+def _bound_peer_group_name(group: BoundDeviceGroup) -> str:
+    peer_group = group.peer_group
+    name = peer_group.name if isinstance(peer_group, BgpPeerGroup) else peer_group
+    if not isinstance(name, str) or not name:
+        raise ValueError(
+            f"policy-evaluation group {group.name!r} has no bound peer-group name"
+        )
+    return name
+
+
+def _policy_evaluation_automation_contract(  # noqa: C901
+    bound: BoundTopology,
+) -> _PolicyEvaluationAutomationContract:
+    peer_plan = build_eos_bgpcpp_peer_plan(bound)
+    groups_by_afi: dict[str, BoundDeviceGroup] = {}
+    for topology_afi, automation_afi in (("v4", "ipv4"), ("v6", "ipv6")):
+        matches = tuple(
+            group
+            for group in bound.device_groups
+            if group.role == "ebgp" and group.afi == topology_afi
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                "policy evaluation requires exactly one bound eBGP group for "
+                f"{automation_afi}; got {[group.name for group in matches]}"
+            )
+        groups_by_afi[automation_afi] = matches[0]
+
+    pool_names: dict[str, str] = {}
+    peer_group_names: dict[str, str] = {}
+    peer_counts: dict[str, int] = {}
+    peer_configs: dict[str, t.Mapping[str, t.Any]] = {}
+    capacities: set[int] = set()
+    local_asns: set[int] = set()
+    port_assignments: set[tuple[str, str, int]] = set()
+    for afi, group in groups_by_afi.items():
+        assignment = group.port_assignment
+        if (
+            assignment is None
+            or assignment.logical_role != "ebgp"
+            or not group.legacy_ixia_device_group_name
+            or not group.legacy_ixia_bgp_peer_name
+            or group.legacy_ixia_device_group_index is None
+            or group.remote_asn is None
+            or not group.parent_network
+            or len(group.a_ips) != 1
+            or len(group.z_ips) != 1
+        ):
+            raise ValueError(
+                f"policy-evaluation {afi} group {group.name!r} has incomplete "
+                "dual-stack eBGP, IXIA, ASN, or route inputs"
+            )
+        if len(group.prefix_advertisements) != 1:
+            raise ValueError(
+                f"policy-evaluation {afi} group {group.name!r} must expose one "
+                "route advertisement"
+            )
+        advertisement = group.prefix_advertisements[0].spec
+        pool_name = advertisement.legacy_ixia_name
+        if not pool_name:
+            raise ValueError(
+                f"policy-evaluation {afi} group {group.name!r} has no IXIA "
+                "prefix-pool handle"
+            )
+        planned_peers = tuple(
+            peer for peer in peer_plan.peers if peer.device_group == group.name
+        )
+        if group.peer_count != 1 or len(planned_peers) != 1:
+            raise ValueError(
+                f"policy-evaluation {afi} group {group.name!r} must expose one "
+                "compiled DUT peer"
+            )
+        if group.local_asn is None:
+            raise ValueError(
+                f"policy-evaluation {afi} group {group.name!r} has no local ASN"
+            )
+        planned_peer = planned_peers[0]
+        peer_group_name = _bound_peer_group_name(group)
+        if (
+            planned_peer.remote_asn is None
+            or planned_peer.peer_group_name != peer_group_name
+        ):
+            raise ValueError(
+                f"policy-evaluation {afi} group {group.name!r} has an incomplete "
+                "compiled peer identity"
+            )
+        pool_names[afi] = pool_name
+        peer_group_names[afi] = peer_group_name
+        peer_counts[afi] = group.peer_count
+        peer_configs[afi] = planned_peer.bgpcpp_config()
+        capacities.add(advertisement.allocation.prefixes_per_peer)
+        local_asns.add(group.local_asn)
+        port_assignments.add(
+            (
+                assignment.dut_interface,
+                assignment.ixia_port,
+                assignment.physical_inventory_index,
+            )
+        )
+
+    for label, handles in (
+        ("IXIA prefix-pool", pool_names),
+        ("BGP peer-group", peer_group_names),
+        (
+            "BGP peer address",
+            {afi: peer["peer_addr"] for afi, peer in peer_configs.items()},
+        ),
+    ):
+        if len(set(handles.values())) != 2:
+            raise ValueError(
+                f"policy evaluation requires distinct {label} handles by AFI; "
+                f"got {handles}"
+            )
+    if len(capacities) != 1 or len(local_asns) != 1:
+        raise ValueError(
+            "policy evaluation requires one shared prefix capacity and local ASN"
+        )
+    if len(port_assignments) != 1:
+        raise ValueError(
+            "policy evaluation IPv4 and IPv6 groups must share one IXIA port"
+        )
+    device_config = bound.device_config
+    if device_config is None:
+        raise ValueError("policy evaluation requires a bound device config")
+    if device_config.openr_mode is not OpenRMode.NONE:
+        raise ValueError("policy evaluation requires OpenRMode.NONE")
+    ebgp_interface, _ixia_port, _inventory_index = port_assignments.pop()
+    return _PolicyEvaluationAutomationContract(
+        ebgp_interface=ebgp_interface,
+        prefix_pool_names_by_afi=pool_names,
+        peer_group_names_by_afi=peer_group_names,
+        peer_counts_by_afi=peer_counts,
+        peer_configs_by_afi=peer_configs,
+        prefix_capacity=capacities.pop(),
+        local_as_4_byte=local_asns.pop(),
+        enable_update_group=device_config.update_group_enable,
+    )
+
+
+def _resolve_policy_evaluation_parent_networks(
+    parent_networks: dict[str, str] | None,
+    *,
+    ixia_chassis_ip: str,
+) -> dict[str, str]:
+    expected = _POLICY_EVALUATION_PARENT_NETWORKS_BY_CHASSIS.get(ixia_chassis_ip)
+    if parent_networks is None:
+        if expected is None:
+            raise ValueError(
+                "unsupported IXIA chassis for policy-evaluation parent networks: "
+                f"{ixia_chassis_ip}"
+            )
+        resolved = expected
+    else:
+        resolved = parent_networks
+    required_keys = frozenset().union(
+        *(
+            frozenset(canonical)
+            for canonical in _POLICY_EVALUATION_PARENT_NETWORKS_BY_CHASSIS.values()
+        )
+    )
+    missing_keys = sorted(required_keys - resolved.keys())
+    if missing_keys:
+        raise ValueError(
+            f"policy-evaluation parent_networks missing required keys: {missing_keys}"
+        )
+    selected = {key: resolved[key] for key in sorted(required_keys)}
+    if expected is not None and selected != expected:
+        raise ValueError(
+            "policy-evaluation parent_networks do not match IXIA chassis "
+            f"{ixia_chassis_ip}"
+        )
+    return selected
+
+
+def _policy_evaluation_setup_tasks(
+    bound: BoundTopology,
+    physical_inventory: PhysicalInventory,
+    automation: _PolicyEvaluationAutomationContract,
+) -> list[taac_types.Task]:
+    device_name = physical_inventory.device_name
+    materialize_acl_task = create_run_commands_on_shell_task(
+        hostname=device_name,
+        cmds=[build_materialize_missing_lab_thrift_acl_files_cmd()],
+        set_outer_hostname=True,
+        ixia_needed=True,
+        validate_output=True,
+    )
+    materialize_startup_task = create_run_commands_on_shell_task(
+        hostname=device_name,
+        cmds=[
+            build_materialize_missing_bgpcpp_startup_cmd(
+                startup_flags=POLICY_EVALUATION_BGPCPP_STARTUP_FLAGS
+            )
+        ],
+        set_outer_hostname=True,
+        ixia_needed=True,
+        validate_output=True,
+    )
+    bgp_asn = physical_inventory.dut_bgp_as
+    configerator_path = physical_inventory.bgpcpp_configerator_path
+    if bgp_asn is None or configerator_path is None:
+        raise ValueError("policy evaluation requires BGP ASN and configerator path")
+    return build_eos_bgpcpp_characteristic_setup_tasks(
+        bound,
+        device_name=device_name,
+        bgp_asn=bgp_asn,
+        ebgp_interface=automation.ebgp_interface,
+        ibgp_interface=automation.ebgp_interface,
+        router_id=getattr(physical_inventory, "router_id", None),
+        bgpcpp_configerator_path=configerator_path,
+        enable_update_group=automation.enable_update_group,
+        openr_mode=OpenRMode.NONE,
+        bgpcpp_local_as_4_byte=automation.local_as_4_byte,
+        component_startup_prefix_tasks=(
+            materialize_acl_task,
+            materialize_startup_task,
+        ),
+        finalization_tasks=(
+            create_bgp_clear_route_filter_task(
+                hostname=device_name,
+                set_outer_hostname=True,
+                ixia_needed=True,
+            ),
+        ),
+    )
+
+
+def _policy_evaluation_teardown_tasks(
+    bound: BoundTopology,
+    physical_inventory: PhysicalInventory,
+) -> list[taac_types.Task]:
+    cleanup_task = create_run_commands_on_shell_task(
+        hostname=physical_inventory.device_name,
+        cmds=[build_cleanup_materialized_policy_evaluation_files_cmd()],
+        set_outer_hostname=True,
+        ixia_needed=True,
+        validate_output=True,
+    )
+    return [*build_eos_bgpcpp_characteristic_teardown_tasks(bound), cleanup_task]
+
+
+def _resolve_egress_peer_scale_parent_networks(  # noqa: C901
+    parent_networks: dict[str, str] | None,
+    *,
+    ixia_chassis_ip: str,
+) -> dict[str, str]:
+    expected = _EGRESS_PEER_SCALE_PARENT_NETWORKS_BY_CHASSIS.get(ixia_chassis_ip)
+    if parent_networks is None:
+        if expected is None:
+            raise ValueError(
+                f"unsupported IXIA chassis for parent networks: {ixia_chassis_ip}"
+            )
+        resolved = expected
+    else:
+        resolved = parent_networks
+    canonical_maps = tuple(_EGRESS_PEER_SCALE_PARENT_NETWORKS_BY_CHASSIS.values())
+    if expected is not None:
+        required_keys = frozenset(expected)
+    elif not canonical_maps:
+        raise ValueError(
+            "cannot derive egress peer-scale parent-network keys without a "
+            "canonical IXIA chassis map"
+        )
+    else:
+        required_keys = frozenset().union(
+            *(frozenset(canonical) for canonical in canonical_maps)
+        )
+    missing_keys = sorted(required_keys - resolved.keys())
+    if missing_keys:
+        raise ValueError(
+            f"egress peer-scale parent_networks missing required keys: {missing_keys}"
+        )
+    # Only topology-owned keys enter runtime configuration. Explicit callers may
+    # carry unrelated metadata, but it must not become an address-plan input.
+    required_parent_networks = {key: resolved[key] for key in sorted(required_keys)}
+    if expected is not None and required_parent_networks != expected:
+        raise ValueError(
+            "egress peer-scale parent_networks do not match IXIA chassis "
+            f"{ixia_chassis_ip}"
+        )
+    for key, parent_network in required_parent_networks.items():
+        if not isinstance(parent_network, str) or not parent_network:
+            raise ValueError(
+                f"egress peer-scale parent_networks[{key!r}] must be a nonempty "
+                "network prefix"
+            )
+        if key.endswith("_v4"):
+            network = f"{parent_network}.0/24"
+            expected_version = 4
+        elif key.endswith("_v6"):
+            hextets = parent_network.split(":")
+            if len(hextets) != 5 or any(not hextet for hextet in hextets):
+                raise ValueError(
+                    f"egress peer-scale parent_networks[{key!r}] is not a valid "
+                    f"bare IPv6 parent-network prefix: {parent_network!r}"
+                )
+            network = f"{parent_network}::/80"
+            expected_version = 6
+        else:
+            raise ValueError(
+                f"egress peer-scale parent_networks key {key!r} must end in _v4 or _v6"
+            )
+        try:
+            ipaddress.ip_network(network, strict=True)
+        except ValueError as error:
+            raise ValueError(
+                f"egress peer-scale parent_networks[{key!r}] is not a valid bare "
+                f"IPv{expected_version} parent-network prefix: {parent_network!r}"
+            ) from error
+    return required_parent_networks
 
 
 # =============================================================================
@@ -373,8 +771,8 @@ def test_config_constant_attribute_storage_on_eos(
 # How long BGP++ waits for a FibAgentBgp thrift reply. The bgpd default is 45s
 # (``kFbossAgentRecvTimeout``), which is short for a full SyncFib at EBB scale --
 # programming ~95K routes has been measured at ~55s. Every other EBB scaling and
-# characteristic config already runs at this value; SC6 was the lone outlier
-# still on the default.
+# characteristic config runs at this common value. SC6 uses its larger,
+# qualification-measured cold-sync deadline below.
 _AGENT_THRIFT_RECV_TIMEOUT_MS: str = "160000"
 
 _CONSTANT_ATTR_EBGP_PEER_COUNT: int = 2
@@ -393,6 +791,10 @@ _CONSTANT_ATTR_ACCEPTANCE_COMMUNITIES: list[str] = ["65529:39744"]
 # the 65529:39744 acceptance tag -- so EB-FA-IN rejects every route (Accepted=0).
 # Matches SC2 / the legacy single-axis config.
 _CONSTANT_ATTR_MAX_COMMUNITIES_PER_ROUTE: int = 5
+_SC3_CONVERGENCE_TIMEOUT_SECONDS: int = 600
+_SC3_CONVERGENCE_POLL_SECONDS: int = 5
+_SC3_CONVERGENCE_QUIESCENCE_SECONDS: int = 30
+_SC3_TRANSIENT_MEMORY_CEILING_MB: float = 50.0
 
 # ─── SC2 (char-2 Constant Storage, INGRESS-ONLY) ───────────────────────────
 # eBGP ingress peer count (IPv6-only), FIXED. No iBGP egress at all.
@@ -405,7 +807,7 @@ _INGRESS_ATTR_TOTAL_PATHS: int = 800_000
 _INGRESS_ATTR_COMBINATION_SWEEP: list[int] = [100_000, 200_000, 400_000, 800_000]
 
 
-def test_config_constant_attribute_storage_route_sweep_on_eos(
+def test_config_sc3_transient_memory_route_scale_on_eos(
     test_config_name: str,
     device_name: str,
     ixia_interface_mimic_ebgp: str,
@@ -435,26 +837,31 @@ def test_config_constant_attribute_storage_route_sweep_on_eos(
     test_route_withdrawal: bool = False,
     withdrawal_wait_minutes: int = 3,
     dump_attribute_assignments: bool = True,
-    soak_time_minutes: int = 10,
     direct_ixia_connections: list | None = None,
     log_collection_timeout: int | None = None,
     oss_mock_device_data=None,
     host_os_type_map=None,
     host_driver_args=None,
-    transient_ratio_tolerance: float = 2.0,
-    dedup_gate_mode: str = "permissive",
-    transient_gate_mode: str = "permissive",
+    setup_tasks: list[Task] | None = None,
+    basic_port_configs: list[BasicPortConfig] | None = None,
+    dedup_gate_mode: str | None = None,
+    adjrib_out_memory_gate_mode: str | None = None,
+    transient_gate_mode: str | None = None,
+    transient_memory_ceiling_mb: float = _SC3_TRANSIENT_MEMORY_CEILING_MB,
+    convergence_timeout_seconds: int = _SC3_CONVERGENCE_TIMEOUT_SECONDS,
+    convergence_poll_seconds: int = _SC3_CONVERGENCE_POLL_SECONDS,
+    convergence_quiescence_seconds: int = _SC3_CONVERGENCE_QUIESCENCE_SECONDS,
 ) -> taac_types.TestConfig:
-    """BGP++ constant-attribute-storage route-scale sweep on Arista EOS.
+    """BGP++ SC3 transient-memory route-scale sweep on Arista EOS.
 
     Fixed topology -- ``ebgp_peer_count`` eBGP (ingress source) + ``ibgp_peer_count``
     iBGP (egress fan-out) -- with the ingress route count as the only swept axis
     (``route_sweep``). Every route draws an attribute-set from a fixed bounded
     pool, so as routes scale the DEDUPLICATOR SIZE (unique attribute count) must
     stay ~constant iff attributes are shared (stored once) rather than re-created
-    per route; RSS is observational (it grows with prefix/path count). Under
-    update-group, holding egress *paths* constant would NOT hold memory constant
-    (adj-rib-out is per-group ~= prefixes), so the deduplicator is the signal.
+    per route. Stable RSS may grow with prefix/path count, but must remain below
+    the raw lower bound for a complete fallback to per-peer Adj-RIB-Out storage.
+    The peak-minus-stable convergence transient has a separate absolute ceiling.
 
     The device is provisioned with the SC1-mirrored setup layer: the test's own
     eBGP+iBGP bgpcpp peer list is written and the interface secondary IPs laid
@@ -489,56 +896,59 @@ def test_config_constant_attribute_storage_route_sweep_on_eos(
     # the device is provisioned at each fixed axis' per-AFI count.
     ebgp_peer_count_per_afi = ebgp_peer_count // 2
     ibgp_peer_count_per_afi = ibgp_peer_count // 2
-    setup_tasks = get_update_packing_setup_tasks(
-        device_name=device_name,
-        bgp_asn=dut_bgp_as,
-        ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-        ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-        ebgp_peer_count=ebgp_peer_count_per_afi,
-        ibgp_peer_count=ibgp_peer_count_per_afi,
-        ebgp_remote_as=ebgp_remote_as,
-        # The device iBGP peer's remote-as must equal the IXIA iBGP peer's own
-        # (local) AS for the session to establish; both are ``ibgp_local_as``.
-        ibgp_remote_as=ibgp_local_as,
-        ixia_ebgp_ic_parent_network_v6=ixia_ebgp_ic_parent_network_v6,
-        ixia_ibgp_ic_parent_network_v6=ixia_ibgp_ic_parent_network_v6,
-        router_id=router_id,
-        bgpcpp_configerator_path=bgpcpp_configerator_path,
-        profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
-        ixia_ebgp_ic_parent_network_v4=ixia_ebgp_ic_parent_network_v4,
-        ixia_ibgp_ic_parent_network_v4=ixia_ibgp_ic_parent_network_v4,
-        enable_update_group=enable_update_group,
-        # Dual-stack: align the generated v4 peers with the device's v4
-        # secondary IPs (offset 10) rather than the default 16.
-        v4_peer_start_offset=IXIA_IPV4_START_OFFSET,
-    )
-    # Clear the baked-in route registry so injected scale prefixes are accepted.
-    setup_tasks.append(
-        create_bgp_clear_route_filter_task(
-            hostname=device_name,
-            set_outer_hostname=True,
-            ixia_needed=True,
+    if setup_tasks is None:
+        resolved_setup_tasks = get_update_packing_setup_tasks(
+            device_name=device_name,
+            bgp_asn=dut_bgp_as,
+            ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
+            ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
+            ebgp_peer_count=ebgp_peer_count_per_afi,
+            ibgp_peer_count=ibgp_peer_count_per_afi,
+            ebgp_remote_as=ebgp_remote_as,
+            # The device iBGP peer's remote-as must equal the IXIA iBGP peer's own
+            # (local) AS for the session to establish; both are ``ibgp_local_as``.
+            ibgp_remote_as=ibgp_local_as,
+            ixia_ebgp_ic_parent_network_v6=ixia_ebgp_ic_parent_network_v6,
+            ixia_ibgp_ic_parent_network_v6=ixia_ibgp_ic_parent_network_v6,
+            router_id=router_id,
+            bgpcpp_configerator_path=bgpcpp_configerator_path,
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
+            ixia_ebgp_ic_parent_network_v4=ixia_ebgp_ic_parent_network_v4,
+            ixia_ibgp_ic_parent_network_v4=ixia_ibgp_ic_parent_network_v4,
+            enable_update_group=enable_update_group,
+            # Dual-stack: align the generated v4 peers with the device's v4
+            # secondary IPs (offset 10) rather than the default 16.
+            v4_peer_start_offset=IXIA_IPV4_START_OFFSET,
         )
-    )
-    # The route-scale-sweep step measures without ever restarting Bgp, so bounce
-    # it here so the nexthop flag and the CRF-free state take effect before the
-    # sweep begins. (SC1 relies on its per-stage Bgp restart for this.)
-    setup_tasks.append(
-        create_arista_daemon_control_task(
-            hostname=device_name,
-            daemon_name="Bgp",
-            action="disable",
-            ixia_needed=True,
+        # Clear the baked-in route registry so injected scale prefixes are accepted.
+        resolved_setup_tasks.append(
+            create_bgp_clear_route_filter_task(
+                hostname=device_name,
+                set_outer_hostname=True,
+                ixia_needed=True,
+            )
         )
-    )
-    setup_tasks.append(
-        create_arista_daemon_control_task(
-            hostname=device_name,
-            daemon_name="Bgp",
-            action="enable",
-            ixia_needed=True,
+        # The route-scale-sweep step measures without ever restarting Bgp, so bounce
+        # it here so the nexthop flag and the CRF-free state take effect before the
+        # sweep begins. (SC1 relies on its per-stage Bgp restart for this.)
+        resolved_setup_tasks.append(
+            create_arista_daemon_control_task(
+                hostname=device_name,
+                daemon_name="Bgpcpp",
+                action="disable",
+                ixia_needed=True,
+            )
         )
-    )
+        resolved_setup_tasks.append(
+            create_arista_daemon_control_task(
+                hostname=device_name,
+                daemon_name="Bgpcpp",
+                action="enable",
+                ixia_needed=True,
+            )
+        )
+    else:
+        resolved_setup_tasks = setup_tasks
 
     return TestConfig(
         name=test_config_name,
@@ -559,9 +969,11 @@ def test_config_constant_attribute_storage_route_sweep_on_eos(
         oss_mock_device_data=oss_mock_device_data,
         host_os_type_map=host_os_type_map,
         startup_checks=[],
-        setup_tasks=setup_tasks,
+        setup_tasks=resolved_setup_tasks,
         teardown_tasks=[],
-        basic_port_configs=[
+        basic_port_configs=basic_port_configs
+        if basic_port_configs is not None
+        else [
             BasicPortConfig(
                 endpoint=f"{device_name}:{ixia_interface_mimic_ebgp}",
                 device_group_configs=[
@@ -642,7 +1054,7 @@ def test_config_constant_attribute_storage_route_sweep_on_eos(
                     DeviceGroupConfig(
                         device_group_name="DEVICE_GROUP_IPV6_IBGP",
                         device_group_index=0,
-                        multiplier=1,
+                        multiplier=ibgp_peer_count_per_afi,
                         v6_addresses_config=IpAddressesConfig(
                             starting_ip=f"{ixia_ibgp_ic_parent_network_v6}::11",
                             increment_ip="0:0:0:0::2",
@@ -660,7 +1072,7 @@ def test_config_constant_attribute_storage_route_sweep_on_eos(
                     DeviceGroupConfig(
                         device_group_name="DEVICE_GROUP_IPV4_IBGP",
                         device_group_index=1,
-                        multiplier=1,
+                        multiplier=ibgp_peer_count_per_afi,
                         v4_addresses_config=IpAddressesConfig(
                             starting_ip=f"{ixia_ibgp_ic_parent_network_v4}.11",
                             increment_ip="0.0.0.2",
@@ -680,26 +1092,31 @@ def test_config_constant_attribute_storage_route_sweep_on_eos(
             ),
         ],
         playbooks=[
-            build_case2_playbook(
-                name="bgp_plus_plus_constant_attribute_storage_test",
-                description="Test BGP++ constant attribute storage with varying EBGP peers and prefix counts",
+            get_bgp_ebb_transient_memory_route_scale_playbook(
+                description=(
+                    "Test BGP++ SC3 transient memory while ingress routes scale"
+                ),
                 stages=[
                     create_steps_stage(
                         steps=[
                             create_custom_step(
                                 params_dict={
-                                    "custom_step_name": "test_constant_attribute_storage_eos_bgp_plus_plus",
+                                    "custom_step_name": "test_sc3_transient_memory_route_scale_eos_bgp_plus_plus",
                                     "test_config_name": test_config_name,
                                     "hostname": device_name,
                                     "ixia_interface_mimic_ebgp": ixia_interface_mimic_ebgp,
                                     "ebgp_peer_count": ebgp_peer_count,
                                     "ibgp_peer_count": ibgp_peer_count,
+                                    "ibgp_remote_as": ibgp_local_as,
                                     "route_sweep": route_sweep,
-                                    "transient_ratio_tolerance": transient_ratio_tolerance,
                                     "dedup_gate_mode": dedup_gate_mode,
+                                    "adjrib_out_memory_gate_mode": adjrib_out_memory_gate_mode,
                                     "transient_gate_mode": transient_gate_mode,
+                                    "transient_memory_ceiling_mb": transient_memory_ceiling_mb,
+                                    "convergence_timeout_seconds": convergence_timeout_seconds,
+                                    "convergence_poll_seconds": convergence_poll_seconds,
+                                    "convergence_quiescence_seconds": convergence_quiescence_seconds,
                                     "constant_total_paths": constant_total_paths,
-                                    "soak_time_minutes": soak_time_minutes,
                                     "attribute_pool_as_paths": as_path_pool,
                                     "attribute_pool_communities": community_pool,
                                     "attribute_pool_extended_communities": extended_community_pool,
@@ -724,24 +1141,30 @@ def test_config_constant_attribute_storage_route_sweep_on_eos(
 def create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
     testbed: PhysicalInventory,
     enable_update_group: bool = False,
+    name_override: str | None = None,
+    parent_networks: dict[str, str] | None = None,
+    include_direct_ixia_connections: bool = False,
 ) -> taac_types.TestConfig:
     """SC3 transient-memory route-scale test config (testbed-driven).
 
     The SC3 "scale & characteristics" test = the (former SC2) route-scale sweep
     WITH egress. Fixed topology (eBGP=2 ingress source, iBGP=500 egress fan-out,
     RESOLVABLE nexthops, routes advertised) and sweeps the INGRESS ROUTE count
-    (``_CONSTANT_ATTR_ROUTE_SWEEP``, 10K->50K). PRIMARY signal = TRANSIENT memory
-    = peak (high-watermark during the convergence burst) - stable (steady-state
-    after soak); it must stay ~flat as routes scale, because bgpd bounds the
-    transient working set via bounded update queues (backpressure). The
-    DEDUPLICATOR-SIZE check rides along as a bonus (the char-2 signal). Both
-    gates expose a blocking|permissive mode flag (default permissive until
-    calibrated on a real run, then flip to blocking).
+    (``_CONSTANT_ATTR_ROUTE_SWEEP``, 10K->50K). PRIMARY signal = transient memory
+    = peak sampled RSS during convergence - stable post-convergence RSS; it must
+    remain within the absolute 50 MB ceiling because bgpd bounds the transient
+    working set via update-queue backpressure. Separate blocking gates rule out
+    a complete fallback to per-peer Adj-RIB-Out storage and verify that the
+    fixed attribute pools stay deduplicated.
 
-    Mirrors the SC1 perf-scaling factory: the DUT is provisioned via
-    ``get_update_packing_setup_tasks`` and the name derives from
-    ``testbed.device_name`` as ``{DEVICE}_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST``
-    (+ ``_UPDATE_GROUP``).
+    The factory binds the DICE topology to physical inventory; the compiler
+    lowers its peer, IXIA, endpoint, host, and setup intent into the established
+    SC3 artifact order. The name derives from ``testbed.device_name`` as
+    ``{DEVICE}_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST`` (+ ``_UPDATE_GROUP``).
+    ``name_override`` provides a stable lifecycle selector when the same factory
+    is rebound to another physical inventory. ``include_direct_ixia_connections``
+    independently opts the TestConfig into explicit chassis/port bindings;
+    overriding address pools alone does not change endpoint binding semantics.
 
     All SC tests run with update-group enabled, so ``enable_update_group=True``
     is the variant that is actually run; the non-UG form does not work and is
@@ -755,33 +1178,58 @@ def create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
     # router_id is optional: bag010 relies on the device-default router-id, which
     # the setup helpers preserve when router_id is None.
 
-    name = (
+    name = name_override or (
         f"{testbed.device_name.upper().replace('.', '_')}"
         "_SC3_TRANSIENT_MEMORY_ROUTE_SCALE_TEST"
     )
-    if enable_update_group:
+    if name_override is None and enable_update_group:
         name += "_UPDATE_GROUP"
+    resolved_parent_networks = _resolve_egress_peer_scale_parent_networks(
+        parent_networks,
+        ixia_chassis_ip=testbed.ixia_chassis_ip,
+    )
 
-    return test_config_constant_attribute_storage_route_sweep_on_eos(
+    bound = TRANSIENT_MEMORY_ROUTE_SCALE.bind_to_inventory(
+        physical_inventory=testbed,
+        port_map=TRANSIENT_MEMORY_ROUTE_SCALE_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=TRANSIENT_MEMORY_ROUTE_SCALE_PEER_GROUPS,
+        as_numbers=TRANSIENT_MEMORY_ROUTE_SCALE_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=OpenRMode.NONE,
+            update_group_enable=enable_update_group,
+        ),
+    )
+    compiled = bound.compile()
+    if len(compiled.endpoints) != 1:
+        raise ValueError(
+            "SC3 compiler must emit exactly one endpoint; "
+            f"got {len(compiled.endpoints)}"
+        )
+    direct_ixia_connections = compiled.endpoints[0].direct_ixia_connections
+
+    config = test_config_sc3_transient_memory_route_scale_on_eos(
         test_config_name=name,
         device_name=testbed.device_name,
         # Bind the DUT to the BGP++-aware AristaFbossSwitch driver (thrift), so
-        # health checks (BGP_SESSION_ESTABLISH_CHECK / BGP_RIB_FIB_CONSISTENCY_CHECK)
-        # query BGP++ instead of falling back to native ar-bgp CLI. Mirrors SC2.
-        host_os_type_map={testbed.device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
+        # the BGP session health check queries BGP++ instead of falling back to
+        # native ar-bgp CLI. Mirrors SC2.
+        host_os_type_map=compiled.host_os_type_map,
         ixia_interface_mimic_ebgp=testbed.ixia_ports[0][0],
         ixia_interface_mimic_ibgp=testbed.ixia_ports[1][0],
         ebgp_remote_as=EBGP_REMOTE_AS,
         ibgp_local_as=IBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ixia_ebgp_ic_parent_network_v4=IXIA_EBGP_IC_PARENT_NETWORK_V4,
-        ixia_ibgp_ic_parent_network_v6=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
-        ixia_ibgp_ic_parent_network_v4=IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+        ixia_ebgp_ic_parent_network_v6=resolved_parent_networks["ebgp_v6"],
+        ixia_ebgp_ic_parent_network_v4=resolved_parent_networks["ebgp_v4"],
+        ixia_ibgp_ic_parent_network_v6=resolved_parent_networks["ibgp_v6"],
+        ixia_ibgp_ic_parent_network_v4=resolved_parent_networks["ibgp_v4"],
         # Fixed topology: eBGP=2 ingress source, iBGP=500 egress fan-out.
         ebgp_peer_count=_CONSTANT_ATTR_EBGP_PEER_COUNT,
         ibgp_peer_count=_CONSTANT_ATTR_IBGP_PEER_COUNT,
-        # The only swept axis: ingress route count. iBGP + attribute pool are
-        # held constant so the deduplicator size is the signal, not egress paths.
+        # The only swept axis is ingress route count. The fixed iBGP fan-out lets
+        # endpoint RSS growth rule out a complete fallback to per-peer
+        # Adj-RIB-Out state, while the fixed attribute pools make their
+        # deduplicator sizes independently testable.
         route_sweep=_CONSTANT_ATTR_ROUTE_SWEEP,
         dut_bgp_as=testbed.dut_bgp_as,
         bgpcpp_configerator_path=testbed.bgpcpp_configerator_path,
@@ -795,7 +1243,13 @@ def create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
         as_path_pool_size=100,
         community_pool_size=50,
         as_path_length=4,
+        direct_ixia_connections=(
+            direct_ixia_connections if include_direct_ixia_connections else None
+        ),
+        setup_tasks=compiled.setup_tasks,
+        basic_port_configs=compiled.basic_port_configs,
     )
+    return config(basset_pool=testbed.basset_pool)
 
 
 def test_config_constant_attribute_storage_varying_combinations_on_eos(
@@ -814,12 +1268,12 @@ def test_config_constant_attribute_storage_varying_combinations_on_eos(
     constant_ibgp_peer_count: int = 2,
     constant_total_paths: int = 800_000,
     test_address_families: list[str] | None = None,
-    base_as_path_pool_size: int = 100,
-    base_community_pool_size: int = 100,
-    base_extended_community_pool_size: int = 100,
+    # Entries in EACH of the three attribute pools (AS paths / community sets /
+    # extended-community sets). A pool entry is one COMPLETE attribute, so the
+    # DUT stores 3x this many attributes for the whole sweep and at most
+    # attribute_pool_size**3 distinct attribute-sets can be requested.
+    attribute_pool_size: int = 100,
     constant_acceptance_communities: list[str] | None = None,
-    max_communities_per_route_from_pool: int | None = None,
-    random_seed: int = 42,
     test_route_withdrawal: bool = False,
     withdrawal_wait_minutes: int = 3,
     dump_attribute_assignments: bool = False,
@@ -835,6 +1289,7 @@ def test_config_constant_attribute_storage_varying_combinations_on_eos(
     peergroup_ibgp_v4: str | None = None,
     ssh_password: str = "",
     setup_tasks: list[Task] | None = None,
+    basic_port_configs: list[BasicPortConfig] | None = None,
     oss_mock_device_data=None,
     host_os_type_map=None,
     host_driver_args=None,
@@ -845,6 +1300,10 @@ def test_config_constant_attribute_storage_varying_combinations_on_eos(
     ``testconfigs/routing/ebb/test_config_performance_scaling_case2``
     ``test_config_constant_attribute_storage_varying_combinations_on_eos``.
     """
+    if basic_port_configs is not None and not basic_port_configs:
+        raise ValueError(
+            "basic_port_configs override must contain at least one port config"
+        )
     if test_address_families is None:
         test_address_families = ["ipv4", "ipv6"]
 
@@ -1016,22 +1475,26 @@ def test_config_constant_attribute_storage_varying_combinations_on_eos(
         startup_checks=[],
         setup_tasks=setup_tasks if setup_tasks else [],
         teardown_tasks=[],
-        basic_port_configs=[
-            BasicPortConfig(
-                endpoint=f"{device_name}:{ixia_interface_mimic_ebgp}",
-                device_group_configs=ebgp_device_groups,
-            ),
-            *(
-                [
-                    BasicPortConfig(
-                        endpoint=f"{device_name}:{ixia_interface_mimic_ibgp}",
-                        device_group_configs=ibgp_device_groups,
-                    ),
-                ]
-                if ibgp_device_groups
-                else []
-            ),
-        ],
+        basic_port_configs=(
+            basic_port_configs
+            if basic_port_configs is not None
+            else [
+                BasicPortConfig(
+                    endpoint=f"{device_name}:{ixia_interface_mimic_ebgp}",
+                    device_group_configs=ebgp_device_groups,
+                ),
+                *(
+                    [
+                        BasicPortConfig(
+                            endpoint=f"{device_name}:{ixia_interface_mimic_ibgp}",
+                            device_group_configs=ibgp_device_groups,
+                        ),
+                    ]
+                    if ibgp_device_groups
+                    else []
+                ),
+            ]
+        ),
         playbooks=[
             get_bgp_ebb_constant_attribute_storage_playbook(
                 device_name=device_name,
@@ -1043,12 +1506,8 @@ def test_config_constant_attribute_storage_varying_combinations_on_eos(
                 unique_combination_counts=unique_combination_counts,
                 test_address_families=test_address_families,
                 soak_time_minutes=soak_time_minutes,
-                base_as_path_pool_size=base_as_path_pool_size,
-                base_community_pool_size=base_community_pool_size,
-                base_extended_community_pool_size=base_extended_community_pool_size,
+                attribute_pool_size=attribute_pool_size,
                 constant_acceptance_communities=constant_acceptance_communities,
-                max_communities_per_route_from_pool=max_communities_per_route_from_pool,
-                random_seed=random_seed,
                 test_route_withdrawal=test_route_withdrawal,
                 withdrawal_wait_minutes=withdrawal_wait_minutes,
                 dump_attribute_assignments=dump_attribute_assignments,
@@ -1467,8 +1926,7 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_varying_combination
     dump_attribute_assignments: bool = True,
     test_address_families: list[str] | None = None,
     constant_acceptance_communities: list[str] | None = None,
-    max_communities_per_route_from_pool: int | None = 5,
-    random_seed: int = 42,
+    attribute_pool_size: int = 100,
     peergroup_ebgp_v6: str = "EB-FA-V6",
     peergroup_ebgp_v4: str = "EB-FA-V4",
     peergroup_ibgp_v6: str = "EB-EB-V6",
@@ -1522,11 +1980,7 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_varying_combination
     lab_password_env = (
         physical_inventory.lab_device_password_env_var or "TAAC_EBB_LAB_DEVICE_PASSWORD"
     )
-    lab_admin_password_default = physical_inventory.extras.get(
-        "lab_admin_password_default",
-        "dnepit",  # pragma: allowlist secret
-    )
-    ssh_password = os.environ.get(lab_password_env, lab_admin_password_default)
+    ssh_password = get_lab_device_password(lab_password_env)
 
     return test_config_constant_attribute_storage_varying_combinations_on_eos(
         test_config_name=name,
@@ -1551,8 +2005,7 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_varying_combination
         host_os_type_map=host_os_type_map,
         direct_ixia_connections=resolved_direct_ixia_connections,
         constant_acceptance_communities=constant_acceptance_communities,
-        max_communities_per_route_from_pool=max_communities_per_route_from_pool,
-        random_seed=random_seed,
+        attribute_pool_size=attribute_pool_size,
         peergroup_ebgp_v6=peergroup_ebgp_v6,
         peergroup_ebgp_v4=peergroup_ebgp_v4,
         peergroup_ibgp_v6=peergroup_ibgp_v6,
@@ -1613,11 +2066,7 @@ def create_bgp_ebb_characteristic_queue_memory_monitor_test_config(
             physical_inventory.lab_device_password_env_var
             or "TAAC_EBB_LAB_DEVICE_PASSWORD"
         )
-        lab_admin_password_default = physical_inventory.extras.get(
-            "lab_admin_password_default",
-            "dnepit",  # pragma: allowlist secret
-        )
-        ssh_password = os.environ.get(lab_password_env, lab_admin_password_default)
+        ssh_password = get_lab_device_password(lab_password_env)
 
     return test_config_bgp_queue_memory_monitoring_with_route_scale(
         test_config_name=name,
@@ -1650,33 +2099,90 @@ def create_bgp_ebb_characteristic_queue_memory_monitor_test_config(
 
 
 # =============================================================================
-# BAG012_ASH6 conveyor family — Update Packing / Constant Attribute Storage /
-# Queue Memory Monitor / Performance Scaling / Bounded ECMP.
+# BAG012_ASH6 conveyor family — Update Packing / Queue Memory Monitor /
+# Performance Scaling / Bounded ECMP.
 # =============================================================================
 # Defaults for the performance-scaling egress IBGP peer sweep match the
 # simplified rewrite of D104072489: per stage n peers per AF, total = 2n + 2
 # EBGP. Each Stage rewrites /mnt/flash/bgpcpp_config to the matching number of
 # peer entries so BGP++ EOR completes from 100% of configured peers.
 # SC4 (char-4, Transient Memory ~independent of PEER scale): sweep the eBGP
-# INGRESS sender count while holding the iBGP egress fan-out and the route count
-# fixed. The transient (HM - SSM) must stay ~flat as the sender count grows
-# (bounded by update-queue backpressure). This is the INGRESS complement to SC1,
-# which sweeps the iBGP EGRESS fan-out at a fixed eBGP=1.
+# INGRESS sender count while holding the iBGP egress fan-out, unique routes,
+# active paths, and attributes fixed. The 50K routes are partitioned evenly
+# across the active senders at each point.
 #
-# v6-ONLY design (matches SC2's single-AF ingress): each eBGP sender advertises
-# _SC4_PREFIX_COUNT v6 prefixes, so the single v6 IXIA port holds
-# max(sweep) * _SC4_PREFIX_COUNT paths -- bounded to SC2's 800K parity
-# (16 * 50000 = 800K; well under IxNetwork's 5M/port limit, which the removed 2x
-# dual-stack factor used to threaten). The iBGP egress fan-out is held fixed at
-# SC3's 500 so the transient burst has a realistic, non-trivial egress baseline
-# (both SC3 and SC4 gate the transient HM-SSM). All sessions are v6-only.
+# The initial serialized IXIA shape uses the maximum sender count: 3,125
+# disjoint /64s per sender and a 3,125-prefix outer stride. The custom step
+# rewrites both values atomically at each point before protocols start.
 _SC4_INGRESS_EBGP_PEER_COUNTS: list = [1, 2, 4, 8, 16]
 _SC4_FIXED_IBGP_PEER_COUNT: int = 500
-_SC4_PREFIX_COUNT: int = 50000
-# Per-sweep-point soak (steady-state mean window) and the ceiling on how long a
-# point may take to reach the full accepted+resolved route set.
-_SC4_SOAK_SECONDS: int = 120
+_SC4_TOTAL_PREFIX_COUNT: int = 50000
+_SC4_INITIAL_PREFIXES_PER_SENDER: int = 3125
+_SC4_INITIAL_V6_PEER_PREFIX_STEP: str = "0:0:0:c35::"
+_SC4_STABLE_SAMPLE_WINDOW_SECONDS: int = SC4_STABLE_SAMPLE_WINDOW_SECONDS
 _SC4_CONVERGENCE_WAIT_SECONDS: int = 600
+
+# Temporary compatibility alias for code importing the old constant. Its
+# meaning is now the fixed total, not a per-sender count.
+_SC4_PREFIX_COUNT: int = _SC4_TOTAL_PREFIX_COUNT
+
+_SC6_CHURN_COUNT: int = 100
+# BAG012 qualification measured the first 50K full SyncFib at 391.5s.  Keep
+# the BGP client deadline above that cold-sync path so it does not disconnect
+# and enqueue overlapping retries behind the still-running FibAgent request.
+_SC6_AGENT_THRIFT_RECV_TIMEOUT_MS: str = "600000"
+# Keep sessions established but reduce the advertised population before the
+# generic RIB/FIB postcheck.  The BAG012 image predates the BGP++ server queue
+# timeout flag, and serializing the 50K/5M-path state through its default queue
+# can block the check for tens of minutes.
+_SC6_POSTCHECK_PREFIX_COUNT: int = _SC6_CHURN_COUNT + 1
+
+
+def _validate_sc6_startup_order(setup_tasks: Sequence[taac_types.Task]) -> None:
+    """Fail closed unless the SC6 timeout is installed before Bgp starts."""
+    relevant_task_params: list[tuple[int, taac_types.Task, object]] = []
+    for index, task in enumerate(setup_tasks):
+        if task.task_name not in {
+            "configure_bgpcpp_startup",
+            "arista_daemon_control",
+        }:
+            continue
+        try:
+            params = json.loads(task.params.json_params or "{}")
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"SC6 startup task {task.task_name!r} has invalid JSON params"
+            ) from error
+        relevant_task_params.append((index, task, params))
+
+    timeout_task_indices = [
+        index
+        for index, task, params in relevant_task_params
+        if task.task_name == "configure_bgpcpp_startup"
+        and isinstance(params, dict)
+        and isinstance(params.get("flags"), dict)
+        and params["flags"].get("agent_thrift_recv_timeout_ms")
+        == _SC6_AGENT_THRIFT_RECV_TIMEOUT_MS
+    ]
+    bgp_enable_indices = [
+        index
+        for index, task, params in relevant_task_params
+        if task.task_name == "arista_daemon_control"
+        and isinstance(params, dict)
+        and params.get("daemon_name") == "Bgpcpp"
+        and params.get("action") == "enable"
+    ]
+    if len(timeout_task_indices) != 1:
+        raise ValueError(
+            "SC6 requires exactly one agent_thrift_recv_timeout_ms startup task"
+        )
+    if not bgp_enable_indices:
+        raise ValueError("SC6 managed provisioning requires a Bgp enable task")
+    if timeout_task_indices[0] >= bgp_enable_indices[0]:
+        raise ValueError(
+            "SC6 agent_thrift_recv_timeout_ms startup task must precede the "
+            "first managed Bgp enable"
+        )
 
 
 def _two_port_direct_ixia_connections(
@@ -1711,6 +2217,7 @@ def create_bgp_ebb_update_packing_test_config(
     name_override: str | None = None,
     profile: BgpPlusPlusProfile = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
     min_advertised_nlri: int = 0,
+    parent_networks: dict[str, str] | None = None,
 ) -> taac_types.TestConfig:
     """BGP Update Packing conveyor test config.
 
@@ -1743,11 +2250,12 @@ def create_bgp_ebb_update_packing_test_config(
     name = name_override or _derive_test_config_name(
         physical_inventory, "UPDATE_PACKING", enable_update_group
     )
+    resolved_parent_networks = parent_networks or IPV6_UPDATE_PACKING_PARENT_NETWORKS
 
     bound = IPV6_UPDATE_PACKING.bind_to_inventory(
         physical_inventory=physical_inventory,
         port_map=IPV6_UPDATE_PACKING_PORT_MAP,
-        parent_networks=IPV6_UPDATE_PACKING_PARENT_NETWORKS,
+        parent_networks=resolved_parent_networks,
         peer_groups=IPV6_UPDATE_PACKING_PEER_GROUPS,
         as_numbers=IPV6_UPDATE_PACKING_AS_NUMBERS,
         device_config_override=RoutingDeviceConfig(
@@ -1757,18 +2265,18 @@ def create_bgp_ebb_update_packing_test_config(
     )
     compiled = bound.compile()
 
-    return test_config_bgp_update_packing_validation(
+    config = test_config_bgp_update_packing_validation(
         test_config_name=name,
         device_name=device_name,
         # EBGP configuration (ingress - routes sent here from Fabric Aggregators)
         ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
         ebgp_remote_as=EBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
+        ixia_ebgp_ic_parent_network_v6=resolved_parent_networks["ebgp_v6"],
         ixia_ebgp_ic_parent_network_v4="",
         # IBGP configuration (egress - capture UPDATEs here)
         ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
         ibgp_local_as=IBGP_REMOTE_AS,
-        ixia_ibgp_ic_parent_network_v6=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+        ixia_ibgp_ic_parent_network_v6=resolved_parent_networks["ibgp_v6"],
         ixia_ibgp_ic_parent_network_v4="",
         # Test parameters (matching EB02)
         ebgp_peer_count=10,
@@ -1792,133 +2300,51 @@ def create_bgp_ebb_update_packing_test_config(
         basic_port_configs=compiled.basic_port_configs,
         log_collection_timeout=600,
     )
-
-
-def create_bgp_ebb_constant_attribute_storage_test_config(
-    physical_inventory: PhysicalInventory,
-    enable_update_group: bool = False,
-    name_override: str | None = None,
-    profile: BgpPlusPlusProfile = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
-) -> taac_types.TestConfig:
-    """Constant Attribute Storage varying-combinations test config.
-
-    Extracted verbatim from the legacy
-    ``bag012_ash6_test_config.create_bag012_ash6_constant_attribute_storage_test_config``
-    factory. Validates that the amount of memory for storing pool of
-    attributes remains constant regardless of the number of unique
-    attribute-set combinations.
-    """
-    assert physical_inventory.ixia_ports, (
-        "factory requires IXIA port map on physical_inventory"
-    )
-    assert physical_inventory.bgpcpp_configerator_path, (
-        "factory requires bgpcpp_configerator_path on physical_inventory"
-    )
-    assert physical_inventory.dut_bgp_as is not None, (
-        "factory requires dut_bgp_as on physical_inventory"
-    )
-    device_name = physical_inventory.device_name
-    ixia_interface_mimic_ebgp = physical_inventory.ixia_ports[0][0]
-    ixia_interface_mimic_ibgp = physical_inventory.ixia_ports[1][0]
-
-    name = name_override or _derive_test_config_name(
-        physical_inventory, "CONSTANT_ATTRIBUTE_STORAGE", enable_update_group
-    )
-
-    setup_tasks = get_update_packing_setup_tasks(
-        device_name=device_name,
-        bgp_asn=physical_inventory.dut_bgp_as,
-        ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-        ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-        ebgp_peer_count=8,
-        ibgp_peer_count=2,
-        ebgp_remote_as=EBGP_REMOTE_AS,
-        ibgp_remote_as=IBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ixia_ibgp_ic_parent_network_v6=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
-        router_id=physical_inventory.router_id,
-        bgpcpp_configerator_path=physical_inventory.bgpcpp_configerator_path,
-        profile=profile,
-        openr_configerator_path=(
-            physical_inventory.openr_configerator_path
-            if profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R
-            else None
-        ),
-        openr_standalone_link=physical_inventory.openr_standalone_link,
-        enable_update_group=enable_update_group,
-    )
-
-    return test_config_constant_attribute_storage_varying_combinations_on_eos(
-        test_config_name=name,
-        device_name=device_name,
-        # EBGP configuration
-        ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-        ebgp_remote_as=EBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ixia_ebgp_ic_parent_network_v4=IXIA_EBGP_IC_PARENT_NETWORK_V4,
-        # IBGP configuration
-        ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-        ibgp_local_as=IBGP_REMOTE_AS,
-        ixia_ibgp_ic_parent_network_v6=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
-        ixia_ibgp_ic_parent_network_v4=IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
-        # Fixed: 8 EBGP peers + 2 IBGP peers (smaller scale)
-        constant_ebgp_peer_count=8,
-        constant_ibgp_peer_count=2,
-        # Fixed: 800K total paths
-        constant_total_paths=800_000,
-        # Variable: unique combination counts
-        unique_combination_counts=[
-            100_000,
-            200_000,
-            400_000,
-            600_000,
-            800_000,
-        ],
-        soak_time_minutes=2,
-        dump_attribute_assignments=True,
-        test_address_families=["ipv6"],
-        # Custom setup tasks
-        setup_tasks=setup_tasks,
-        host_os_type_map={device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
-        direct_ixia_connections=_two_port_direct_ixia_connections(physical_inventory),
-        # Constant acceptance community (required by device BGP policy)
-        constant_acceptance_communities=["65529:39744"],
-        max_communities_per_route_from_pool=5,
-        random_seed=42,
-        # Device-level BGP peer group names
-        peergroup_ebgp_v6=PEERGROUP_EBGP_V6,
-        peergroup_ebgp_v4=PEERGROUP_EBGP_V4,
-        peergroup_ibgp_v6=PEERGROUP_IBGP_V6,
-        peergroup_ibgp_v4=PEERGROUP_IBGP_V4,
-        log_collection_timeout=600,
-    )
+    return config(basset_pool=physical_inventory.basset_pool)
 
 
 def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
     testbed: PhysicalInventory,
     enable_update_group: bool = False,
+    name_override: str | None = None,
+    parent_networks: dict[str, str] | None = None,
+    include_direct_ixia_connections: bool = False,
 ) -> taac_types.TestConfig:
     """SC2 constant-attribute-storage INGRESS-ONLY test config (testbed-driven).
 
     The SC2 "scale & characteristics" test (char-2). Reuses the BAG012
-    varying-combinations engine but made INGRESS-ONLY and non-vacuous on bag010:
-    8 eBGP peers advertise 100K prefixes each (800K paths); routes are ACCEPTED
-    into the RIB (route_registry cleared + acceptance community) but the nexthop
-    is left UNRESOLVABLE (the interface-state nexthop gflag is deliberately NOT
-    enabled) so they are received+accepted but never best-path/advertised. NO
-    iBGP egress is configured. The swept axis is the number of unique attribute
-    COMBINATIONS (100K->800K) at fixed 800K paths; steady memory must stay
-    ~constant (attribute storage depends on the individual attribute pools, not
-    the combination count).
+    varying-combinations engine but made INGRESS-ONLY and non-vacuous on NRQEB006:
+    8 eBGP peers advertise 100K prefixes each (800K paths); routes are accepted
+    into the RIB with resolvable directly connected nexthops. No iBGP egress is
+    configured, so the workload remains ingress-only without weakening the
+    stored-route state.
+
+    FIXED across the whole sweep: 800K paths, and the three attribute pools --
+    100 complete AS paths + 100 complete community sets + 100 complete
+    extended-community sets = 300 attributes, the only attribute payloads the DUT
+    ever stores. SWEPT: N, the number of distinct attribute-SETS (triples drawn
+    from those pools) spread round-robin over the 800K paths, 100K -> 800K. Since
+    100**3 = 1M, N can reach 800K without ever growing the pools -- which is
+    precisely why the SoT pairs 100-entry pools with an 800K path count.
+
+    Steady memory must therefore stay ~constant as N grows: the attributes are
+    the same 300 objects at every point, and only the per-combination attribute
+    BUNDLE (pointers + scalars) scales with N.
 
     Gates: an acceptance gate (RECEIVED = TRibSummary.total_prefixes >=
     prefixes/peer -- the anti-vacuousness guard, default blocking) and the
-    memory-growth gate (stable memory <= k^0.5, blocking). The nexthop is
-    unresolvable, so the acceptance gate deliberately counts RECEIVED, not
-    selected.
+    memory-growth gate (stable memory <= k^0.5, blocking -- a loose backstop
+    pending recalibration, see _SC2_MEMORY_SCALING_EXPONENT). The acceptance
+    gate deliberately counts RECEIVED routes and a separate blocking gate
+    requires zero unresolved nexthops.
 
     All SC tests run with update-group enabled; only the ``_UPDATE_GROUP``
-    variant is registered.
+    variant is registered. ``name_override`` provides a stable lifecycle
+    selector when the same factory is rebound to another physical inventory.
+    ``parent_networks=None`` derives the canonical address map from the
+    inventory's IXIA chassis. An explicit map may carry unrelated metadata but
+    must match that chassis for every required address. Direct IXIA ownership
+    is controlled independently by ``include_direct_ixia_connections``.
     """
     assert testbed.ixia_ports, "factory requires IXIA port map on testbed"
     assert testbed.bgpcpp_configerator_path, (
@@ -1928,43 +2354,38 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
 
     device_name = testbed.device_name
     ixia_interface_mimic_ebgp = testbed.ixia_ports[0][0]
-    # get_update_packing_setup_tasks requires an iBGP interface arg; with
-    # ibgp_peer_count=0 it lays zero iBGP peers (eBGP-only device config).
-    ixia_interface_mimic_ibgp = testbed.ixia_ports[1][0]
 
-    name = (
+    name = name_override or (
         f"{device_name.upper().replace('.', '_')}"
         "_SC2_CONSTANT_ATTRIBUTE_STORAGE_INGRESS_TEST"
     )
-    if enable_update_group:
+    if name_override is None and enable_update_group:
         name += "_UPDATE_GROUP"
-
-    # Ingress-only device setup: eBGP peers only (ibgp_peer_count=0), IPv6-only.
-    setup_tasks = get_update_packing_setup_tasks(
-        device_name=device_name,
-        bgp_asn=testbed.dut_bgp_as,
-        ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-        ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-        ebgp_peer_count=_INGRESS_ATTR_EBGP_PEER_COUNT,
-        ibgp_peer_count=0,
-        ebgp_remote_as=EBGP_REMOTE_AS,
-        ibgp_remote_as=IBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ixia_ibgp_ic_parent_network_v6=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
-        router_id=testbed.router_id,
-        bgpcpp_configerator_path=testbed.bgpcpp_configerator_path,
-        profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
-        enable_update_group=enable_update_group,
+    resolved_parent_networks = _resolve_egress_peer_scale_parent_networks(
+        parent_networks,
+        ixia_chassis_ip=testbed.ixia_chassis_ip,
     )
-    # Clear the route_registry / CRF so injected scale prefixes are accepted.
-    # This scenario remains ingress-only because it has no iBGP egress peers.
-    setup_tasks.append(
-        create_bgp_clear_route_filter_task(
-            device_name, set_outer_hostname=True, ixia_needed=True
+
+    bound = CONSTANT_ATTRIBUTE_STORAGE.bind_to_inventory(
+        physical_inventory=testbed,
+        port_map=CONSTANT_ATTRIBUTE_STORAGE_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=CONSTANT_ATTRIBUTE_STORAGE_PEER_GROUPS,
+        as_numbers=CONSTANT_ATTRIBUTE_STORAGE_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=OpenRMode.NONE,
+            update_group_enable=enable_update_group,
+        ),
+    )
+    compiled = bound.compile()
+    if len(compiled.endpoints) != 1:
+        raise ValueError(
+            "SC2 compiler must emit exactly one endpoint; "
+            f"got {len(compiled.endpoints)}"
         )
-    )
+    direct_ixia_connections = compiled.endpoints[0].direct_ixia_connections
 
-    return test_config_constant_attribute_storage_varying_combinations_on_eos(
+    config = test_config_constant_attribute_storage_varying_combinations_on_eos(
         test_config_name=name,
         device_name=device_name,
         # Bind the DUT to the BGP++-aware AristaFbossSwitch driver (thrift), so
@@ -1973,8 +2394,8 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
         host_os_type_map={device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
         ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
         ebgp_remote_as=EBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ixia_ebgp_ic_parent_network_v4=IXIA_EBGP_IC_PARENT_NETWORK_V4,
+        ixia_ebgp_ic_parent_network_v6=resolved_parent_networks["ebgp_v6"],
+        ixia_ebgp_ic_parent_network_v4=resolved_parent_networks["ebgp_v4"],
         # INGRESS-ONLY: no iBGP egress device group / peers.
         ixia_interface_mimic_ibgp=None,
         ibgp_local_as=None,
@@ -1985,21 +2406,36 @@ def create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config
         constant_total_paths=_INGRESS_ATTR_TOTAL_PATHS,
         unique_combination_counts=_INGRESS_ATTR_COMBINATION_SWEEP,
         soak_time_minutes=2,
-        dump_attribute_assignments=True,
+        direct_ixia_connections=(
+            direct_ixia_connections if include_direct_ixia_connections else None
+        ),
+        # SC2 is a scale-CHARACTERISTIC measurement, so both activities this
+        # flag enables are switched off:
+        #   - Step 9 (dump_and_verify_rib_attributes) pulls the whole 800K-path
+        #     RIB over thrift per sweep point. The sweep deliberately does not
+        #     restart BGP between iterations, so the RSS that dump churns in
+        #     bgpd_main lands in the NEXT point's stable-memory sample and skews
+        #     the blocking sc2_memory_growth gate.
+        #   - Step 1's combination file-dump writes ~180MB to the runner's /tmp
+        #     across the sweep, is never uploaded anywhere, and each file is a
+        #     prefix of the next. The combinations are deterministic (seeded
+        #     pools, fixed attribute_pool_size) and reproducible offline.
+        # Set back to True only for one-off attribute-correctness debugging.
+        dump_attribute_assignments=False,
         test_address_families=["ipv6"],
-        setup_tasks=setup_tasks,
+        setup_tasks=compiled.setup_tasks,
+        basic_port_configs=compiled.basic_port_configs,
         constant_acceptance_communities=_CONSTANT_ATTR_ACCEPTANCE_COMMUNITIES,
-        max_communities_per_route_from_pool=5,
-        random_seed=42,
         peergroup_ebgp_v6=PEERGROUP_EBGP_V6,
         peergroup_ebgp_v4=PEERGROUP_EBGP_V4,
-        # Acceptance gate (anti-vacuousness): routes must REACH the RIB. Nexthops
-        # are unresolvable, so this counts RECEIVED (total_prefixes), not selected.
+        # Acceptance gate (anti-vacuousness): routes must reach the RIB. Count
+        # RECEIVED routes here; a separate gate requires every nexthop to resolve.
         verify_received_prefixes=True,
         acceptance_gate_mode="blocking",
         memory_growth_gate_mode="blocking",
         log_collection_timeout=600,
     )
+    return config(basset_pool=testbed.basset_pool)
 
 
 def create_bgp_ebb_queue_memory_monitor_test_config(
@@ -2093,9 +2529,25 @@ def create_bgp_ebb_queue_memory_monitor_test_config(
     )
 
 
+def _insert_gateway_resolution_gate(
+    setup_tasks: Sequence[taac_types.Task],
+) -> list[taac_types.Task]:
+    """Gate the first post-IXIA Bgpcpp enable on every SC1 IXIA BGP gateway MAC."""
+    return insert_gateway_resolution_gate(
+        setup_tasks,
+        device_group_names=[
+            device_group.legacy_ixia_device_group_name
+            for device_group in EGRESS_PEER_SCALE.device_groups
+            if device_group.legacy_ixia_device_group_name is not None
+        ],
+    )
+
+
 def create_bgp_ebb_characteristic_performance_scaling_test_config(
     physical_inventory: PhysicalInventory,
     enable_update_group: bool = False,
+    name_override: str | None = None,
+    parent_networks: dict[str, str] | None = None,
 ) -> taac_types.TestConfig:
     """Performance-scaling egress IBGP peer-sweep test config (physical-inventory-driven).
 
@@ -2107,10 +2559,11 @@ def create_bgp_ebb_characteristic_performance_scaling_test_config(
     measured. A final aggregator Stage produces one consolidated everpaste
     plot.
 
-    The internal ``TestConfig.name`` is derived from ``physical_inventory.device_name`` as
-    ``{DEVICE}_BGP_PERFORMANCE_SCALING_CONVEYOR_TEST`` (+ ``_UPDATE_GROUP``); for
-    bag012 this reproduces the grandfathered name byte-for-byte, so its golden
-    manifest hash is unchanged.
+    The default internal ``TestConfig.name`` is derived from
+    ``physical_inventory.device_name`` as
+    ``{DEVICE}_SC1_EGRESS_PEER_SCALE_TEST`` (+ ``_UPDATE_GROUP``).
+    ``name_override`` provides a stable lifecycle selector when the same
+    factory is rebound to another physical inventory.
     """
     assert physical_inventory.ixia_ports, (
         "factory requires IXIA port map on physical_inventory"
@@ -2127,17 +2580,23 @@ def create_bgp_ebb_characteristic_performance_scaling_test_config(
 
     device_name = physical_inventory.device_name
     # Derived from the physical_inventory device name. SC1 = the first "scale &
-    # characteristics" test (egress peer-scale). The legacy
-    # `_BGP_PERFORMANCE_SCALING_CONVEYOR_TEST` suffix was dropped: CONVEYOR
-    # overclaimed (this is an ad-hoc test, not conveyor-scheduled).
-    name = f"{physical_inventory.device_name.upper().replace('.', '_')}_SC1_EGRESS_PEER_SCALE_TEST"
-    if enable_update_group:
+    # characteristics" test (egress peer-scale). Lifecycle bindings that need a
+    # stable scheduler selector provide an explicit override.
+    name = (
+        name_override
+        or f"{physical_inventory.device_name.upper().replace('.', '_')}_SC1_EGRESS_PEER_SCALE_TEST"
+    )
+    if name_override is None and enable_update_group:
         name += "_UPDATE_GROUP"
+    resolved_parent_networks = _resolve_egress_peer_scale_parent_networks(
+        parent_networks,
+        ixia_chassis_ip=physical_inventory.ixia_chassis_ip,
+    )
 
     bound = EGRESS_PEER_SCALE.bind_to_inventory(
         physical_inventory=physical_inventory,
         port_map=EGRESS_PEER_SCALE_PORT_MAP,
-        parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS,
+        parent_networks=resolved_parent_networks,
         peer_groups=EGRESS_PEER_SCALE_PEER_GROUPS,
         as_numbers=EGRESS_PEER_SCALE_AS_NUMBERS,
         device_config_override=RoutingDeviceConfig(
@@ -2151,10 +2610,10 @@ def create_bgp_ebb_characteristic_performance_scaling_test_config(
         router_id=physical_inventory.router_id,
         ebgp_remote_as=EBGP_REMOTE_AS,
         ibgp_remote_as=IBGP_REMOTE_AS,
-        ebgp_v6_base=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ebgp_v4_base=IXIA_EBGP_IC_PARENT_NETWORK_V4,
-        ibgp_v6_base=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
-        ibgp_v4_base=IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+        ebgp_v6_base=resolved_parent_networks["ebgp_v6"],
+        ebgp_v4_base=resolved_parent_networks["ebgp_v4"],
+        ibgp_v6_base=resolved_parent_networks["ibgp_v6"],
+        ibgp_v4_base=resolved_parent_networks["ibgp_v4"],
         peergroup_ebgp_v6=PEERGROUP_EBGP_V6,
         peergroup_ebgp_v4=PEERGROUP_EBGP_V4,
         peergroup_ibgp_v6=PEERGROUP_IBGP_V6,
@@ -2164,7 +2623,7 @@ def create_bgp_ebb_characteristic_performance_scaling_test_config(
         # load-bearing path at convergence time.
         v4_peer_start_offset=IXIA_IPV4_START_OFFSET,
     )
-    return create_bgp_ebb_scaling_performance_test_config(
+    config = create_bgp_ebb_scaling_performance_test_config(
         physical_inventory,
         name=name,
         host_driver_args=None,
@@ -2177,39 +2636,37 @@ def create_bgp_ebb_characteristic_performance_scaling_test_config(
         ebgp_peer_count=1,
         ebgp_remote_as=EBGP_REMOTE_AS,
         ibgp_remote_as=IBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ixia_ebgp_ic_parent_network_v4=IXIA_EBGP_IC_PARENT_NETWORK_V4,
-        ixia_ibgp_ic_parent_network_v6=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
-        ixia_ibgp_ic_parent_network_v4=IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+        ixia_ebgp_ic_parent_network_v6=resolved_parent_networks["ebgp_v6"],
+        ixia_ebgp_ic_parent_network_v4=resolved_parent_networks["ebgp_v4"],
+        ixia_ibgp_ic_parent_network_v6=resolved_parent_networks["ibgp_v6"],
+        ixia_ibgp_ic_parent_network_v4=resolved_parent_networks["ibgp_v4"],
         log_collection_timeout=600,
-        setup_tasks=compiled.setup_tasks,
+        setup_tasks=_insert_gateway_resolution_gate(compiled.setup_tasks),
         teardown_tasks=compiled.teardown_tasks,
         per_iteration_setup_steps_factory=factory,
     )
+    return config(basset_pool=physical_inventory.basset_pool)
 
 
 def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
     testbed: PhysicalInventory,
     enable_update_group: bool = False,
+    name_override: str | None = None,
+    parent_networks: dict[str, str] | None = None,
 ) -> taac_types.TestConfig:
     """SC4 transient-memory eBGP-INGRESS-sender-scale test config (testbed-driven).
 
     SC4 = characteristic 4 (Transient Memory (Almost) Independent of PEER scale).
     Sweeps the eBGP INGRESS sender count (``_SC4_INGRESS_EBGP_PEER_COUNTS``,
-    v6-only) while holding the iBGP egress fan-out (``_SC4_FIXED_IBGP_PEER_COUNT``,
-    a fixed v6-only 500) and the route count (``_SC4_PREFIX_COUNT``) fixed. All
-    sessions are v6-only, so the single v6 IXIA port holds
-    ``max(sweep) * _SC4_PREFIX_COUNT`` paths (SC2's ~800K ingress parity). Routes are RESOLVABLE (nexthop
-    gflag ON) and advertised, so each Stage exercises the full ingress-absorb ->
-    best-path -> egress-advertise burst; the PRIMARY signal is the TRANSIENT
-    memory (peak high-watermark during the burst - stable after soak), which the
-    shared perf-scaling step gates to stay ~flat as the sender count grows
-    (bounded by update-queue backpressure). INGRESS complement to SC1 (which
-    sweeps the iBGP EGRESS fan-out at a fixed eBGP=1).
+    v6-only) while holding the iBGP egress fan-out (``_SC4_FIXED_IBGP_PEER_COUNT``)
+    and a disjoint 50K-route/path workload fixed. At each point the custom step
+    partitions the same total route inventory evenly across the active senders.
+    Routes are resolvable and advertised, so each point exercises the full
+    ingress-absorb -> best-path -> egress-advertise burst.
 
-    Mirrors the SC1 perf-scaling factory: the DUT is provisioned via
-    ``get_update_packing_setup_tasks`` and the name derives from
-    ``testbed.device_name`` as
+    The factory binds the DICE topology to physical inventory, and the compiler
+    lowers endpoint, IXIA, peer, state-guard, setup, and teardown artifacts in
+    the established SC4 order. The name derives from ``testbed.device_name`` as
     ``{DEVICE}_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST`` (+ ``_UPDATE_GROUP``).
 
     All SC tests run with update-group enabled, so ``enable_update_group=True`` is
@@ -2223,130 +2680,94 @@ def create_bgp_ebb_characteristic_transient_memory_peer_scale_test_config(
 
     device_name = testbed.device_name
     ixia_interface_mimic_ebgp = testbed.ixia_ports[0][0]
-    ixia_interface_mimic_ibgp = testbed.ixia_ports[1][0]
 
-    name = (
+    name = name_override or (
         f"{testbed.device_name.upper().replace('.', '_')}"
         "_SC4_TRANSIENT_MEMORY_PEER_SCALE_TEST"
     )
-    if enable_update_group:
+    if name_override is None and enable_update_group:
         name += "_UPDATE_GROUP"
+    resolved_parent_networks = _resolve_egress_peer_scale_parent_networks(
+        parent_networks,
+        ixia_chassis_ip=testbed.ixia_chassis_ip,
+    )
 
-    setup_tasks = get_update_packing_setup_tasks(
-        device_name=device_name,
-        bgp_asn=testbed.dut_bgp_as,
-        ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
-        ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-        # Write the peer list ONCE at the sweep MAX. The sweep resizes the IXIA
-        # eBGP device group rather than rescaling the device, so the configured
-        # peer set must be a superset of every sweep point -- otherwise senders
-        # above the initial count have no configured neighbour and can never
-        # establish (observed: at n=2 the gate saw expected 502 / found 501).
-        # Senders above the current point stay idle, which the exact-count
-        # session gate ignores.
-        ebgp_peer_count=max(_SC4_INGRESS_EBGP_PEER_COUNTS),
-        ibgp_peer_count=_SC4_FIXED_IBGP_PEER_COUNT,
-        ebgp_remote_as=EBGP_REMOTE_AS,
-        ibgp_remote_as=IBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ixia_ibgp_ic_parent_network_v6=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
-        # v6-only ingress: a v4 parent network here writes a v4 eBGP peer to the
-        # device that the v6-only IXIA never answers, so it sits IDLE for the whole
-        # run (10.163.28.11), inflating the session total and polluting every
-        # non-established list.
-        ixia_ebgp_ic_parent_network_v4=None,
-        # iBGP egress is v6-only (the per-iteration factory + IXIA side write 0 v4
-        # iBGP peers). Passing a v4 network here would make get_update_packing lay
-        # the iBGP interface DUAL-STACK -- 500 v6 + 500 v4 secondaries on one
-        # interface -- overflowing Arista's ~500-secondary-per-interface ceiling,
-        # so v6 iBGP peers past ~250 get no local source IP and stay IDLE
-        # (P2441146392). None keeps only the 500 v6 secondaries the test uses.
-        ixia_ibgp_ic_parent_network_v4=None,
-        router_id=testbed.router_id,
-        bgpcpp_configerator_path=testbed.bgpcpp_configerator_path,
-        profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
-        enable_update_group=enable_update_group,
-        v4_peer_start_offset=IXIA_IPV4_START_OFFSET,
+    bound = INGRESS_PEER_SCALE.bind_to_inventory(
+        physical_inventory=testbed,
+        port_map=INGRESS_PEER_SCALE_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=INGRESS_PEER_SCALE_PEER_GROUPS,
+        as_numbers=INGRESS_PEER_SCALE_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=OpenRMode.NONE,
+            update_group_enable=enable_update_group,
+        ),
     )
-    # The swept axis is eBGP: re-lay the eBGP interface's secondary IPs once at the
-    # full sweep max so every Stage's eBGP senders have a local source address
-    # (mirrors SC1's re-lay of the iBGP interface). The iBGP egress interface is
-    # laid by get_update_packing_setup_tasks for the constant fan-out and never
-    # needs re-laying.
-    setup_tasks.append(
-        create_interface_ip_configuration_task(
-            interface=ixia_interface_mimic_ebgp,
-            peer_count=max(_SC4_INGRESS_EBGP_PEER_COUNTS),
-            ipv4_base_network=IXIA_EBGP_IC_PARENT_NETWORK_V4,
-            ipv6_base_network=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-            # v6-only ingress: lay only the v6 eBGP secondary IPs (no v4 senders).
-            address_families=["ipv6"],
-            clear_existing=True,
-            ipv4_start_offset=IXIA_IPV4_START_OFFSET,
-            ipv6_start_offset=IXIA_IPV6_START_OFFSET,
-            hostname=device_name,
-            ixia_needed=True,
-        )
-    )
-    # Scale prefixes are not in the device's baked-in route registry; clear the
-    # Centralized Route Filter so inbound prefixes are not denied (the clear
-    # persists across the per-stage Bgp restarts).
-    setup_tasks.append(
-        create_bgp_clear_route_filter_task(
-            hostname=device_name,
-            set_outer_hostname=True,
-            ixia_needed=True,
-        )
-    )
-    return create_bgp_ebb_scaling_ingress_peer_scale_test_config(
+    compiled = bound.compile()
+    config = create_bgp_ebb_scaling_ingress_peer_scale_test_config(
         testbed,
         name=name,
         host_driver_args=None,
         oss_mock_device_data=None,
-        host_os_type_map={device_name: taac_types.DeviceOsType.ARISTA_FBOSS},
-        direct_ixia_connections=_two_port_direct_ixia_connections(testbed),
+        host_os_type_map=compiled.host_os_type_map,
+        endpoints=compiled.endpoints,
+        basic_port_configs=compiled.basic_port_configs,
         ingress_peer_counts=_SC4_INGRESS_EBGP_PEER_COUNTS,
         ibgp_peer_count=_SC4_FIXED_IBGP_PEER_COUNT,
-        prefix_count=_SC4_PREFIX_COUNT,
+        prefix_count=_SC4_TOTAL_PREFIX_COUNT,
         # v6-only ingress + egress (SC2 single-AF parity, bounded per-port paths).
         address_families=["ipv6"],
         ebgp_remote_as=EBGP_REMOTE_AS,
         ibgp_remote_as=IBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ixia_ebgp_ic_parent_network_v4=IXIA_EBGP_IC_PARENT_NETWORK_V4,
-        ixia_ibgp_ic_parent_network_v6=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
-        ixia_ibgp_ic_parent_network_v4=IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+        ixia_ebgp_ic_parent_network_v6=resolved_parent_networks["ebgp_v6"],
+        ixia_ebgp_ic_parent_network_v4=resolved_parent_networks["ebgp_v4"],
+        ixia_ibgp_ic_parent_network_v6=resolved_parent_networks["ibgp_v6"],
+        ixia_ibgp_ic_parent_network_v4=resolved_parent_networks["ibgp_v4"],
+        ebgp_prefixes_per_sender=_SC4_INITIAL_PREFIXES_PER_SENDER,
+        ebgp_v6_prefix_block_step=_SC4_INITIAL_V6_PEER_PREFIX_STEP,
         log_collection_timeout=600,
-        setup_tasks=setup_tasks,
+        setup_tasks=compiled.setup_tasks,
+        teardown_tasks=compiled.teardown_tasks,
         # The sweep lives inside the convergence custom step (it resizes the IXIA
         # eBGP device group per point), so there are no per-Stage setup steps and
         # therefore no per-Stage Bgp restart.
         per_iteration_setup_steps_factory=None,
-        sweep_playbook=create_transient_memory_ingress_peer_scale_playbook(
+        sweep_playbook=get_bgp_ebb_transient_memory_peer_scale_playbook(
             device_name=device_name,
             ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
             ingress_peer_counts=_SC4_INGRESS_EBGP_PEER_COUNTS,
-            prefix_count_per_peer=_SC4_PREFIX_COUNT,
+            total_prefix_count=_SC4_TOTAL_PREFIX_COUNT,
+            prefix_pool_regex="^PREFIX_POOL_IPV6_EBGP$",
+            prefix_start="2001:db8:1000::",
+            prefix_length=64,
             ibgp_peer_count=_SC4_FIXED_IBGP_PEER_COUNT,
             address_families=["ipv6"],
-            soak_seconds=_SC4_SOAK_SECONDS,
+            stable_sample_window_seconds=_SC4_STABLE_SAMPLE_WINDOW_SECONDS,
             convergence_wait_seconds=_SC4_CONVERGENCE_WAIT_SECONDS,
-            # Anti-vacuousness is hard from the start (mirrors SC2); the flatness
-            # claim stays observe-only until we have a calibrated 5-point dataset.
-            acceptance_gate_mode="blocking",
-            transient_gate_mode="permissive",
+            # Keep the serialized Conveyor config self-contained: the shared
+            # registry also marks these gates blocking, but an explicit mode
+            # prevents a registry-policy drift from weakening this promotion
+            # gate at runtime.
+            acceptance_gate_mode=GATE_MODE_BLOCKING,
+            rib_out_gate_mode=GATE_MODE_BLOCKING,
+            measurement_gate_mode=GATE_MODE_BLOCKING,
+            memory_ceiling_gate_mode=GATE_MODE_BLOCKING,
+            transient_gate_mode=GATE_MODE_BLOCKING,
         ),
     )
+    return config(basset_pool=testbed.basset_pool)
 
 
 def create_bgp_ebb_characteristic_route_churn_processing_test_config(
     testbed: PhysicalInventory,
     enable_update_group: bool = False,
+    name_override: str | None = None,
+    parent_networks: dict[str, str] | None = None,
 ) -> taac_types.TestConfig:
     """SC6 churn-processing P(N) test config (testbed-driven).
 
-    SC6 = characteristic 6 (Churn Processing time P(N)): hold route churn fixed
-    at ~100 routes, sweep total route scale N, and verify BGP keeps up
+    SC6 = characteristic 6 (Churn Processing time P(N)): hold route churn fixed,
+    sweep total route scale N, and verify BGP keeps up
     (reconverge/processing ~independent of N). Reuses the existing EB02 churn
     P(N) engine (``create_bgp_ebb_scaling_route_churn_prefix_test_config``) with
     bag010 device setup: interface-state nexthop gflag + Centralized Route
@@ -2363,9 +2784,9 @@ def create_bgp_ebb_characteristic_route_churn_processing_test_config(
     ``testbed.device_name`` as ``{DEVICE}_SC6_CHURN_PROCESSING_TEST`` + ``_UPDATE_GROUP``
     when ``enable_update_group=True``.
 
-    Provisioning goes through the engine's ``get_update_packing_setup_tasks``
-    recipe -- the same one SC2/SC3/SC4 run. Update-group is folded into the
-    config that recipe deploys, rather than patched on afterwards.
+    The factory binds the DICE topology to physical inventory. The compiler
+    owns the endpoint, IXIA, peer, state-guard, setup, and teardown artifacts;
+    this factory retains only the churn workload and playbook.
 
     Args:
         testbed: PhysicalInventory with ixia_ports, bgpcpp_configerator_path,
@@ -2374,58 +2795,58 @@ def create_bgp_ebb_characteristic_route_churn_processing_test_config(
             enabled and includes a UG health check in the playbook postchecks.
     """
     assert testbed.ixia_ports, "factory requires IXIA port map on testbed"
+    assert testbed.bgpcpp_configerator_path, (
+        "factory requires bgpcpp_configerator_path on testbed"
+    )
+    assert testbed.dut_bgp_as is not None, "factory requires dut_bgp_as on testbed"
 
-    device_name = testbed.device_name
-
-    name = f"{testbed.device_name.upper().replace('.', '_')}_SC6_CHURN_PROCESSING_TEST"
-    if enable_update_group:
+    name = name_override or (
+        f"{testbed.device_name.upper().replace('.', '_')}_SC6_CHURN_PROCESSING_TEST"
+    )
+    if name_override is None and enable_update_group:
         name += "_UPDATE_GROUP"
+    resolved_parent_networks = _resolve_egress_peer_scale_parent_networks(
+        parent_networks,
+        ixia_chassis_ip=testbed.ixia_chassis_ip,
+    )
 
-    extra_setup_tasks = [
-        # SC6 drives the largest full SyncFib of any config here (50K prefixes
-        # at the top of the sweep), and was the only one still on bgpd's 45s
-        # default FIB-agent receive timeout.
-        #
-        # ``restart_bgp`` is required, not incidental: the task edits
-        # ``run_bgpcpp.sh``, which bgpd only re-reads on start, and
-        # ``extra_setup_tasks`` are appended AFTER the managed recipe's final
-        # Bgp enable. Without the restart the flag would sit on disk unread --
-        # the step itself no longer cycles the daemon per scale.
-        create_configure_bgpcpp_startup_task(
-            hostname=device_name,
-            flags={
-                "agent_thrift_recv_timeout_ms": _AGENT_THRIFT_RECV_TIMEOUT_MS,
-            },
-            use_managed_shell=True,
-            restart_bgp=True,
+    bound = ROUTE_CHURN_SCALE.bind_to_inventory(
+        physical_inventory=testbed,
+        port_map=ROUTE_CHURN_SCALE_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=ROUTE_CHURN_SCALE_PEER_GROUPS,
+        as_numbers=ROUTE_CHURN_SCALE_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=OpenRMode.NONE,
+            update_group_enable=enable_update_group,
         ),
-        create_bgp_clear_route_filter_task(
-            hostname=device_name,
-            set_outer_hostname=True,
-            ixia_needed=True,
-        ),
-    ]
+    )
+    compiled = bound.compile()
 
     # Queue-backpressure monitoring is a generic bgpd health signal now bundled
     # into create_standard_periodic_tasks (like CPU/memory), so the churn
     # playbook picks it up automatically -- no per-test wiring needed here.
-    return create_bgp_ebb_scaling_route_churn_prefix_test_config(
+    test_config = create_bgp_ebb_scaling_route_churn_prefix_test_config(
         testbed,
         name=name,
-        extra_setup_tasks=extra_setup_tasks,
+        setup_tasks=compiled.setup_tasks,
+        teardown_tasks=compiled.teardown_tasks,
+        endpoints=compiled.endpoints,
+        host_os_type_map=compiled.host_os_type_map,
+        basic_port_configs=compiled.basic_port_configs,
         ebgp_peer_count=100,
         ibgp_peer_count=100,
         ebgp_remote_as=EBGP_REMOTE_AS,
         ibgp_remote_as=IBGP_REMOTE_AS,
-        ixia_ebgp_ic_parent_network_v6=IXIA_EBGP_IC_PARENT_NETWORK_V6,
-        ixia_ibgp_ic_parent_network_v6=IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+        ixia_ebgp_ic_parent_network_v6=resolved_parent_networks["ebgp_v6"],
+        ixia_ibgp_ic_parent_network_v6=resolved_parent_networks["ibgp_v6"],
         peergroup_ebgp_v6=PEERGROUP_EBGP_V6,
         peergroup_ibgp_v6=PEERGROUP_IBGP_V6,
         # (route_scale, settle_seconds). The second element is only the wait
         # for the background load to settle BEFORE churn is applied; it is not a
         # gate. Churn reconvergence itself is gated by sc6_churn_latency.
         prefix_configs=[(5000, 120), (10000, 120), (20000, 180), (50000, 300)],
-        churn_count=100,
+        churn_count=_SC6_CHURN_COUNT,
         # Per-phase ceiling. 700s was unusable as a gate -- it cannot separate
         # "P(N) is flat" from "P(N) grew 100x", only a total hang. A fixed
         # 100-route churn should reconverge in seconds.
@@ -2435,12 +2856,14 @@ def create_bgp_ebb_characteristic_route_churn_processing_test_config(
         # 600s default is 20x the 30s hard-fail ceiling, so it is not just dead
         # wall clock (2x600s per scale, 4 scales): convergence is measured as
         # the SPAN of UPDATE frames in the window, so a long tail of near
-        # silence lets any unrelated late UPDATE inflate the result, and a 600s
-        # capture at 50K x 100 peers risks wrapping the IXIA capture buffer and
-        # losing the start of the burst. 60s = 2x the hard-fail ceiling.
+        # silence needlessly grows the captures and risks wrapping the IXIA
+        # capture buffer at 50K x 100 peers. 60s = 2x the hard-fail ceiling.
         soak_duration_seconds=60,
+        postcheck_prefix_count=_SC6_POSTCHECK_PREFIX_COUNT,
         enable_update_group=enable_update_group,
     )
+    _validate_sc6_startup_order(test_config.setup_tasks or [])
+    return test_config(basset_pool=testbed.basset_pool)
 
 
 def create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
@@ -2487,7 +2910,7 @@ def create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
         ),
         skip_ixia_protocol_verification=True,
         log_collection_timeout=600,
-        basset_pool="dne.test",
+        basset_pool=physical_inventory.basset_pool,
         endpoints=compiled.endpoints,
         host_driver_args=physical_inventory.host_driver_args,
         oss_mock_device_data=physical_inventory.oss_mock_device_data,
@@ -2499,6 +2922,213 @@ def create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
         playbooks=[
             get_bgp_ebb_bounded_ecmp_sets_playbook(
                 device_name=device_name,
+            )
+        ],
+    )
+
+
+_SC9_IXIA_BGP_HOLD_TIMER_S = 15
+_SC9_IXIA_BGP_KEEPALIVE_TIMER_S = 5
+
+
+def _with_sc9_ixia_settings(
+    basic_port_configs: Sequence[taac_types.BasicPortConfig],
+) -> list[taac_types.BasicPortConfig]:
+    return [
+        port_config(
+            device_group_configs=[
+                device_group(
+                    enable=False,
+                    v4_bgp_config=(
+                        device_group.v4_bgp_config(
+                            hold_timer=_SC9_IXIA_BGP_HOLD_TIMER_S,
+                            keepalive_timer=_SC9_IXIA_BGP_KEEPALIVE_TIMER_S,
+                        )
+                        if device_group.v4_bgp_config is not None
+                        else None
+                    ),
+                    v6_bgp_config=(
+                        device_group.v6_bgp_config(
+                            hold_timer=_SC9_IXIA_BGP_HOLD_TIMER_S,
+                            keepalive_timer=_SC9_IXIA_BGP_KEEPALIVE_TIMER_S,
+                        )
+                        if device_group.v6_bgp_config is not None
+                        else None
+                    ),
+                )
+                for device_group in port_config.device_group_configs or []
+            ]
+        )
+        if port_config.device_group_configs is not None
+        else port_config
+        for port_config in basic_port_configs
+    ]
+
+
+def create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config(
+    physical_inventory: PhysicalInventory,
+    name_override: str | None = None,
+    enable_update_group: bool = True,
+    profile: BgpPlusPlusProfile = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
+    parent_networks: dict[str, str] | None = None,
+    bgpcpp_logging_config_override: str | None = None,
+) -> taac_types.TestConfig:
+    """Build the SC9 bounded-ECMP characteristic config from DICE intent.
+
+    Sibling of ``create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config``,
+    reusing the BOUNDED_ECMP topology unchanged. It differs only in the playbook
+    it attaches: SC9 asserts the characteristic (steady-state ECMP width, a
+    simultaneous drain, hardware headroom on the device-maintained watermark,
+    and recovery), where the retained config runs a staggered oscillation with a
+    single raw-count ceiling.
+
+    A separate factory rather than a flag on the existing one, so the scheduled
+    bounded-ECMP config stays byte-identical and its golden entry does not move.
+
+    Open/R is OFF (the profile default). SC9 does not need an IGP: every eBGP
+    peer advertises with next-hop = its own session address on a directly
+    attached /127 (v6) or /31 (v4), so all 128 next-hops resolve as connected
+    routes. Open/R would only add background nexthop groups that are noise in a
+    count whose converged value should be 2.
+    """
+    assert physical_inventory.ixia_ports, (
+        "factory requires IXIA port map on physical_inventory"
+    )
+    assert physical_inventory.bgpcpp_configerator_path, (
+        "factory requires bgpcpp_configerator_path on physical_inventory"
+    )
+    assert physical_inventory.dut_bgp_as is not None, (
+        "factory requires dut_bgp_as on physical_inventory"
+    )
+    device_name = physical_inventory.device_name
+    resolved_parent_networks = parent_networks or BOUNDED_ECMP_PARENT_NETWORKS
+    bound = BOUNDED_ECMP.bind_to_inventory(
+        physical_inventory=physical_inventory,
+        port_map=BOUNDED_ECMP_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=BOUNDED_ECMP_PEER_GROUPS,
+        as_numbers=BOUNDED_ECMP_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=openr_mode_for_bgpcpp_profile(profile),
+            update_group_enable=enable_update_group,
+            # None keeps the BOUNDED_ECMP topology's logging level.
+            **(
+                {"bgpcpp_logging_config_override": bgpcpp_logging_config_override}
+                if bgpcpp_logging_config_override is not None
+                else {}
+            ),
+        ),
+    )
+    compiled = bound.compile()
+
+    return TestConfig(
+        name=name_override
+        or _derive_test_config_name(
+            physical_inventory,
+            "SC9_BOUNDED_ECMP_SETS",
+            enable_update_group=enable_update_group,
+        ),
+        skip_ixia_protocol_verification=True,
+        log_collection_timeout=600,
+        basset_pool=physical_inventory.basset_pool,
+        endpoints=compiled.endpoints,
+        host_driver_args=physical_inventory.host_driver_args,
+        oss_mock_device_data=physical_inventory.oss_mock_device_data,
+        host_os_type_map=compiled.host_os_type_map,
+        startup_checks=[],
+        setup_tasks=compiled.setup_tasks,
+        teardown_tasks=compiled.teardown_tasks,
+        basic_port_configs=_with_sc9_ixia_settings(
+            compiled.basic_port_configs,
+        ),
+        playbooks=[
+            get_bgp_ebb_bounded_ecmp_sc9_playbook(
+                device_name=device_name,
+            )
+        ],
+    )
+
+
+def create_bgp_ebb_separable_policy_evaluation_test_config(
+    physical_inventory: PhysicalInventory,
+    name_override: str | None = None,
+    enable_update_group: bool = True,
+    profile: BgpPlusPlusProfile = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
+    parent_networks: dict[str, str] | None = None,
+    max_absolute_overhead_us: float = 5_000_000,
+    max_slope_overhead_us_per_10k: float = 1_000_000,
+) -> taac_types.TestConfig:
+    """Build the paired CICD-EBB-23 policy-evaluation TestConfig.
+
+    This is deliberately separate from the retained EB02/EB04 compatibility
+    TestConfigs: those two Playbooks are observational and their serialized
+    identities must remain unchanged.
+    """
+    assert physical_inventory.ixia_ports, (
+        "factory requires IXIA port map on physical_inventory"
+    )
+    assert physical_inventory.bgpcpp_configerator_path, (
+        "factory requires bgpcpp_configerator_path on physical_inventory"
+    )
+    assert physical_inventory.dut_bgp_as is not None, (
+        "factory requires dut_bgp_as on physical_inventory"
+    )
+    resolved_parent_networks = _resolve_policy_evaluation_parent_networks(
+        parent_networks,
+        ixia_chassis_ip=physical_inventory.ixia_chassis_ip,
+    )
+    bound = SEPARABLE_POLICY_EVALUATION.bind_to_inventory(
+        physical_inventory=physical_inventory,
+        port_map=SEPARABLE_POLICY_EVALUATION_PORT_MAP,
+        parent_networks=resolved_parent_networks,
+        peer_groups=SEPARABLE_POLICY_EVALUATION_PEER_GROUPS,
+        as_numbers=SEPARABLE_POLICY_EVALUATION_AS_NUMBERS,
+        device_config_override=RoutingDeviceConfig(
+            openr_mode=openr_mode_for_bgpcpp_profile(profile),
+            update_group_enable=enable_update_group,
+        ),
+    )
+    automation = _policy_evaluation_automation_contract(bound)
+    compiled = bound.compile()
+    setup_tasks = _policy_evaluation_setup_tasks(
+        bound,
+        physical_inventory,
+        automation,
+    )
+    teardown_tasks = _policy_evaluation_teardown_tasks(bound, physical_inventory)
+    return TestConfig(
+        name=name_override
+        or _derive_test_config_name(
+            physical_inventory,
+            "SC8_POLICY_EVALUATION",
+            enable_update_group=enable_update_group,
+        ),
+        skip_ixia_protocol_verification=True,
+        log_collection_timeout=600,
+        basset_pool=physical_inventory.basset_pool,
+        endpoints=compiled.endpoints,
+        host_driver_args=physical_inventory.host_driver_args,
+        oss_mock_device_data=physical_inventory.oss_mock_device_data,
+        host_os_type_map=compiled.host_os_type_map,
+        startup_checks=[],
+        setup_tasks=setup_tasks,
+        teardown_tasks=teardown_tasks,
+        basic_port_configs=compiled.basic_port_configs,
+        playbooks=[
+            get_bgp_ebb_separable_policy_evaluation_playbook(
+                device_name=physical_inventory.device_name,
+                prefix_counts=SEPARABLE_POLICY_EVALUATION_SWEEP,
+                prefix_capacity=automation.prefix_capacity,
+                prefix_pool_names_by_afi=automation.prefix_pool_names_by_afi,
+                peer_group_names_by_afi=automation.peer_group_names_by_afi,
+                peer_counts_by_afi=automation.peer_counts_by_afi,
+                expected_peers=tuple(
+                    automation.peer_configs_by_afi[afi] for afi in ("ipv4", "ipv6")
+                ),
+                expected_local_as_4_byte=automation.local_as_4_byte,
+                expect_update_group_enabled=automation.enable_update_group,
+                max_absolute_overhead_us=max_absolute_overhead_us,
+                max_slope_overhead_us_per_10k=(max_slope_overhead_us_per_10k),
             )
         ],
     )
@@ -2730,7 +3360,7 @@ def test_config_for_bgp_plus_plus_on_ebb_arista_separable_policy(
     )
 
 
-def test_config_bgp_update_packing_validation(
+def test_config_bgp_update_packing_validation(  # noqa: C901
     test_config_name: str,
     device_name: str,
     # IBGP configuration (ingress)
@@ -3823,11 +4453,7 @@ def create_bgp_ebb_characteristic_separable_policy_test_config(
             physical_inventory.lab_device_password_env_var
             or "TAAC_EBB_LAB_DEVICE_PASSWORD"
         )
-        lab_admin_password_default = physical_inventory.extras.get(
-            "lab_admin_password_default",
-            "dnepit",  # pragma: allowlist secret
-        )
-        ssh_password = os.environ.get(lab_password_env, lab_admin_password_default)
+        ssh_password = get_lab_device_password(lab_password_env)
 
     return test_config_for_bgp_plus_plus_on_ebb_arista_separable_policy(
         test_config_name=name,

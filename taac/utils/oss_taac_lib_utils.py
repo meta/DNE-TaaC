@@ -60,6 +60,49 @@ FB_FQDN_FACEBOOK_SUFFIX = ".facebook.com"
 # has been imported has no effect on the value below.
 TAAC_OSS: bool = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
+# The containerized OSS runner against Meta lab hardware. Also IMPORT time.
+TAAC_OSS_META_INTERNAL: bool = os.environ.get("TAAC_OSS_META_INTERNAL", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def oss_agent_restart_paths_enabled() -> bool:
+    """Whether agent restart and cold/warm boot take the OSS-only paths.
+
+    Those paths (split-agent orchestration, per-agent cold-boot flags, flag
+    clearing) were written against OSS FBOSS images. Meta lab devices,
+    including under ``TAAC_OSS_META_INTERNAL=1``, keep the internal paths: a
+    ``systemctl restart`` of the agent unit and the ``cold_boot_once_0`` flag.
+    """
+    return TAAC_OSS and not TAAC_OSS_META_INTERNAL
+
+
+def oss_config_patcher_enabled() -> bool:
+    """Whether config patchers use the OSS implementation in
+    ``driver/oss_coop_patcher.py``, which edits ``/etc/coop/*.conf`` directly.
+
+    Internal runs apply patchers through COOP (``FbossSwitchInternal``). Under
+    ``TAAC_OSS_META_INTERNAL=1`` the device is still a Meta lab device: COOP owns
+    its config and its agent reads ``/etc/coop/agent/current``, not the files the
+    OSS patcher edits. So the container keeps the pre-OSS-patcher behaviour too.
+    """
+    return TAAC_OSS and not TAAC_OSS_META_INTERNAL
+
+
+def oss_bgpd_config_install_enabled() -> bool:
+    """Whether a drain reads bgpd's ``--config`` path from its unit and, where
+    that is a real file, installs the drain config by content.
+
+    OSS images point ``--config`` straight at a file. Meta devices -- internal
+    runs and the ``TAAC_OSS_META_INTERNAL=1`` container alike -- select through
+    the startup symlink that their bgpd unit and config_selector use, so they
+    keep the symlink-only drain.
+    """
+    return TAAC_OSS and not TAAC_OSS_META_INTERNAL
+
+
 # =============================================================================
 # none_throws - from libfb.py.pyre
 # =============================================================================
@@ -117,7 +160,6 @@ def retryable(
     print_ex: bool = False,
     debug: bool = False,
     max_duration: Optional[float] = None,
-    # pyre-fixme[34]: `Variable[F (bound to typing.Callable[..., typing.Any])]` isn't
     #  present in the function's parameters.
 ) -> Callable[[F], F]:
     """
@@ -169,7 +211,7 @@ def retryable(
                             actual_sleep = min(actual_sleep, remaining)
                         if print_ex or debug:
                             LOGGER.warning(
-                                f"Attempt {attempt + 1}/{num_tries} failed for {func.__name__}: {e}. "  # pyre-ignore[16]
+                                f"Attempt {attempt + 1}/{num_tries} failed for {func.__name__}: {e}. "
                                 f"Retrying in {actual_sleep:.2f}s..."
                             )
                         time.sleep(actual_sleep)
@@ -200,7 +242,6 @@ def async_retryable(
     exception_to_raise: Optional[
         Exception
     ] = None,  # Custom exception to raise on failure
-    # pyre-fixme[34]: `Variable[AsyncF (bound to typing.Callable[...,
     #  typing.Coroutine[typing.Any, typing.Any, typing.Any]])]` isn't present in the
     #  function's parameters.
 ) -> Callable[[AsyncF], AsyncF]:
@@ -252,7 +293,7 @@ def async_retryable(
                     elapsed = time.time() - start_time
                     if elapsed >= max_duration:
                         timeout_message = (
-                            f"Retry operation for {func.__name__} exceeded max duration "  # pyre-ignore[16]
+                            f"Retry operation for {func.__name__} exceeded max duration "
                             f"of {max_duration}s after {attempt} attempts"
                         )
                         if last_exception is not None:
@@ -349,7 +390,6 @@ def memoize_forever(func: F) -> F:
 
 def memoize_timed(
     timeout_sec: float = 60.0,
-    # pyre-fixme[34]: `Variable[F (bound to typing.Callable[..., typing.Any])]` isn't
     #  present in the function's parameters.
 ) -> Callable[[F], F]:
     """
@@ -399,7 +439,6 @@ def memoize_timed(
 
 def async_memoize_timed(
     timeout_sec: float = 60.0,
-    # pyre-fixme[34]: `Variable[AsyncF (bound to typing.Callable[...,
     #  typing.Coroutine[typing.Any, typing.Any, typing.Any]])]` isn't present in the
     #  function's parameters.
 ) -> Callable[[AsyncF], AsyncF]:
@@ -650,10 +689,9 @@ def convert_to_async(func: Callable[..., T]) -> Callable[..., t.Coroutine[Any, A
 
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> T:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,  # Use default executor
-            # pyre-fixme[6]: For 2nd argument expected `(*(*asyncio.events._Ts)) ->
             #  _T` but got `partial[T]`.
             functools.partial(func, *args, **kwargs),
         )
@@ -696,7 +734,6 @@ def await_sync(coro: t.Coroutine[Any, Any, T]) -> T:
         import concurrent.futures
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            # pyre-fixme[6]: For 1st argument expected `(_P) -> _T` but got `(main:
             #  Coroutine[Any, Any, _T], debug: Optional[bool] = ..., loop_factory:
             #  Optional[() -> AbstractEventLoop] = ...) -> _T`.
             future = executor.submit(asyncio.run, coro)
@@ -738,7 +775,6 @@ def lazy_import(module_path: str) -> Any:
 
 def memoize_timed_herd(
     timeout_sec: float = 60.0,
-    # pyre-fixme[34]: `Variable[AsyncF (bound to typing.Callable[...,
     #  typing.Coroutine[typing.Any, typing.Any, typing.Any]])]` isn't present in the
     #  function's parameters.
 ) -> Callable[[AsyncF], AsyncF]:
@@ -771,10 +807,7 @@ def memoize_timed_herd(
 # `TAAC_OSS` is defined at the top of this module (it gates behaviour above
 # this point too). Only import the Meta-internal logger when not in OSS mode.
 if not TAAC_OSS:
-    from neteng.netcastle.logger import (  # pyre-ignore[21]
-        ConsoleFileLogger,
-        get_root_logger,
-    )
+    from neteng.netcastle.logger import ConsoleFileLogger, get_root_logger
 else:
     # OSS fallback implementation
     DEFAULT_LOG_FMT = "%(asctime)s.%(msecs)03d|%(process)d|%(threadName)s|%(levelname).1s|%(module)s: %(message)s"
@@ -845,6 +878,14 @@ else:
         def log_file(self) -> str:
             """Return the path to the log file."""
             return self._log_file
+
+        def get_log_file(self) -> str:
+            """Return the log file path (parity with Meta ConsoleFileLogger)."""
+            return self._log_file
+
+        def set_console_log_level(self, level: int) -> None:
+            """Set console handler log level (parity with Meta ConsoleFileLogger)."""
+            self._console_handler.setLevel(level)
 
         def enable_console_debug_log(self) -> None:
             """Enable debug level logging to console."""

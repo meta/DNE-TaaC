@@ -27,6 +27,50 @@ DNE_LOG_DIR: str = "/var/facebook/dne"
 RSYSLOG_AGENT_FILE: str = "/etc/rsyslog.d/00-agent-log.conf"
 FBOSS_LOG_DIR: str = "/var/facebook/logs/fboss"
 
+# The agents read their cold-boot flags from this fixed FBOSS on-device path;
+# TAAC only touches it on the DUT and does not use /dev/shm for its own storage.
+# patternlint-disable-next-line no-dev-shm-usage
+FBOSS_WARM_BOOT_DIR: str = "/dev/shm/fboss/warm_boot"
+
+# One-shot cold-boot flag honoured by the Meta-internal monolithic agent
+# wrapper. The glob deliberately matches only numeric switch indices:
+# qsfp_service owns a separate `cold_boot_once_qsfp_service` in the same
+# directory, and clearing the agent's flag must not touch it.
+#
+# On a split-agent (OSS) DUT nothing reads this path -- it is reachable only
+# via AgentDirectoryUtil::getColdBootOnceFile(), whose one non-test caller
+# (fboss2 FbossServiceUtil.cpp) gates it on the monolithic wedge_agent case.
+# Use FBOSS_SPLIT_COLD_BOOT_ONCE_* below there instead.
+FBOSS_COLD_BOOT_ONCE_FILE: str = f"{FBOSS_WARM_BOOT_DIR}/cold_boot_once_0"
+FBOSS_COLD_BOOT_ONCE_GLOB: str = f"{FBOSS_WARM_BOOT_DIR}/cold_boot_once_[0-9]*"
+
+# Split-agent equivalents: each agent reads and clears its own flag at startup,
+# so a cold boot needs one file per running agent. Per the FBOSS sources in the
+# image:
+#   * fboss_sw_agent       -> `sw_cold_boot_once`
+#     (AgentDirectoryUtil.cpp getSwColdBootOnceFile)
+#   * fboss_hw_agent@<idx> -> `hw_cold_boot_once_<switchIndex>`
+#     (hw/HwSwitchWarmBootHelper.cpp forceColdBootPrefix, keyed on
+#     getAsic()->getSwitchIndex() per platforms/sai/SaiPlatform.cpp)
+FBOSS_SPLIT_SW_COLD_BOOT_ONCE_FILE: str = f"{FBOSS_WARM_BOOT_DIR}/sw_cold_boot_once"
+FBOSS_SPLIT_HW_COLD_BOOT_ONCE_FILE_FMT: str = (
+    f"{FBOSS_WARM_BOOT_DIR}/hw_cold_boot_once_{{switch_index}}"
+)
+
+# Every cold-boot flag a clear must remove, monolithic and split alike, so the
+# same cleanup works regardless of which kind of DUT ran.
+#
+# The sw entry is a prefix glob on purpose: besides `sw_cold_boot_once` the sw
+# agent also honours a legacy `sw_cold_boot_once_0`
+# (FileBasedWarmbootUtils.cpp getForceColdBootOnceFlagLegacy), and unlike the
+# others it is probed with checkFileExists rather than removeFile -- so it is
+# never self-cleared and would cold boot every subsequent start if left behind.
+FBOSS_COLD_BOOT_ONCE_GLOBS: t.List[str] = [
+    FBOSS_COLD_BOOT_ONCE_GLOB,
+    f"{FBOSS_WARM_BOOT_DIR}/sw_cold_boot_once*",
+    f"{FBOSS_WARM_BOOT_DIR}/hw_cold_boot_once_[0-9]*",
+]
+
 # Single source of truth for the systemd `BindsTo` cascade that fires when
 # wedge_agent is restarted. In practice the observable effect is that
 # `bgpd` restarts alongside wedge_agent — bgpd's RIB state depends on
@@ -82,6 +126,7 @@ FAILED_HC_STATUSES: t.List[hc_types.HealthCheckStatus] = [
 ]
 
 ISOLATE_TEST_BED_CONNECTIVITY_PATCHER_NAME: str = "isolate_test_bed_connectivity"
+TESTBED_ISOLATION_BYPASS_TAG: str = "testbed_isolation:bypass"
 TAAC_TEST_CONFIG_CONFIGERATOR_PATH: str = "neteng/taac/test_configs/{test_config_name}"
 
 
@@ -115,6 +160,18 @@ class FbossPackage(Enum):
     QSFP = "fboss_qsfp_service"
     OPENR = "openr"
     FSDB = "fboss_fsdb"
+    # Deliberately absent, and do not re-add without field evidence that a
+    # successful `fboss-updater update stack` clears them:
+    #   fboss_forwarding_stack, fboss_forwarding_stack_disruptive
+    #     The spec, not installable components. Measured on
+    #     fsw004.p003.f01.qzd1 on 2026-09-24: a successful COLD update moved
+    #     agent, bgp, qsfp_service and fsdb to current, yet the disruptive
+    #     spec stayed `needed`. Either one parks the device DEAD for good on
+    #     the run that just fixed it.
+    #   fboss_qsfp_firmware
+    #     Installable by the updater, but whether it clears is untested: it
+    #     was already up to date on the device above, so the run proves
+    #     nothing, and it matched zero extra stale devices across 36 hosts.
     AGENT_CONFIG = "fboss_agent_config"
     AGENT_CONFIG_DISRUPTIVE = "fboss_agent_config_disruptive"
     BGP_CONFIG = "fboss_bgp_config"
@@ -239,19 +296,6 @@ class TestTopology:
 
 
 @dataclass
-class TestResult:
-    hostnames: str
-    test_case_name: str
-    start_time: str
-    end_time: str
-    platforms: t.Optional[str] = None
-    check_name: t.Optional[str] = None
-    check_stage: t.Optional[str] = None
-    test_status: t.Optional[str] = None
-    message: t.Optional[str] = None
-
-
-@dataclass
 class PeriodicCheckResult:
     name: str
     status: hc_types.HealthCheckStatus
@@ -291,9 +335,18 @@ IXIA_LLDP_PEERS: t.Dict[str, str] = {
 #                  Arista Daemon Control                   #
 #############################################################
 
+# EOS daemon names that were renamed, mapped to the names they replace. The
+# bgpcpp daemon used "Bgp" in older TAAC configs and "bgpcpp" on some lab
+# devices before standardizing on the production "Bgpcpp" spelling. Enabling
+# the canonical name removes either old stanza first, otherwise two copies can
+# run against the same config and ports.
+RENAMED_ARISTA_DAEMONS: t.Dict[str, t.Tuple[str, ...]] = {
+    "Bgpcpp": ("Bgp", "bgpcpp"),
+}
+
 # Default execution scripts for Arista daemon control
 ARISTA_DAEMON_EXEC_SCRIPTS: t.Dict[str, str] = {
-    "Bgp": "/usr/sbin/run_bgpcpp.sh",
+    "Bgpcpp": "/usr/sbin/run_bgpcpp.sh",
     "FibAgent": "/usr/bin/AristaFibAgent --admin_distance=10 --net_acl_checker_module_enable --net_acl_checker_module_enforce=false --net_static_file_acl=/usr/facebook/thrift_acls/FibAgent.json --undefok=net_service_identity,net_static_file_acl,net_acl_checker_module_enable,net_acl_checker_module_enforce,net_auth_checker_kill_switch_file --use_agent_config=1 --net_service_identity=FibAgent_lab",
     "FibAgentBgp": "/usr/bin/AristaFibAgent --agent_config_path=/mnt/fb/agent_configs/fib_agent_bgp.conf --admin_distance=10 --net_acl_checker_module_enable --net_acl_checker_module_enforce=false --net_static_file_acl=/usr/facebook/thrift_acls/FibAgent.json --undefok=net_service_identity,net_static_file_acl,net_acl_checker_module_enable,net_acl_checker_module_enforce,net_auth_checker_kill_switch_file --use_agent_config=1 --net_service_identity=FibAgent_lab",
     "FibBgpGrpc": "/usr/bin/EosSdkRpc --listen 0.0.0.0:9545 --nobfd",
@@ -306,9 +359,9 @@ ARISTA_DAEMON_EXEC_SCRIPTS: t.Dict[str, str] = {
 # Arista BGP++ daemon mappings for EOS devices
 # Maps service names to their actual process names and log file patterns
 ARISTA_BGP_PLUS_PLUS_DAEMON_MAPPINGS: t.Dict[str, t.Dict[str, t.Any]] = {
-    "Bgp": {
+    "Bgpcpp": {
         "processes": ["bgpcpp"],
-        "log_pattern": "Bgp-{pid}",
+        "log_pattern": "Bgpcpp-{pid}",
     },
     "Fib": {
         "processes": ["AristaFibAgent"],

@@ -14,10 +14,15 @@ from taac.constants import TestDevice
 from taac.health_checks.abstract_health_check import (
     AbstractDeviceHealthCheck,
 )
+from taac.health_checks.common_utils import declares_bgpcpp
 from taac.utils.health_check_utils import is_parent_prefix
 from taac.health_check.health_check import types as hc_types
 
 BGPCPP_CONFIG_PATH = "/mnt/flash/bgpcpp_config"
+# NetOS launches bgpd with this fixed FBOSS runtime path; TAAC reads that
+# service-owned file and does not use /dev/shm for its own storage.
+# patternlint-disable-next-line no-dev-shm-usage
+NETOS_BGPCPP_CONFIG_PATH = "/dev/shm/fboss/bgpcpp_startup_config"
 
 
 class BgpSessionEstablishedHealthCheck(
@@ -41,17 +46,25 @@ class BgpSessionEstablishedHealthCheck(
     async def _read_bgpcpp_config(self, hostname: str) -> t.Optional[t.Dict[str, str]]:
         """Read bgpcpp_config from the device and extract expected peer addresses.
 
-        Reads /mnt/flash/bgpcpp_config, parses the JSON, and builds a map of
+        Reads the active BGP++ config path for the device OS, parses the JSON,
+        and builds a map of
         {normalized_peer_addr: normalized_local_addr} from the configured peers.
 
         Returns None if the file cannot be read or parsed.
         """
         try:
+            # NetOS keeps the active config in the fwdstack runtime namespace;
+            # classic FBOSS keeps it on /mnt/flash. async_read_file routes the
+            # command through that same namespace on NetOS.
+            # Arista drivers have no NetOS mode and keep the config on /mnt/flash.
+            is_netos_fn = getattr(self.driver, "async_is_netos", None)
+            is_netos = is_netos_fn is not None and await is_netos_fn()
+            config_path = NETOS_BGPCPP_CONFIG_PATH if is_netos else BGPCPP_CONFIG_PATH
             # pyrefly: ignore [missing-attribute]
-            config_content = await self.driver.async_read_file(BGPCPP_CONFIG_PATH)
+            config_content = await self.driver.async_read_file(config_path)
             if not config_content:
                 self.logger.info(
-                    f"{hostname}: No bgpcpp_config found at {BGPCPP_CONFIG_PATH}, "
+                    f"{hostname}: No bgpcpp_config found at {config_path}, "
                     "skipping peer identity validation"
                 )
                 return None
@@ -253,11 +266,14 @@ class BgpSessionEstablishedHealthCheck(
         Uses ``date -d`` on the device to convert the systemd timestamp to
         epoch, avoiding timezone parsing issues on the devserver side.
         """
-        cmd = (
-            f"ts=$(systemctl show {service} -p ActiveEnterTimestamp --value); "
-            f'date -d "$ts" +%s 2>/dev/null || echo ""'
-        )
         try:
+            # pyrefly: ignore [missing-attribute]
+            service_name = await self.driver.async_get_systemctl_service_name(service)
+            cmd = (
+                f"ts=$(systemctl show {service_name} "
+                "-p ActiveEnterTimestamp --value); "
+                f'date -d "$ts" +%s 2>/dev/null || echo ""'
+            )
             # pyrefly: ignore [missing-attribute]
             output = await self.driver.async_run_cmd_on_shell(cmd)
             epoch_str = output.strip()
@@ -402,6 +418,12 @@ class BgpSessionEstablishedHealthCheck(
             input: Base health check input
             check_params: Dictionary containing:
                 - expected_established_session_count: Expected number of established BGP sessions (optional, defaults to "all established")
+                - max_established_session_count: Maximum number of established
+                  sessions allowed when validating an expected degradation
+                - min_established_pct: Minimum fraction of in-scope sessions
+                  that must be established
+                - session_restarted_after: Epoch timestamp after which at least
+                  one currently established session must have restarted
                 - parent_prefixes_to_ignore: Optional list of CIDR prefixes to exclude (subnet_of matching)
                 - ignore_all_prefixes_except: Optional list of prefixes to exclusively check
                   (only sessions with these prefixes will be checked, all others will be ignored)
@@ -418,6 +440,9 @@ class BgpSessionEstablishedHealthCheck(
         expected_established_session_count = check_params.get(
             "expected_established_session_count"
         )
+        max_established_session_count = check_params.get(
+            "max_established_session_count"
+        )
 
         if expected_established_session_count is not None:
             try:
@@ -428,10 +453,30 @@ class BgpSessionEstablishedHealthCheck(
                     f"Expected_established_session_count = {expected_established_session_count}"
                 )
             except (ValueError, TypeError):
-                self.logger.warning(
-                    f"Invalid expected_established_session_count value: {expected_established_session_count}, ignoring"
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        "Invalid expected_established_session_count value "
+                        f"{expected_established_session_count!r} on {hostname}; "
+                        "expected an integer"
+                    ),
                 )
-                expected_established_session_count = None
+        if max_established_session_count is not None:
+            try:
+                max_established_session_count = int(max_established_session_count)
+                self.logger.info(
+                    "Max_established_session_count = %s",
+                    max_established_session_count,
+                )
+            except (ValueError, TypeError):
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        "Invalid max_established_session_count value "
+                        f"{max_established_session_count!r} on {hostname}; "
+                        "expected an integer"
+                    ),
+                )
 
         self.logger.info(f"Running BGP session health check on {hostname}")
 
@@ -525,6 +570,23 @@ class BgpSessionEstablishedHealthCheck(
         ]
 
         min_established_pct = check_params.get("min_established_pct")
+        session_restarted_after = check_params.get("session_restarted_after")
+
+        if (
+            total_sessions == 0
+            and expected_established_session_count is None
+            and (
+                min_established_pct is not None
+                or max_established_session_count is not None
+            )
+        ):
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.FAIL,
+                message=(
+                    f"No in-scope BGP sessions found on {hostname}; verify the "
+                    "peer filters before evaluating a percentage or maximum"
+                ),
+            )
 
         # Generalized logic: If expected count is provided, use simple comparison
         if expected_established_session_count is not None:
@@ -539,6 +601,27 @@ class BgpSessionEstablishedHealthCheck(
                     message=f"BGP session count mismatch on {hostname}: expected {expected_established_session_count} established sessions, found {established_sessions}. "
                     f"Total sessions: {total_sessions}. "
                     f"Non-established: {non_established_details}. {session_summary}",
+                )
+        elif max_established_session_count is not None:
+            if established_sessions <= max_established_session_count:
+                pass_result = hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.PASS,
+                    message=(
+                        f"BGP degradation observed on {hostname}: "
+                        f"{established_sessions} Established session(s), at or "
+                        f"below the maximum {max_established_session_count}. "
+                        f"{session_summary}"
+                    ),
+                )
+            else:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        f"Expected BGP degradation on {hostname}, but found "
+                        f"{established_sessions} Established session(s), above "
+                        f"the maximum {max_established_session_count}. "
+                        f"{session_summary}"
+                    ),
                 )
         elif min_established_pct is not None and total_sessions > 0:
             pct = established_sessions / total_sessions
@@ -569,7 +652,7 @@ class BgpSessionEstablishedHealthCheck(
                         f"{session_summary}"
                     ),
                 )
-        else:
+        elif session_restarted_after is None:
             # Backward compatibility: Original behavior when no expected count is provided
             if non_established_sessions:
                 return hc_types.HealthCheckResult(
@@ -585,6 +668,94 @@ class BgpSessionEstablishedHealthCheck(
             pass_result = hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.PASS,
                 message=f"All {total_sessions} BGP sessions are established on {hostname}. {session_summary}",
+            )
+        else:
+            # A restart-only assertion intentionally permits sessions to be
+            # down at the mid-test observation point. Its contract is to prove
+            # that at least one currently Established session restarted after
+            # the supplied epoch, not to imply an all-Established count check.
+            pass_result = hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.PASS,
+                message=(
+                    f"BGP session count is unconstrained on {hostname} while "
+                    f"validating restart timing. {session_summary}"
+                ),
+            )
+
+        if session_restarted_after is not None:
+            try:
+                restart_epoch = float(session_restarted_after)
+            except (TypeError, ValueError):
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        "Invalid session_restarted_after value "
+                        f"{session_restarted_after!r} on {hostname}; expected "
+                        "an epoch timestamp"
+                    ),
+                )
+            now = time.time()
+            if restart_epoch > now:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        f"Invalid session_restarted_after value "
+                        f"{restart_epoch:.3f} on {hostname}; timestamp is "
+                        f"{restart_epoch - now:.1f}s in the future"
+                    ),
+                )
+            elapsed_since_test_start = now - restart_epoch
+            recently_restarted = []
+            valid_uptime_count = 0
+            if not established_session_list:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        f"No Established BGP sessions remain on {hostname}; "
+                        "restart timing cannot be validated"
+                    ),
+                )
+            for session in established_session_list:
+                try:
+                    # FBOSS reports BGP session uptime in milliseconds.
+                    uptime_seconds = float(session.uptime) / 1000.0
+                except (TypeError, ValueError):
+                    self.logger.warning(
+                        "Ignoring invalid BGP uptime %r for peer %s on %s",
+                        session.uptime,
+                        session.peer_addr,
+                        hostname,
+                    )
+                    continue
+                valid_uptime_count += 1
+                if uptime_seconds <= elapsed_since_test_start:
+                    recently_restarted.append(session)
+            if valid_uptime_count == 0:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        f"No valid uptime was reported for currently Established "
+                        f"BGP sessions on {hostname}; restart timing cannot be "
+                        "validated"
+                    ),
+                )
+            if not recently_restarted:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        f"No currently Established BGP session on {hostname} "
+                        f"was established after epoch {restart_epoch:.3f}; "
+                        "the expected in-test BGP flap was not observed"
+                    ),
+                )
+            restarted_peers = [str(session.peer_addr) for session in recently_restarted]
+            pass_result = hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.PASS,
+                message=(
+                    f"{pass_result.message or ''}. Observed "
+                    f"{len(recently_restarted)} Established BGP session(s) "
+                    f"re-established after the test began: {restarted_peers}"
+                ),
             )
 
         # Validate peer identities against bgpcpp_config on the device
@@ -637,7 +808,9 @@ class BgpSessionEstablishedHealthCheck(
         check_params: t.Dict[str, t.Any],
     ) -> hc_types.HealthCheckResult:
         """
-        Verify BGP sessions on ar-bgp (native EOS BGP) devices via EOS CLI.
+        Devices the TestConfig declares ``ARISTA_FBOSS`` in ``host_os_type_map``
+        run BGP++ and delegate to the thrift ``_run``. Other EOS devices are
+        native EOS BGP and are verified via EOS CLI.
 
         ar-bgp devices have no BGP++ thrift API, so async_get_bgp_sessions()
         is not available. Instead, uses 'show bgp ipv6 unicast summary | json'
@@ -650,6 +823,8 @@ class BgpSessionEstablishedHealthCheck(
                 - expected_established_session_count: Expected established sessions (optional)
                 - address_family: "ipv4", "ipv6", or "both" (optional, defaults to "both")
         """
+        if declares_bgpcpp(obj.name):
+            return await self._run(obj, input, check_params)
         hostname = obj.name
         expected_established_session_count = check_params.get(
             "expected_established_session_count"

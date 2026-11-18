@@ -15,6 +15,10 @@ from the gate-test allowlist.
 import json
 import typing as t
 
+from taac.utils.characterization import (
+    CPU_SUMMARY_JQ_VAR,
+    RSS_SUMMARY_JQ_VAR,
+)
 from taac.utils.json_thrift_utils import thrift_to_json
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config.types import (
@@ -26,6 +30,60 @@ from taac.test_as_a_config.types import (
 )
 
 _PV = ParamValue
+
+
+def create_fpf_remote_prefix_lifecycle_check(
+    *,
+    mode: str = "present",
+    runner_device: str = "",
+    scalar_expectations: t.Optional[t.List[t.List[t.Any]]] = None,
+    a_hrt_positive_expected: t.Optional[t.Dict[str, t.Dict[str, t.List[int]]]] = None,
+    a_hrt_remote_failure_expected: t.Optional[
+        t.Dict[str, t.Dict[str, t.List[int]]]
+    ] = None,
+    b_hrt_positive_expected: t.Optional[t.Dict[str, t.Dict[str, t.List[int]]]] = None,
+    b_hrt_remote_failure_expected: t.Optional[
+        t.Dict[str, t.Dict[str, t.List[int]]]
+    ] = None,
+    deadline_sec: int = 120,
+    outage_tolerant_collectors: t.Optional[t.List[str]] = None,
+    check_id: t.Optional[str] = None,
+) -> PointInTimeHealthCheck:
+    """Build the exact A/B remote-prefix lifecycle check."""
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.FPF_REMOTE_PREFIX_LIFECYCLE_CHECK,
+        check_params=Params(
+            json_params=json.dumps(
+                {
+                    "mode": mode,
+                    "runner_device": runner_device,
+                    "scalar_expectations": scalar_expectations or [],
+                    "a_hrt_positive_expected": a_hrt_positive_expected or {},
+                    "a_hrt_remote_failure_expected": (
+                        a_hrt_remote_failure_expected or {}
+                    ),
+                    "b_hrt_positive_expected": b_hrt_positive_expected or {},
+                    "b_hrt_remote_failure_expected": (
+                        b_hrt_remote_failure_expected or {}
+                    ),
+                    "deadline_sec": deadline_sec,
+                    "outage_tolerant_collectors": (outage_tolerant_collectors or []),
+                }
+            )
+        ),
+        check_id=check_id,
+    )
+
+
+def _is_same_device_name(left: str, right: str) -> bool:
+    def normalize(device_name: str) -> str:
+        normalized = device_name.rstrip(".").casefold()
+        for suffix in (".facebook.com", ".tfbnw.net"):
+            if normalized.endswith(suffix):
+                return normalized[: -len(suffix)]
+        return normalized
+
+    return normalize(left) == normalize(right)
 
 
 def create_bare_health_check(check_name: hc_types.CheckName) -> PointInTimeHealthCheck:
@@ -43,6 +101,8 @@ def create_device_core_dumps_check(
     core_dumps_to_ignore: t.Optional[t.List[str]] = None,
     use_start_time: bool = True,
     use_end_time: bool = False,
+    start_time_jq_var: str = "test_case_start_time",
+    core_dump_processes_to_ignore: t.Optional[t.List[str]] = None,
 ) -> PointInTimeHealthCheck:
     """DEVICE_CORE_DUMPS_CHECK — detects new device core dumps.
 
@@ -53,11 +113,12 @@ def create_device_core_dumps_check(
     not supplied. See ``DeviceCoreDumpsHealthCheck._resolve_time_window``.
 
     Args:
-        core_dumps_to_ignore: Process names whose core dumps should NOT cause
-            the check to fail (e.g. ``["bgpd_main"]`` for force-kill tests).
+        core_dumps_to_ignore: Exact core filenames whose dumps should not fail.
+        core_dump_processes_to_ignore: Opt-in process names matched against
+            FBOSS packaged core/metadata paths; does not change legacy matching.
         use_start_time: When True (default), scopes the check to dumps after
-            ``.test_case_start_time``. Set False for the bare variant (no
-            check_params).
+            the jq timestamp named by ``start_time_jq_var``. Set False for the
+            bare variant (no check_params).
         use_end_time: When True, additionally emits ``end_time`` from
             ``.test_case_end_time`` to bound the upper edge of the window.
             Note: ``test_case_end_time`` is not yet populated in the jq context
@@ -65,14 +126,21 @@ def create_device_core_dumps_check(
             null — the check then falls back to *now*, which is the desired
             behavior anyway. Kept for forward-compatibility.
     """
-    if not use_start_time and not use_end_time and core_dumps_to_ignore is None:
+    if (
+        not use_start_time
+        and not use_end_time
+        and core_dumps_to_ignore is None
+        and core_dump_processes_to_ignore is None
+    ):
         return PointInTimeHealthCheck(name=hc_types.CheckName.DEVICE_CORE_DUMPS_CHECK)
     json_payload: t.Dict[str, t.Any] = {}
     if core_dumps_to_ignore is not None:
         json_payload["core_dumps_to_ignore"] = core_dumps_to_ignore
+    if core_dump_processes_to_ignore is not None:
+        json_payload["core_dump_processes_to_ignore"] = core_dump_processes_to_ignore
     jq_params: t.Dict[str, str] = {}
     if use_start_time:
-        jq_params["start_time"] = ".test_case_start_time"
+        jq_params["start_time"] = f".{start_time_jq_var}"
     if use_end_time:
         jq_params["end_time"] = ".test_case_end_time"
     return PointInTimeHealthCheck(
@@ -89,8 +157,10 @@ def create_bgp_session_establish_check(
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
     expected_established_sessions: t.Optional[int] = None,
     expected_established_sessions_static: t.Optional[int] = None,
+    max_established_sessions: t.Optional[int] = None,
     min_established_pct: t.Optional[float] = None,
     max_session_uptime_sec: t.Optional[float] = None,
+    session_restarted_after_jq_var: t.Optional[str] = None,
     verbose: bool = False,
     check_id: t.Optional[str] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
@@ -108,6 +178,9 @@ def create_bgp_session_establish_check(
         expected_established_sessions_static: Same assertion via the
             `static_params` ParamValue variant (used by EBB). Mutually
             exclusive with `expected_established_sessions`.
+        max_established_sessions: Maximum number of sessions that may be
+            Established. Use this for a MID_TEST assertion that traffic caused
+            the expected session degradation.
         min_established_pct: Minimum fraction of sessions that must be
             Established (0.0–1.0). E.g. 0.5 = at least 50% must be up.
             When set, overrides the default all-or-nothing behavior.
@@ -115,6 +188,11 @@ def create_bgp_session_establish_check(
             least one established session has ``uptime <= max_session_uptime_sec``,
             confirming sessions came up recently after a process restart.
             Use as a postcheck for BGP/agent restart test cases.
+        session_restarted_after_jq_var: When set, resolves the named TAAC jq
+            variable (normally ``test_case_start_time``) into an epoch and
+            requires at least one currently Established session to have been
+            established after that epoch. This is suitable for a MID_TEST
+            assertion that stress traffic actually caused a BGP flap.
         verbose: Pass ``verbose=True`` through to the check for richer logs.
         retry_count: Number of retries after the initial attempt when the
             check returns FAIL.  0 (default) = single-shot, no retry.
@@ -130,13 +208,20 @@ def create_bgp_session_establish_check(
             1.0 = constant delay, 1.5 = 50 % longer each retry,
             2.0 = double each retry.
     """
-    if (
-        expected_established_sessions is not None
-        and expected_established_sessions_static is not None
-    ):
+    count_constraints = sum(
+        value is not None
+        for value in (
+            expected_established_sessions,
+            expected_established_sessions_static,
+            max_established_sessions,
+            min_established_pct,
+        )
+    )
+    if count_constraints > 1:
         raise ValueError(
-            "expected_established_sessions and expected_established_sessions_static "
-            "are mutually exclusive — pass exactly one."
+            "expected_established_sessions, expected_established_sessions_static, "
+            "max_established_sessions, and min_established_pct are mutually "
+            "exclusive"
         )
     json_payload: t.Dict[str, t.Any] = {}
     if ignore_all_prefixes_except is not None:
@@ -151,6 +236,8 @@ def create_bgp_session_establish_check(
         )
     if parent_prefixes_to_ignore is not None:
         json_payload["parent_prefixes_to_ignore"] = parent_prefixes_to_ignore
+    if max_established_sessions is not None:
+        json_payload["max_established_session_count"] = max_established_sessions
     if min_established_pct is not None:
         json_payload["min_established_pct"] = min_established_pct
     if max_session_uptime_sec is not None:
@@ -173,14 +260,148 @@ def create_bgp_session_establish_check(
         }
     # Emit check_params=None when no payload to match the inline-construction
     # serialized output (PointInTimeHealthCheck(name=...) → check_params=None).
+    jq_params = None
+    if session_restarted_after_jq_var is not None:
+        jq_params = {"session_restarted_after": f".{session_restarted_after_jq_var}"}
     check_params = None
-    if json_payload or static_params:
+    if json_payload or static_params or jq_params:
         check_params = Params(
             json_params=json.dumps(json_payload) if json_payload else None,
             static_params=static_params,
+            jq_params=jq_params,
         )
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.BGP_SESSION_ESTABLISH_CHECK,
+        check_params=check_params,
+        check_id=check_id,
+        check_scope=check_scope,
+    )
+
+
+def create_openr_spark_neighbor_check(
+    expected_neighbor_count: t.Optional[int] = None,
+    expected_neighbors: t.Optional[t.List[str]] = None,
+    allow_zero: bool = False,
+    check_id: t.Optional[str] = None,
+    check_scope: t.Optional["hc_types.Scope"] = None,
+    retry_count: t.Optional[int] = None,
+    retry_delay_seconds: t.Optional[float] = None,
+    retry_delay_multiplier: t.Optional[float] = None,
+) -> PointInTimeHealthCheck:
+    """OPENR_SPARK_NEIGHBOR_CHECK — verifies Open/R Spark neighbors are ESTABLISHED.
+
+    Args:
+        expected_neighbor_count: Exact number of ESTABLISHED neighbors expected.
+            When set, the check FAILs if the count differs. If omitted, the
+            count is derived from ``expected_neighbors`` or the device topology.
+        expected_neighbors: Optional list of expected neighbor node names. Each
+            must be present and ESTABLISHED, otherwise the check FAILs.
+        allow_zero: Set True to allow 0 neighbors (e.g. isolated-node test).
+            Defaults to False, so an empty neighbor set FAILs.
+        retry_count: Number of retries after the initial attempt when the check
+            returns FAIL. 0 (default) = single-shot. Each attempt re-fetches
+            live data from the device.
+        retry_delay_seconds: Base delay in seconds before the first retry.
+        retry_delay_multiplier: Exponential backoff multiplier applied to the
+            delay after each retry.
+    """
+    json_payload: t.Dict[str, t.Any] = {}
+    if expected_neighbor_count is not None:
+        json_payload["expected_neighbor_count"] = expected_neighbor_count
+    if expected_neighbors is not None:
+        json_payload["expected_neighbors"] = expected_neighbors
+    if allow_zero:
+        json_payload["allow_zero"] = True
+    if retry_count is not None:
+        json_payload["retry_count"] = retry_count
+    if retry_delay_seconds is not None:
+        json_payload["retry_delay_seconds"] = retry_delay_seconds
+    if retry_delay_multiplier is not None:
+        json_payload["retry_delay_multiplier"] = retry_delay_multiplier
+    check_params = None
+    if json_payload:
+        check_params = Params(json_params=json.dumps(json_payload))
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.OPENR_SPARK_NEIGHBOR_CHECK,
+        check_params=check_params,
+        check_id=check_id,
+        check_scope=check_scope,
+    )
+
+
+def create_openr_kvstore_keys_check(
+    expected_nodes: t.Optional[t.List[str]] = None,
+    prefixes_per_node: t.Optional[int] = None,
+    area: t.Optional[str] = None,
+    device_names: t.Optional[t.List[str]] = None,
+    expected_nodes_jq_var: t.Optional[str] = None,
+    prefixes_per_node_jq_var: t.Optional[str] = None,
+    check_id: t.Optional[str] = None,
+    check_scope: t.Optional["hc_types.Scope"] = None,
+    retry_count: t.Optional[int] = None,
+    retry_delay_seconds: t.Optional[float] = None,
+    retry_delay_multiplier: t.Optional[float] = None,
+) -> PointInTimeHealthCheck:
+    """OPENR_KVSTORE_KEYS_CHECK — asserts specific injected KvStore keys exist.
+
+    For each expected synthetic node the check asserts that ``adj:<node>`` is
+    present and that exactly ``prefixes_per_node`` keys match
+    ``prefix:<node>:``. Scoping to the injected node names is what makes the
+    assertion immune to the DUT's own real keys: a lab box already holds
+    thousands of genuine ``prefix:`` keys, so a total-based count is satisfied
+    by real traffic alone.
+
+    Both expectations are normally sourced from the Open/R scale injection
+    step, which derives the node list from the same topology flags it passes to
+    the injector. A check with neither FAILs rather than skipping.
+
+    Args:
+        expected_nodes: synthetic node names that must be present. A static
+            value here overrides ``expected_nodes_jq_var``.
+        prefixes_per_node: exact number of ``prefix:`` keys per expected node,
+            i.e. the injector's ``num_prefixes_per_node``.
+        area: restrict the audit to one KvStore area. Default: all areas.
+        device_names: restrict the check to these devices. Device health checks
+            run across the whole topology, so a DUT + helper rig must scope the
+            assertion to the DUT.
+        expected_nodes_jq_var / prefixes_per_node_jq_var: jq variables holding
+            the expectations published by the injection step. This is the
+            shipped wiring.
+        retry_count: retries after the initial attempt when the check FAILs.
+            KvStore flooding settles asynchronously, so a short retry is
+            usually appropriate here.
+    """
+    json_payload: t.Dict[str, t.Any] = {}
+    for key, value in (
+        ("expected_nodes", expected_nodes),
+        ("prefixes_per_node", prefixes_per_node),
+        ("area", area),
+        ("device_names", device_names),
+        ("retry_count", retry_count),
+        ("retry_delay_seconds", retry_delay_seconds),
+        ("retry_delay_multiplier", retry_delay_multiplier),
+    ):
+        if value is not None:
+            json_payload[key] = value
+
+    jq_params: t.Dict[str, str] = {}
+    for key, jq_var in (
+        ("expected_nodes", expected_nodes_jq_var),
+        ("prefixes_per_node", prefixes_per_node_jq_var),
+    ):
+        # A static expectation wins over the jq-sourced one so a run can
+        # deliberately tighten the gate without rewiring the injection step.
+        if jq_var is not None and key not in json_payload:
+            jq_params[key] = f".{jq_var}"
+
+    check_params = None
+    if json_payload or jq_params:
+        check_params = Params(
+            json_params=json.dumps(json_payload) if json_payload else None,
+            jq_params=jq_params or None,
+        )
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.OPENR_KVSTORE_KEYS_CHECK,
         check_params=check_params,
         check_id=check_id,
         check_scope=check_scope,
@@ -354,6 +575,12 @@ def create_ixia_packet_loss_check_traffic_split(
     expect_loss_traffic: t.List[str],
     no_loss_traffic: t.List[str],
     no_loss_threshold: str = "0.1",
+    no_loss_metric: hc_types.PacketLossMetric = hc_types.PacketLossMetric.DURATION,
+    no_loss_comparison: hc_types.ComparisonType = (
+        hc_types.ComparisonType.LESS_THAN_EQUAL_TO
+    ),
+    skip_traffic_items: t.Optional[t.List[str]] = None,
+    clear_traffic_stats: bool = False,
 ) -> PointInTimeHealthCheck:
     """IXIA_PACKET_LOSS_CHECK — split-threshold variant.
 
@@ -361,29 +588,60 @@ def create_ixia_packet_loss_check_traffic_split(
     one set of traffic items and **not exceeded** beyond ``no_loss_threshold``
     for another set. Traffic-item names are formed as
     ``f"{device_name.upper()}_{traffic}"``.
+
+    ``clear_traffic_stats`` zeroes the IXIA counters before sampling. Set it on
+    a PREcheck: counters are cumulative for the whole session, and setup's trial
+    traffic runs every item at once before routes converge, so an unclear
+    precheck samples ~100% loss and fails before the playbook starts. Leave it
+    False on a POSTcheck, which should measure the playbook's own window.
     """
+    thresholds = []
+    if expect_loss_traffic:
+        thresholds.append(
+            hc_types.PacketLossThreshold(
+                names=[
+                    f"{device_name.upper()}_{traffic}"
+                    for traffic in expect_loss_traffic
+                ],
+                expect_packet_loss=True,
+            )
+        )
+    if no_loss_traffic:
+        thresholds.append(
+            hc_types.PacketLossThreshold(
+                names=[
+                    f"{device_name.upper()}_{traffic}" for traffic in no_loss_traffic
+                ],
+                str_value=no_loss_threshold,
+                metric=no_loss_metric,
+                comparison=no_loss_comparison,
+                expect_packet_loss=False,
+            )
+        )
+    if not thresholds:
+        raise ValueError("packet loss check requires at least one traffic item")
+
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.IXIA_PACKET_LOSS_CHECK,
         input_json=thrift_to_json(
             hc_types.IxiaPacketLossHealthCheckIn(
-                thresholds=[
-                    hc_types.PacketLossThreshold(
-                        names=[
-                            f"{device_name.upper()}_{traffic}"
-                            for traffic in expect_loss_traffic
-                        ],
-                        expect_packet_loss=True,
-                    ),
-                    hc_types.PacketLossThreshold(
-                        names=[
-                            f"{device_name.upper()}_{traffic}"
-                            for traffic in no_loss_traffic
-                        ],
-                        str_value=no_loss_threshold,
-                        expect_packet_loss=False,
-                    ),
-                ]
+                thresholds=thresholds,
+                clear_traffic_stats=clear_traffic_stats,
             )
+        ),
+        check_params=(
+            Params(
+                json_params=json.dumps(
+                    {
+                        "skip_traffic_items": [
+                            f"{device_name.upper()}_{traffic}"
+                            for traffic in skip_traffic_items
+                        ]
+                    }
+                )
+            )
+            if skip_traffic_items is not None
+            else None
         ),
     )
 
@@ -394,6 +652,8 @@ def create_ixia_packet_loss_check(
     priority: t.Optional[int] = None,
     json_params: t.Optional[t.Dict[str, t.Any]] = None,
     sleep_time: int = 10,
+    skip_traffic_items: t.Optional[t.List[str]] = None,
+    check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """IXIA_PACKET_LOSS_CHECK — generic thrift-input variant.
 
@@ -408,15 +668,24 @@ def create_ixia_packet_loss_check(
     (e.g. `{"expect_loss": True}`).
     `sleep_time` is the seconds the check waits between stopping traffic and
     sampling stats (lets in-flight frames drain before measuring); default 10.
+    `check_id` provides a stable identifier when the same check type is used
+    more than once in a playbook.
     """
     if json_params is not None:
+        if skip_traffic_items is not None:
+            json_params = {
+                **json_params,
+                "skip_traffic_items": skip_traffic_items,
+            }
         return PointInTimeHealthCheck(
             name=hc_types.CheckName.IXIA_PACKET_LOSS_CHECK,
+            check_id=check_id,
             check_params=Params(json_params=json.dumps(json_params)),
             priority=priority,
         )
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.IXIA_PACKET_LOSS_CHECK,
+        check_id=check_id,
         input_json=thrift_to_json(
             hc_types.IxiaPacketLossHealthCheckIn(
                 thresholds=thresholds or [],
@@ -425,10 +694,18 @@ def create_ixia_packet_loss_check(
             )
         ),
         priority=priority,
+        check_params=(
+            Params(json_params=json.dumps({"skip_traffic_items": skip_traffic_items}))
+            if skip_traffic_items is not None
+            else None
+        ),
     )
 
 
-def create_core_dumps_snapshot_check() -> SnapshotHealthCheck:
+def create_core_dumps_snapshot_check(
+    core_dumps_to_ignore: t.Optional[t.List[str]] = None,
+    core_dump_processes_to_ignore: t.Optional[t.List[str]] = None,
+) -> SnapshotHealthCheck:
     """Create a snapshot check that no new core dumps appeared during the playbook.
 
     Captures the set of core dump files at the pre-snapshot checkpoint and
@@ -436,10 +713,20 @@ def create_core_dumps_snapshot_check() -> SnapshotHealthCheck:
     blanket guard around disruptive stages (warmboot, BGP restart, service
     churn) to catch unexpected daemon crashes.
 
-    Returns:
-        A bare `SnapshotHealthCheck` with `name=CORE_DUMPS_CHECK` (no params).
+    Args:
+        core_dumps_to_ignore: Exact filenames (or EOS process names) to ignore.
+        core_dump_processes_to_ignore: Opt-in process names matched against
+            FBOSS packaged core/metadata paths. Other new cores remain blocking.
     """
-    return SnapshotHealthCheck(name=hc_types.CheckName.CORE_DUMPS_CHECK)
+    params = {}
+    if core_dumps_to_ignore is not None:
+        params["core_dumps_to_ignore"] = core_dumps_to_ignore
+    if core_dump_processes_to_ignore is not None:
+        params["core_dump_processes_to_ignore"] = core_dump_processes_to_ignore
+    return SnapshotHealthCheck(
+        name=hc_types.CheckName.CORE_DUMPS_CHECK,
+        check_params=Params(json_params=json.dumps(params)) if params else None,
+    )
 
 
 def _build_threshold_check(
@@ -450,6 +737,7 @@ def _build_threshold_check(
     delta: t.Optional[float] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
     vmhwm_threshold: t.Optional[t.Union[int, float]] = None,
+    sleep_timer: t.Optional[int] = None,
 ) -> PointInTimeHealthCheck:
     """Internal helper: build a CPU/memory-style threshold-based PointInTimeHealthCheck.
 
@@ -465,6 +753,8 @@ def _build_threshold_check(
         json_payload["delta"] = delta
     if vmhwm_threshold is not None:
         json_payload["vmhwm_threshold"] = vmhwm_threshold
+    if sleep_timer is not None:
+        json_payload["sleep_timer"] = sleep_timer
     jq_params = {"start_time": f".{start_time_jq_var}"} if start_time_jq_var else None
     if not json_payload and not jq_params:
         return PointInTimeHealthCheck(name=check_name, check_scope=check_scope)
@@ -483,6 +773,7 @@ def create_cpu_utilization_check(
     threshold_by_service: t.Optional[t.Dict[str, float]] = None,
     start_time_jq_var: t.Optional[str] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
+    sleep_timer: t.Optional[int] = None,
 ) -> PointInTimeHealthCheck:
     """CPU_UTILIZATION_CHECK — verifies CPU utilization stays below thresholds.
 
@@ -494,6 +785,8 @@ def create_cpu_utilization_check(
             jq variable name (typically ``"test_case_start_time"``).
         check_scope: Optional scope override (e.g. ``Scope.DEFAULT`` to run on
             the DUT only).
+        sleep_timer: Sampling window in seconds. When omitted, the runtime
+            default is used.
     """
     return _build_threshold_check(
         hc_types.CheckName.CPU_UTILIZATION_CHECK,
@@ -501,6 +794,7 @@ def create_cpu_utilization_check(
         threshold_by_service,
         start_time_jq_var,
         check_scope=check_scope,
+        sleep_timer=sleep_timer,
     )
 
 
@@ -511,6 +805,7 @@ def create_memory_utilization_check(
     delta: t.Optional[t.Union[int, float]] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
     vmhwm_threshold: t.Optional[t.Union[int, float]] = None,
+    sleep_timer: t.Optional[int] = None,
 ) -> PointInTimeHealthCheck:
     """MEMORY_UTILIZATION_CHECK — verifies memory usage stays below thresholds.
 
@@ -529,6 +824,8 @@ def create_memory_utilization_check(
             counter, so this reads ``/proc/<pid>/status`` VmHWM directly and
             asserts it stays below the ceiling. Use for the UG spec's
             "VmHWM below 10 GB" pass criterion. Only honored on the Arista path.
+        sleep_timer: Sampling window in seconds. When omitted, the runtime
+            default is used.
     """
     return _build_threshold_check(
         hc_types.CheckName.MEMORY_UTILIZATION_CHECK,
@@ -537,6 +834,7 @@ def create_memory_utilization_check(
         start_time_jq_var,
         check_scope=check_scope,
         vmhwm_threshold=vmhwm_threshold,
+        sleep_timer=sleep_timer,
     )
 
 
@@ -558,18 +856,31 @@ def create_port_speed_check(
 def create_ecmp_group_and_member_count_check(
     ecmp_member_count: t.Optional[int] = None,
     ecmp_group_count: t.Optional[int] = None,
+    allow_parent_child_mismatch: bool = False,
 ) -> PointInTimeHealthCheck:
     """ECMP_GROUP_AND_MEMBER_COUNT_CHECK — verifies ECMP group + member counts.
+
+    Both counts are upper bounds: fewer groups/members than the threshold
+    passes. Zero, however, always fails -- churn can reduce the counts but
+    never empty the table, so zero means nothing is programmed (or the dump
+    returned no data).
 
     Args:
         ecmp_member_count: Maximum allowed ECMP member count.
         ecmp_group_count: Maximum allowed ECMP group count.
+        allow_parent_child_mismatch: Skip the parent/child group-id set
+            equality assertion. Set this only where the table is expected to
+            be mid-flight -- e.g. under prefix flapping, where a parent group
+            legitimately exists before its members are programmed. The count
+            ceilings remain enforced either way.
     """
     json_payload: t.Dict[str, t.Any] = {}
     if ecmp_member_count is not None:
         json_payload["ecmp_member_count"] = ecmp_member_count
     if ecmp_group_count is not None:
         json_payload["ecmp_group_count"] = ecmp_group_count
+    if allow_parent_child_mismatch:
+        json_payload["allow_parent_child_mismatch"] = True
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.ECMP_GROUP_AND_MEMBER_COUNT_CHECK,
         check_params=Params(json_params=json.dumps(json_payload)),
@@ -626,6 +937,27 @@ def create_log_parsing_check(
             jq_params=jq if jq else None,
             json_params=json.dumps(json_params) if json_params else None,
         ),
+        check_id=check_id,
+    )
+
+
+def create_resource_accountant_activation_check(
+    start_time_jq_var: str = "test_case_start_time",
+    retry_count: int = 4,
+    retry_delay_seconds: float = 10.0,
+    retry_delay_multiplier: float = 1.0,
+    check_id: t.Optional[str] = None,
+) -> PointInTimeHealthCheck:
+    """Require a canonical ResourceAccountant rejection in a bounded window."""
+    return create_log_parsing_check(
+        json_params={
+            "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+            "resource_accountant_activation": True,
+            "retry_count": retry_count,
+            "retry_delay_seconds": retry_delay_seconds,
+            "retry_delay_multiplier": retry_delay_multiplier,
+        },
+        start_time_jq_var=start_time_jq_var,
         check_id=check_id,
     )
 
@@ -1046,7 +1378,11 @@ def create_hardware_capacity_check(
     max_ecmp_level3: t.Optional[t.Any] = None,
     watermark_delta_threshold: t.Optional[t.Any] = None,
     check_watermarks: t.Optional[bool] = None,
+    check_instantaneous_usage: t.Optional[bool] = None,
     check_id: t.Optional[str] = None,
+    retry_count: t.Optional[int] = None,
+    retry_delay_seconds: t.Optional[float] = None,
+    retry_delay_multiplier: t.Optional[float] = None,
 ) -> PointInTimeHealthCheck:
     """Create a point-in-time check of hardware capacity (FEC + ECMP) utilization.
 
@@ -1067,7 +1403,14 @@ def create_hardware_capacity_check(
             high-water-mark utilization.
         check_watermarks: If True, also asserts watermark values stayed within
             tolerance.
+        check_instantaneous_usage: If False, skips the current FEC, ECMP, and
+            ECMP-level thresholds. Explicit absolute watermark thresholds are
+            still enforced.
         check_id: Optional unique identifier for the check.
+        retry_count: Retries after the initial attempt when the check FAILs.
+            0 (default) = single-shot.
+        retry_delay_seconds: Base delay before the first retry (default 5.0).
+        retry_delay_multiplier: Backoff multiplier per retry (default 1.5).
 
     Returns:
         A `PointInTimeHealthCheck` with `name=HARDWARE_CAPACITY_CHECK`.
@@ -1085,6 +1428,14 @@ def create_hardware_capacity_check(
         payload["fec_high_watermark_threshold"] = fec_high_watermark_threshold
     if ecmp_high_watermark_threshold is not None:
         payload["ecmp_high_watermark_threshold"] = ecmp_high_watermark_threshold
+    if check_instantaneous_usage is not None:
+        payload["check_instantaneous_usage"] = check_instantaneous_usage
+    if retry_count is not None:
+        payload["retry_count"] = retry_count
+    if retry_delay_seconds is not None:
+        payload["retry_delay_seconds"] = retry_delay_seconds
+    if retry_delay_multiplier is not None:
+        payload["retry_delay_multiplier"] = retry_delay_multiplier
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.HARDWARE_CAPACITY_CHECK,
         check_params=Params(json_params=json.dumps(payload)),
@@ -1096,6 +1447,10 @@ def create_ibgp_pnh_metric_check(
     expected_openr_metric: int,
     expected_openr_ad: int,
     check_id: t.Optional[str] = None,
+    start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    count: t.Optional[int] = None,
+    step: t.Optional[int] = None,
 ) -> PointInTimeHealthCheck:
     """Create a point-in-time check of iBGP protocol-next-hop (PNH) metric/AD vs Open/R.
 
@@ -1108,20 +1463,38 @@ def create_ibgp_pnh_metric_check(
         expected_openr_metric: Required Open/R IGP metric for the PNH route.
         expected_openr_ad: Required Open/R administrative-distance value.
         check_id: Optional unique identifier for the check.
+        start_ipv4s: Optional IPv4 route-range starts from the bound topology.
+        start_ipv6s: Optional IPv6 route-range starts from the bound topology.
+        count: Optional synthetic nodes per range, from the resolved Open/R
+            injection plan. The runtime check defaults to 63 nodes at stride
+            2 when these are omitted, which happens to equal the FY26 scale,
+            so FY26 validated the right population only by coincidence of two
+            independent defaults. Passing the resolved values removes that
+            coincidence and is what makes any non-FY26 scale validate the
+            population its setup actually injected.
+        step: Optional address stride within a range, from the same plan.
 
     Returns:
         A `PointInTimeHealthCheck` with `name=IBGP_PNH_METRIC_CHECK`.
     """
+    payload: t.Dict[str, t.Any] = {
+        "expected_openr_metric": expected_openr_metric,
+        "expected_openr_ad": expected_openr_ad,
+    }
+    if start_ipv4s is not None:
+        payload["start_ipv4s"] = list(start_ipv4s)
+    if start_ipv6s is not None:
+        payload["start_ipv6s"] = list(start_ipv6s)
+    # Omitted rather than defaulted: a caller that does not resolve a plan
+    # serializes exactly the payload it did before these fields existed.
+    if count is not None:
+        payload["count"] = count
+    if step is not None:
+        payload["step"] = step
+
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.IBGP_PNH_METRIC_CHECK,
-        check_params=Params(
-            json_params=json.dumps(
-                {
-                    "expected_openr_metric": expected_openr_metric,
-                    "expected_openr_ad": expected_openr_ad,
-                }
-            )
-        ),
+        check_params=Params(json_params=json.dumps(payload)),
         check_id=check_id,
     )
 
@@ -1251,11 +1624,40 @@ def create_dsf_fabric_reachability_check() -> PointInTimeHealthCheck:
     return PointInTimeHealthCheck(name=hc_types.CheckName.DSF_FABRIC_REACHABILITY_CHECK)
 
 
+def create_dsf_fsdb_session_check(
+    check_id: t.Optional[str] = None,
+) -> PointInTimeHealthCheck:
+    """Create the topology-wide DSF FSDB-session health check."""
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.DSF_FSDB_SESSION_CHECK,
+        check_id=check_id,
+    )
+
+
+def create_dsf_traffic_rebalance_check(
+    deviation_threshold_pct: int = 20,
+    check_id: t.Optional[str] = None,
+) -> PointInTimeHealthCheck:
+    """Verify fabric-port traffic remains within the allowed deviation."""
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.DSF_TRAFFIC_REBALANCE_CHECK,
+        input_json=thrift_to_json(
+            hc_types.DsfTrafficRebalanceHealthCheckIn(
+                deviation_threshold_pct=deviation_threshold_pct
+            )
+        ),
+        check_id=check_id,
+    )
+
+
 def create_dsf_pfc_check(
     json_params: t.Optional[t.Dict[str, t.Any]] = None,
     thresholds: t.Optional[t.List["hc_types.DsfPfcThreshold"]] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
     mode: t.Optional[str] = None,
+    executor_device: t.Optional[str] = None,
+    replace_snapshot: bool = False,
+    snapshot_retry_out_pfc_on_zero: bool = False,
 ) -> PointInTimeHealthCheck:
     """DSF_PFC_CHECK — verifies DSF PFC counters.
 
@@ -1270,11 +1672,56 @@ def create_dsf_pfc_check(
     - "snapshot": read monotonic `.sum`, store as pretest baseline, always PASS.
     - "check": read monotonic `.sum`, compare (current - snapshot) against
       thresholds. Requires a matching mode="snapshot" precheck to have run first.
+
+    `executor_device` selects the single DUT context that performs any remote
+    endpoint reads. When omitted, each DUT reads only its own endpoints.
+    `replace_snapshot` discards an earlier baseline for an intentional new
+    measurement window. `snapshot_retry_out_pfc_on_zero` retries only the
+    out-PFC counter when that baseline is expected to be non-zero.
     """
     if json_params is not None and thresholds is not None:
         raise ValueError("json_params and thresholds are mutually exclusive")
+    if thresholds is None and (
+        executor_device is not None
+        or (json_params is not None and "executor_device" in json_params)
+    ):
+        raise ValueError(
+            "executor_device requires typed thresholds so the executor can be validated"
+        )
+    if executor_device is not None and thresholds is not None:
+        threshold_devices = [
+            endpoint.split(":", 1)[0]
+            for threshold in thresholds
+            for endpoint in threshold.interfaces
+            if ":" in endpoint
+        ]
+        if not any(
+            _is_same_device_name(executor_device, device)
+            for device in threshold_devices
+        ):
+            raise ValueError(
+                f"executor_device {executor_device!r} must match a configured "
+                "DSF PFC endpoint device"
+            )
+    static_params = {}
+    if mode:
+        static_params["mode"] = ParamValue(string_value=mode)
+    if executor_device:
+        static_params["executor_device"] = ParamValue(string_value=executor_device)
+    if replace_snapshot:
+        static_params["replace_snapshot"] = ParamValue(int_value=1)
+    if snapshot_retry_out_pfc_on_zero:
+        static_params["snapshot_retry_out_pfc_on_zero"] = ParamValue(int_value=1)
+    effective_mode = mode if mode is not None else (json_params or {}).get("mode")
+    jq_params = (
+        {"snapshot_id": ".test_case_start_time"}
+        if effective_mode in ("snapshot", "check")
+        else None
+    )
     check_params = (
-        Params(static_params={"mode": ParamValue(string_value=mode)}) if mode else None
+        Params(static_params=static_params or None, jq_params=jq_params)
+        if static_params or jq_params
+        else None
     )
     if thresholds is not None:
         return PointInTimeHealthCheck(
@@ -1291,18 +1738,13 @@ def create_dsf_pfc_check(
             check_scope=check_scope,
             check_params=check_params,
         )
-    if mode:
-        return PointInTimeHealthCheck(
-            name=hc_types.CheckName.DSF_PFC_CHECK,
-            check_params=Params(
-                json_params=json.dumps(json_params),
-                static_params={"mode": ParamValue(string_value=mode)},
-            ),
-            check_scope=check_scope,
-        )
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.DSF_PFC_CHECK,
-        check_params=Params(json_params=json.dumps(json_params)),
+        check_params=Params(
+            json_params=json.dumps(json_params),
+            static_params=static_params or None,
+            jq_params=jq_params,
+        ),
         check_scope=check_scope,
     )
 
@@ -1344,26 +1786,38 @@ def create_fsdb_subscriber_timestamp_check(
 
 def create_ixia_port_stats_check(
     json_params: t.Optional[t.Dict[str, t.Any]] = None,
+    snapshot_baseline: bool = False,
 ) -> PointInTimeHealthCheck:
     """Create a point-in-time check of IXIA port-level statistics thresholds.
 
-    Polls IXIA port stats (link state, error counters, signal lock) and
-    asserts each value satisfies the supplied thresholds. Used as a precheck
-    in IXIA-driven tests to confirm chassis ports are healthy before traffic
-    starts.
+    Polls IXIA port fault counters (CRC errors, local/remote faults) plus the
+    current link / link-fault state, and fails on any increase since the
+    baseline, reporting which direction of the link lost RX.
+
+    The counters are cumulative since port ownership, so the check compares
+    against a baseline snapshotted on its first invocation in a test run —
+    faults from setup-time link training don't fail later invocations.
 
     Args:
-        json_params: Opaque dict carrying threshold expectations
-            (port-name → metric → threshold map). Bare check when omitted.
+        json_params: Extra check_params merged verbatim (e.g. retry knobs).
+            The fault-counter threshold itself is fixed at 0 new faults;
+            per-port threshold maps are NOT supported.
+        snapshot_baseline: Force this invocation to (re)take the baseline.
+            The point-in-time link/link-fault state is still asserted. Use on
+            the precheck of a pre/post pair when an earlier check may already
+            have taken one, or after deliberately flapping links during setup.
 
     Returns:
         A `PointInTimeHealthCheck` with `name=IXIA_PORT_STATS_CHECK`.
     """
-    if json_params is None:
+    params = dict(json_params or {})
+    if snapshot_baseline:
+        params["snapshot_baseline"] = True
+    if not params:
         return PointInTimeHealthCheck(name=hc_types.CheckName.IXIA_PORT_STATS_CHECK)
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.IXIA_PORT_STATS_CHECK,
-        check_params=Params(json_params=json.dumps(json_params)),
+        check_params=Params(json_params=json.dumps(params)),
     )
 
 
@@ -1371,6 +1825,7 @@ def create_ixia_traffic_rate_check(
     json_params: t.Optional[t.Dict[str, t.Any]] = None,
     thresholds: t.Optional[t.List["hc_types.TrafficRateThreshold"]] = None,
     base_bandwidth_gbps: t.Optional[int] = None,
+    rate_tolerance_percent: t.Optional[int] = None,
 ) -> PointInTimeHealthCheck:
     """IXIA_TRAFFIC_RATE_CHECK — verifies IXIA traffic-rate thresholds.
 
@@ -1384,16 +1839,28 @@ def create_ixia_traffic_rate_check(
     ``ThresholdType.PERCENT``. Defaults to the check's built-in 400 Gbps
     when omitted. Set this to the physical port speed (200, 400, 800)
     when the traffic items are running against non-400G ports.
+
+    When ``rate_tolerance_percent`` is set, each threshold becomes an expected
+    rate and the selected rates must stay within that percentage above or below it.
+    Omitting it preserves the historical lower-bound-only behavior.
+
+    Runtime ``check_params.json_params`` may explicitly select
+    ``rate_metrics=["rx_rate"]`` or ``["tx_rate"]``. Omitting this option
+    preserves verification of both directions. Missing selected rate data or
+    missing named traffic items fail the check.
     """
     if json_params is not None and thresholds is not None:
         raise ValueError("json_params and thresholds are mutually exclusive")
-    check_params: t.Optional[Params] = None
+    if rate_tolerance_percent is not None and not 0 <= rate_tolerance_percent <= 100:
+        raise ValueError("rate_tolerance_percent must be between 0 and 100")
+    static_params = {}
     if base_bandwidth_gbps is not None:
-        check_params = Params(
-            static_params={
-                "base_bandwidth_gbps": _PV(int_value=int(base_bandwidth_gbps))
-            }
+        static_params["base_bandwidth_gbps"] = _PV(int_value=int(base_bandwidth_gbps))
+    if rate_tolerance_percent is not None:
+        static_params["rate_tolerance_percent"] = _PV(
+            int_value=int(rate_tolerance_percent)
         )
+    check_params = Params(static_params=static_params) if static_params else None
     if thresholds is not None:
         return PointInTimeHealthCheck(
             name=hc_types.CheckName.IXIA_TRAFFIC_RATE_CHECK,
@@ -1426,6 +1893,11 @@ def create_pfc_wd_check(
     json_params: t.Optional[t.Dict[str, t.Any]] = None,
     thresholds: t.Optional[t.List["hc_types.PfcWdThreshold"]] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
+    mode: t.Optional[str] = None,
+    max_detection_recovery_difference: t.Optional[int] = None,
+    snapshot_retry_on_zero: bool = False,
+    replace_snapshot: bool = False,
+    executor_device: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """PFC_WD_CHECK — PFC watchdog verification.
 
@@ -1436,9 +1908,67 @@ def create_pfc_wd_check(
     - `json_params`: pass-through Params.json_params dict.
     - `thresholds`: typed thrift `PfcWdHealthCheckIn(thresholds=...)` via input_json.
     Mutually exclusive.
+
+    `mode="snapshot"` records monotonic detection/recovery counters and
+    `mode="check"` validates deltas from that baseline. Snapshot state is
+    isolated by `.test_case_start_time`; `max_detection_recovery_difference`
+    bounds the absolute detection/recovery delta imbalance. Set
+    `snapshot_retry_on_zero` when a monotonic baseline may race FB303 refresh.
+    Set `replace_snapshot` to overwrite a same-run baseline on a retried
+    snapshot step. `executor_device` selects the single DUT context that reads
+    all configured endpoints, including remote ones.
     """
     if json_params is not None and thresholds is not None:
         raise ValueError("json_params and thresholds are mutually exclusive")
+    if thresholds is None and (
+        executor_device is not None
+        or (json_params is not None and "executor_device" in json_params)
+    ):
+        raise ValueError(
+            "executor_device requires typed thresholds so the executor can be validated"
+        )
+    if executor_device is not None and thresholds is not None:
+        threshold_devices = [
+            endpoint.split(":", 1)[0]
+            for threshold in thresholds
+            for endpoint in threshold.interfaces
+            if ":" in endpoint
+        ]
+        if not any(
+            _is_same_device_name(executor_device, device)
+            for device in threshold_devices
+        ):
+            raise ValueError(
+                f"executor_device {executor_device!r} must match a configured "
+                "PFC watchdog endpoint device"
+            )
+    params_payload = dict(json_params or {})
+    if mode is not None:
+        params_payload["mode"] = mode
+    if max_detection_recovery_difference is not None:
+        params_payload["max_detection_recovery_difference"] = (
+            max_detection_recovery_difference
+        )
+    if snapshot_retry_on_zero:
+        params_payload["snapshot_retry_on_zero"] = True
+    if replace_snapshot:
+        params_payload["replace_snapshot"] = True
+    if executor_device is not None:
+        params_payload["executor_device"] = executor_device
+    effective_mode = params_payload.get("mode")
+    jq_params = (
+        {"snapshot_id": ".test_case_start_time"}
+        if effective_mode in ("snapshot", "check")
+        else None
+    )
+    check_params = (
+        Params(
+            json_params=json.dumps(params_payload),
+            jq_params=jq_params,
+        )
+        if params_payload or json_params is not None or jq_params
+        else None
+    )
     if thresholds is not None:
         return PointInTimeHealthCheck(
             name=hc_types.CheckName.PFC_WD_CHCEK,
@@ -1446,20 +1976,24 @@ def create_pfc_wd_check(
                 hc_types.PfcWdHealthCheckIn(thresholds=thresholds)
             ),
             check_scope=check_scope,
+            check_params=check_params,
         )
     if json_params is None:
         return PointInTimeHealthCheck(
-            name=hc_types.CheckName.PFC_WD_CHCEK, check_scope=check_scope
+            name=hc_types.CheckName.PFC_WD_CHCEK,
+            check_scope=check_scope,
+            check_params=check_params,
         )
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.PFC_WD_CHCEK,
-        check_params=Params(json_params=json.dumps(json_params)),
+        check_params=check_params,
         check_scope=check_scope,
     )
 
 
 def create_port_channel_expected_state_check(
     json_params: t.Optional[t.Dict[str, t.Any]] = None,
+    check_scope: t.Optional[hc_types.Scope] = None,
 ) -> PointInTimeHealthCheck:
     """Create a point-in-time check that port-channels (LAGs) are in their expected state.
 
@@ -1472,17 +2006,20 @@ def create_port_channel_expected_state_check(
         json_params: Opaque dict mapping port-channel name → expected state
             attributes (e.g. ``oper_state``, ``min_links``, ``active_members``).
             Bare check when omitted.
+        check_scope: Devices on which the health check runs.
 
     Returns:
         A `PointInTimeHealthCheck` with `name=PORT_CHANNEL_EXPECTED_STATE_CHECK`.
     """
     if json_params is None:
         return PointInTimeHealthCheck(
-            name=hc_types.CheckName.PORT_CHANNEL_EXPECTED_STATE_CHECK
+            name=hc_types.CheckName.PORT_CHANNEL_EXPECTED_STATE_CHECK,
+            check_scope=check_scope,
         )
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.PORT_CHANNEL_EXPECTED_STATE_CHECK,
         check_params=Params(json_params=json.dumps(json_params)),
+        check_scope=check_scope,
     )
 
 
@@ -1589,6 +2126,9 @@ def create_lldp_check(
     disabled_interfaces_jq_var: t.Optional[str] = None,
     disabled_interfaces_jq: t.Optional[str] = None,
     disabled_interfaces_transforms: t.Optional[t.List[TransformFunction]] = None,
+    retry_count: t.Optional[int] = None,
+    retry_delay_seconds: t.Optional[float] = None,
+    retry_delay_multiplier: t.Optional[float] = None,
 ) -> PointInTimeHealthCheck:
     """LLDP_CHECK — LLDP neighbor verification.
 
@@ -1602,11 +2142,24 @@ def create_lldp_check(
             expected-down set deterministically (no prior cache step needed).
         disabled_interfaces_transforms: transforms applied to the jq result to
             select the expected-down set (e.g. ``SELECT_SNAKE_CIRCUIT_A_ENDS``).
+        retry_count: Number of retries after an initial failed LLDP check.
+        retry_delay_seconds: Delay before the first retry.
+        retry_delay_multiplier: Multiplier applied to each successive delay.
     """
+    payload: t.Dict[str, t.Any] = {}
+    if retry_count is not None:
+        payload["retry_count"] = retry_count
+    if retry_delay_seconds is not None:
+        payload["retry_delay_seconds"] = retry_delay_seconds
+    if retry_delay_multiplier is not None:
+        payload["retry_delay_multiplier"] = retry_delay_multiplier
+    json_params = json.dumps(payload) if payload else None
+
     if disabled_interfaces_jq is not None:
         return PointInTimeHealthCheck(
             name=hc_types.CheckName.LLDP_CHECK,
             check_params=Params(
+                json_params=json_params,
                 jq_params={"disabled_interfaces": disabled_interfaces_jq},
                 transform_params=(
                     {"disabled_interfaces": disabled_interfaces_transforms}
@@ -1616,10 +2169,16 @@ def create_lldp_check(
             ),
         )
     if disabled_interfaces_jq_var is None:
-        return PointInTimeHealthCheck(name=hc_types.CheckName.LLDP_CHECK)
+        if json_params is None:
+            return PointInTimeHealthCheck(name=hc_types.CheckName.LLDP_CHECK)
+        return PointInTimeHealthCheck(
+            name=hc_types.CheckName.LLDP_CHECK,
+            check_params=Params(json_params=json_params),
+        )
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.LLDP_CHECK,
         check_params=Params(
+            json_params=json_params,
             jq_params={"disabled_interfaces": f".{disabled_interfaces_jq_var}"},
         ),
     )
@@ -1631,6 +2190,9 @@ def create_port_state_check(
     disabled_interfaces_jq_var: t.Optional[str] = None,
     disabled_interfaces_jq: t.Optional[str] = None,
     disabled_interfaces_transforms: t.Optional[t.List[TransformFunction]] = None,
+    retry_count: t.Optional[int] = None,
+    retry_delay_seconds: t.Optional[float] = None,
+    retry_delay_multiplier: t.Optional[float] = None,
 ) -> PointInTimeHealthCheck:
     """PORT_STATE_CHECK — port operational-state verification.
 
@@ -1648,16 +2210,27 @@ def create_port_state_check(
             deterministically (no prior cache step needed).
         disabled_interfaces_transforms: transforms applied to the jq result to
             select the expected-down set (e.g. ``SELECT_SNAKE_CIRCUIT_A_ENDS``).
+        retry_count: Number of retries after an initial failed state check.
+        retry_delay_seconds: Delay before the first retry.
+        retry_delay_multiplier: Multiplier applied to each successive delay.
     """
+    payload: t.Dict[str, t.Any] = {}
+    if additional_interfaces is not None:
+        payload["additional_interfaces"] = additional_interfaces
+    if disabled_interfaces is not None:
+        payload["disabled_interfaces"] = disabled_interfaces
+    if retry_count is not None:
+        payload["retry_count"] = retry_count
+    if retry_delay_seconds is not None:
+        payload["retry_delay_seconds"] = retry_delay_seconds
+    if retry_delay_multiplier is not None:
+        payload["retry_delay_multiplier"] = retry_delay_multiplier
+
     if disabled_interfaces_jq is not None:
         return PointInTimeHealthCheck(
             name=hc_types.CheckName.PORT_STATE_CHECK,
             check_params=Params(
-                json_params=(
-                    json.dumps({"additional_interfaces": additional_interfaces})
-                    if additional_interfaces is not None
-                    else None
-                ),
+                json_params=json.dumps(payload) if payload else None,
                 jq_params={"disabled_interfaces": disabled_interfaces_jq},
                 transform_params=(
                     {"disabled_interfaces": disabled_interfaces_transforms}
@@ -1670,13 +2243,11 @@ def create_port_state_check(
         additional_interfaces is None
         and disabled_interfaces is None
         and disabled_interfaces_jq_var is None
+        and retry_count is None
+        and retry_delay_seconds is None
+        and retry_delay_multiplier is None
     ):
         return PointInTimeHealthCheck(name=hc_types.CheckName.PORT_STATE_CHECK)
-    payload: t.Dict[str, t.Any] = {}
-    if additional_interfaces is not None:
-        payload["additional_interfaces"] = additional_interfaces
-    if disabled_interfaces is not None:
-        payload["disabled_interfaces"] = disabled_interfaces
     jq_params = (
         {"disabled_interfaces": f".{disabled_interfaces_jq_var}"}
         if disabled_interfaces_jq_var
@@ -1768,11 +2339,9 @@ def create_buffer_utilization_snapshot_check(
     binds a hostname + interface set + active/other queue byte ceilings).
     """
     return SnapshotHealthCheck(
-        name=hc_types.CheckName.BUFFER_UTILIZATION_CHECK,  # pyre-ignore[16]
+        name=hc_types.CheckName.BUFFER_UTILIZATION_CHECK,
         input_json=thrift_to_json(
-            hc_types.BufferUtilizationHealthCheckIn(
-                thresholds=thresholds
-            )  # pyre-ignore[16]
+            hc_types.BufferUtilizationHealthCheckIn(thresholds=thresholds)
         ),
         pre_snapshot_checkpoint_id=pre_snapshot_checkpoint_id,
         post_snapshot_checkpoint_id=post_snapshot_checkpoint_id,
@@ -1840,22 +2409,53 @@ def create_next_hop_count_snapshot_check() -> SnapshotHealthCheck:
     return SnapshotHealthCheck(name=hc_types.CheckName.NEXT_HOP_COUNT_CHECK)
 
 
-def create_bgp_peer_route_snapshot_check() -> SnapshotHealthCheck:
-    """Create a bare snapshot check that BGP per-peer route counts are unchanged across the playbook.
+def create_bgp_peer_route_snapshot_check(
+    parent_peers_to_ignore: t.Optional[t.List[str]] = None,
+    parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
+    fail_on_collection_error: bool = False,
+) -> SnapshotHealthCheck:
+    """Create a snapshot check that BGP per-peer route counts are unchanged across the playbook.
 
     Captures advertised/received route counts per peer at pre/post checkpoints
     and asserts no churn. Used as a blanket guard around stages that should
     not affect peer-route exchange.
 
+    Bare by default. Both ignore lists are CIDR prefixes matched by subnet
+    containment, and they filter at different levels:
+        parent_peers_to_ignore: drop matching PEERS from the snapshot entirely.
+            Also suppresses the spurious "new peer" a churn peer produces when
+            it is down at one checkpoint and Established at the other.
+        parent_prefixes_to_ignore: keep every peer, but strip matching PREFIXES
+            out of each peer's counts. Needed when churned routes propagate to
+            otherwise-steady peers. NOTE this switches the check off the cheap
+            session counters onto per-peer post-filter RIB dumps.
+
+        fail_on_collection_error: When True, propagate filtered-RIB collection
+            failures instead of retaining the legacy zero-count fallback.
+
     Returns:
-        A bare `SnapshotHealthCheck` with `name=BGP_PEER_ROUTE_CHECK`.
+        A `SnapshotHealthCheck` with `name=BGP_PEER_ROUTE_CHECK`, carrying
+        `check_params` when an ignore list or strict collection is supplied.
     """
-    return SnapshotHealthCheck(name=hc_types.CheckName.BGP_PEER_ROUTE_CHECK)
+    json_payload: t.Dict[str, t.Any] = {}
+    if parent_peers_to_ignore is not None:
+        json_payload["parent_peers_to_ignore"] = parent_peers_to_ignore
+    if parent_prefixes_to_ignore is not None:
+        json_payload["parent_prefixes_to_ignore"] = parent_prefixes_to_ignore
+    if fail_on_collection_error:
+        json_payload["fail_on_collection_error"] = True
+    return SnapshotHealthCheck(
+        name=hc_types.CheckName.BGP_PEER_ROUTE_CHECK,
+        check_params=(
+            Params(json_params=json.dumps(json_payload)) if json_payload else None
+        ),
+    )
 
 
 def create_cpu_queue_snapshot_check(
     active_queues: t.Optional[t.List[int]] = None,
     no_discard_queues: t.Optional[t.List[int]] = None,
+    active_discard_queues: t.Optional[t.List[int]] = None,
     active_min_out_pps_per_queue: t.Optional[t.Dict[int, int]] = None,
     inactive_queues: t.Optional[t.List[int]] = None,
     inactive_max_pps_per_queue: t.Optional[t.Dict[int, int]] = None,
@@ -1873,6 +2473,7 @@ def create_cpu_queue_snapshot_check(
         active_queues: Queue IDs that MUST see non-zero tx packets in the window.
         no_discard_queues: Queue IDs that MUST NOT see any discards (e.g. high-
             priority BGP_CP queue).
+        active_discard_queues: Queue IDs that MUST see discard-counter growth.
         active_min_out_pps_per_queue: Per-queue minimum out-pps requirements
             (e.g. ``{low_queue: 10}``).
         inactive_queues: Queue IDs that MUST stay below a noise threshold (A2
@@ -1908,6 +2509,8 @@ def create_cpu_queue_snapshot_check(
         kwargs["inactive_queues"] = inactive_queues
     if no_discard_queues is not None:
         kwargs["no_discard_queues"] = no_discard_queues
+    if active_discard_queues is not None:
+        kwargs["active_discard_queues"] = active_discard_queues
     if active_min_out_pps_per_queue is not None:
         kwargs["active_min_out_pps_per_queue"] = active_min_out_pps_per_queue
     return SnapshotHealthCheck(
@@ -1920,6 +2523,7 @@ def create_cpu_queue_snapshot_check(
 
 def create_service_restart_check(
     services: t.Optional[t.List[str]] = None,
+    services_to_skip: t.Optional[t.List[str]] = None,
     daemons: t.Optional[t.List[str]] = None,
     expected_restarted_services: t.Optional[t.List[str]] = None,
     start_time_jq_var: t.Optional[str] = "test_case_start_time",
@@ -1931,6 +2535,8 @@ def create_service_restart_check(
 
     Args:
         services: Services to monitor (e.g. ARISTA_CRITICAL_SAND_AGENTS list).
+        services_to_skip: Services to drop from the monitored set, for platforms
+            that do not deploy them at all (e.g. Open/R on FX).
         daemons: Daemon names variant of services (some checks use this key).
         expected_restarted_services: Services that MUST have restarted.
         start_time_jq_var: jq variable name carrying the lookback start time.
@@ -1941,6 +2547,8 @@ def create_service_restart_check(
     json_payload: t.Dict[str, t.Any] = {}
     if services is not None:
         json_payload["services"] = services
+    if services_to_skip is not None:
+        json_payload["services_to_skip"] = services_to_skip
     if daemons is not None:
         json_payload["daemons"] = daemons
     if expected_restarted_services is not None:
@@ -1963,26 +2571,57 @@ def create_service_restart_check(
 
 
 def create_cpu_percentile_observe_check(
-    summary_jq_var: str = "cpu_percentile_summary",
+    # Defaulted only so this factory stays introspectable by the
+    # factory-coverage and snapshot tests, which exercise every factory that
+    # takes no required argument. The base name is NOT what a real bracket
+    # writes: every caller passes the span-qualified name from
+    # characterization_summary_jq_var().
+    summary_jq_var: str = CPU_SUMMARY_JQ_VAR,
     gate_percentile: float = 95.0,
     gate_threshold_pct: t.Optional[float] = None,
+    gate_thresholds_pct: t.Optional[t.Mapping[int | float, float]] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
 ) -> PointInTimeHealthCheck:
     """CPU_PERCENTILE_CHECK — report bgpcpp CPU percentiles into the results table.
 
     Reads the percentile summary stashed as a jq var by the START/STOP collector
-    (``summary_jq_var``) and reports it. Observe-only when ``gate_threshold_pct``
-    is None (always PASS, value in the message); supply a threshold to gate on
-    the raw ``gate_percentile``.
+    (``summary_jq_var``) and reports it. ``gate_threshold_pct`` gates one raw
+    ``gate_percentile`` for compatibility; ``gate_thresholds_pct`` gates every
+    configured raw percentile with AND semantics. Leave both unset to report
+    the values without gating them.
+
+    "Observe-only" applies to the LEVEL comparison only, and the check is not
+    inert without a threshold. It FAILs unconditionally when the collector
+    stashed nothing usable, meaning no summary, zero samples, or non-finite
+    percentiles, because a signal that cannot be measured must not read as a
+    silent pass. See device_health_checks/cpu_percentile_health_check.py.
 
     Args:
         summary_jq_var: jq var holding the percentile summary dict from STOP.
         gate_percentile: raw percentile to gate on when a threshold is set.
-        gate_threshold_pct: gate threshold; None => observe-only.
+        gate_threshold_pct: level gate threshold. None leaves the CPU level
+            ungated; it does not make the check unable to fail.
+        gate_thresholds_pct: raw percentile-to-threshold mapping. Every entry
+            must pass. A non-empty mapping cannot be combined with
+            ``gate_threshold_pct``.
     """
+    if gate_threshold_pct is not None and gate_thresholds_pct:
+        raise ValueError(
+            "CPU percentile check cannot combine gate_threshold_pct with "
+            "gate_thresholds_pct"
+        )
     json_payload: t.Dict[str, t.Any] = {"gate_percentile": gate_percentile}
     if gate_threshold_pct is not None:
         json_payload["gate_threshold_pct"] = gate_threshold_pct
+    if gate_thresholds_pct:
+        normalized_thresholds: t.Dict[str, float] = {}
+        for percentile, threshold in sorted(gate_thresholds_pct.items()):
+            if not float(percentile).is_integer():
+                raise ValueError(
+                    f"CPU gate percentile must be an integer: {percentile}"
+                )
+            normalized_thresholds[str(int(percentile))] = threshold
+        json_payload["gate_thresholds_pct"] = normalized_thresholds
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.CPU_PERCENTILE_CHECK,
         check_params=Params(
@@ -1994,16 +2633,30 @@ def create_cpu_percentile_observe_check(
 
 
 def create_rss_delta_observe_check(
-    summary_jq_var: str = "rss_delta_summary",
+    # Defaulted for factory introspection only; see
+    # create_cpu_percentile_observe_check above.
+    summary_jq_var: str = RSS_SUMMARY_JQ_VAR,
     max_growth_pct: t.Optional[float] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
 ) -> PointInTimeHealthCheck:
     """RSS_DELTA_CHECK — report the bgpcpp RSS delta bracket into the results table.
 
     Reads the {baseline, current, peak, growth%} summary stashed as a jq var by
-    the START/STOP bracket (``summary_jq_var``) and reports it. Observe-only when
-    ``max_growth_pct`` is None (always PASS, value in the message); supply a
-    threshold to gate on steady-state growth over the in-run baseline.
+    the START/STOP bracket (``summary_jq_var``) and reports it.
+    ``max_growth_pct`` gates steady-state growth over the in-run baseline; leave
+    it None to report the growth without gating it.
+
+    "Observe-only" applies to the GROWTH comparison only, and the check is not
+    inert without a threshold. Two paths FAIL unconditionally, both evaluated
+    before ``max_growth_pct`` is consulted: a missing summary, and a bgpcpp
+    restart mid-span, which invalidates the steady-state comparison rather than
+    being reported as the negative growth a restart would otherwise produce.
+    See device_health_checks/rss_delta_health_check.py.
+
+    Args:
+        summary_jq_var: jq var holding the RSS summary dict from STOP.
+        max_growth_pct: growth gate threshold. None leaves growth ungated; it
+            does not make the check unable to fail.
     """
     json_payload: t.Dict[str, t.Any] = {}
     if max_growth_pct is not None:
@@ -2021,6 +2674,11 @@ def create_rss_delta_observe_check(
 def create_systemctl_active_state_check(
     services: t.Optional[t.List["hc_types.Service"]] = None,
     services_json: t.Optional[t.List[str]] = None,
+    retry_count: t.Optional[int] = None,
+    retry_delay_seconds: t.Optional[float] = None,
+    retry_delay_multiplier: t.Optional[float] = None,
+    expected_restarted_services: t.Optional[t.List[str]] = None,
+    min_active_seconds: t.Optional[int] = None,
 ) -> PointInTimeHealthCheck:
     """SYSTEMCTL_ACTIVE_STATE_CHECK — systemctl active-state verification.
 
@@ -2029,14 +2687,47 @@ def create_systemctl_active_state_check(
       (typed Service enum list).
     - `services_json`: check_params.json_params variant (string list).
     Mutually exclusive — pass at most one.
+
+    `expected_restarted_services` (OSS collector path): services allowed to go
+    inactive during the window — for them only end-of-window recovery is
+    verified, not full-window activity. Use for playbooks that intentionally
+    restart a service. check_params variant only (incompatible with
+    `services`). Passing it WITHOUT `services_json` is valid: the check's
+    consumer falls back to DEFAULT_SERVICE_NAMES when no `services` key is
+    present in check_params — the allowlist still applies to that set.
+
+    `min_active_seconds` (internal path): each unit must also have been active
+    for at least this long, so a crash-looping unit that is briefly active
+    between restarts FAILs.
     """
     if services is not None and services_json is not None:
         raise ValueError(
             "services and services_json are mutually exclusive — pass at most one."
         )
-    if services is None and services_json is None:
+    if services is not None and expected_restarted_services is not None:
+        raise ValueError(
+            "expected_restarted_services requires the check_params variant — "
+            "pass services_json (or neither), not services."
+        )
+    retry_params: t.Dict[str, t.Any] = {}
+    if retry_count is not None:
+        retry_params["retry_count"] = retry_count
+    if retry_delay_seconds is not None:
+        retry_params["retry_delay_seconds"] = retry_delay_seconds
+    if retry_delay_multiplier is not None:
+        retry_params["retry_delay_multiplier"] = retry_delay_multiplier
+    if min_active_seconds is not None:
+        retry_params["min_active_seconds"] = min_active_seconds
+    if (
+        services is None
+        and services_json is None
+        and expected_restarted_services is None
+    ):
         return PointInTimeHealthCheck(
-            name=hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK
+            name=hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK,
+            check_params=(
+                Params(json_params=json.dumps(retry_params)) if retry_params else None
+            ),
         )
     if services is not None:
         return PointInTimeHealthCheck(
@@ -2044,10 +2735,18 @@ def create_systemctl_active_state_check(
             input_json=thrift_to_json(
                 hc_types.SystemctlActiveStateHealthCheckIn(services=services)
             ),
+            check_params=(
+                Params(json_params=json.dumps(retry_params)) if retry_params else None
+            ),
         )
+    params: t.Dict[str, t.Any] = dict(retry_params)
+    if services_json is not None:
+        params["services"] = services_json
+    if expected_restarted_services is not None:
+        params["expected_restarted_services"] = expected_restarted_services
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK,
-        check_params=Params(json_params=json.dumps({"services": services_json})),
+        check_params=Params(json_params=json.dumps(params)),
     )
 
 
@@ -2109,6 +2808,13 @@ def create_l2_entry_threshold_check(
     ndp_entry_upper_lower_threshold: t.Optional[t.Sequence[int]] = None,
     arp_entry_upper_lower_threshold: t.Optional[t.Sequence[int]] = None,
     mac_entry_upper_lower_threshold: t.Optional[t.Sequence[int]] = None,
+    ndp_entry_observe_only: bool = False,
+    arp_entry_observe_only: bool = False,
+    mac_entry_observe_only: bool = False,
+    retry_count: int = 0,
+    retry_delay_seconds: float = 5.0,
+    retry_delay_multiplier: float = 1.5,
+    check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """L2_ENTRY_THRESHOLD_CHECK — verifies NDP/ARP/MAC entry counts stay within bounds.
 
@@ -2128,9 +2834,24 @@ def create_l2_entry_threshold_check(
         json_payload["mac_entry_upper_lower_threshold"] = (
             mac_entry_upper_lower_threshold
         )
+    if ndp_entry_observe_only:
+        json_payload["ndp_entry_observe_only"] = True
+    if arp_entry_observe_only:
+        json_payload["arp_entry_observe_only"] = True
+    if mac_entry_observe_only:
+        json_payload["mac_entry_observe_only"] = True
+    if retry_count:
+        json_payload.update(
+            {
+                "retry_count": retry_count,
+                "retry_delay_seconds": retry_delay_seconds,
+                "retry_delay_multiplier": retry_delay_multiplier,
+            }
+        )
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.L2_ENTRY_THRESHOLD_CHECK,
         check_params=Params(json_params=json.dumps(json_payload)),
+        check_id=check_id,
     )
 
 
@@ -2139,6 +2860,9 @@ def create_route_convergence_time_check(
     iterations: int = 5,
     time_threshold: int = 35,
     wait_time_seconds: int = 60,
+    expected_route_count: int | None = None,
+    observation_timeout_seconds: int = 15,
+    observation_poll_interval_seconds: float = 1,
 ) -> PointInTimeHealthCheck:
     """ROUTE_CONVERGENCE_TIME_CHECK — DELETE/ADD-cycle BGP convergence check.
 
@@ -2150,7 +2874,11 @@ def create_route_convergence_time_check(
         "iterations": iterations,
         "time_threshold": time_threshold,
         "wait_time_seconds": wait_time_seconds,
+        "observation_timeout_seconds": observation_timeout_seconds,
+        "observation_poll_interval_seconds": observation_poll_interval_seconds,
     }
+    if expected_route_count is not None:
+        check_params["expected_route_count"] = expected_route_count
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.ROUTE_CONVERGENCE_TIME_CHECK,
         check_params=Params(json_params=json.dumps(check_params)),
@@ -2196,6 +2924,7 @@ def create_clear_counters_check() -> PointInTimeHealthCheck:
 def create_drain_state_check(
     expected_drained: t.Optional[bool] = None,
     device_name: t.Optional[str] = None,
+    check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """DRAIN_STATE_CHECK — verifies the drain state of a device.
 
@@ -2213,12 +2942,16 @@ def create_drain_state_check(
         check_params=(
             Params(json_params=json.dumps(json_payload)) if json_payload else None
         ),
+        check_id=check_id,
     )
 
 
 def create_unclean_exit_check(
     start_time_jq_var: t.Optional[str] = "test_case_start_time",
     exclude_services: t.Optional[t.List[str]] = None,
+    services: t.Optional[t.List[str]] = None,
+    sleep_timer: t.Optional[int] = None,
+    check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """UNCLEAN_EXIT_CHECK — detects unclean process exits since the test started.
 
@@ -2226,17 +2959,29 @@ def create_unclean_exit_check(
         start_time_jq_var: jq variable name carrying the lookback start time.
             Defaults to ``"test_case_start_time"``; set to ``None`` to omit.
         exclude_services: Process names to ignore (e.g. ``["bgpd"]`` for crash tests).
+        services: When set, limit validation to these process names.
+        sleep_timer: Optional delay in seconds before collecting exit state.
+        check_id: Stable identifier for this check instance.
     """
+    if exclude_services is not None and services is not None:
+        raise ValueError("exclude_services and services are mutually exclusive")
     jq_params = {"start_time": f".{start_time_jq_var}"} if start_time_jq_var else None
-    json_params = (
-        json.dumps({"exclude_services": exclude_services})
-        if exclude_services is not None
-        else None
-    )
+    json_payload: t.Dict[str, t.Any] = {}
+    if exclude_services is not None:
+        json_payload["exclude_services"] = exclude_services
+    if services is not None:
+        json_payload["services"] = services
+    if sleep_timer is not None:
+        json_payload["sleep_timer"] = sleep_timer
+    json_params = json.dumps(json_payload) if json_payload else None
     if not jq_params and not json_params:
-        return PointInTimeHealthCheck(name=hc_types.CheckName.UNCLEAN_EXIT_CHECK)
+        return PointInTimeHealthCheck(
+            name=hc_types.CheckName.UNCLEAN_EXIT_CHECK,
+            check_id=check_id,
+        )
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.UNCLEAN_EXIT_CHECK,
+        check_id=check_id,
         check_params=Params(jq_params=jq_params, json_params=json_params),
     )
 
@@ -2276,8 +3021,10 @@ def create_bgp_route_count_verification_check(
     """BGP_ROUTE_COUNT_VERIFICATION_CHECK — opaque pass-through with optional check_id.
 
     The check schema (descriptions_to_check / descriptions_to_ignore /
-    direction / expected_count / policy_type / etc.) varies enough across
-    callers that an opaque dict is the simplest factory shape.
+    direction / expected_count / policy_type, or absolute bgpcpp Loc-RIB
+    ``rib_prefix_ranges`` / ``expected_rib_prefix_count`` /
+    ``expected_rib_path_count``) varies enough across callers that an opaque
+    dict is the simplest factory shape.
 
     When called with no arguments (``json_params=None``), produces a bare
     PointInTime check (no ``check_params``), matching the previously-separate
@@ -2322,6 +3069,10 @@ def create_next_hop_count_check(
     expected_nexthop_count: t.Optional[int] = None,
     min_nexthop_count: t.Optional[int] = None,
     max_nexthop_count: t.Optional[int] = None,
+    convergence_hard_timeout_seconds: t.Optional[float] = None,
+    convergence_poll_interval_seconds: t.Optional[float] = None,
+    convergence_stability_window_seconds: t.Optional[float] = None,
+    convergence_predicate_timeout_seconds: t.Optional[float] = None,
     check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """NEXT_HOP_COUNT_CHECK — BGP multipath next-hop count.
@@ -2353,8 +3104,45 @@ def create_next_hop_count_check(
         expected_nexthop_count: Exact number of next-hops to require.
         min_nexthop_count: Minimum acceptable next-hops.
         max_nexthop_count: Maximum acceptable next-hops.
+        convergence_hard_timeout_seconds: Discovery-only. When set, discovery
+            POLLS the measured width until it satisfies the sanity bounds and
+            holds, instead of reading once. Detecting steady state beats
+            guessing it with a fixed settle: too short captures a
+            mid-convergence baseline, too long taxes every run.
+        convergence_poll_interval_seconds: Upper bound on the gap between
+            polls (runtime default 10s). Each poll is a full dual-AFI RIB walk,
+            so keep it generous on high-scale testbeds.
+        convergence_stability_window_seconds: How long the measurement must
+            HOLD before it is accepted (runtime default 0 = accept the first
+            good sample). This is the part a plain retry loop cannot express.
+        convergence_predicate_timeout_seconds: Per-read cap, so one hung RIB
+            walk cannot consume the whole budget.
         check_id: Optional unique identifier for the check.
+
+    Raises:
+        ValueError: if a convergence sub-parameter is supplied without
+            ``convergence_hard_timeout_seconds``. The sub-parameters are inert
+            without it, and a silently inert gate is the failure mode this
+            check exists to prevent.
     """
+    convergence_sub_params = {
+        "convergence_poll_interval_seconds": convergence_poll_interval_seconds,
+        "convergence_stability_window_seconds": convergence_stability_window_seconds,
+        "convergence_predicate_timeout_seconds": convergence_predicate_timeout_seconds,
+    }
+    if convergence_hard_timeout_seconds is None:
+        orphaned = sorted(k for k, v in convergence_sub_params.items() if v is not None)
+        if orphaned:
+            raise ValueError(
+                f"{', '.join(orphaned)} require convergence_hard_timeout_seconds; "
+                f"without it discovery does not poll and these are ignored"
+            )
+    elif not discover_baseline:
+        raise ValueError(
+            "convergence_hard_timeout_seconds only applies to discovery mode "
+            "(discover_baseline=True); validation mode reads the stored baseline"
+        )
+
     check_params: t.Dict[str, t.Any] = {}
 
     def _set_if_present(key: str, value: t.Any) -> None:
@@ -2368,6 +3156,23 @@ def create_next_hop_count_check(
         _set_if_present("expected_max_baseline_width", expected_max_baseline_width)
         _set_if_present("min_multipath_width", min_multipath_width)
         _set_if_present("required_address_families", required_address_families)
+        # Appended AFTER every pre-existing key: check_params is serialized with
+        # plain json.dumps (no sort_keys) and the golden hashes that string, so
+        # insertion position matters as much as presence.
+        _set_if_present(
+            "convergence_hard_timeout_seconds", convergence_hard_timeout_seconds
+        )
+        _set_if_present(
+            "convergence_poll_interval_seconds", convergence_poll_interval_seconds
+        )
+        _set_if_present(
+            "convergence_stability_window_seconds",
+            convergence_stability_window_seconds,
+        )
+        _set_if_present(
+            "convergence_predicate_timeout_seconds",
+            convergence_predicate_timeout_seconds,
+        )
     if use_discovered_prefixes:
         check_params["use_discovered_prefixes"] = True
     if use_discovered_width:
@@ -2603,9 +3408,15 @@ def create_fpf_stale_prefix_check(
 def create_fpf_hrt_fsdb_session_check(
     hosts: t.Optional[t.List[str]] = None,
     expected_session_count: t.Optional[int] = None,
+    device_ids: t.Optional[t.List[int]] = None,
+    planes_per_device: t.Optional[int] = None,
     impacted_lanes_by_host_gpu: t.Optional[
         t.Dict[str, t.Dict[int, t.List[int]]]
     ] = None,
+    impacted_tuples_by_host_device: t.Optional[
+        t.Dict[str, t.Dict[str, t.List[int]]]
+    ] = None,
+    only_hosts: t.Optional[t.List[str]] = None,
     reconcile_device_id: t.Optional[int] = None,
     planes_per_gpu: t.Optional[int] = None,
     check_id: t.Optional[str] = None,
@@ -2623,8 +3434,16 @@ def create_fpf_hrt_fsdb_session_check(
     params: t.Dict[str, t.Any] = {"hosts": hosts or []}
     if expected_session_count is not None:
         params["expected_session_count"] = expected_session_count
+    if device_ids is not None:
+        params["device_ids"] = device_ids
+    if planes_per_device is not None:
+        params["planes_per_device"] = planes_per_device
     if impacted_lanes_by_host_gpu is not None:
         params["impacted_lanes_by_host_gpu"] = impacted_lanes_by_host_gpu
+    if impacted_tuples_by_host_device is not None:
+        params["impacted_tuples_by_host_device"] = impacted_tuples_by_host_device
+    if only_hosts:
+        params["only_hosts"] = only_hosts
     if reconcile_device_id is not None:
         params["reconcile_device_id"] = reconcile_device_id
     if planes_per_gpu is not None:
@@ -2649,6 +3468,9 @@ def create_fpf_fsdb_ribmap_convergence_check(
     signal3_stability_duration_sec: t.Optional[float] = None,
     mode: t.Optional[str] = None,
     reconverge_sla_sec: t.Optional[float] = None,
+    use_restart_time: bool = False,
+    use_mutation_time: bool = False,
+    require_final_exact: bool = False,
     stability_mode: str = "strict",
     check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
@@ -2656,7 +3478,9 @@ def create_fpf_fsdb_ribmap_convergence_check(
 
     mode="restart": tolerate null/unresponsive polls during an FSDB restart and
     assert each device's ribMap returns to expected_matched within
-    ``reconverge_sla_sec`` of the recorded restart moment.
+    ``reconverge_sla_sec`` of the recorded restart moment. Set
+    ``use_restart_time=True`` when the test also needs to retain an earlier
+    disruption timestamp for another observation window.
 
     ``stability_mode`` selects the Signal-3 (post-convergence stability) blip
     contract: "strict" (default, every sample held at expected — byte-identical
@@ -2687,6 +3511,12 @@ def create_fpf_fsdb_ribmap_convergence_check(
         params["mode"] = mode
     if reconverge_sla_sec is not None:
         params["reconverge_sla_sec"] = reconverge_sla_sec
+    if use_restart_time:
+        params["use_restart_time"] = True
+    if use_mutation_time:
+        params["use_mutation_time"] = True
+    if require_final_exact:
+        params["require_final_exact"] = True
     if stability_mode != "strict":
         params["stability_mode"] = stability_mode
     return PointInTimeHealthCheck(
@@ -2709,7 +3539,10 @@ def create_fpf_bgp_rib_convergence_check(
     signal3_stability_duration_sec: t.Optional[float] = None,
     mode: t.Optional[str] = None,
     reconverge_sla_sec: t.Optional[float] = None,
+    use_mutation_time: bool = False,
+    require_final_exact: bool = False,
     stability_mode: str = "strict",
+    informational: bool = False,
     check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """FPF_BGP_RIB_CONVERGENCE_CHECK — BGP RIB convergence per lane.
@@ -2723,6 +3556,10 @@ def create_fpf_bgp_rib_convergence_check(
     (MODE A — only the last sample must equal expected), or "skip_null_strict"
     (MODE B — tolerate null samples; every non-null sample, and the last, must
     equal expected).
+
+    ``informational`` preserves the complete collector evaluation and artifact,
+    but reports a failed evaluation as non-gating. Use only for a deliberate
+    disruption window; recovered/stable-state checks must remain strict.
     """
     params: t.Dict[str, t.Any] = {
         "lane_map": lane_map or {},
@@ -2746,8 +3583,14 @@ def create_fpf_bgp_rib_convergence_check(
         params["mode"] = mode
     if reconverge_sla_sec is not None:
         params["reconverge_sla_sec"] = reconverge_sla_sec
+    if use_mutation_time:
+        params["use_mutation_time"] = True
+    if require_final_exact:
+        params["require_final_exact"] = True
     if stability_mode != "strict":
         params["stability_mode"] = stability_mode
+    if informational:
+        params["informational"] = True
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.FPF_BGP_RIB_CONVERGENCE_CHECK,
         check_params=Params(json_params=json.dumps(params)),
@@ -2757,10 +3600,14 @@ def create_fpf_bgp_rib_convergence_check(
 
 def create_fpf_hrt_bulk_convergence_check(
     lanes: t.Optional[t.List[int]] = None,
+    device_ids: t.Optional[t.List[int]] = None,
     expected_per_lane: t.Optional[t.Dict[str, int]] = None,
     trigger_delay_sec: int = 120,
     use_live_collectors: bool = False,
     impacted_lanes: t.Optional[t.List[int]] = None,
+    impacted_tuple_lanes_by_host_device: t.Optional[
+        t.Dict[str, t.Dict[str, t.List[int]]]
+    ] = None,
     withdrawn_max_count: t.Optional[int] = None,
     lane_labels: t.Optional[t.Dict[str, str]] = None,
     only_hosts: t.Optional[t.List[str]] = None,
@@ -2771,6 +3618,9 @@ def create_fpf_hrt_bulk_convergence_check(
     signal2_local_max_sec: t.Optional[float] = None,
     signal3_stability_duration_sec: t.Optional[float] = None,
     stability_mode: str = "strict",
+    restart_tolerant_hosts: t.Optional[t.List[str]] = None,
+    use_mutation_time: bool = False,
+    require_final_exact: bool = False,
     check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """FPF_HRT_BULK_CONVERGENCE_CHECK — HRT bulk convergence per lane.
@@ -2783,12 +3633,18 @@ def create_fpf_hrt_bulk_convergence_check(
     ``only_hosts`` restricts evaluation to those GPU host(s) — for a link event
     only the impacted host's lane withdraws, so the unimpacted remote host must
     be excluded or it is a false FAIL.
+    ``device_ids`` expands each lane assertion across independent HRT devices.
+    ``impacted_tuple_lanes_by_host_device`` scopes withdrawal to exact
+    host/device/local-plane tuples on multi-device hosts.
 
     ``stability_mode`` selects the Signal-3 (post-convergence stability) blip
     contract for the unimpacted injected lanes: "strict" (default, byte-identical
     to legacy), "last_sample" (MODE A — only the last sample must equal expected),
     or "skip_null_strict" (MODE B — tolerate null samples; every non-null sample,
     and the last, must equal expected).
+    ``restart_tolerant_hosts`` applies null/error tolerance only to hosts whose
+    HRT process is intentionally restarted; all valid counts and all other hosts
+    remain strict, and a post-outage recovery sample is required.
     """
     params: t.Dict[str, t.Any] = {
         "lanes": lanes or [],
@@ -2798,6 +3654,12 @@ def create_fpf_hrt_bulk_convergence_check(
     }
     if impacted_lanes is not None:
         params["impacted_lanes"] = impacted_lanes
+    if impacted_tuple_lanes_by_host_device:
+        params["impacted_tuple_lanes_by_host_device"] = (
+            impacted_tuple_lanes_by_host_device
+        )
+    if device_ids and device_ids != [0]:
+        params["device_ids"] = device_ids
     if lane_labels:
         params["lane_labels"] = lane_labels
     if only_hosts:
@@ -2818,6 +3680,12 @@ def create_fpf_hrt_bulk_convergence_check(
         params["signal3_stability_duration_sec"] = signal3_stability_duration_sec
     if stability_mode != "strict":
         params["stability_mode"] = stability_mode
+    if restart_tolerant_hosts:
+        params["restart_tolerant_hosts"] = restart_tolerant_hosts
+    if use_mutation_time:
+        params["use_mutation_time"] = True
+    if require_final_exact:
+        params["require_final_exact"] = True
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.FPF_HRT_BULK_CONVERGENCE_CHECK,
         check_params=Params(json_params=json.dumps(params)),
@@ -2827,9 +3695,14 @@ def create_fpf_hrt_bulk_convergence_check(
 
 def create_fpf_hrt_remote_failure_convergence_check(
     lanes: t.Optional[t.List[int]] = None,
+    device_ids: t.Optional[t.List[int]] = None,
     expected_per_lane: t.Optional[t.Dict[str, int]] = None,
     direction: str = "drain",
     max_convergence_sec: int = 120,
+    recovery_stability_sec: t.Optional[float] = None,
+    poll_grace_sec: t.Optional[float] = None,
+    poll_interval_sec: t.Optional[float] = None,
+    poll_duration_budget_sec: t.Optional[float] = None,
     trigger_delay_sec: int = 120,
     use_live_collectors: bool = False,
     lane_labels: t.Optional[t.Dict[str, str]] = None,
@@ -2837,6 +3710,14 @@ def create_fpf_hrt_remote_failure_convergence_check(
     window_start: t.Optional[float] = None,
     window_end: t.Optional[float] = None,
     collector_name: t.Optional[str] = None,
+    tuple_lanes_by_host_device: t.Optional[
+        t.Dict[str, t.Dict[str, t.List[int]]]
+    ] = None,
+    excluded_tuple_lanes_by_host_device: t.Optional[
+        t.Dict[str, t.Dict[str, t.List[int]]]
+    ] = None,
+    restart_tolerant_hosts: t.Optional[t.List[str]] = None,
+    use_mutation_time: bool = False,
     check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """FPF_HRT_REMOTE_FAILURE_CONVERGENCE_CHECK — HRT negative-route convergence per lane.
@@ -2849,8 +3730,18 @@ def create_fpf_hrt_remote_failure_convergence_check(
     ``collector_name`` selects which registered HRT remote-failure collector to
     read (default "hrt_remote_failure"). For the 8-STSW split-per-VF injection,
     pass the per-group collector ("hrt_remote_failure_vf1" / "_vf2") so the stable
-    assertion on a group's own lanes sees only that group's (zero) failures, not
-    the other group's expected cross-plane failures.
+    assertion evaluates only that group's prefixes. ``expected_per_lane`` may be
+    set for transition checks; healthy per-VF stable checks default to zero.
+    Tuple include/exclude maps preserve exact host/device/local-plane scope for
+    multi-device link events.
+    ``restart_tolerant_hosts`` applies null/error tolerance only to intentionally
+    restarted HRT hosts; every valid count, final state, and unaffected host
+    remains strict, and a post-outage recovery sample is required.
+    For scale recovery, an explicit ``poll_grace_sec`` takes precedence. Live
+    evaluation otherwise derives grace from the collector's declared cadence;
+    offline evaluation requires ``poll_interval_sec`` (it never infers cadence
+    from observed gaps). ``poll_duration_budget_sec`` extends only the evidence
+    horizon for a bounded in-flight RPC; it does not relax recovery or stability.
     """
     params: t.Dict[str, t.Any] = {
         "lanes": lanes or [0, 1, 2, 3],
@@ -2860,8 +3751,24 @@ def create_fpf_hrt_remote_failure_convergence_check(
         "trigger_delay_sec": trigger_delay_sec,
         "use_live_collectors": use_live_collectors,
     }
+    if recovery_stability_sec is not None:
+        params["recovery_stability_sec"] = recovery_stability_sec
+    if poll_grace_sec is not None:
+        params["poll_grace_sec"] = poll_grace_sec
+    if poll_interval_sec is not None:
+        params["poll_interval_sec"] = poll_interval_sec
+    if poll_duration_budget_sec is not None:
+        params["poll_duration_budget_sec"] = poll_duration_budget_sec
     if collector_name:
         params["collector_name"] = collector_name
+    if tuple_lanes_by_host_device:
+        params["tuple_lanes_by_host_device"] = tuple_lanes_by_host_device
+    if excluded_tuple_lanes_by_host_device:
+        params["excluded_tuple_lanes_by_host_device"] = (
+            excluded_tuple_lanes_by_host_device
+        )
+    if device_ids and device_ids != [0]:
+        params["device_ids"] = device_ids
     if lane_labels:
         params["lane_labels"] = lane_labels
     if only_hosts:
@@ -2870,6 +3777,10 @@ def create_fpf_hrt_remote_failure_convergence_check(
         params["window_start"] = window_start
     if window_end is not None:
         params["window_end"] = window_end
+    if restart_tolerant_hosts:
+        params["restart_tolerant_hosts"] = restart_tolerant_hosts
+    if use_mutation_time:
+        params["use_mutation_time"] = True
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.FPF_HRT_REMOTE_FAILURE_CONVERGENCE_CHECK,
         check_params=Params(json_params=json.dumps(params)),
@@ -2883,18 +3794,22 @@ def create_fpf_prod_hrt_prefix_stability_check(
     expected_unreachable: t.Optional[t.List[int]] = None,
     expected_plane_up: t.Optional[t.List[int]] = None,
     prefixes: t.Optional[t.List[str]] = None,
+    prefixes_by_host: t.Optional[t.Dict[str, t.List[str]]] = None,
     mode: t.Optional[str] = None,
     impacted_planes_by_host: t.Optional[t.Dict[str, t.List[int]]] = None,
     max_transition_sec: t.Optional[float] = None,
     local_prefixes: t.Optional[t.List[str]] = None,
+    affected_prefixes_by_host: t.Optional[t.Dict[str, t.List[str]]] = None,
     max_drain_sec: t.Optional[float] = None,
     disruption_ts: t.Optional[float] = None,
     lookback_sec: int = 900,
+    use_test_case_start_time: bool = True,
     settle_sec: t.Optional[float] = None,
     window_start: t.Optional[float] = None,
     window_end: t.Optional[float] = None,
     stability_mode: str = "strict",
     recovery_last_n: t.Optional[int] = None,
+    max_recovery_sec: t.Optional[float] = None,
     check_id: t.Optional[str] = None,
 ) -> PointInTimeHealthCheck:
     """FPF_PROD_HRT_PREFIX_STABILITY_CHECK — production HRT prefix reachability.
@@ -2914,8 +3829,21 @@ def create_fpf_prod_hrt_prefix_stability_check(
     is taken after the link recovers (plane comes back), instead of capturing the
     still-degraded state at window start and flagging the recovery as a
     regression. Ignored in transition mode.
+
+    ``mode="restart_recovery"`` uses the last complete pre-restart sample as
+    each prefix's baseline, tolerates empty/incomplete outage rows, and requires
+    full recovery within ``max_recovery_sec`` of the first complete sample after
+    restart completion or the final observed outage row. The final complete
+    sample must remain at baseline.
+
+    ``prefixes_by_host`` scopes each host to its configured prefix set and makes
+    every listed host required. ``affected_prefixes_by_host`` identifies which
+    of those routes must transition in local_drain/local_undrain mode; legacy
+    callers may continue using the global ``prefixes``/``local_prefixes`` lists.
     """
     params: t.Dict[str, t.Any] = {"lookback_sec": lookback_sec}
+    if not use_test_case_start_time:
+        params["use_test_case_start_time"] = False
     if mode is not None:
         params["mode"] = mode
     if settle_sec is not None:
@@ -2926,6 +3854,8 @@ def create_fpf_prod_hrt_prefix_stability_check(
         params["max_transition_sec"] = max_transition_sec
     if local_prefixes is not None:
         params["local_prefixes"] = local_prefixes
+    if affected_prefixes_by_host is not None:
+        params["affected_prefixes_by_host"] = affected_prefixes_by_host
     if max_drain_sec is not None:
         params["max_drain_sec"] = max_drain_sec
     if disruption_ts is not None:
@@ -2940,6 +3870,8 @@ def create_fpf_prod_hrt_prefix_stability_check(
         params["expected_plane_up"] = expected_plane_up
     if prefixes is not None:
         params["prefixes"] = prefixes
+    if prefixes_by_host is not None:
+        params["prefixes_by_host"] = prefixes_by_host
     if window_start is not None:
         params["window_start"] = window_start
     if window_end is not None:
@@ -2948,6 +3880,8 @@ def create_fpf_prod_hrt_prefix_stability_check(
         params["stability_mode"] = stability_mode
     if recovery_last_n is not None:
         params["recovery_last_n"] = recovery_last_n
+    if max_recovery_sec is not None:
+        params["max_recovery_sec"] = max_recovery_sec
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.FPF_PROD_HRT_PREFIX_STABILITY_CHECK,
         check_params=Params(json_params=json.dumps(params)),
@@ -2957,7 +3891,11 @@ def create_fpf_prod_hrt_prefix_stability_check(
 
 def create_fpf_hrt_plane_status_check(
     mode: str = "all_up",
+    device_ids: t.Optional[t.List[int]] = None,
     impacted_planes: t.Optional[t.List[int]] = None,
+    impacted_tuples_by_host_device: t.Optional[
+        t.Dict[str, t.Dict[str, t.List[int]]]
+    ] = None,
     expected_planes: t.Optional[t.List[int]] = None,
     lookback_sec: int = 900,
     settle_sec: t.Optional[float] = None,
@@ -2987,8 +3925,12 @@ def create_fpf_hrt_plane_status_check(
     tolerated). Ignored by mode="drain".
     """
     params: t.Dict[str, t.Any] = {"mode": mode, "lookback_sec": lookback_sec}
+    if device_ids is not None and device_ids != [0]:
+        params["device_ids"] = device_ids
     if impacted_planes is not None:
         params["impacted_planes"] = impacted_planes
+    if impacted_tuples_by_host_device is not None:
+        params["impacted_tuples_by_host_device"] = impacted_tuples_by_host_device
     if expected_planes is not None:
         params["expected_planes"] = expected_planes
     if settle_sec is not None:
@@ -3006,11 +3948,69 @@ def create_fpf_hrt_plane_status_check(
     )
 
 
+def create_fpf_gar_vf_capacity_check(
+    *,
+    pairs: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
+    prefixes: t.Optional[t.List[str]] = None,
+    timeout_sec: float = 120,
+    poll_interval_sec: float = 5,
+    check_id: t.Optional[str] = None,
+) -> PointInTimeHealthCheck:
+    """Validate production VF prefixes and GAR capacity on both rack sides."""
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.FPF_GAR_VF_CAPACITY_CHECK,
+        check_params=Params(
+            json_params=json.dumps(
+                {
+                    "pairs": pairs or [],
+                    "prefixes": prefixes or [],
+                    "timeout_sec": timeout_sec,
+                    "poll_interval_sec": poll_interval_sec,
+                }
+            )
+        ),
+        check_id=check_id,
+    )
+
+
+def create_fpf_gar_scale_capacity_check(
+    *,
+    pairs: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
+    prefix_base: str = "",
+    prefix_count: int = 0,
+    increment_step: str = "0:0:1::",
+    timeout_sec: float = 120,
+    poll_interval_sec: float = 5,
+    check_id: t.Optional[str] = None,
+) -> PointInTimeHealthCheck:
+    """Validate every injected scale prefix and GAR capacity on both rack sides."""
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.FPF_GAR_SCALE_CAPACITY_CHECK,
+        check_params=Params(
+            json_params=json.dumps(
+                {
+                    "pairs": pairs or [],
+                    "prefix_base": prefix_base,
+                    "prefix_count": prefix_count,
+                    "increment_step": increment_step,
+                    "timeout_sec": timeout_sec,
+                    "poll_interval_sec": poll_interval_sec,
+                }
+            )
+        ),
+        check_id=check_id,
+    )
+
+
 def create_fpf_hrt_session_stat_check(
     mode: str = "disruption",
     expected_connected: int = 32,
     expected_connected_during: int = 28,
     impacted_lanes: t.Optional[t.List[int]] = None,
+    impacted_tuples_by_host_device: t.Optional[
+        t.Dict[str, t.Dict[str, t.List[int]]]
+    ] = None,
+    only_hosts: t.Optional[t.List[str]] = None,
     recovery_min_sec: float = 60.0,
     lookback_sec: int = 900,
     window_start: t.Optional[float] = None,
@@ -3034,6 +4034,11 @@ def create_fpf_hrt_session_stat_check(
 
     mode="stable": the CONNECTED count stays at ``expected_connected`` across the
     whole window with no churn.
+
+    ``only_hosts`` scopes a disruption contract to the affected host while the
+    shared collector can still retain unaffected hosts for subsequent recovery
+    gates and stable checks. ``None`` preserves host auto-discovery; an explicit
+    nonempty scope fails closed if any requested host has no in-window samples.
     """
     params: t.Dict[str, t.Any] = {
         "mode": mode,
@@ -3044,6 +4049,10 @@ def create_fpf_hrt_session_stat_check(
     }
     if impacted_lanes is not None:
         params["impacted_lanes"] = impacted_lanes
+    if impacted_tuples_by_host_device is not None:
+        params["impacted_tuples_by_host_device"] = impacted_tuples_by_host_device
+    if only_hosts:
+        params["only_hosts"] = only_hosts
     if window_start is not None:
         params["window_start"] = window_start
     if window_end is not None:
@@ -3069,6 +4078,7 @@ def create_fpf_hrt_system_memory_check(
     threshold_bytes: t.Optional[int] = None,
     transform_desc: t.Optional[str] = None,
     lookback_sec: int = 900,
+    use_test_case_start_time: bool = True,
     window_start: t.Optional[float] = None,
     window_end: t.Optional[float] = None,
     check_id: t.Optional[str] = None,
@@ -3086,6 +4096,8 @@ def create_fpf_hrt_system_memory_check(
         "threshold_gib": threshold_gib,
         "lookback_sec": lookback_sec,
     }
+    if not use_test_case_start_time:
+        params["use_test_case_start_time"] = False
     if hosts is not None:
         params["hosts"] = hosts
     if entity_desc is not None:
@@ -3114,6 +4126,7 @@ def create_fpf_hrt_driver_disconnect_check(
     transform_desc: t.Optional[str] = None,
     expected_value: t.Optional[float] = None,
     lookback_sec: int = 900,
+    use_test_case_start_time: bool = True,
     window_start: t.Optional[float] = None,
     window_end: t.Optional[float] = None,
     check_id: t.Optional[str] = None,
@@ -3130,6 +4143,8 @@ def create_fpf_hrt_driver_disconnect_check(
     params: t.Dict[str, t.Any] = {
         "lookback_sec": lookback_sec,
     }
+    if not use_test_case_start_time:
+        params["use_test_case_start_time"] = False
     if hosts is not None:
         params["hosts"] = hosts
     if entity_desc is not None:
@@ -3238,6 +4253,11 @@ def create_fpf_ods_counter_check(
     aggregate: t.Optional[str] = None,
     require: str = "all",
     informational: bool = False,
+    baseline_excess_max: t.Optional[float] = None,
+    transient_excess_informational: bool = False,
+    baseline_lookback_sec: int = 420,
+    min_baseline_buckets: int = 5,
+    final_bucket_count: int = 2,
     check_id: t.Optional[str] = None,
     use_test_case_start_time: bool = True,
     min_ods_query_duration: int = 0,
@@ -3256,6 +4276,13 @@ def create_fpf_ods_counter_check(
     require="any"`` for "assert a transient event happened on the impacted path"
     checks — e.g. in_discard loss during a disable/drain, where the counter is 0
     at most samples and only spikes on the impacted device.
+
+    ``baseline_excess_max`` enables FPF's ``.sum.60`` discard policy: compare
+    each entity's complete test buckets with its complete pre-test bucket
+    ceiling, excluding the boundary-straddling bucket. The value is the allowed
+    additional events/minute. ``transient_excess_informational`` permits an
+    in-window spike but never permits the final complete bucket(s) to remain
+    above the baseline-adjusted limit.
     """
     params: t.Dict[str, t.Any] = {
         "entity_desc": entity_desc,
@@ -3273,11 +4300,95 @@ def create_fpf_ods_counter_check(
         # transient discards during a disruptive restart/coldboot.
         "informational": informational,
     }
+    if baseline_excess_max is not None:
+        params.update(
+            {
+                "baseline_excess_max": baseline_excess_max,
+                "transient_excess_informational": transient_excess_informational,
+                "baseline_lookback_sec": baseline_lookback_sec,
+                "min_baseline_buckets": min_baseline_buckets,
+                "final_bucket_count": final_bucket_count,
+            }
+        )
     if aggregate is not None:
         params["aggregate"] = aggregate
         params["require"] = require
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.GENERIC_ODS_CHECK,
+        check_scope=hc_types.Scope.DEFAULT,
         check_params=Params(json_params=json.dumps(params)),
         check_id=check_id,
+    )
+
+
+def create_in_congestion_discard_check(
+    priority_groups: t.Optional[t.List[int]] = None,
+) -> PointInTimeHealthCheck:
+    """IN_CONGESTION_DISCARD_CHECK — assert no ASIC in-congestion discards.
+
+    Reads the FBOSS port-level ``in_congestion_discards`` fb303 counter and
+    fails if it incremented. Used by the backend (DSF/RTSW) QoS suite, where
+    traffic is deliberately driven into congestion and the ingress path must
+    stay clean.
+
+    This is an *ingress* ASIC counter exported per port and (optionally) per
+    ingress priority group. It has no per-egress-queue form; use
+    QOS_DSCP_TX_QUEUE_CHECK or BUFFER_UTILIZATION_CHECK for per-queue egress
+    behaviour.
+
+    Args:
+        priority_groups: Ingress priority groups to check in addition to the
+            port total. Omit to check only the port counter.
+    """
+    check_params = (
+        Params(json_params=json.dumps({"priority_groups": priority_groups}))
+        if priority_groups is not None
+        else None
+    )
+    return PointInTimeHealthCheck(
+        name=hc_types.CheckName.IN_CONGESTION_DISCARD_CHECK,
+        check_params=check_params,
+    )
+
+
+def create_fpf_prod_switch_prefix_check(
+    protocol: str,
+    expected_by_gtsw: dict[str, dict[str, bool]] | None = None,
+    mode: str = "stability",
+    trigger: str = "disruption",
+    lookback_sec: float = 300,
+    use_test_case_start_time: bool = True,
+    max_convergence_sec: float = 10,
+    max_sample_age_sec: float = 60,
+    check_id: str | None = None,
+) -> PointInTimeHealthCheck:
+    """Exact native/remote production routes, with NULL and timing evidence.
+
+    Expected maps explicitly select each switch/prefix state for withdrawal or
+    restoration. Omit the map to require every monitored route to have a best
+    path. Convergence windows must be anchored to the verified trigger through
+    the normal registry observation window.
+    """
+    if protocol not in {"bgp", "fsdb"} or mode not in {"stability", "convergence"}:
+        raise ValueError("Unsupported production route check protocol or mode")
+    params: dict[str, t.Any] = {
+        "production_prefixes": True,
+        "production_mode": mode,
+        "trigger": trigger,
+        "lookback_sec": lookback_sec,
+        "use_test_case_start_time": use_test_case_start_time,
+        "max_convergence_sec": max_convergence_sec,
+        "max_sample_age_sec": max_sample_age_sec,
+    }
+    if expected_by_gtsw is not None:
+        params["expected_by_gtsw"] = expected_by_gtsw
+    name = (
+        hc_types.CheckName.FPF_BGP_RIB_CONVERGENCE_CHECK
+        if protocol == "bgp"
+        else hc_types.CheckName.FPF_FSDB_RIBMAP_CONVERGENCE_CHECK
+    )
+    return PointInTimeHealthCheck(
+        name=name,
+        check_params=Params(json_params=json.dumps(params)),
+        check_id=check_id or f"fpf_prod_{protocol}_prefix",
     )

@@ -2,6 +2,8 @@
 # pyre-unsafe
 import asyncio
 import inspect
+import math
+import statistics
 import time
 import typing as t
 from datetime import datetime
@@ -15,10 +17,16 @@ from taac.tasks.thrift_stress_payloads import (
 from taac.utils.arista_utils import (
     get_nexthop_group_summary,
     NexthopGroupSummary,
+    parse_bgp_nexthop_group_sizes,
+    parse_programmed_nexthop_group_sizes,
 )
-from taac.utils.common import async_everpaste_file
+from taac.utils.common import (
+    async_everpaste_file,
+    format_everpaste_url,
+)
 from taac.utils.driver_factory import async_get_device_driver
 from taac.health_check.health_check import types as hc_types
+from thrift.python.exceptions import TransportError
 
 try:
     from configerator.client import ConfigeratorClient
@@ -37,6 +45,7 @@ try:
     import matplotlib
 
     matplotlib.use("Agg")  # Non-interactive backend
+    import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
 
     MATPLOTLIB_AVAILABLE = True
@@ -70,6 +79,17 @@ def _parse_memory_value(mem_str: str) -> int:
     else:
         # Already in KB
         return int(mem_str)
+
+
+def _process_lifetime_label(process_key: str) -> str:
+    """Format a ``command_pid`` key for monitored-lifetime plot labels."""
+    if process_key.isdigit():
+        return f"PID {process_key} — full monitored PID lifetime"
+
+    command, separator, pid = process_key.rpartition("_")
+    if not separator or not pid.isdigit():
+        return f"{process_key} — full monitored PID lifetime"
+    return f"{command} PID {pid} — full monitored PID lifetime"
 
 
 async def _generate_multi_series_plot(
@@ -193,6 +213,7 @@ async def _generate_plot(
     ylabel: str,
     threshold: t.Optional[float] = None,
     output_path: t.Optional[str] = None,
+    y_axis_starts_at_zero: bool = False,
 ) -> t.Optional[str]:
     """
     Generate a time-series plot from collected data.
@@ -203,6 +224,7 @@ async def _generate_plot(
         ylabel: Y-axis label
         threshold: Optional threshold line to draw
         output_path: Optional path to save plot (default: temp file)
+        y_axis_starts_at_zero: Anchor the Y axis at zero.
 
     Returns:
         Path to saved plot file, or None if matplotlib unavailable or no data
@@ -246,6 +268,9 @@ async def _generate_plot(
         plt.ylabel(ylabel, fontsize=12)
         plt.title(title, fontsize=14, fontweight="bold")
         plt.grid(True, alpha=0.3, linestyle=":", linewidth=0.5)
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%b %d %H:%M"))
+        if y_axis_starts_at_zero:
+            plt.ylim(bottom=0)
         plt.xticks(rotation=45, ha="right")
         plt.legend(loc="best")
         plt.tight_layout()
@@ -282,6 +307,19 @@ class CounterThresholdBreach(Exception):
 
 class CounterThresholdTask(PeriodicTask):
     NAME = "counter_utilization"
+    _COLLECTION_ERROR_COUNT = "__collection_error_count"
+    _LAST_COLLECTION_ERROR = "__last_collection_error"
+
+    async def _run(self, params: t.Dict[str, t.Any]) -> None:
+        error_count = self._params.get(self._COLLECTION_ERROR_COUNT, 0)
+        last_error = self._params.get(self._LAST_COLLECTION_ERROR)
+        self._params.clear()
+        self._params.update(params)
+        if error_count:
+            self._params[self._COLLECTION_ERROR_COUNT] = error_count
+        if last_error is not None:
+            self._params[self._LAST_COLLECTION_ERROR] = last_error
+        await self.run(params)
 
     async def run(self, params: t.Dict[str, t.Any]) -> None:
         """
@@ -301,14 +339,18 @@ class CounterThresholdTask(PeriodicTask):
                 - fail_on_breach: When True, raise ``CounterThresholdBreach``
                     the moment a sample exceeds ``threshold`` so the
                     PeriodicTaskWorker (with ``terminate_on_error=True``) fails
-                    the test mid-run. When False (default), a breach only warns
-                    and is left to the non-gating final check. Default: False.
+                    the test mid-run. When False (default), a breach is left to
+                    the final check. Default: False.
+                - observe_only: When True, retain threshold warnings and plots
+                    but report the final check as PASS for calibration. Default:
+                    False.
         """
         hostname = params["hostname"]
         key = params["key"]
         threshold = params["threshold"]
         cpu_count = params.get("cpu_count", None)
         fail_on_breach = params.get("fail_on_breach", False)
+        observe_only = params.get("observe_only", False)
 
         counter = None
         try:
@@ -326,6 +368,10 @@ class CounterThresholdTask(PeriodicTask):
 
             self.add_data(counter)
         except Exception as e:
+            self._params[self._COLLECTION_ERROR_COUNT] = (
+                int(self._params.get(self._COLLECTION_ERROR_COUNT, 0)) + 1
+            )
+            self._params[self._LAST_COLLECTION_ERROR] = f"{type(e).__name__}: {e}"
             self.logger.error(
                 f"Error collecting counter data for {key}: {e}", exc_info=True
             )
@@ -335,14 +381,17 @@ class CounterThresholdTask(PeriodicTask):
         # try/except: a fail_on_breach raise must propagate to the worker (which
         # terminates the test) rather than being swallowed as a collection error.
         if counter > threshold:
-            if fail_on_breach:
+            if fail_on_breach and not observe_only:
                 raise CounterThresholdBreach(
                     f"{key} value {counter} exceeded threshold {threshold} "
                     f"mid-run on {hostname}; failing test (fail_on_breach=True)."
                 )
 
+            verdict = (
+                "observe-only reference" if observe_only else "will check max at end"
+            )
             self.logger.warning(
-                f"{key} value {counter} exceeds threshold {threshold} (will check max at end)"
+                f"{key} value {counter} exceeds threshold {threshold} ({verdict})"
             )
         else:
             self.logger.info(f"{key} value {counter} is within threshold {threshold}")
@@ -365,8 +414,10 @@ class CounterThresholdTask(PeriodicTask):
             return PeriodicCheckResult(
                 # pyrefly: ignore [bad-argument-type]
                 name=self.NAME,
-                status=hc_types.HealthCheckStatus.SKIP,
-                message="No data collected during periodic task execution",
+                status=hc_types.HealthCheckStatus.ERROR,
+                message=self._collection_summary(
+                    "No data collected during periodic task execution"
+                ),
             )
 
         max_counter = max(self._data.values())
@@ -381,14 +432,23 @@ class CounterThresholdTask(PeriodicTask):
             )
 
         key = self._params.get("key", "counter")
+        observe_only = self._params.get("observe_only", False)
 
         # Determine status and base message
-        if max_counter > threshold:
+        if observe_only:
+            status = hc_types.HealthCheckStatus.PASS
+            message = (
+                f"Observed max {key} value {max_counter} against reference "
+                f"threshold {threshold} (observe-only)"
+            )
+        elif max_counter > threshold:
             status = hc_types.HealthCheckStatus.FAIL
             message = f"Max {key} value {max_counter} exceeded threshold {threshold}"
         else:
             status = hc_types.HealthCheckStatus.PASS
             message = f"Max {key} value {max_counter} is within threshold {threshold}"
+
+        message = self._collection_summary(message)
 
         # Generate plot if enabled via params
         enable_plotting = self._params.get("enable_plotting", False)
@@ -398,11 +458,14 @@ class CounterThresholdTask(PeriodicTask):
                 title=f"Counter Utilization Over Time: {key}",
                 ylabel=key,
                 threshold=threshold,
+                y_axis_starts_at_zero=True,
             )
             if plot_path:
                 # Upload to everpaste
                 try:
-                    plot_url = await async_everpaste_file(plot_path)
+                    plot_url = format_everpaste_url(
+                        await async_everpaste_file(plot_path, extension="png")
+                    )
                     message += f"\nPlot: {plot_url}"
                     self.logger.info(f"Plot uploaded to: {plot_url}")
                 except Exception as e:
@@ -414,6 +477,805 @@ class CounterThresholdTask(PeriodicTask):
             status=status,
             message=message,
         )
+
+    def _collection_summary(self, message: str) -> str:
+        error_count = int(self._params.get(self._COLLECTION_ERROR_COUNT, 0))
+        if not error_count:
+            return message
+        last_error = self._params.get(self._LAST_COLLECTION_ERROR, "unknown")
+        return (
+            f"{message}; collection_errors={error_count}; "
+            f"last_collection_error={last_error}"
+        )
+
+
+def _unprogrammed_verdict(
+    series: t.Dict[float, int],
+    maximum: int,
+    tolerance_samples: t.Optional[int],
+) -> t.Tuple[bool, str]:
+    """Verdict on the device's own "I could not program this group" counter.
+
+    A max-over-the-run comparison is the wrong SHAPE here, and a hardware run
+    proved it: across 391 samples of a five-cycle drain the counter read 0 in
+    390 and 4 in exactly ONE, caught mid-rebuild with the group widths climbing
+    1, 2, 3, 12, 13 ... 26 as peers returned to the next-hop sets. Five seconds
+    later it was 0 again. Group creation and hardware programming are not
+    atomic, so a poll landing inside a rebuild sees groups in flight, and
+    ``max == 0`` asserts something an asynchronous pipeline cannot promise. One
+    drain cycle hid this; five cycles are five rebuilds and five chances for the
+    poll to land in one.
+
+    What IS assertable is that groups do not STAY unprogrammed. One in flight
+    for a poll interval is the pipeline working; one still unprogrammed seconds
+    later is blackholing traffic. So this gates on the longest CONSECUTIVE run
+    above the ceiling, not on the peak -- the same duration-not-magnitude
+    principle the converged and recovery verdicts already use.
+
+    With ``tolerance_samples`` unset the behaviour is exactly the old one: any
+    exceedance at all is a breach.
+
+    The empty-series case stays a FAILURE here rather than a guard at the call
+    site. It is unreachable through ``run_final_check`` -- that series is filled
+    in the same ``isinstance`` arm as the count series, whose emptiness already
+    returned -- so at the call site it would be a branch no test could execute,
+    and ``max()`` below would raise on it rather than report it.
+    """
+    if not series:
+        return True, (
+            "unprogrammed NOT EVALUATED: max_unprogrammed was set but no "
+            "num_unprogrammed_groups samples were recorded, so the device's "
+            "own hardware-rejection signal was never read"
+        )
+    ordered = [series[ts] for ts in sorted(series)]
+    peak = max(ordered)
+    longest = current = 0
+    for value in ordered:
+        current = current + 1 if value > maximum else 0
+        longest = max(longest, current)
+    detail = (
+        f"peak {peak}, longest consecutive run above {maximum} = {longest} of "
+        f"{len(ordered)} samples"
+    )
+    if longest == 0:
+        return False, f"unprogrammed OK: never exceeded {maximum} ({detail})"
+    if tolerance_samples is None:
+        return (
+            True,
+            f"unprogrammed BREACH: {detail} -- the device could not program at "
+            f"least one nexthop group",
+        )
+    if longest <= tolerance_samples:
+        return (
+            False,
+            f"unprogrammed OK: exceeded {maximum} only transiently ({detail}), "
+            f"within the {tolerance_samples}-sample tolerance -- consistent "
+            f"with groups in flight during a rebuild",
+        )
+    return (
+        True,
+        f"unprogrammed BREACH: {detail}, beyond the {tolerance_samples}-sample "
+        f"tolerance -- groups STAYED unprogrammed rather than being momentarily "
+        f"in flight, so the device is failing to program them",
+    )
+
+
+def _converged_unprogrammed_verdict(
+    series: t.Dict[float, int], maximum: int, window: int
+) -> t.Tuple[bool, str]:
+    ordered = sorted(series)
+    if len(ordered) < window:
+        return True, (
+            f"converged unprogrammed NOT EVALUATED: {len(ordered)} samples is "
+            f"fewer than the {window} needed for a closing window"
+        )
+    values = _series_window(series, window, last=True)
+    peak = max(values)
+    detail = f"closing-window peak {peak} across {window} samples"
+    if peak <= maximum:
+        return False, (f"converged unprogrammed OK: {detail}, within maximum {maximum}")
+    return True, (
+        f"converged unprogrammed BREACH: {detail}, above maximum {maximum} -- "
+        f"the device was left with an unprogrammed nexthop group after the soak"
+    )
+
+
+def _count_multiway_groups(sizes: t.Dict[int, int], min_width: int) -> int:
+    """Number of nexthop groups at least ``min_width`` next-hops wide.
+
+    ``num_groups_configured`` counts EVERY group, including width-1 ones. A
+    width-1 group is not an ECMP set -- it is a single next-hop that happens to
+    be expressed as a group. Conflating the two makes the count report the wrong
+    event: when a DUT sheds its ECMP structure into per-peer singletons the
+    total *rises* sharply, so a "too many ECMP sets" gate fires on what is
+    actually a loss of ECMP.
+
+    Observed on bag013 (release 191): the healthy shape is ``{128: 2}`` -- two
+    real 128-way sets, one per AFI -- and the count is 2. During the collapse
+    the shape became ``{1: 256, 128: 2}`` and then ``{1: 256}``, so the count
+    read 258 and then 256 while the number of genuine ECMP sets went 2 -> 2 -> 0.
+    """
+    return sum(count for width, count in sizes.items() if width >= min_width)
+
+
+class _NexthopGroupPollSample(t.NamedTuple):
+    summary: NexthopGroupSummary
+    bgp_group_sizes: t.Dict[str, int]
+    programmed_group_sizes: t.Optional[t.Dict[str, int]] = None
+
+
+def _width_histogram(group_sizes: t.Mapping[str, int]) -> t.Dict[int, int]:
+    histogram: t.Dict[int, int] = {}
+    for width in group_sizes.values():
+        histogram[width] = histogram.get(width, 0) + 1
+    return histogram
+
+
+def _bgp_high_watermark_verdict(
+    series: t.Mapping[t.Any, int],
+    group_sizes: t.Mapping[t.Any, t.Mapping[str, int]],
+    minimum_groups: int,
+    minimum_consecutive_samples: int,
+    min_ecmp_width: t.Optional[int],
+) -> t.Tuple[bool, str]:
+    """Require a sustained, named BGP-NHG high-water mark."""
+    trigger_name = (
+        "bgp-nhg all-width trigger" if min_ecmp_width is None else "bgp-nhg trigger"
+    )
+    group_scope = (
+        "across all widths" if min_ecmp_width is None else f">= {min_ecmp_width}-wide"
+    )
+    if not series:
+        return True, (
+            f"{trigger_name} NOT EVALUATED: no detailed bgpgrp_* samples were recorded"
+        )
+
+    ordered = sorted(series, key=float)
+    longest = current = 0
+    crossing: t.List[t.Any] = []
+    for timestamp in ordered:
+        if series[timestamp] >= minimum_groups:
+            crossing.append(timestamp)
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+
+    peak_timestamp = max(ordered, key=lambda timestamp: series[timestamp])
+    peak = series[peak_timestamp]
+    peak_widths = _width_histogram(group_sizes[peak_timestamp])
+    detail = (
+        f"peak {peak} bgpgrp_* groups {group_scope} at timestamp "
+        f"{peak_timestamp}, peak width distribution {dict(sorted(peak_widths.items()))}; "
+        f"{len(crossing)}/{len(ordered)} samples reached the floor "
+        f"{minimum_groups}, longest consecutive run {longest}"
+    )
+    if longest >= minimum_consecutive_samples:
+        return (
+            False,
+            f"{trigger_name} ACKNOWLEDGED: {detail} (required "
+            f"{minimum_consecutive_samples} consecutive samples)",
+        )
+    return (
+        True,
+        f"{trigger_name} BREACH: {detail}; required "
+        f"{minimum_consecutive_samples} consecutive samples -- the requested "
+        f"NHG churn was not observed on the device",
+    )
+
+
+def _programmed_group_ceiling_verdict(
+    series: t.Mapping[t.Any, int],
+    group_sizes: t.Mapping[t.Any, t.Mapping[str, int]],
+    maximum_groups: int,
+) -> t.Tuple[bool, str]:
+    """Require every sampled programmed EOS NHG count to stay under a ceiling."""
+    if not series:
+        return True, (
+            "programmed EOS NHG ceiling NOT EVALUATED: no detailed programmed "
+            "nexthop-group samples were recorded"
+        )
+
+    peak_timestamp = max(series, key=lambda timestamp: series[timestamp])
+    peak = series[peak_timestamp]
+    peak_widths = _width_histogram(group_sizes[peak_timestamp])
+    detail = (
+        f"peak {peak} programmed EOS nexthop groups across all widths at timestamp "
+        f"{peak_timestamp}, peak width distribution "
+        f"{dict(sorted(peak_widths.items()))}"
+    )
+    if peak <= maximum_groups:
+        return (
+            False,
+            f"programmed EOS NHG ceiling OK: {detail}; did not exceed inclusive "
+            f"ceiling {maximum_groups}",
+        )
+    return (
+        True,
+        f"programmed EOS NHG ceiling BREACH: {detail}; exceeded inclusive "
+        f"ceiling {maximum_groups}",
+    )
+
+
+def _programmed_group_floor_verdict(
+    series: t.Mapping[t.Any, int],
+    minimum_groups: int,
+) -> t.Tuple[bool, str]:
+    """Require at least one direct EOS programmed-group sample at the floor."""
+    if not series:
+        return True, (
+            "programmed EOS NHG floor NOT EVALUATED: no detailed programmed "
+            "nexthop-group samples were recorded"
+        )
+    peak_timestamp = max(series, key=lambda timestamp: series[timestamp])
+    peak = series[peak_timestamp]
+    if peak >= minimum_groups:
+        return False, (
+            f"programmed EOS NHG floor ACKNOWLEDGED: peak {peak} at timestamp "
+            f"{peak_timestamp} reached floor {minimum_groups}"
+        )
+    return True, (
+        f"programmed EOS NHG floor BREACH: peak {peak} at timestamp "
+        f"{peak_timestamp} never reached floor {minimum_groups}"
+    )
+
+
+def _series_window(series: t.Dict[float, t.Any], count: int, last: bool) -> t.List:
+    """First or last ``count`` values of a timestamp-keyed series, in time order."""
+    ordered = [series[ts] for ts in sorted(series)]
+    if count <= 0 or count >= len(ordered):
+        return ordered
+    return ordered[-count:] if last else ordered[:count]
+
+
+def _checked_int(
+    params: t.Mapping[str, t.Any],
+    name: str,
+    problems: t.List[str],
+    *,
+    minimum: int,
+) -> t.Optional[int]:
+    """``int(params[name])`` with a coercion failure turned into a verdict.
+
+    A bare ``int()`` here was the one place the misconfiguration DETECTOR could
+    itself crash: a non-numeric value raised ValueError straight out of
+    ``run_final_check`` instead of being reported as the config breach it is.
+    That is the exact failure mode this function exists to convert into a
+    verdict, so it must not be the one that escapes as an exception.
+
+    Returns None -- and records a problem -- when the value is unusable, so the
+    caller can skip any further reasoning about it.
+    """
+    value = params.get(name)
+    if value is None:
+        return None
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        problems.append(f"{name} must be an integer, got {value!r}")
+        return None
+    if coerced < minimum:
+        problems.append(f"{name} must be >= {minimum}, got {coerced}")
+        return None
+    return coerced
+
+
+def _aggregate_nhg_trigger_param_problems(
+    params: t.Mapping[str, t.Any],
+) -> t.List[str]:
+    problems: t.List[str] = []
+    _checked_int(params, "min_observed_groups", problems, minimum=1)
+    _checked_int(params, "min_ecmp_width", problems, minimum=1)
+    if params.get("min_observed_multiway_groups") is not None:
+        if params.get("min_observed_groups") is None:
+            problems.append(
+                "min_observed_multiway_groups was set without "
+                "min_observed_groups, so there is no configured-group floor "
+                "for the same-sample trigger"
+            )
+        if params.get("min_ecmp_width") is None:
+            problems.append(
+                "min_observed_multiway_groups was set without min_ecmp_width, "
+                "so the same-sample multipath floor cannot be evaluated"
+            )
+    if params.get("min_observed_groups_consecutive_samples") is not None and (
+        params.get("min_observed_groups") is None
+    ):
+        problems.append(
+            "min_observed_groups_consecutive_samples was set without "
+            "min_observed_groups, so there is no observation floor to sustain"
+        )
+    _checked_int(params, "min_observed_multiway_groups", problems, minimum=1)
+    _checked_int(
+        params,
+        "min_observed_groups_consecutive_samples",
+        problems,
+        minimum=1,
+    )
+    return problems
+
+
+def _misconfigured_params(params: t.Dict[str, t.Any]) -> t.List[str]:  # noqa: C901
+    """Opt-in params that were requested but cannot produce a verdict.
+
+    Silence is the wrong response to a misconfigured gate: the caller asked for
+    an assertion and would otherwise get a green run with no assertion.
+    """
+    problems: t.List[str] = []
+    if params.get("max_multiway_groups") is not None and (
+        params.get("min_ecmp_width") is None
+    ):
+        problems.append(
+            "max_multiway_groups was set without min_ecmp_width, so the "
+            "ECMP-set ceiling cannot be evaluated"
+        )
+    if params.get("min_bgp_multiway_groups") is not None and (
+        params.get("min_ecmp_width") is None
+    ):
+        problems.append(
+            "min_bgp_multiway_groups was set without min_ecmp_width, so the "
+            "BGP multipath-NHG trigger cannot be evaluated"
+        )
+    if params.get("min_bgp_multiway_consecutive_samples") is not None and (
+        params.get("min_bgp_multiway_groups") is None
+    ):
+        problems.append(
+            "min_bgp_multiway_consecutive_samples was set without "
+            "min_bgp_multiway_groups, so there is no trigger floor to sustain"
+        )
+    _checked_int(params, "min_bgp_multiway_groups", problems, minimum=1)
+    _checked_int(
+        params,
+        "min_bgp_multiway_consecutive_samples",
+        problems,
+        minimum=1,
+    )
+    if params.get("min_bgp_groups_consecutive_samples") is not None and (
+        params.get("min_bgp_groups") is None
+    ):
+        problems.append(
+            "min_bgp_groups_consecutive_samples was set without "
+            "min_bgp_groups, so there is no all-width BGP-group floor to sustain"
+        )
+    _checked_int(params, "min_bgp_groups", problems, minimum=1)
+    min_programmed_groups = _checked_int(
+        params, "min_programmed_groups", problems, minimum=1
+    )
+    max_programmed_groups = _checked_int(
+        params, "max_programmed_groups", problems, minimum=0
+    )
+    if (
+        min_programmed_groups is not None
+        and max_programmed_groups is not None
+        and min_programmed_groups > max_programmed_groups
+    ):
+        problems.append(
+            "min_programmed_groups must be <= max_programmed_groups, got "
+            f"{min_programmed_groups} > {max_programmed_groups}"
+        )
+    _checked_int(
+        params,
+        "min_bgp_groups_consecutive_samples",
+        problems,
+        minimum=1,
+    )
+    problems.extend(_aggregate_nhg_trigger_param_problems(params))
+    if params.get("recovery_window_samples") is not None and (
+        params.get("recovery_tolerance") is None
+    ):
+        problems.append(
+            "recovery_window_samples was set without recovery_tolerance, so "
+            "the recovery gate is inert"
+        )
+    _checked_int(params, "recovery_window_samples", problems, minimum=1)
+    _checked_int(params, "min_samples", problems, minimum=1)
+    # 0 is meaningful here: "no exceedance tolerated", i.e. the pre-tolerance
+    # behaviour stated explicitly rather than by omission.
+    _checked_int(params, "unprogrammed_tolerance_samples", problems, minimum=0)
+    if params.get("unprogrammed_tolerance_samples") is not None and (
+        params.get("max_unprogrammed") is None
+    ):
+        problems.append(
+            "unprogrammed_tolerance_samples was set without max_unprogrammed, "
+            "so there is no unprogrammed ceiling for it to soften"
+        )
+    _checked_int(params, "expected_converged_multiway_groups", problems, minimum=0)
+    _checked_int(params, "max_converged_unprogrammed", problems, minimum=0)
+    # The closing window must be ODD. statistics.median AVERAGES the two middle
+    # values of an even-length window, so a window straddling 2 and 3 medians to
+    # 2.5 -- and 2.5 never equals an integer expectation, so a HEALTHY device
+    # breaches. This is not theoretical: the first fully green run logged
+    # "settled at 2.0", a float, and passed only because all ten closing samples
+    # happened to be identical. An odd window always medians to a real observed
+    # sample.
+    converged_window = _checked_int(
+        params, "converged_window_samples", problems, minimum=1
+    )
+    if converged_window is not None and converged_window % 2 == 0:
+        problems.append(
+            f"converged_window_samples must be ODD, got {converged_window}: an "
+            f"even window medians to the average of its two middle samples, so "
+            f"a window straddling two values yields a half-integer that can "
+            f"never equal the expected count -- a healthy device would breach"
+        )
+    if params.get("expected_converged_multiway_groups") is not None and (
+        params.get("min_ecmp_width") is None
+    ):
+        problems.append(
+            "expected_converged_multiway_groups was set without min_ecmp_width, "
+            "so there is no multi-way series to settle"
+        )
+    # The recovery band is baseline/tolerance .. baseline*tolerance, so the
+    # parameter is only meaningful at >= 1. Zero divides; anything in (0, 1)
+    # INVERTS the band (low > high), which no value can satisfy, so the gate
+    # would fail every run for a reason the message would not explain; and a
+    # non-finite tolerance widens the band to admit everything.
+    tolerance = params.get("recovery_tolerance")
+    if tolerance is not None:
+        try:
+            numeric_tolerance = float(tolerance)
+        except (TypeError, ValueError):
+            problems.append(f"recovery_tolerance must be a number, got {tolerance!r}")
+        else:
+            if not math.isfinite(numeric_tolerance) or numeric_tolerance < 1:
+                problems.append(
+                    f"recovery_tolerance must be a finite value >= 1, got "
+                    f"{tolerance}: 0 raises, 0 < tolerance < 1 inverts the "
+                    f"recovery band so no value can satisfy it, and an infinite "
+                    f"tolerance admits anything"
+                )
+    return problems
+
+
+def _observation_verdict(observed_max: int, floor: int) -> t.Tuple[bool, str]:
+    """Verdict on whether the metric observed anything plausible at all.
+
+    An all-zero series is not empty, so it clears the empty-series guard and
+    then satisfies any ceiling. On bag012 this metric read 0 for all 884
+    samples and the suite passed repeatedly on a structurally blind gate.
+    """
+    if observed_max >= floor:
+        return (
+            False,
+            f"observation OK: peak nexthop-group count {observed_max} reaches "
+            f"the expected floor ({floor})",
+        )
+    return (
+        True,
+        f"observation BREACH: peak nexthop-group count {observed_max} never "
+        f"reached the expected floor ({floor}) -- the metric is reporting "
+        f"values but they are implausible for this topology, so any ceiling "
+        f"above it is vacuous",
+    )
+
+
+def _aggregate_nhg_trigger_verdict(
+    group_counts: t.Mapping[t.Any, int],
+    sizes_data: t.Mapping[t.Any, t.Dict[int, int]],
+    minimum_groups: int,
+    minimum_consecutive_samples: int,
+    min_ecmp_width: t.Optional[int],
+    minimum_multiway_groups: t.Optional[int],
+) -> t.Tuple[bool, str]:
+    """Require an EOS summary sample to satisfy the count and width floors."""
+    ordered = sorted(group_counts, key=float)
+    if minimum_multiway_groups is not None:
+        inconsistent = [
+            timestamp
+            for timestamp in ordered
+            if timestamp not in sizes_data
+            or sum(sizes_data[timestamp].values()) != group_counts[timestamp]
+        ]
+        if inconsistent:
+            return True, (
+                "device NHG trigger NOT EVALUATED: the nexthop-group size "
+                "histogram did not account for every configured group in "
+                f"{len(inconsistent)}/{len(ordered)} samples"
+            )
+
+    multiway_by_timestamp = {
+        timestamp: (
+            _count_multiway_groups(sizes_data[timestamp], min_ecmp_width)
+            if minimum_multiway_groups is not None and min_ecmp_width is not None
+            else 0
+        )
+        for timestamp in ordered
+    }
+    qualifying: t.List[t.Any] = []
+    longest = current = 0
+    for timestamp in ordered:
+        meets_floor = group_counts[timestamp] >= minimum_groups
+        if minimum_multiway_groups is not None:
+            meets_floor = meets_floor and (
+                multiway_by_timestamp[timestamp] >= minimum_multiway_groups
+            )
+        if meets_floor:
+            qualifying.append(timestamp)
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+
+    peak_timestamp = max(
+        ordered,
+        key=lambda timestamp: (
+            group_counts[timestamp],
+            multiway_by_timestamp[timestamp],
+        ),
+    )
+    detail = (
+        f"peak {group_counts[peak_timestamp]} configured groups at timestamp "
+        f"{peak_timestamp}"
+    )
+    if minimum_multiway_groups is not None and min_ecmp_width is not None:
+        detail += (
+            f", including {multiway_by_timestamp[peak_timestamp]} groups "
+            f">= {min_ecmp_width}-wide, width distribution "
+            f"{dict(sorted(sizes_data[peak_timestamp].items()))}"
+        )
+    detail += (
+        f"; {len(qualifying)}/{len(ordered)} samples satisfied the same-sample "
+        f"floor, longest consecutive run {longest}"
+    )
+    if longest >= minimum_consecutive_samples:
+        return False, (
+            f"device NHG trigger ACKNOWLEDGED: {detail} (required "
+            f"{minimum_consecutive_samples} consecutive samples)"
+        )
+    return True, (
+        f"device NHG trigger BREACH: {detail}; required "
+        f"{minimum_consecutive_samples} consecutive samples with at least "
+        f"{minimum_groups} configured groups"
+        + (
+            f" and {minimum_multiway_groups} groups >= {min_ecmp_width}-wide"
+            if minimum_multiway_groups is not None
+            else ""
+        )
+    )
+
+
+def _observed_group_floor_verdict(
+    params: t.Mapping[str, t.Any],
+    group_counts: t.Mapping[t.Any, int],
+    sizes_data: t.Mapping[t.Any, t.Dict[int, int]],
+    min_ecmp_width: t.Optional[int],
+) -> t.Tuple[bool, str]:
+    minimum_groups = int(params["min_observed_groups"])
+    minimum_multiway_groups = params.get("min_observed_multiway_groups")
+    consecutive_samples = params.get("min_observed_groups_consecutive_samples")
+    if minimum_multiway_groups is None and consecutive_samples is None:
+        return _observation_verdict(max(group_counts.values()), minimum_groups)
+    return _aggregate_nhg_trigger_verdict(
+        group_counts,
+        sizes_data,
+        minimum_groups,
+        int(consecutive_samples or 1),
+        min_ecmp_width,
+        (None if minimum_multiway_groups is None else int(minimum_multiway_groups)),
+    )
+
+
+def _ecmp_set_verdict(
+    sizes_data: t.Dict[float, t.Dict[int, int]],
+    min_ecmp_width: int,
+    max_multiway_groups: t.Optional[int],
+) -> t.Tuple[bool, str]:
+    """Verdict on the number of REAL (multi-way) ECMP sets.
+
+    Returns ``(is_failure, message)``. With no ceiling supplied this is
+    observe-and-report, so a caller can land the measurement before committing
+    to a number.
+    """
+    # An empty histogram is not evidence of zero ECMP sets -- it is evidence of
+    # nothing parsed. The size table has no found-flag in the parser, so a
+    # wording or column change yields sizes={} for every sample, which would
+    # otherwise read as a confident "0 groups >= N wide" and PASS.
+    if not any(sizes for sizes in sizes_data.values()):
+        return (
+            True,
+            "ecmp-sets NOT EVALUATED: every sample reported an empty "
+            "nexthop-group size histogram, so no ECMP set could be counted -- "
+            "this is a parse or collection failure, not a device with no "
+            "nexthop groups",
+        )
+    multiway = max(
+        _count_multiway_groups(sizes, min_ecmp_width) for sizes in sizes_data.values()
+    )
+    singletons = max(sizes.get(1, 0) for sizes in sizes_data.values())
+    detail = (
+        f"max groups >= {min_ecmp_width}-wide = {multiway}, "
+        f"max width-1 groups = {singletons}"
+    )
+    if multiway == 0:
+        return (
+            True,
+            f"ecmp-sets BREACH: {detail} -- the device reported nexthop groups "
+            f"but not one of them was {min_ecmp_width} next-hops wide, so ECMP "
+            f"was never formed (or was entirely destroyed)",
+        )
+    if max_multiway_groups is None:
+        return False, f"ecmp-sets OBSERVED: {detail}"
+    if multiway <= max_multiway_groups:
+        # The bound is rendered NEXT TO the quantity it bounds. Trailing it
+        # after the whole detail put it immediately after the width-1 count,
+        # where it read as a ceiling on singleton groups -- which it is not.
+        return (
+            False,
+            f"ecmp-sets OK: max groups >= {min_ecmp_width}-wide = {multiway} "
+            f"(allowed {max_multiway_groups}), "
+            f"max width-1 groups = {singletons}",
+        )
+    return (
+        True,
+        f"ecmp-sets BREACH: {detail} exceeds the allowed maximum "
+        f"({max_multiway_groups})",
+    )
+
+
+# ODD on purpose -- see the converged_window_samples check in
+# _misconfigured_params. An even default would make the half-integer median trap
+# reachable by every caller that does not think to override it.
+_DEFAULT_CONVERGED_WINDOW_SAMPLES = 11
+_DEFAULT_RECOVERY_WINDOW_SAMPLES = 10
+
+# The fraction of the closing window that must agree with its own median before
+# that median is treated as a SETTLED value. FITTED to observed shapes, not
+# derived: a run that reaches its soak holds one value across the entire window
+# (100%), while SC9 run 9 -- whose drain aborted mid-cycle, so the window
+# covered a drained device, a rebuild and the recovered steady state -- split
+# 17/11/3 across three values and its median held only 55%. Three quarters sits
+# well clear of both and still tolerates a sampling artifact per four samples,
+# which is the whole reason the verdict medians rather than reading the last
+# sample.
+_CONVERGED_WINDOW_DOMINANCE = 0.75
+
+
+def _converged_verdict(
+    series: t.Dict[float, int], expected: int, window: int, metric: str
+) -> t.Tuple[bool, str]:
+    """Verdict on whether ``metric`` SETTLED at its expected steady-state value.
+
+    ``window`` must be ODD, which ``_misconfigured_params`` enforces for any
+    caller that sets it and ``_DEFAULT_CONVERGED_WINDOW_SAMPLES`` guarantees for
+    every caller that does not. The median of an even window is the AVERAGE of
+    its two middle samples, so a window straddling two values produces a
+    half-integer that cannot equal the integer expectation.
+
+    Distinct from ``_recovery_verdict``, and usable where that one is not. The
+    recovery check compares the closing window against the OPENING window, and
+    the opening window is unreliable here: periodic tasks start in
+    ``async_test_case_setUp``, before ``setup_steps``, so on a scale test the
+    first samples predate convergence and the baseline reads zero. This compares
+    the closing window against a LITERAL expected value instead, which needs no
+    opening baseline at all.
+
+    It is also the only thing that tests the steady state. Every other verdict
+    on this task is a maximum over the whole run, so a device that idles at five
+    ECMP sets is indistinguishable from one that idles at the two the topology
+    should produce.
+
+    Uses the MEDIAN of the closing window so one sampling artifact cannot decide
+    the verdict, and requires that median to be DOMINANT within the window --
+    see ``_CONVERGED_WINDOW_DOMINANCE`` -- so that a run which never reached a
+    steady state is reported as unevaluated rather than as a device left in
+    whatever state the run was interrupted in. Returns ``(is_failure, message)``.
+    """
+    ordered = sorted(series)
+    if len(ordered) < window:
+        return (
+            True,
+            f"converged NOT EVALUATED: {len(ordered)} samples is fewer than the "
+            f"{window} needed for a closing window, so the settled value of "
+            f"{metric} could not be assessed -- failing rather than passing an "
+            f"unevaluated gate",
+        )
+    values = _series_window(series, window, last=True)
+    final = statistics.median(values)
+    # A median is only a SETTLED value if the window it came from had settled.
+    # Without this, an aborted run reports the state it was interrupted in as
+    # though the device had been left there: SC9 run 9's drain failed in cycle 3
+    # of 5, so Stage C's soak never ran, the closing window covered the drained
+    # and rebuilding device, and the verdict read "settled at 0" -- i.e. every
+    # ECMP set destroyed -- about a device that was sitting at the correct
+    # {128: 2} in its final samples.
+    #
+    # This can never convert a real BREACH into a pass. A device genuinely stuck
+    # at the wrong value produces a FLAT closing window, which is dominant by
+    # definition and still evaluated. It only abstains where the run did not end
+    # in a steady state at all -- and per this file's policy, abstaining is
+    # itself a failure, so nothing is laundered into a green run either.
+    agreeing = values.count(final)
+    dominance = agreeing / len(values)
+    if dominance < _CONVERGED_WINDOW_DOMINANCE:
+        return (
+            True,
+            f"converged NOT EVALUATED: only {agreeing} of {len(values)} closing "
+            f"samples hold the median value {final} ({dominance:.0%}, floor "
+            f"{_CONVERGED_WINDOW_DOMINANCE:.0%}), so the window never settled "
+            f"and no steady-state value of {metric} can be read from it. This is "
+            f"what an ABORTED run looks like -- the closing window covers "
+            f"whatever the device was doing when the run stopped, not a "
+            f"post-soak steady state -- so diagnose the step that aborted, not "
+            f"this gate",
+        )
+    if final == expected:
+        return (
+            False,
+            f"converged OK: {metric} settled at {final}, the expected steady state",
+        )
+    return (
+        True,
+        f"converged BREACH: {metric} settled at {final}, not the expected "
+        f"{expected}. The closing window is post-soak, so this is the state the "
+        f"device was LEFT in, not a transient -- a value above {expected} means "
+        f"ECMP sets that never collapsed back, and below means sets that never "
+        f"formed",
+    )
+
+
+def _recovery_verdict(
+    series: t.Dict[float, int], tolerance: float, window: int, metric: str
+) -> t.Tuple[bool, str]:
+    """Verdict on whether ``metric`` returned to its opening baseline.
+
+    A bounded transient collapses back; a structural regression does not. This
+    separates the two by DURATION rather than magnitude, so it needs no
+    calibrated ceiling. Returns ``(is_failure, message)``.
+
+    The two windows must be DISJOINT. ``_series_window`` returns the whole
+    series when the requested count exceeds its length, so on a short series
+    the baseline and closing windows would be the same samples, making
+    ``final == baseline`` and the gate pass for any tolerance >= 1 -- a
+    vacuous pass of exactly the kind this check exists to prevent. Too few
+    samples is therefore a FAILURE to evaluate, not a pass.
+    """
+    ordered = sorted(series)
+    if len(ordered) < 2 * window:
+        return (
+            True,
+            f"recovery NOT EVALUATED: {len(ordered)} samples is fewer than the "
+            f"{2 * window} needed for disjoint baseline and closing windows of "
+            f"{window}, so recovery of {metric} could not be assessed -- "
+            f"failing rather than passing an unevaluated gate",
+        )
+    # Median, not max. A single spike inside the opening window would inflate
+    # the baseline and make the whole gate permissive; a single spike in the
+    # closing window would make a recovered run look broken.
+    baseline = statistics.median(_series_window(series, window, last=False))
+    final = statistics.median(_series_window(series, window, last=True))
+
+    # A zero baseline means the opening window saw nothing to recover TO --
+    # almost always because the poll starts in async_test_case_setUp, before
+    # setup_steps and convergence. Any ratio against 0 is meaningless, so
+    # refuse rather than produce a verdict that looks authoritative.
+    if baseline <= 0:
+        return (
+            True,
+            f"recovery NOT EVALUATED: the baseline window of {metric} is "
+            f"{baseline}, so there is no steady state to compare against -- the "
+            f"opening window most likely predates convergence. Start the poll "
+            f"later or widen recovery_window_samples",
+        )
+
+    # TWO-SIDED. An upper bound alone passes a collapse: on the real bag013
+    # series the multi-way count went 2 -> 0 and "settled at 0", which is every
+    # ECMP set destroyed, yet 0 <= 2 * 1.5 and the gate said OK. Recovery means
+    # returning to the steady state, not merely staying under it.
+    low, high = baseline / tolerance, baseline * tolerance
+    if low <= final <= high:
+        return (
+            False,
+            f"recovery OK: {metric} settled at {final} against a baseline of "
+            f"{baseline} (allowed {low:g}-{high:g}, window {window} samples)",
+        )
+    direction = "below" if final < low else "above"
+    return (
+        True,
+        f"recovery BREACH: {metric} settled at {final}, {direction} the "
+        f"allowed band {low:g}-{high:g} around its baseline of {baseline} -- it "
+        f"never returned to its steady state, so this is a persistent change, "
+        f"not a transient",
+    )
 
 
 class NexthopGroupPoll(PeriodicTask):
@@ -443,14 +1305,52 @@ class NexthopGroupPoll(PeriodicTask):
             else:
                 self.logger.info("No nexthop group sizes data available")
 
-            self.add_data(output)
+            sample: NexthopGroupSummary | _NexthopGroupPollSample = output
+            if (
+                params.get("min_bgp_groups") is not None
+                or params.get("min_programmed_groups") is not None
+                or params.get("max_programmed_groups") is not None
+                or params.get("min_bgp_multiway_groups") is not None
+            ):
+                group_data = await driver.get_nexthop_group_data()
+                bgp_group_sizes = (
+                    parse_bgp_nexthop_group_sizes(group_data)
+                    if params.get("min_bgp_groups") is not None
+                    or params.get("min_bgp_multiway_groups") is not None
+                    else {}
+                )
+                programmed_group_sizes = (
+                    parse_programmed_nexthop_group_sizes(group_data)
+                    if params.get("min_programmed_groups") is not None
+                    or params.get("max_programmed_groups") is not None
+                    else None
+                )
+                sample = _NexthopGroupPollSample(
+                    output,
+                    bgp_group_sizes,
+                    programmed_group_sizes,
+                )
+                if bgp_group_sizes:
+                    self.logger.info(
+                        "BGP nexthop-group width distribution: "
+                        f"{dict(sorted(_width_histogram(bgp_group_sizes).items()))}"
+                    )
+                if programmed_group_sizes is not None:
+                    self.logger.info(
+                        "Programmed EOS nexthop-group width distribution: "
+                        f"{dict(sorted(_width_histogram(programmed_group_sizes).items()))}"
+                    )
+
+            self.add_data(sample)
 
             # Display max num_groups_configured across all collected data
             if self._data:
                 max_num_groups = max(
-                    summary.num_groups_configured
-                    for summary in self._data.values()
-                    if isinstance(summary, NexthopGroupSummary)
+                    value.summary.num_groups_configured
+                    if isinstance(value, _NexthopGroupPollSample)
+                    else value.num_groups_configured
+                    for value in self._data.values()
+                    if isinstance(value, (NexthopGroupSummary, _NexthopGroupPollSample))
                 )
                 self.logger.info(
                     f"Current max num_groups_configured across all samples: {max_num_groups}"
@@ -465,10 +1365,41 @@ class NexthopGroupPoll(PeriodicTask):
         """
         Analyzes collected nexthop group data and generates a multi-series plot.
 
-        Checks if the maximum num_groups_configured is below threshold.
+        Independent verdicts, reported separately so triage can tell them apart.
+        Only the first is always on; every other one is opt-in via a param, so
+        existing callers are unaffected until they ask for it:
+
+        1. ``max(num_groups_configured) < threshold`` -- the transient ECMP-set
+           ceiling.
+        2. ``max(num_unprogrammed_groups) <= max_unprogrammed`` -- the device's
+           own "I could not program this group" signal, i.e. the closest thing
+           the box reports to "the hardware table is full".
+        3. ``max_converged_unprogrammed`` -- the closing post-soak window has
+           no persistent unprogrammed groups.
+        4. ``len(samples) >= min_samples`` -- the poll stayed alive.
+        5. multi-way ECMP-set count and ceiling (``min_ecmp_width`` /
+           ``max_multiway_groups``).
+        6. the settled multi-way count (``expected_converged_multiway_groups``).
+        7. a floor on what was observed at all (``min_observed_groups``).
+        8. an optional same-sample aggregate count and multipath floor.
+        9. recovery to the opening baseline (``recovery_tolerance``).
+        10. BGP-only named-NHG creation across every width
+           (``min_bgp_groups``).
+        11. sustained BGP-only multipath-NHG creation
+           (``min_bgp_multiway_groups``).
+        12. a floor on the peak sampled EOS programmed-group count
+            (``min_programmed_groups``).
+        13. an inclusive ceiling on every sampled EOS nexthop group whose
+            group-level programmed state is true (``max_programmed_groups``).
+
+        Collecting no data is a FAILURE, not a SKIP. ``run`` swallows every
+        collection exception, so an empty series means every single poll failed
+        -- reporting SKIP there let the check pass having proven nothing. An
+        entirely empty series is caught below; a series that merely lost most of
+        its samples is what ``min_samples`` is for.
 
         Returns:
-            PeriodicCheckResult with PASS if max is above/equal to threshold, FAIL otherwise
+            PeriodicCheckResult: PASS only when every enabled verdict passes.
         """
         self.logger.info(
             f"NexthopGroupPoll run_final_check: self._data has {len(self._data)} entries"
@@ -478,8 +1409,13 @@ class NexthopGroupPoll(PeriodicTask):
             return PeriodicCheckResult(
                 # pyrefly: ignore [bad-argument-type]
                 name=self.NAME,
-                status=hc_types.HealthCheckStatus.SKIP,
-                message="No data collected during periodic task execution",
+                status=hc_types.HealthCheckStatus.FAIL,
+                message=(
+                    "No nexthop-group data collected during the run. run() logs "
+                    "and swallows every collection failure, so an empty series "
+                    "means every poll failed and the ceiling was never measured "
+                    "-- failing rather than reporting an unverified pass."
+                ),
             )
 
         threshold = self._params.get("threshold")
@@ -494,20 +1430,38 @@ class NexthopGroupPoll(PeriodicTask):
 
         num_groups_configured_data: t.Dict[float, int] = {}
         num_unprogrammed_groups_data: t.Dict[float, int] = {}
+        # Width histogram per sample, so the verdict can separate real ECMP sets
+        # from width-1 groups. Without it the count conflates the two -- see
+        # _count_multiway_groups.
+        sizes_data: t.Dict[float, t.Dict[int, int]] = {}
+        bgp_group_sizes_data: t.Dict[float, t.Dict[str, int]] = {}
+        programmed_group_sizes_data: t.Dict[float, t.Dict[str, int]] = {}
 
-        for timestamp, summary in self._data.items():
+        for timestamp, value in self._data.items():
+            summary = value
+            if isinstance(value, _NexthopGroupPollSample):
+                summary = value.summary
+                bgp_group_sizes_data[timestamp] = value.bgp_group_sizes
+                if value.programmed_group_sizes is not None:
+                    programmed_group_sizes_data[timestamp] = (
+                        value.programmed_group_sizes
+                    )
             if isinstance(summary, NexthopGroupSummary):
                 num_groups_configured_data[timestamp] = summary.num_groups_configured
                 num_unprogrammed_groups_data[timestamp] = (
                     summary.num_unprogrammed_groups
                 )
+                sizes_data[timestamp] = summary.nexthop_group_sizes or {}
 
         if not num_groups_configured_data:
             return PeriodicCheckResult(
                 # pyrefly: ignore [bad-argument-type]
                 name=self.NAME,
-                status=hc_types.HealthCheckStatus.SKIP,
-                message="No valid NexthopGroupSummary data collected",
+                status=hc_types.HealthCheckStatus.FAIL,
+                message=(
+                    "Samples were recorded but none was a NexthopGroupSummary, "
+                    "so no nexthop-group count could be evaluated."
+                ),
             )
 
         max_num_groups_configured = max(num_groups_configured_data.values())
@@ -517,29 +1471,387 @@ class NexthopGroupPoll(PeriodicTask):
             f"Final max num_groups_configured across all samples: {max_num_groups_configured}"
         )
 
+        # A gate that was asked for but cannot run must say so, not stay silent.
+        # Each of these combinations previously produced no verdict at all, so a
+        # typo in a TestConfig disabled the gate invisibly.
+        #
+        # This RETURNS rather than accumulating a failure and carrying on: a
+        # parameter that failed validation must not then be used. Reporting
+        # recovery_tolerance=0 as a breach and then passing that same 0 to
+        # _recovery_verdict divides by it, so the config error escaped as a
+        # ZeroDivisionError instead of a verdict. A broken gate needs a
+        # corrected config and a re-run regardless, so the remaining verdicts
+        # would be scored against a configuration nobody intended.
+        problems = _misconfigured_params(self._params)
+        if problems:
+            return PeriodicCheckResult(
+                # pyrefly: ignore [bad-argument-type]
+                name=self.NAME,
+                status=hc_types.HealthCheckStatus.FAIL,
+                message="; ".join(f"config BREACH: {problem}" for problem in problems),
+            )
+
+        verdicts: t.List[str] = []
+        failures: t.List[str] = []
+
         if max_num_groups_configured < threshold:
-            status = hc_types.HealthCheckStatus.PASS
-            message = (
-                f"Max num_groups_configured ({max_num_groups_configured}) "
-                f"is below threshold ({threshold})"
+            verdicts.append(
+                f"count OK: max num_groups_configured "
+                f"({max_num_groups_configured}) is below threshold ({threshold})"
             )
         else:
-            status = hc_types.HealthCheckStatus.FAIL
-            message = (
-                f"Max num_groups_configured ({max_num_groups_configured}) "
-                f"meets or exceeds threshold ({threshold})"
+            failures.append(
+                f"count BREACH: max num_groups_configured "
+                f"({max_num_groups_configured}) meets or exceeds threshold "
+                f"({threshold})"
             )
+
+        # Opt-in second verdict. `num_unprogrammed_groups` is the device's own
+        # report that it could not program a group -- the most direct signal
+        # available that a hardware table was exceeded. It has always been
+        # sampled and plotted; until now nothing asserted on it. See
+        # `_unprogrammed_verdict` for why the empty case is a failure and why
+        # the check lives there rather than inline here.
+        max_unprogrammed = self._params.get("max_unprogrammed")
+        if max_unprogrammed is not None:
+            tolerance = self._params.get("unprogrammed_tolerance_samples")
+            failed, text = _unprogrammed_verdict(
+                num_unprogrammed_groups_data,
+                int(max_unprogrammed),
+                None if tolerance is None else int(tolerance),
+            )
+            (failures if failed else verdicts).append(text)
+
+        max_converged_unprogrammed = self._params.get("max_converged_unprogrammed")
+        if max_converged_unprogrammed is not None:
+            failed, text = _converged_unprogrammed_verdict(
+                num_unprogrammed_groups_data,
+                int(max_converged_unprogrammed),
+                int(
+                    self._params.get(
+                        "converged_window_samples",
+                        _DEFAULT_CONVERGED_WINDOW_SAMPLES,
+                    )
+                ),
+            )
+            (failures if failed else verdicts).append(text)
+
+        # Opt-in: a floor on HOW MANY samples the run collected at all. `run`
+        # swallows every collection exception and the guard above fails only on
+        # an ENTIRELY empty series, so a run that lost most of its polls still
+        # evaluates every verdict here on the survivors -- and reports them with
+        # exactly the same confidence as a complete series. The first clean SC9
+        # run recorded 195 samples and nothing remarked on it either way.
+        #
+        # This is a liveness floor, not a completeness assertion: the exact count
+        # is appended to every message regardless, so the number is always
+        # visible even when this gate is not set.
+        min_samples = self._params.get("min_samples")
+        if min_samples is not None:
+            collected = len(num_groups_configured_data)
+            if collected >= min_samples:
+                verdicts.append(
+                    f"samples OK: collected {collected} nexthop-group samples "
+                    f"(floor {min_samples})"
+                )
+            else:
+                failures.append(
+                    f"samples BREACH: collected only {collected} nexthop-group "
+                    f"samples against a floor of {min_samples} -- the poll lost "
+                    f"most of its reads, so every other verdict here was scored "
+                    f"on an unrepresentative subset of the run"
+                )
+
+        # Opt-in third verdict: the ECMP-set ceiling measured on REAL sets only.
+        # This is the quantity the "bounded number of programmed ECMP sets"
+        # characteristic is actually about; the raw count above cannot tell a
+        # genuine ECMP-set increase from a collapse into width-1 singletons.
+        min_ecmp_width = self._params.get("min_ecmp_width")
+        multiway_series: t.Optional[t.Dict[float, int]] = None
+        if min_ecmp_width is not None and sizes_data:
+            multiway_series = {
+                ts: _count_multiway_groups(sizes, min_ecmp_width)
+                for ts, sizes in sizes_data.items()
+            }
+            failed, text = _ecmp_set_verdict(
+                sizes_data, min_ecmp_width, self._params.get("max_multiway_groups")
+            )
+            (failures if failed else verdicts).append(text)
+
+        # Opt-in gates for C16-style NHG churn. BGP-named rows support the
+        # legacy trigger metric, while the resource ceiling uses every EOS row:
+        # the FibAgent watermark is global and live AristaFibAgent rows can be
+        # named igpgrp_* rather than bgpgrp_*.
+        bgp_group_series: t.Optional[t.Dict[float, int]] = None
+        bgp_multiway_series: t.Optional[t.Dict[float, int]] = None
+        programmed_group_series: t.Optional[t.Dict[float, int]] = None
+        min_bgp_groups = self._params.get("min_bgp_groups")
+        min_programmed_groups = self._params.get("min_programmed_groups")
+        max_programmed_groups = self._params.get("max_programmed_groups")
+        min_bgp_multiway_groups = self._params.get("min_bgp_multiway_groups")
+        detailed_requested = (
+            min_bgp_groups is not None
+            or min_programmed_groups is not None
+            or max_programmed_groups is not None
+            or min_bgp_multiway_groups is not None
+        )
+        if detailed_requested:
+            if len(bgp_group_sizes_data) != len(num_groups_configured_data):
+                if min_bgp_groups is not None or min_bgp_multiway_groups is not None:
+                    failures.append(
+                        "bgp-nhg trigger NOT EVALUATED: detailed bgpgrp_* data was "
+                        f"recorded for {len(bgp_group_sizes_data)} of "
+                        f"{len(num_groups_configured_data)} nexthop-group samples"
+                    )
+            if len(bgp_group_sizes_data) == len(num_groups_configured_data):
+                if min_bgp_groups is not None:
+                    bgp_group_series = {
+                        ts: len(named_sizes)
+                        for ts, named_sizes in bgp_group_sizes_data.items()
+                    }
+                if min_bgp_groups is not None:
+                    assert bgp_group_series is not None
+                    required_samples = int(
+                        self._params.get("min_bgp_groups_consecutive_samples", 1)
+                    )
+                    failed, text = _bgp_high_watermark_verdict(
+                        bgp_group_series,
+                        bgp_group_sizes_data,
+                        int(min_bgp_groups),
+                        required_samples,
+                        None,
+                    )
+                    (failures if failed else verdicts).append(text)
+                if min_bgp_multiway_groups is not None and min_ecmp_width is not None:
+                    bgp_multiway_series = {
+                        ts: sum(
+                            1
+                            for width in named_sizes.values()
+                            if width >= min_ecmp_width
+                        )
+                        for ts, named_sizes in bgp_group_sizes_data.items()
+                    }
+                    required_samples = int(
+                        self._params.get(
+                            "min_bgp_multiway_consecutive_samples",
+                            1,
+                        )
+                    )
+                    failed, text = _bgp_high_watermark_verdict(
+                        bgp_multiway_series,
+                        bgp_group_sizes_data,
+                        int(min_bgp_multiway_groups),
+                        required_samples,
+                        int(min_ecmp_width),
+                    )
+                    (failures if failed else verdicts).append(text)
+                raw_evidence = [
+                    {
+                        "timestamp": str(ts),
+                        "all_width_groups": len(bgp_group_sizes_data[ts]),
+                        **(
+                            {"multiway_groups": bgp_multiway_series[ts]}
+                            if bgp_multiway_series is not None
+                            else {}
+                        ),
+                        "width_distribution": dict(
+                            sorted(_width_histogram(bgp_group_sizes_data[ts]).items())
+                        ),
+                    }
+                    for ts in sorted(bgp_group_sizes_data, key=float)
+                ]
+                self.logger.info(f"BGP nexthop-group raw samples: {raw_evidence}")
+            if min_programmed_groups is not None or max_programmed_groups is not None:
+                if len(programmed_group_sizes_data) != len(num_groups_configured_data):
+                    failures.append(
+                        "programmed EOS NHG ceiling NOT EVALUATED: detailed "
+                        "group-level programmed data was recorded for "
+                        f"{len(programmed_group_sizes_data)} of "
+                        f"{len(num_groups_configured_data)} nexthop-group samples"
+                    )
+                else:
+                    programmed_group_series = {
+                        ts: len(named_sizes)
+                        for ts, named_sizes in programmed_group_sizes_data.items()
+                    }
+                    if min_programmed_groups is not None:
+                        failed, text = _programmed_group_floor_verdict(
+                            programmed_group_series,
+                            int(min_programmed_groups),
+                        )
+                        (failures if failed else verdicts).append(text)
+                    if max_programmed_groups is not None:
+                        failed, text = _programmed_group_ceiling_verdict(
+                            programmed_group_series,
+                            programmed_group_sizes_data,
+                            int(max_programmed_groups),
+                        )
+                        (failures if failed else verdicts).append(text)
+                    programmed_raw_evidence = [
+                        {
+                            "timestamp": str(ts),
+                            "programmed_groups": programmed_group_series[ts],
+                            "width_distribution": dict(
+                                sorted(
+                                    _width_histogram(
+                                        programmed_group_sizes_data[ts]
+                                    ).items()
+                                )
+                            ),
+                        }
+                        for ts in sorted(programmed_group_sizes_data, key=float)
+                    ]
+                    self.logger.info(
+                        "Programmed EOS nexthop-group raw samples: "
+                        f"{programmed_raw_evidence}"
+                    )
+
+        # Opt-in: the STEADY STATE, as opposed to every other verdict here,
+        # which is a maximum over the whole run.
+        expected_converged = self._params.get("expected_converged_multiway_groups")
+        if expected_converged is not None and multiway_series is not None:
+            failed, text = _converged_verdict(
+                multiway_series,
+                int(expected_converged),
+                int(
+                    self._params.get(
+                        "converged_window_samples",
+                        _DEFAULT_CONVERGED_WINDOW_SAMPLES,
+                    )
+                ),
+                f"groups >= {min_ecmp_width}-wide",
+            )
+            (failures if failed else verdicts).append(text)
+
+        # Opt-in: a floor on what was observed at all. An ALL-ZERO series is not
+        # empty, so it survives the empty-series guard above and then satisfies
+        # any "max below threshold" ceiling -- max(0) < 50 passes. That is not
+        # hypothetical: on bag012 this metric read 0 for all 884 samples and the
+        # suite passed 11 times on a gate that was structurally blind.
+        min_observed = self._params.get("min_observed_groups")
+        if min_observed is not None:
+            failed, text = _observed_group_floor_verdict(
+                self._params,
+                num_groups_configured_data,
+                sizes_data,
+                None if min_ecmp_width is None else int(min_ecmp_width),
+            )
+            (failures if failed else verdicts).append(text)
+
+        # Opt-in: RECOVERY. A bounded transient collapses back to the steady
+        # state; a structural regression does not. Asserting recovery separates
+        # the two by DURATION rather than magnitude, which means it needs no
+        # calibrated ceiling -- deliberately, because the historical ceiling on
+        # this task has never had a hardware derivation.
+        recovery_tolerance = self._params.get("recovery_tolerance")
+        if recovery_tolerance is not None:
+            # Prefer the multi-way series when we have it: a collapse from
+            # {128: 2} to {1: 2} leaves the RAW count at 2 and would "recover"
+            # cleanly while every real ECMP set was destroyed. When
+            # min_ecmp_width is set the multi-way series is always the one used:
+            # sizes_data carries one entry per NexthopGroupSummary sample, so it
+            # is falsy only when there were no summaries at all -- and that case
+            # has already returned above. An all-empty histogram therefore
+            # yields a populated all-zero series, which _ecmp_set_verdict flags
+            # as a parse failure and the zero-baseline guard refuses to score.
+            series = (
+                multiway_series
+                if multiway_series is not None
+                else num_groups_configured_data
+            )
+            metric = (
+                f"groups >= {min_ecmp_width}-wide"
+                if multiway_series is not None
+                else "nexthop-group count"
+            )
+            failed, text = _recovery_verdict(
+                series,
+                recovery_tolerance,
+                int(
+                    self._params.get(
+                        "recovery_window_samples",
+                        _DEFAULT_RECOVERY_WINDOW_SAMPLES,
+                    )
+                ),
+                metric,
+            )
+            (failures if failed else verdicts).append(text)
+
+        status = (
+            hc_types.HealthCheckStatus.FAIL
+            if failures
+            else hc_types.HealthCheckStatus.PASS
+        )
+        # Sample COUNT is not sample COVERAGE, and `min_samples` only bounds the
+        # former. `_converged_verdict` reads a positional tail -- the last N
+        # samples -- so if collection wedges partway through (every poll raising
+        # and being swallowed by `run`), the series simply stops growing and
+        # that "closing window" is really a mid-run window. A drain-phase window
+        # medians to 0, which reports as `converged BREACH ... settled at 0`:
+        # instrument death wearing the costume of a device that destroyed every
+        # ECMP set. Exactly the misattribution that made the rel-191 triage
+        # wrong.
+        #
+        # Gating on it needs a threshold nobody has measured: workers are torn
+        # down -- including everpaste upload -- BEFORE run_final_check, so even
+        # a perfectly healthy run's newest sample is already minutes old here.
+        # Reporting the SPAN costs nothing and is what makes that threshold
+        # measurable: a span far short of the run's duration is a wedge, and it
+        # is now visible in the message instead of having to be inferred from
+        # the plot. Gate once there is a number.
+        # float() on the keys is NOT defensive padding. In production `_data` is
+        # a `_SharedDataView` over a multiprocessing Manager dict: `add_data`
+        # casts the timestamp to int, but the view stores it as
+        # `f"{prefix}{key}"` and hands it back as `key[prefix_len:]` -- a
+        # concatenation and a slice -- so every key is a STR at runtime. Tests
+        # construct the task with `shared_data=None`, which takes the plain-dict
+        # branch and keeps int keys, so the whole suite exercises a key type
+        # production never uses. Every verdict above survives that because it
+        # only ever SORTS the keys (lexicographic order matches numeric order
+        # for fixed-width epoch seconds); this is the first arithmetic on one.
+        timestamps = sorted(float(ts) for ts in num_groups_configured_data)
+        span_seconds = int(timestamps[-1] - timestamps[0]) if timestamps else 0
+        message = "; ".join(failures + verdicts)
+        message += f" [samples={len(num_groups_configured_data)}, span={span_seconds}s]"
 
         data_series = {
             "num_groups_configured": num_groups_configured_data,
             "num_unprogrammed_groups": num_unprogrammed_groups_data,
         }
+        # The multi-way series is the one that shows the characteristic. The raw
+        # count cannot distinguish "more ECMP sets" from "ECMP collapsed into
+        # width-1 singletons" -- the latter makes it RISE -- so a triager
+        # opening the plot to see the steady -> transient -> steady shape was
+        # looking at the one series that cannot show it. Computed already; it
+        # was simply never plotted.
+        if multiway_series is not None:
+            data_series[f"groups_>={min_ecmp_width}_wide"] = multiway_series
+        if bgp_group_series is not None:
+            data_series["bgpgrp_groups_all_widths"] = bgp_group_series
+        if programmed_group_series is not None:
+            data_series["programmed_eos_nexthop_groups_all_widths"] = (
+                programmed_group_series
+            )
+        if bgp_multiway_series is not None:
+            data_series[f"bgpgrp_groups_>={min_ecmp_width}_wide"] = bgp_multiway_series
 
         # Create annotations with max num_groups_configured value
         plot_annotations = {
             "Max Groups Configured": max_num_groups_configured,
             "Samples Collected": len(self._data),
         }
+        if bgp_multiway_series:
+            plot_annotations["Max BGP Multiway Groups"] = max(
+                bgp_multiway_series.values()
+            )
+        if bgp_group_series:
+            plot_annotations["Max BGP Groups (All Widths)"] = max(
+                bgp_group_series.values()
+            )
+        if programmed_group_series:
+            plot_annotations["Max Programmed EOS Groups (All Widths)"] = max(
+                programmed_group_series.values()
+            )
 
         plot_path = await _generate_multi_series_plot(
             data_series=data_series,
@@ -551,7 +1863,9 @@ class NexthopGroupPoll(PeriodicTask):
 
         if plot_path:
             try:
-                plot_url = await async_everpaste_file(plot_path)
+                plot_url = format_everpaste_url(
+                    await async_everpaste_file(plot_path, extension="png")
+                )
                 message += f"\nPlot: {plot_url}"
                 self.logger.info(f"Plot uploaded to: {plot_url}")
             except Exception as e:
@@ -768,21 +2082,22 @@ class ProcessMonitorTask(PeriodicTask):
             String containing plot URLs to append to message
         """
         plot_urls = ""
-
         # Generate CPU plot for each process
         for process_name, cpu_data in process_cpu_data.items():
+            process_label = _process_lifetime_label(process_name)
             cpu_plot_path = await _generate_plot(
                 data=cpu_data,
-                title=f"CPU Usage Over Time: {process_name}",
+                title=f"CPU Usage — {process_label}",
                 ylabel="CPU %",
+                y_axis_starts_at_zero=True,
             )
             if cpu_plot_path:
                 try:
-                    cpu_plot_url = await async_everpaste_file(cpu_plot_path)
-                    plot_urls += f"\n\nCPU Plot [{process_name}]: {cpu_plot_url}"
-                    self.logger.info(
-                        f"CPU plot for {process_name} uploaded to: {cpu_plot_url}"
+                    cpu_plot_url = format_everpaste_url(
+                        await async_everpaste_file(cpu_plot_path, extension="png")
                     )
+                    plot_urls += f"\n\nCPU Plot [{process_label}]: {cpu_plot_url}"
+                    self.logger.info(f"CPU plot [{process_label}]: {cpu_plot_url}")
                 except Exception as e:
                     self.logger.warning(
                         f"Failed to upload CPU plot for {process_name}: {e}"
@@ -790,17 +2105,21 @@ class ProcessMonitorTask(PeriodicTask):
 
         # Generate resident memory plot for each process
         for process_name, mem_data in process_mem_data.items():
+            process_label = _process_lifetime_label(process_name)
             mem_plot_path = await _generate_plot(
                 data=mem_data,
-                title=f"Resident Memory Usage Over Time: {process_name}",
+                title=f"Resident Memory — {process_label}",
                 ylabel="Resident Memory (MB)",
+                y_axis_starts_at_zero=True,
             )
             if mem_plot_path:
                 try:
-                    mem_plot_url = await async_everpaste_file(mem_plot_path)
-                    plot_urls += f"\nMemory Plot [{process_name}]: {mem_plot_url}"
+                    mem_plot_url = format_everpaste_url(
+                        await async_everpaste_file(mem_plot_path, extension="png")
+                    )
+                    plot_urls += f"\nMemory Plot [{process_label}]: {mem_plot_url}"
                     self.logger.info(
-                        f"Resident memory plot for {process_name} uploaded to: {mem_plot_url}"
+                        f"Resident memory plot [{process_label}]: {mem_plot_url}"
                     )
                 except Exception as e:
                     self.logger.warning(
@@ -944,11 +2263,14 @@ class CpuLoadAverageTask(PeriodicTask):
                 title="CPU Load Average Over Time",
                 ylabel="CPU Load Average",
                 threshold=threshold,
+                y_axis_starts_at_zero=True,
             )
             if plot_path:
                 # Upload to everpaste
                 try:
-                    plot_url = await async_everpaste_file(plot_path)
+                    plot_url = format_everpaste_url(
+                        await async_everpaste_file(plot_path, extension="png")
+                    )
                     message += f"\nPlot: {plot_url}"
                     self.logger.info(f"Plot uploaded to: {plot_url}")
                 except Exception as e:
@@ -1219,7 +2541,9 @@ class OpticsTemperatureTask(PeriodicTask):
         )
         if plot_path:
             try:
-                plot_url = await async_everpaste_file(plot_path)
+                plot_url = format_everpaste_url(
+                    await async_everpaste_file(plot_path, extension="png")
+                )
                 message += f"\nPlot: {plot_url}"
                 self.logger.info(f"Plot uploaded to: {plot_url}")
             except Exception as e:
@@ -1254,10 +2578,10 @@ class ThriftStressPeriodicTask(PeriodicTask):
     in which case each api name is wrapped in a default `ThriftStressCall`
     with the legacy `requests_per_api` request count (default 10000).
 
-    `run_final_check()` always returns PASS — thrift exceptions are expected
-    during the process-restart THFT variants (THFT_001-004) and the per-burst
-    success/exception counts are logged for forensic review, not used to gate
-    the test verdict.
+    For read-only workloads, `run_final_check()` treats rate-limit exceptions
+    as forensic signal because the stress intentionally exceeds the configured
+    QPS. For dynamic flap workloads, an RPC failure/timeout or a target that is
+    still down after the stability stage fails the test.
     """
 
     NAME = "thrift_stress"
@@ -1316,6 +2640,10 @@ class ThriftStressPeriodicTask(PeriodicTask):
                     wrapped in a default `ThriftStressCall`.
                 - requests_per_api: Legacy. Only consulted when `apis` is set.
                     Default 10000.
+                - resolve_flap_interfaces_from_lldp: Replace the interface list
+                    of every rapid-flap call with the sorted local interfaces
+                    whose LLDP neighbor name does not contain ``ixia``. LLDP is
+                    queried anew for every invocation.
         """
         hostname = params["hostname"]
         calls = self._resolve_calls(params)
@@ -1328,6 +2656,58 @@ class ThriftStressPeriodicTask(PeriodicTask):
                 exc_info=True,
             )
             return
+
+        burst_timeout_s: float = float(
+            params.get("burst_timeout_s", self.DEFAULT_BURST_TIMEOUT_S)
+        )
+        flap_interfaces: t.List[str] = []
+        if params.get("resolve_flap_interfaces_from_lldp", False):
+            try:
+                async with asyncio.timeout(burst_timeout_s):
+                    while True:
+                        try:
+                            lldp_neighbors = await driver.async_get_lldp_neighbors()
+                        except TransportError as error:
+                            self.logger.warning(
+                                f"thrift_stress: LLDP transport failure on {hostname}: "
+                                f"{error}; retrying in 5s within {burst_timeout_s}s"
+                            )
+                            await asyncio.sleep(5)
+                            continue
+                        flap_interfaces = sorted(
+                            interface
+                            for interface, neighbor in lldp_neighbors.items()
+                            if "ixia"
+                            not in str(
+                                getattr(neighbor, "remote_device_name", "")
+                            ).lower()
+                        )
+                        if flap_interfaces:
+                            break
+                        self.logger.warning(
+                            f"thrift_stress: {hostname} has no non-IXIA LLDP "
+                            f"interfaces yet; retrying in 5s within {burst_timeout_s}s"
+                        )
+                        await asyncio.sleep(5)
+            except TimeoutError as error:
+                raise TimeoutError(
+                    f"thrift_stress: non-IXIA LLDP interface discovery on {hostname} "
+                    f"did not recover within {burst_timeout_s}s"
+                ) from error
+            self.logger.info(
+                f"thrift_stress: dynamically selected {len(flap_interfaces)} "
+                f"non-IXIA LLDP interfaces for this flap cycle: {flap_interfaces}"
+            )
+            calls = [
+                ThriftStressCall(
+                    method=call.method,
+                    args=(flap_interfaces, *call.args[1:]),
+                    requests_per_burst=call.requests_per_burst,
+                )
+                if call.method == "async_do_rapid_interface_flaps"
+                else call
+                for call in calls
+            ]
 
         coros: t.List[t.Coroutine] = []
         skipped: t.List[str] = []
@@ -1353,9 +2733,6 @@ class ThriftStressPeriodicTask(PeriodicTask):
             )
             return
 
-        burst_timeout_s: float = float(
-            params.get("burst_timeout_s", self.DEFAULT_BURST_TIMEOUT_S)
-        )
         self.logger.info(
             f"thrift_stress: firing {len(coros)} concurrent calls "
             f"(timeout={burst_timeout_s:.0f}s) ({', '.join(scheduled_breakdown)})"
@@ -1383,6 +2760,8 @@ class ThriftStressPeriodicTask(PeriodicTask):
             )
             self.add_data(
                 {
+                    "hostname": hostname,
+                    "flap_interfaces": flap_interfaces,
                     "total": len(coros),
                     "success": 0,
                     "failures": 0,
@@ -1397,6 +2776,8 @@ class ThriftStressPeriodicTask(PeriodicTask):
         failures = len(results) - success
         self.add_data(
             {
+                "hostname": hostname,
+                "flap_interfaces": flap_interfaces,
                 "total": len(results),
                 "success": success,
                 "failures": failures,
@@ -1410,11 +2791,12 @@ class ThriftStressPeriodicTask(PeriodicTask):
         )
 
     async def run_final_check(self) -> t.Optional[PeriodicCheckResult]:
-        """Summarize total/success/exception counts across all bursts.
+        """Summarize bursts and verify every dynamically flapped port recovered.
 
-        Returns PASS unconditionally: thrift exceptions during the
-        process-restart THFT variants are expected (the restarting service
-        drops in-flight calls). The forensic counts go in the result message.
+        Thrift exceptions remain forensic-only because restart variants
+        deliberately drop in-flight calls. The write worker additionally
+        records the union of interfaces it actually flapped and fails when any
+        of those interfaces is not operational after the final stability stage.
         """
         if not self._data:
             return PeriodicCheckResult(
@@ -1443,6 +2825,67 @@ class ThriftStressPeriodicTask(PeriodicTask):
             f"{failures} exceptions, {timed_out} timed-out calls, "
             f"avg burst {avg_elapsed:.1f}s"
         )
+
+        flap_interfaces = sorted(
+            {
+                interface
+                for data in self._data.values()
+                for interface in data.get("flap_interfaces", [])
+            }
+        )
+        if flap_interfaces:
+            if failures or timed_out:
+                return PeriodicCheckResult(
+                    # pyrefly: ignore [bad-argument-type]
+                    name=self.NAME,
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        f"{message}; dynamic flap RPC failed or timed out, so "
+                        "the requested write workload did not complete"
+                    ),
+                )
+            hostname = next(
+                (
+                    str(data.get("hostname"))
+                    for data in self._data.values()
+                    if data.get("hostname")
+                ),
+                "",
+            )
+            try:
+                driver = await async_get_device_driver(hostname)
+                interfaces_oper_state = (
+                    await driver.async_get_all_interfaces_operational_status()
+                )
+            except Exception as e:
+                return PeriodicCheckResult(
+                    # pyrefly: ignore [bad-argument-type]
+                    name=self.NAME,
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        f"{message}; failed to verify dynamically flapped "
+                        f"interfaces on {hostname}: {e}"
+                    ),
+                )
+            down_interfaces = [
+                interface
+                for interface in flap_interfaces
+                if not interfaces_oper_state.get(interface, False)
+            ]
+            if down_interfaces:
+                return PeriodicCheckResult(
+                    # pyrefly: ignore [bad-argument-type]
+                    name=self.NAME,
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        f"{message}; dynamically flapped interfaces still DOWN "
+                        f"after stability stage: {down_interfaces}"
+                    ),
+                )
+            message += (
+                f"; all {len(flap_interfaces)} dynamically flapped interfaces "
+                "are UP after the stability stage"
+            )
 
         return PeriodicCheckResult(
             # pyrefly: ignore [bad-argument-type]

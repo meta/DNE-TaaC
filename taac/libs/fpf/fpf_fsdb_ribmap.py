@@ -84,15 +84,15 @@ async def get_fsdb_rib_map(
     from neteng.fboss.fsdb.clients import FsdbService
     from neteng.fboss.fsdb_oper import types as fsdb_oper_types
     from neteng.fboss.lib.asyncio import hostnames
+    from taac.utils.fboss_ports import fboss_thrift_port
     from servicerouter.py3 import ClientParams, get_sr_client
 
     ip_addr = await hostnames.host_to_ip(driver.hostname)
     if not ip_addr:
-        logger.error(f"Cannot resolve {driver.hostname} for FSDB rib")
-        return {}
+        raise RuntimeError(f"Cannot resolve {driver.hostname} for FSDB rib")
     client_params = (
         ClientParams()
-        .setSingleHost(ipAddr=ip_addr, port=5908)
+        .setSingleHost(ipAddr=ip_addr, port=fboss_thrift_port(5908))
         .setOverallTimeoutMs(10000)
     )
     client_params.setProcessingTimeoutMs(10000)
@@ -109,7 +109,7 @@ async def get_fsdb_rib_map(
         if mode == "canonical" and isinstance(data, dict):
             return data.get("rib_entries", data)
         return data
-    return {}
+    raise RuntimeError(f"FSDB returned no RIB contents for {driver.hostname}")
 
 
 def parse_rib_map(rib_map: dict) -> Dict[str, List[str]]:

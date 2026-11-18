@@ -16,6 +16,93 @@ from taac.utils import (  # oss-rewrite (force ShipIt re-export to taac.* root)
 from taac.health_check.health_check import types as hc_types
 
 
+_RESOURCE_ACCOUNTANT_REJECTION_RE = re.compile(
+    r"(?:"
+    r"Total (?:NDP|ARP|l2|unified neighbor) entries in new switchState: "
+    r"\d+ exceeds the limit: \d+"
+    r"|Invalid route update - exceeding (?:DLB|route or ECMP) resource limits"
+    r"|State updated rejected by resource accountant"
+    r")",
+    re.IGNORECASE,
+)
+_AGENT_LOG_TIMESTAMP_RE = re.compile(r"\b[A-Z]\d{4} \d{2}:\d{2}:\d{2}")
+_EOS_LOG_MNEMONIC_RE = re.compile(
+    r"%[A-Z0-9_]+-\d+-([A-Z0-9_]+):",
+    re.IGNORECASE,
+)
+_EOS_RESOURCE_STATE_SUFFIX_RE = re.compile(r"_(?:FULL|NORMAL)$", re.IGNORECASE)
+_RESOURCE_ACCOUNTANT_GREP_PATTERN = (
+    "Total (NDP|ARP|l2|unified neighbor) entries in new switchState: "
+    "[0-9]+ exceeds the limit: [0-9]+|"
+    "Invalid route update - exceeding (DLB|route or ECMP) resource limits|"
+    "State updated rejected by resource accountant"
+)
+
+
+def _eos_log_mnemonic(entry: str) -> str | None:
+    match = _EOS_LOG_MNEMONIC_RE.search(entry)
+    return match.group(1).upper() if match else None
+
+
+def _has_eos_resource_state(entry: str, mnemonic: str, state: str) -> bool:
+    return _eos_log_mnemonic(entry) == f"{mnemonic}_{state}".upper()
+
+
+def _normalize_eos_resource_mnemonic(mnemonic: str) -> str:
+    return _EOS_RESOURCE_STATE_SUFFIX_RE.sub("", mnemonic).upper()
+
+
+def _recovered_eos_resource_full_indexes(
+    entries: t.Iterable[str],
+    mnemonic: str,
+) -> frozenset[int]:
+    pending_full_indexes = []
+    recovered_full_indexes = set()
+    for index, entry in enumerate(entries):
+        if _has_eos_resource_state(entry, mnemonic, "FULL"):
+            pending_full_indexes.append(index)
+        elif _has_eos_resource_state(entry, mnemonic, "NORMAL"):
+            recovered_full_indexes.update(pending_full_indexes)
+            pending_full_indexes.clear()
+    return frozenset(recovered_full_indexes)
+
+
+def find_resource_accountant_rejections(
+    log_content: str,
+    start_time: int | None = None,
+    end_time: int | None = None,
+    utc_offset_seconds: int = 0,
+) -> list[str]:
+    """Return canonical ResourceAccountant rejection lines in the time window.
+
+    utc_offset_seconds is the device's offset (seconds east of UTC); FBOSS
+    agent logs are stamped in device-local time.
+    """
+    current_year = time.gmtime().tm_year
+    matching_lines = []
+    for line in log_content.splitlines():
+        if not _RESOURCE_ACCOUNTANT_REJECTION_RE.search(line):
+            continue
+        if start_time is not None:
+            # A windowed assertion must never accept an undated continuation or
+            # a historical line merely because it contains the class name.
+            # NetOS journald output prepends a syslog date/host/process prefix
+            # before the embedded FBOSS timestamp, so parse from that marker.
+            timestamp_match = _AGENT_LOG_TIMESTAMP_RE.search(line)
+            if timestamp_match is None:
+                continue
+            if not log_parsing_utils.is_agent_log_line_in_time_range(
+                line[timestamp_match.start() :],
+                start_time,
+                end_time if end_time is not None else int(time.time()),
+                current_year,
+                utc_offset_seconds,
+            ):
+                continue
+        matching_lines.append(line)
+    return matching_lines
+
+
 class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn]):
     CHECK_NAME = hc_types.CheckName.LOG_PARSING_CHECK
     OPERATING_SYSTEMS = [
@@ -33,23 +120,63 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
         start_time = check_params.get("start_time")
         end_time = int(check_params.get("end_time") or time.time())
         log_file_path = check_params["log_file_path"]
+        if check_params.get("resource_accountant_activation"):
+            # FBOSS agent logs carry the device's wall clock, not UTC, so
+            # both the remote grep and the exact window need its offset.
+            utc_offset_seconds = log_parsing_utils.parse_utc_offset_seconds(
+                await self.driver.async_run_cmd_on_shell("date +%z")
+            )
+            self.logger.debug(
+                f"[LOG_PARSING] {obj.name} UTC offset: {utc_offset_seconds}s"
+            )
+            # The driver reads Classic/NSPAWN files and native NetOS journald,
+            # while bounding remote output before applying exact timestamps.
+            # pyrefly: ignore [missing-attribute]
+            log_content = await self.driver.async_read_log_file(
+                log_file_path,
+                start_time=int(start_time) if start_time is not None else None,
+                end_time=end_time,
+                grep_pattern=_RESOURCE_ACCOUNTANT_GREP_PATTERN,
+                tail_lines=200,
+                utc_offset_seconds=utc_offset_seconds,
+            )
+            matching_lines = find_resource_accountant_rejections(
+                log_content,
+                int(start_time) if start_time is not None else None,
+                end_time,
+                utc_offset_seconds,
+            )
+            if not matching_lines:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message=(
+                        "No ResourceAccountant rejection was logged in the "
+                        "requested validation window"
+                    ),
+                )
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.PASS,
+                message=(
+                    f"Found {len(matching_lines)} ResourceAccountant rejection "
+                    f"line(s): {matching_lines[:3]}"
+                ),
+            )
         include_regex = check_params.get("include_regex")
         exclude_regex = check_params.get("exclude_regex")
         assert bool(include_regex) ^ bool(exclude_regex), (
             "Please provide either include_regex or exclude_regex, but not both"
         )
-        if start_time and end_time:
-            formatted_times = [
-                time.strftime("%b %e %H:%M", time.localtime(t))
-                for t in range(start_time, end_time, 60)
-            ]
-            formatted_times_regex = r"\(" + r"\|".join(formatted_times) + r"\)"
-            cmd = f'cat {log_file_path} | grep -ia "{formatted_times_regex}"'
-            # pyrefly: ignore [missing-attribute]
-            log_content = await self.driver.async_run_cmd_on_shell(cmd)
-        else:
-            # pyrefly: ignore [missing-attribute]
-            log_content = await self.driver.async_read_file(log_file_path)
+        read_kwargs = {
+            "start_time": int(start_time) if start_time is not None else None,
+            "end_time": end_time if start_time is not None else None,
+        }
+        if check_params.get("tail_lines") is not None:
+            read_kwargs["tail_lines"] = int(check_params["tail_lines"])
+        # pyrefly: ignore [missing-attribute]
+        log_content = await self.driver.async_read_log_file(
+            log_file_path,
+            **read_kwargs,
+        )
         matching_lines = [
             line
             for line in log_content.splitlines()
@@ -115,6 +242,25 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
                 f"end_time ({end_time}) must not be earlier than start_time "
                 f"({start_time})"
             )
+        allowed_recovered_resource_mnemonics = check_params.get(
+            "allowed_recovered_resource_mnemonics", []
+        )
+        if not isinstance(allowed_recovered_resource_mnemonics, list) or any(
+            not isinstance(mnemonic, str) or not mnemonic
+            for mnemonic in allowed_recovered_resource_mnemonics
+        ):
+            raise ValueError(
+                "allowed_recovered_resource_mnemonics must be a list of "
+                "non-empty strings"
+            )
+        normalized_resource_mnemonics = tuple(
+            _normalize_eos_resource_mnemonic(mnemonic)
+            for mnemonic in allowed_recovered_resource_mnemonics
+        )
+        if any(not mnemonic for mnemonic in normalized_resource_mnemonics):
+            raise ValueError(
+                "allowed_recovered_resource_mnemonics must name an EOS resource"
+            )
 
         return {
             "start_time": start_time,
@@ -122,6 +268,7 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
             "include_regex": include_regex,
             "exclude_regex": exclude_regex,
             "agent_name": check_params.get("agent_name"),
+            "allowed_recovered_resource_mnemonics": normalized_resource_mnemonics,
         }
 
     async def _handle_arista_agent_logs(
@@ -195,15 +342,84 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
         system_logs = await arista_utils.check_eos_system_logs(
             self.driver, params.get("start_time"), params.get("end_time")
         )
-        if system_logs:
-            return hc_types.HealthCheckResult(
-                status=hc_types.HealthCheckStatus.FAIL,
-                message=f"Found {len(system_logs)} system log issues: {system_logs}",
+        allowed_recovered_resource_mnemonics = params[
+            "allowed_recovered_resource_mnemonics"
+        ]
+        recovered_full_indexes_by_mnemonic = {}
+        for mnemonic in allowed_recovered_resource_mnemonics:
+            recovered_full_indexes_by_mnemonic[mnemonic] = (
+                _recovered_eos_resource_full_indexes(system_logs, mnemonic)
+            )
+        classification = arista_utils.classify_eos_system_log_entries(system_logs)
+        recovery_context = list(classification.excluded)
+        system_log_issues = []
+        tolerated_issues = []
+        indexed_issues = classification.issues_with_indexes
+        if tuple(issue for _, issue in indexed_issues) != classification.issues:
+            self.logger.warning(
+                "Bypassing allowed recovered EOS resource tolerance because "
+                "indexed issue evidence does not align with classified issues "
+                "(%d indexed entries for %d issues)",
+                len(indexed_issues),
+                len(classification.issues),
+            )
+            system_log_issues.extend(classification.issues)
+        else:
+            for index, issue in indexed_issues:
+                issue_mnemonic = _eos_log_mnemonic(issue)
+                is_allowed_recovered_resource = any(
+                    index in recovered_indexes
+                    and issue_mnemonic == f"{mnemonic.upper()}_FULL"
+                    for mnemonic, recovered_indexes in (
+                        recovered_full_indexes_by_mnemonic.items()
+                    )
+                )
+                target = (
+                    tolerated_issues
+                    if is_allowed_recovered_resource
+                    else system_log_issues
+                )
+                target.append(issue)
+        if tolerated_issues:
+            self.logger.warning(
+                "Observed allowed recovered EOS resource issues: %s",
+                tolerated_issues,
             )
 
+        if recovery_context:
+            self.logger.warning(
+                "Observed excluded EOS recovery logs: %s",
+                recovery_context,
+            )
+
+        if system_log_issues:
+            recovery_suffix = (
+                f"; recovery context: {recovery_context}" if recovery_context else ""
+            )
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.FAIL,
+                message=(
+                    f"Found {len(system_log_issues)} system log issues: "
+                    f"{system_log_issues}{recovery_suffix}"
+                ),
+            )
+
+        recovery_suffix = (
+            f"; observed recovery context: {recovery_context}"
+            if recovery_context
+            else ""
+        )
+        tolerated_suffix = (
+            f"; allowed recovered resource issues: {tolerated_issues}"
+            if tolerated_issues
+            else ""
+        )
         return hc_types.HealthCheckResult(
             status=hc_types.HealthCheckStatus.PASS,
-            message="No emergency/critical/error logs found in EOS system logs",
+            message=(
+                "No emergency/critical/error issues found in EOS system logs"
+                f"{recovery_suffix}{tolerated_suffix}"
+            ),
         )
 
     def _filter_log_content_with_time_filter(

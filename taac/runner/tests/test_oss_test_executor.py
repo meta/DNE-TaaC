@@ -8,6 +8,7 @@ event loop as setUp/tearDown, so these tests use IsolatedAsyncioTestCase
 and async mocks for run_tests to match the production call shape.
 """
 
+import asyncio
 import unittest
 from unittest import mock
 
@@ -34,6 +35,8 @@ class TestOSSTestExecutor(unittest.IsolatedAsyncioTestCase):
         )
         self.mock_playbook = mock.MagicMock()
         self.mock_playbook.name = "test_playbook"
+        self.mock_runner.topology.get_device_by_name.return_value = mock.MagicMock()
+        self.mock_runner.playbook_applies_to_device.return_value = True
 
     @staticmethod
     def _async_raise(exc):
@@ -66,6 +69,20 @@ class TestOSSTestExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.dut, "device1")
         self.assertEqual(result.test_config, "test_config")
         self.assertFalse(result.is_transient)
+
+    async def test_filtered_playbook_returns_omitted_without_running(self):
+        self.mock_runner.playbook_applies_to_device.return_value = False
+        self.mock_runner.run_tests = mock.AsyncMock()
+
+        result = await self.executor.execute_playbook(
+            playbook=self.mock_playbook,
+            dut="device2",
+            test_config="test_config",
+        )
+
+        self.assertEqual(result.status, OSSTestStatus.OMITTED)
+        self.assertIn("filters do not match", result.message)
+        self.mock_runner.run_tests.assert_not_awaited()
 
     async def test_assertion_error_returns_failed(self):
         self.mock_runner.run_tests = self._async_raise(
@@ -147,6 +164,76 @@ class TestOSSTestExecutor(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.status, OSSTestStatus.ERROR)
         self.assertFalse(result.is_transient)
+
+    async def test_base_exception_group_is_caught_not_propagated(self):
+        """A BaseExceptionGroup must not escape execute_playbook.
+
+        TaacRunner.run_test_case raises BaseExceptionGroup when the test case
+        and its teardown both fail. Python keeps it a BaseExceptionGroup (rather
+        than the Exception-derived ExceptionGroup) if ANY member is a
+        BaseException -- asyncio.CancelledError, raised when a health check
+        blows up inside the postcheck gather and cancels its siblings. Such a
+        group is not caught by `except Exception`, so it used to escape the
+        playbook loop in oss_entry_point and silently abandon every remaining
+        playbook in a batch.
+        """
+        group = BaseExceptionGroup(
+            "test case execution and teardown both failed",
+            [asyncio.CancelledError(), TestCaseFailure("health check failed")],
+        )
+        # Guard the premise: if this is not a BaseExceptionGroup the test is
+        # vacuous, because `except Exception` would already have caught it.
+        self.assertNotIsInstance(group, Exception)
+
+        self.mock_runner.run_tests = self._async_raise(group)
+        result = await self.executor.execute_playbook(
+            playbook=self.mock_playbook,
+            dut="device1",
+            test_config="test_config",
+        )
+        # FAILED, not just `.failed`: ERROR also satisfies `.failed`, and a
+        # health-check failure reported as ERROR reads as an infra flake.
+        self.assertEqual(result.status, OSSTestStatus.FAILED)
+        self.assertEqual(result.exception_type, "TestCaseFailure")
+
+    async def test_nested_group_is_classified_by_its_failure(self):
+        group = BaseExceptionGroup(
+            "outer",
+            [
+                asyncio.CancelledError(),
+                BaseExceptionGroup("inner", [TestCaseFailure("health check failed")]),
+            ],
+        )
+        self.mock_runner.run_tests = self._async_raise(group)
+        result = await self.executor.execute_playbook(
+            playbook=self.mock_playbook,
+            dut="device1",
+            test_config="test_config",
+        )
+        self.assertEqual(result.status, OSSTestStatus.FAILED)
+
+    async def test_group_of_only_cancellations_still_propagates(self):
+        """Cancellation wrapped in a group is still cancellation, not a result."""
+        group = BaseExceptionGroup(
+            "cancelled", [asyncio.CancelledError(), asyncio.CancelledError()]
+        )
+        self.mock_runner.run_tests = self._async_raise(group)
+        with self.assertRaises(BaseExceptionGroup):
+            await self.executor.execute_playbook(
+                playbook=self.mock_playbook,
+                dut="device1",
+                test_config="test_config",
+            )
+
+    async def test_bare_cancelled_error_still_propagates(self):
+        """Genuine task cancellation must not be swallowed."""
+        self.mock_runner.run_tests = self._async_raise(asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await self.executor.execute_playbook(
+                playbook=self.mock_playbook,
+                dut="device1",
+                test_config="test_config",
+            )
 
 
 if __name__ == "__main__":

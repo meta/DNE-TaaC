@@ -2,15 +2,63 @@
 # pyre-unsafe
 """BGP++-on-EBB playbook factories (one factory = one test case).
 
-Naming: ``Playbook.name = bgp_ebb_<case>_playbook`` and each public factory is
-exactly ``get_{playbook_name}``. See README.md for the routing suite contract.
+New factories use ``Playbook.name = bgp_ebb_<case>_playbook`` and
+``get_{playbook_name}``. Catalog-facing wrappers for established
+scale-characteristic Playbook names preserve their runtime identities.
 
-The ordered ``__all__`` below is the stable CI/CD catalog order, not
-alphabetical export order.
+The ordered ``__all__`` keeps the original CI/CD exports stable and appends
+durable characteristic factories.
 """
 
 import typing as t
 
+from taac.abstractions.churn.attribute import (
+    AttributeChurn,
+    AttributePoolIdentity,
+    AttributeTargetSelector,
+    BaselineExpectation,
+    BlockGeometryExpectation,
+    DEFAULT_ATTRIBUTE_CHURN_CANCELLATION_GRACE_SECONDS,
+    DEFAULT_ATTRIBUTE_CHURN_CLEANUP_TIMEOUT_SECONDS,
+    DEFAULT_ATTRIBUTE_CHURN_DURATION_SECONDS,
+    DEFAULT_ATTRIBUTE_CHURN_GEOMETRY_TIMEOUT_SECONDS,
+    DEFAULT_ATTRIBUTE_CHURN_IXIA_RESTORE_TIMEOUT_SECONDS,
+    DEFAULT_ATTRIBUTE_CHURN_RESTORE_TIMEOUT_SECONDS,
+    DEFAULT_ATTRIBUTE_CHURN_SNAPSHOT_TIMEOUT_SECONDS,
+    DEFAULT_ATTRIBUTE_CHURN_WORK_RESERVE_SECONDS,
+)
+from taac.abstractions.churn.playbook import (
+    attribute_churn_spec,
+    igp_churn_spec,
+    longevity_churn_spec,
+    multipath_churn_spec,
+    route_churn_spec,
+    session_churn_spec,
+)
+from taac.abstractions.churn.policies import (
+    ExecutionPolicy,
+    PreparationPolicy,
+    RecoveryPolicy,
+)
+from taac.abstractions.churn.route import (
+    RouteChurn,
+    RouteStorm,
+    RouteStormAttributeShape,
+    RouteStormCyclePolicy,
+    RouteStormGeometry,
+    RouteStormHeavySetup,
+    RouteStormObservationPolicy,
+    RouteStormTargetSelector,
+)
+from taac.abstractions.churn.selectors import UniformRowSelection
+from taac.abstractions.churn.session import SessionChurn
+from taac.abstractions.churn.specs import (
+    AttributeFamily,
+    AttributePhase,
+    ChurnScenario,
+    ChurnWorkload,
+)
+from taac.abstractions.churn.workloads import IgpMetricChurn
 from taac.constants import (
     BgpPlusPlusProfile,
     DEFAULT_OPENR_START_IPV4S,
@@ -21,60 +69,102 @@ from taac.constants import (
 from taac.health_checks.healthcheck_definitions import (
     create_bgp_session_snapshot_check,
 )
+from taac.playbooks.playbook_definitions import (
+    build_case2_playbook,
+    build_case6_playbook,
+    create_performance_scaling_egress_peer_sweep_playbook,
+    create_transient_memory_ingress_peer_scale_playbook,
+    get_bgp_ebb_bounded_ecmp_sc9_playbook,
+    PerIterationSetupStepsFactory,
+)
+from taac.playbooks.routing.dice_churn import (
+    create_dice_unified_churn_playbook,
+)
 from taac.stages.stage_definitions import (
     create_bgp_ebb_attribute_churn_stage,
     create_bgp_ebb_route_storm_stage,
+    create_bgp_nhg_random_storm_stage,
     create_bgp_restart_test_stage,
+    create_characterization_bracket_stages,
     create_cold_start_test_stage,
     create_fauu_drain_undrain_stage,
     create_longevity_churn_stage,
     create_multipath_group_oscillation_cleanup_steps,
     create_multipath_group_oscillation_stage,
     create_plane_drain_undrain_stage,
+    create_route_churn_stage,
     create_route_oscillations_stage,
     create_route_registry_runtime_update_stage,
+    create_session_churn_stage,
     create_steps_stage,
     create_validated_bgp_igp_instability_unresolvable_pnhs_stage,
-    create_validated_bgp_route_oscillations_stage,
-    create_validated_ebgp_route_oscillations_stage,
-    create_validated_ebgp_session_oscillation_stage,
-    create_validated_plane_bgp_session_oscillation_stage,
+    generate_tornado_plane_definitions,
 )
 from taac.steps.step_definitions import (
-    create_advertise_withdraw_prefixes_step,
     create_bgp_instability_setup_steps,
     create_bgp_restart_setup_steps,
     create_custom_step,
+    create_igp_metric_churn_step,
     create_longevity_step,
     create_openr_route_action_step,
+    create_policy_evaluation_point_steps,
+    create_policy_evaluation_sweep_control_step,
+    create_route_registry_cleanup_step,
     create_route_registry_prefix_list_setup_steps,
-    create_set_route_filter_step,
-    create_validated_igp_pnh_metric_oscillation_step,
+    create_validation_step,
 )
 from taac.task_definitions import (
     create_nexthop_group_poll_periodic_task,
 )
 from taac.testconfigs.routing.util.bgp_ebb_check_profiles import (
+    CharacterizationGates,
     CheckProfile,
     CpuCharacterizationConfig,
     get_profile_checks,
+    NO_CHARACTERIZATION_GATES,
     ProfileContext,
     RssDeltaConfig,
     RUNTIME_UPDATE_EXACT_PEER_GROUP_NAMES,
 )
-from taac.testconfigs.routing.util.bgp_ebb_constants import (
-    IXIA_BGP_MON_IC_PARENT_NETWORK,
+from taac.testconfigs.routing.util.bgp_ebb_health_checks import (
+    BgpMonScope,
 )
 from taac.testconfigs.routing.util.bgp_ebb_periodic_tasks import (
     create_standard_periodic_tasks,
+)
+from taac.utils.characterization import (
+    characterization_summary_jq_var,
+    CharacterizationConfig,
+    DISABLED,
+    KIND_CPU_PERCENTILE,
+    KIND_RSS_DELTA,
+    PHASE_CONVERGENCE,
+    PHASE_SOAK,
+    PHASE_WORKLOAD,
+)
+from taac.utils.gate_catalog import (
+    SC4_MAX_PEAK_MEMORY_MB,
+    SC4_TRANSIENT_MEMORY_CEILING_MB,
 )
 from taac.utils.hardware_capacity_utils import (
     get_postcheck_thresholds,
     get_precheck_thresholds,
     HardwareCapacityThresholds,
 )
-from taac.test_as_a_config.types import Playbook
+from taac.test_as_a_config.types import (
+    PeriodicTask,
+    Playbook,
+    PointInTimeHealthCheck,
+    SnapshotHealthCheck,
+    Stage,
+    ValidationStage,
+)
 
+
+if t.TYPE_CHECKING:
+    from taac.abstractions.topologies.ebb_full_scale import (
+        EbbScaleProfile,
+    )
 
 __all__ = [
     "get_bgp_ebb_daemon_restart_playbook",
@@ -97,7 +187,113 @@ __all__ = [
     "get_bgp_ebb_update_packing_playbook",
     "get_bgp_ebb_constant_attribute_storage_playbook",
     "get_bgp_ebb_bounded_ecmp_sets_playbook",
+    "get_bgp_ebb_related_peer_compute_playbook",
+    "get_bgp_ebb_transient_memory_route_scale_playbook",
+    "get_bgp_ebb_transient_memory_peer_scale_playbook",
+    "get_bgp_ebb_churn_processing_playbook",
+    "get_bgp_ebb_bounded_ecmp_sc9_playbook",
+    "get_bgp_ebb_separable_policy_evaluation_playbook",
 ]
+
+
+def _characterized(
+    stages: t.List[Stage],
+    *,
+    playbook_name: str,
+    phase: str,
+    device_name: str,
+    config: CharacterizationConfig,
+) -> t.List[Stage]:
+    """Wrap the measured stages in a bgpcpp CPU/RSS characterization bracket.
+
+    Thin adapter over create_characterization_bracket_stages so each playbook
+    spends one call, not a start/stop dance. Returns ``stages`` unchanged when
+    the config disables both measurements.
+
+    The bracket encloses ALL the stages passed in, so the caller decides the
+    span by choosing what to hand over: pass only the workload stage to exclude
+    setup and teardown from the measurement.
+
+    Pair every call with _characterization_profile_configs() on the SAME phase:
+    this places the producer, that builds the matching consumer.
+    """
+    start_stages, stop_stages = create_characterization_bracket_stages(
+        playbook_name=playbook_name,
+        phase=phase,
+        device_name=device_name,
+        config=config,
+    )
+    return [*start_stages, *stages, *stop_stages]
+
+
+def _characterization_profile_configs(
+    phase: str,
+    config: CharacterizationConfig,
+    gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+) -> tuple[t.Optional[CpuCharacterizationConfig], t.Optional[RssDeltaConfig]]:
+    """Build the postcheck configs that read what a bracket on ``phase`` wrote.
+
+    The bracket's STOP steps stash their summaries into jq variables named from
+    (kind, span); these postcheck configs must name the same variables or the
+    checks read nothing and report an empty measurement. Both sides derive the
+    names from characterization_summary_jq_var() rather than repeating a literal,
+    so the only way to desync them is to pass a different ``phase`` here than to
+    _characterized() on the same playbook.
+
+    Args:
+        phase: The phase passed to _characterized() for this playbook.
+        config: The same CharacterizationConfig passed to _characterized(); a
+            disabled measurement yields None so no postcheck is added for it.
+        gates: Optional blocking criteria for the collected summary. Empty
+            criteria preserve observe-only reporting.
+
+    Returns:
+        (cpu_characterization, rss_delta), each None when that measurement is
+        disabled. Feed straight into the matching ProfileContext fields.
+    """
+    if gates.cpu_thresholds_pct and not config.enable_cpu:
+        raise ValueError("CPU characterization gates require CPU collection")
+    if gates.rss_max_growth_pct is not None and not config.enable_rss:
+        raise ValueError("RSS characterization gate requires RSS collection")
+
+    cpu = (
+        CpuCharacterizationConfig(
+            summary_jq_var=characterization_summary_jq_var(KIND_CPU_PERCENTILE, phase),
+            gate_thresholds_pct=gates.cpu_thresholds_pct,
+        )
+        if config.enable_cpu
+        else None
+    )
+    rss = (
+        RssDeltaConfig(
+            summary_jq_var=characterization_summary_jq_var(KIND_RSS_DELTA, phase),
+            max_growth_pct=gates.rss_max_growth_pct,
+        )
+        if config.enable_rss
+        else None
+    )
+    return (cpu, rss)
+
+
+def _all_parent_prefixes_to_ignore(
+    parent_prefixes_to_ignore: t.Iterable[str] | None,
+    bgp_mon: BgpMonScope,
+) -> list[str]:
+    """Combine explicit exclusions with the bound BGP-MON prefix once."""
+    return list(
+        dict.fromkeys(
+            [
+                *(parent_prefixes_to_ignore or ()),
+                *(bgp_mon.ignore_prefixes() or ()),
+            ]
+        )
+    )
+
+
+def _optional_pnh_route_starts(
+    starts: t.Optional[t.Sequence[str]],
+) -> t.Optional[tuple[str, ...]]:
+    return tuple(starts) if starts is not None else None
 
 
 def get_bgp_ebb_daemon_restart_playbook(
@@ -121,6 +317,12 @@ def get_bgp_ebb_daemon_restart_playbook(
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
     exclude_bgp_mon: bool = True,
+    characterization: CharacterizationConfig = DISABLED,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-01: BGP daemon restart.
@@ -163,6 +365,20 @@ def get_bgp_ebb_daemon_restart_playbook(
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    all_parent_prefixes_to_ignore = _all_parent_prefixes_to_ignore(
+        parent_prefixes_to_ignore,
+        bgp_mon_scope,
+    )
+
+    # Same phase as the _characterized() bracket below: the bracket writes
+    # these jq vars and these configs read them back.
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_CONVERGENCE, characterization
+    )
     restart_checks = get_profile_checks(
         CheckProfile.DAEMON_RESTART,
         ProfileContext(
@@ -172,10 +388,16 @@ def get_bgp_ebb_daemon_restart_playbook(
             postcheck_thresholds=postcheck_thresholds,
             cpu_baseline=cpu_baseline,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             parent_prefixes_to_ignore=parent_prefixes_to_ignore,
             expected_established_sessions=expected_established_sessions,
-            exclude_bgp_mon=exclude_bgp_mon,
+            bgp_mon=bgp_mon_scope,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
     return Playbook(
@@ -184,7 +406,7 @@ def get_bgp_ebb_daemon_restart_playbook(
             device_name=device_name,
             start_with_active_peers=True,
             expected_established_sessions=expected_established_sessions,
-            parent_prefixes_to_ignore=parent_prefixes_to_ignore or (),
+            parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
         ),
         prechecks=restart_checks.prechecks,
         postchecks=restart_checks.postchecks,
@@ -195,21 +417,27 @@ def get_bgp_ebb_daemon_restart_playbook(
             cpu_util_terminate_on_error=cpu_util_terminate_on_error,
             memory_terminate_on_error=memory_terminate_on_error,
         ),
-        stages=[
-            create_bgp_restart_test_stage(
-                device_name=device_name,
-                enable_thread_cpu_monitoring=enable_thread_cpu_monitoring,
-                thread_name_filter=thread_name_filter,
-                enable_offcpu_profiling=enable_offcpu_profiling,
-                enable_perf_profiling=enable_perf_profiling,
-                enable_bgp_events=enable_bgp_events,
-                enable_socket_monitoring=enable_socket_monitoring,
-                reactivate_device_groups=False,
-                adaptive_convergence=True,
-                expected_established_sessions=expected_established_sessions,
-                parent_prefixes_to_ignore=parent_prefixes_to_ignore,
-            ),
-        ],
+        stages=_characterized(
+            [
+                create_bgp_restart_test_stage(
+                    device_name=device_name,
+                    enable_thread_cpu_monitoring=enable_thread_cpu_monitoring,
+                    thread_name_filter=thread_name_filter,
+                    enable_offcpu_profiling=enable_offcpu_profiling,
+                    enable_perf_profiling=enable_perf_profiling,
+                    enable_bgp_events=enable_bgp_events,
+                    enable_socket_monitoring=enable_socket_monitoring,
+                    reactivate_device_groups=False,
+                    adaptive_convergence=True,
+                    expected_established_sessions=expected_established_sessions,
+                    parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
+                ),
+            ],
+            playbook_name="bgp_ebb_daemon_restart_playbook",
+            phase=PHASE_CONVERGENCE,
+            device_name=device_name,
+            config=characterization,
+        ),
     )
 
 
@@ -237,6 +465,12 @@ def get_bgp_ebb_cold_start_playbook(
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
     exclude_bgp_mon: bool = True,
     enable_rss_delta_gate: bool = True,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
+    gateway_resolution_device_group_names: t.Sequence[str] = (),
 ) -> Playbook:
     """
     Build CICD-EBB-02: BGP cold start.
@@ -277,6 +511,9 @@ def get_bgp_ebb_cold_start_playbook(
             characterization (RSS START/STOP bracket + RSS_DELTA_CHECK reader)
             around convergence (default: True). Observe-only: reports settled
             baseline/current/peak/growth into the results table, no threshold.
+        gateway_resolution_device_group_names: IXIA device groups whose
+            gateway MACs must resolve right after the cold-start enable and
+            before convergence is observed. Empty skips the gate.
 
     Returns:
         Playbook configured for BGP cold start testing
@@ -294,6 +531,15 @@ def get_bgp_ebb_cold_start_playbook(
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    all_parent_prefixes_to_ignore = _all_parent_prefixes_to_ignore(
+        parent_prefixes_to_ignore,
+        bgp_mon_scope,
+    )
+
     cold_start_checks = get_profile_checks(
         CheckProfile.COLD_START,
         ProfileContext(
@@ -303,16 +549,32 @@ def get_bgp_ebb_cold_start_playbook(
             postcheck_thresholds=postcheck_thresholds,
             cpu_baseline=cpu_baseline,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
             expected_established_sessions=expected_established_sessions,
-            exclude_bgp_mon=exclude_bgp_mon,
+            bgp_mon=bgp_mon_scope,
             fail_on_eor_expired=fail_on_eor_expired,
             # Observe-only characterization postchecks (results land in the
             # POST-HEALTH CHECK RESULTS table). CPU percentile is reported from
             # the stage START/STOP collector's stashed summary; RSS delta is a
             # self-soaking postcheck. Both observe-only (no threshold) for now.
-            cpu_characterization=CpuCharacterizationConfig(),
-            rss_delta=(RssDeltaConfig() if enable_rss_delta_gate else None),
+            cpu_characterization=CpuCharacterizationConfig(
+                summary_jq_var=characterization_summary_jq_var(
+                    KIND_CPU_PERCENTILE, PHASE_CONVERGENCE
+                ),
+            ),
+            rss_delta=(
+                RssDeltaConfig(
+                    summary_jq_var=characterization_summary_jq_var(
+                        KIND_RSS_DELTA, PHASE_CONVERGENCE
+                    ),
+                )
+                if enable_rss_delta_gate
+                else None
+            ),
         ),
     )
     stages = [
@@ -332,9 +594,15 @@ def get_bgp_ebb_cold_start_playbook(
             enable_socket_monitoring=enable_socket_monitoring,
             adaptive_convergence=True,
             expected_established_sessions=expected_established_sessions,
-            parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+            parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
             enable_cpu_percentile_characterization=True,
             enable_rss_delta_characterization=enable_rss_delta_gate,
+            # Must match the Playbook name below: it is the identity embedded
+            # in the characterization session key and every TAAC_CHAR log line.
+            # The catalog audit pins that name to the factory name, so this is
+            # the string to keep in step with, not the other way round.
+            characterization_playbook_name="bgp_ebb_cold_start_playbook",
+            gateway_resolution_device_group_names=gateway_resolution_device_group_names,
         ),
     ]
     return Playbook(
@@ -356,14 +624,131 @@ def get_bgp_ebb_cold_start_playbook(
     )
 
 
+def _ebb_scale(scale: "EbbScaleProfile | None") -> "EbbScaleProfile":
+    """The given EBB scale, or the scheduled FY26 one.
+
+    Local import keeps the topology constants off this module's import path.
+    """
+    if scale is not None:
+        return scale
+    from taac.abstractions.topologies.ebb_full_scale import (
+        EBB_FY26_SCALE,
+    )
+
+    return EBB_FY26_SCALE
+
+
+def _bgp_ebb_attribute_churn(
+    duration_seconds: int,
+    scale: "EbbScaleProfile",
+    prefix_sources: t.Mapping[str, t.Mapping[str, object]] | None = None,
+) -> AttributeChurn:
+    return AttributeChurn(
+        scenario=ChurnScenario(
+            scenario_id="bgp_ebb_attribute_churn",
+            workload=ChurnWorkload(
+                families=(
+                    AttributeFamily(
+                        name="med",
+                        phases=(
+                            AttributePhase(name="plane_1_preferred", value=100),
+                            AttributePhase(name="reference", value=200),
+                            AttributePhase(name="plane_1_nonpreferred", value=300),
+                        ),
+                    ),
+                    AttributeFamily(
+                        name="origin",
+                        phases=(
+                            AttributePhase(name="plane_1_preferred", value="igp"),
+                            AttributePhase(name="reference", value="egp"),
+                            AttributePhase(
+                                name="plane_1_nonpreferred", value="incomplete"
+                            ),
+                        ),
+                    ),
+                    AttributeFamily(
+                        name="local_pref",
+                        phases=(
+                            AttributePhase(name="plane_1_preferred", value=200),
+                            AttributePhase(name="reference", value=100),
+                            AttributePhase(name="plane_1_nonpreferred", value=50),
+                        ),
+                    ),
+                )
+            ),
+            preparation=PreparationPolicy(
+                initial_resolution_timeout_seconds=(
+                    DEFAULT_ATTRIBUTE_CHURN_GEOMETRY_TIMEOUT_SECONDS
+                ),
+                baseline_capture_timeout_seconds=(
+                    DEFAULT_ATTRIBUTE_CHURN_SNAPSHOT_TIMEOUT_SECONDS
+                ),
+                total_timeout_seconds=(
+                    duration_seconds + DEFAULT_ATTRIBUTE_CHURN_WORK_RESERVE_SECONDS
+                ),
+            ),
+            execution=ExecutionPolicy(
+                duration_seconds=duration_seconds,
+                cadence_seconds=scale.attribute_churn_cadence_seconds,
+                max_iterations=100_000,
+            ),
+            recovery=RecoveryPolicy(
+                total_timeout_seconds=DEFAULT_ATTRIBUTE_CHURN_CLEANUP_TIMEOUT_SECONDS,
+                restore_observation_timeout_seconds=(
+                    DEFAULT_ATTRIBUTE_CHURN_RESTORE_TIMEOUT_SECONDS
+                ),
+                ixia_restore_timeout_seconds=(
+                    DEFAULT_ATTRIBUTE_CHURN_IXIA_RESTORE_TIMEOUT_SECONDS
+                ),
+                cancellation_grace_seconds=(
+                    DEFAULT_ATTRIBUTE_CHURN_CANCELLATION_GRACE_SECONDS
+                ),
+            ),
+        ),
+        selector=AttributeTargetSelector(
+            prefix_pools=tuple(
+                AttributePoolIdentity(
+                    afi=afi,
+                    plane=plane,
+                    name=f"PREFIX_POOL_IBGP_{afi.upper()}_PLANE_{plane}_REMOTE_EB",
+                )
+                for afi in ("ipv4", "ipv6")
+                for plane in range(1, 5)
+            ),
+            peer_count_per_pool=scale.ibgp_peers_per_group,
+            row_selection=UniformRowSelection(rows_per_pool=7),
+        ),
+        baseline_expectation=BaselineExpectation(
+            block_geometry=BlockGeometryExpectation(
+                routes_per_block=scale.routes_per_he_peer,
+                samples_per_block=2,
+            )
+        ),
+        prefix_sources=prefix_sources or {},
+        ixia_apply_timeout_seconds=scale.attribute_churn_ixia_apply_timeout_seconds,
+    )
+
+
 def get_bgp_ebb_attribute_churn_playbook(
     device_name: str,
     peergroup_ibgp_v6: str,
     peergroup_ibgp_v4: str,
     total_session_count: int,
     profile,  # BgpPlusPlusProfile
+    ibgp_route_next_hop_starts: t.Mapping[str, t.Mapping[str, str]],
+    precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     exclude_bgp_mon: bool = True,
-    duration_seconds: int = 3_600,
+    duration_seconds: int = DEFAULT_ATTRIBUTE_CHURN_DURATION_SECONDS,
+    transient_observation_logging: str = "off",
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
+    scale: "EbbScaleProfile | None" = None,
+    ibgp_prefix_sources: t.Mapping[str, t.Mapping[str, object]] | None = None,
 ) -> Playbook:
     """Build CICD-EBB-10: BGP attribute churn.
 
@@ -385,8 +770,16 @@ def get_bgp_ebb_attribute_churn_playbook(
             by precheck/postcheck health checks.
         profile: `BgpPlusPlusProfile` enum value; enables the IBGP-PNH
             precheck when the OpenR variant is selected.
+        ibgp_route_next_hop_starts: Per-plane first iBGP route next hop from
+            the bound topology (`ebb_ibgp_route_next_hop_starts`), so exact RIB
+            checks expect the chassis the run is wired to.
+        precheck_thresholds: Custom precheck thresholds (uses defaults if None).
         duration_seconds: Active monotonic churn window, divided evenly
             across MED, origin, and local-pref.
+        transient_observation_logging: `off` suppresses retryable convergence
+            warnings; `extended` logs each retry with its stack trace.
+        scale: EBB fleet profile the per-pool peer rows and route blocks come
+            from; the scheduled FY26 profile when omitted.
 
     Returns:
         A `Playbook` named `bgp_ebb_attribute_churn_playbook` with standard
@@ -394,85 +787,128 @@ def get_bgp_ebb_attribute_churn_playbook(
         tasks (CPU/memory @ 9 GiB, non-terminating), and one audited custom
         attribute-churn stage.
     """
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    # Same phase as the _characterized() bracket below: the bracket writes
+    # these jq vars and these configs read them back.
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     instability_checks = get_profile_checks(
         CheckProfile.CHURN_STORM,
         ProfileContext(
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
+            precheck_thresholds=precheck_thresholds,
             expected_established_sessions=total_session_count,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
-            exclude_bgp_mon=exclude_bgp_mon,
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
+            bgp_mon=bgp_mon_scope,
             full_session_snapshot=True,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_attribute_churn_playbook",
-        setup_steps=create_bgp_instability_setup_steps(
-            device_name=device_name,
+    playbook_name = "bgp_ebb_attribute_churn_playbook"
+    return create_dice_unified_churn_playbook(
+        restore_topology_baseline=True,
+        spec=attribute_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=instability_checks.prechecks,
+            postchecks=instability_checks.postchecks,
+            snapshot_checks=instability_checks.snapshot_checks,
+            periodic_tasks=create_standard_periodic_tasks(
+                device_name=device_name,
+                memory_threshold=Gigabyte.GIG_9.value,
+                cpu_util_terminate_on_error=False,
+                memory_terminate_on_error=False,
+            ),
+            action_factory=lambda: _characterized(
+                [
+                    create_bgp_ebb_attribute_churn_stage(
+                        hostname=device_name,
+                        attribute_churn=_bgp_ebb_attribute_churn(
+                            duration_seconds,
+                            _ebb_scale(scale),
+                            ibgp_prefix_sources,
+                        ),
+                        poll_interval_seconds=5,
+                        transition_timeout_seconds=_ebb_scale(
+                            scale
+                        ).attribute_churn_transition_timeout_seconds,
+                        reference_setup_timeout_seconds=120,
+                        quiet_window_seconds=120,
+                        max_lookup_concurrency=8,
+                        transient_observation_logging=(transient_observation_logging),
+                        openr_mode=(
+                            "standalone"
+                            if profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R
+                            else "none"
+                        ),
+                        ibgp_route_next_hop_starts=ibgp_route_next_hop_starts,
+                    )
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_WORKLOAD,
+                device_name=device_name,
+                config=characterization,
+            ),
         ),
-        prechecks=instability_checks.prechecks,
-        postchecks=instability_checks.postchecks,
-        snapshot_checks=instability_checks.snapshot_checks,
-        periodic_tasks=create_standard_periodic_tasks(
-            device_name=device_name,
-            memory_threshold=Gigabyte.GIG_9.value,
-            cpu_util_terminate_on_error=False,
-            memory_terminate_on_error=False,
+    )
+
+
+def _bgp_ebb_route_storm(
+    *,
+    ixia_interface_mimic_ibgp: str,
+    observer_peer_parent_prefix: str,
+    expected_established_sessions: int,
+    cycles: int,
+    quiet_window_seconds: int,
+    bounded_validation: bool,
+) -> RouteStorm:
+    return RouteStorm(
+        expected_established_sessions=expected_established_sessions,
+        selector=RouteStormTargetSelector(
+            ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
+            observer_peer_parent_prefix=observer_peer_parent_prefix,
+            ipv4_prefix_pool_name="PREFIX_POOL_IBGP_IPV4_PLANE_1_REMOTE_EB",
+            ipv6_prefix_pool_name="PREFIX_POOL_IBGP_IPV6_PLANE_1_REMOTE_EB",
+            peer_count_per_plane=62,
+            selected_peer_rows=(0, 10, 20, 30, 40, 50, 61),
         ),
-        stages=[
-            create_bgp_ebb_attribute_churn_stage(
-                hostname=device_name,
-                prefix_pool_names={
-                    "ipv4": {
-                        "1": "PREFIX_POOL_IBGP_IPV4_PLANE_1_REMOTE_EB",
-                        "2": "PREFIX_POOL_IBGP_IPV4_PLANE_2_REMOTE_EB",
-                        "3": "PREFIX_POOL_IBGP_IPV4_PLANE_3_REMOTE_EB",
-                        "4": "PREFIX_POOL_IBGP_IPV4_PLANE_4_REMOTE_EB",
-                    },
-                    "ipv6": {
-                        "1": "PREFIX_POOL_IBGP_IPV6_PLANE_1_REMOTE_EB",
-                        "2": "PREFIX_POOL_IBGP_IPV6_PLANE_2_REMOTE_EB",
-                        "3": "PREFIX_POOL_IBGP_IPV6_PLANE_3_REMOTE_EB",
-                        "4": "PREFIX_POOL_IBGP_IPV6_PLANE_4_REMOTE_EB",
-                    },
-                },
-                peer_count_per_plane=62,
-                selected_block_count_per_afi=7,
-                samples_per_block=2,
-                routes_per_block=750,
-                duration_seconds=duration_seconds,
-                max_iterations=100_000,
-                cadence_seconds=60,
-                poll_interval_seconds=5,
-                transition_timeout_seconds=60,
-                reference_setup_timeout_seconds=120,
-                restore_timeout_seconds=120,
-                quiet_window_seconds=120,
-                max_lookup_concurrency=8,
-                openr_mode=(
-                    "standalone"
-                    if profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R
-                    else "none"
-                ),
-                attribute_matrix={
-                    "local_pref": {
-                        "plane_1_preferred": 200,
-                        "reference": 100,
-                        "plane_1_nonpreferred": 50,
-                    },
-                    "med": {
-                        "plane_1_preferred": 100,
-                        "reference": 200,
-                        "plane_1_nonpreferred": 300,
-                    },
-                    "origin": {
-                        "plane_1_preferred": "igp",
-                        "reference": "egp",
-                        "plane_1_nonpreferred": "incomplete",
-                    },
-                },
-            )
-        ],
+        geometry=RouteStormGeometry(routes_per_peer=750, samples_per_block=2),
+        cycle=RouteStormCyclePolicy(
+            cycles=cycles,
+            advertise_seconds=30,
+            withdraw_seconds=30,
+        ),
+        observation=RouteStormObservationPolicy(
+            poll_interval_seconds=5,
+            convergence_hard_timeout_seconds=300,
+            session_establish_timeout_seconds=300,
+            restore_timeout_seconds=300,
+            quiet_window_seconds=quiet_window_seconds,
+            max_lookup_concurrency=1,
+        ),
+        heavy_setup=RouteStormHeavySetup(
+            hard_timeout_seconds=1_800,
+            route_batch_rows=15_750,
+        ),
+        attributes=RouteStormAttributeShape(
+            as_path_pool_size=10,
+            as_path_length=255,
+            as_set_length=255,
+            communities_per_route=32,
+            extended_communities_per_route=16,
+        ),
+        bounded_validation=bounded_validation,
     )
 
 
@@ -484,7 +920,18 @@ def get_bgp_ebb_route_storm_playbook(
     ixia_interface_mimic_ibgp: str,
     observer_peer_parent_prefix: str,
     profile,  # BgpPlusPlusProfile
+    precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     exclude_bgp_mon: bool = True,
+    cycles: int = 60,
+    quiet_window_seconds: int = 120,
+    bounded_validation: bool = False,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """Build CICD-EBB-11: BGP route storm.
 
@@ -492,8 +939,10 @@ def get_bgp_ebb_route_storm_playbook(
 
     Drives 10,500 dual-stack plane-1 route paths through 60 verified
     advertise/withdraw cycles with a deterministic supported heavy-attribute
-    shape. The workflow groups IXIA protocol lifecycle changes, proves each
-    transition on IXIA and the DUT, and restores the exact captured baseline.
+    shape. The workflow uses three peer-aligned IXIA route shards. It does not
+    restart the parent network group or apply route state through the global
+    topology update. It proves each transition on IXIA and the DUT, and
+    restores the exact captured baseline.
 
     Args:
         device_name: DUT hostname (used for setup steps and periodic tasks).
@@ -506,65 +955,71 @@ def get_bgp_ebb_route_storm_playbook(
             that are excluded from the fail-closed measured session count.
         profile: `BgpPlusPlusProfile` enum value; enables IBGP-PNH precheck
             when the OpenR variant is selected.
+        precheck_thresholds: Custom precheck thresholds (uses defaults if None).
 
     Returns:
         A `Playbook` named `bgp_ebb_route_storm_playbook` with standard
-        BGP++ prechecks/postchecks, core-dump snapshots, standard periodic
-        resource tasks, and one audited failure-safe route-storm stage.
+        BGP++ prechecks/postchecks, core-dump snapshots, and one audited
+        failure-safe route-storm stage.
     """
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    # Same phase as the _characterized() bracket below: the bracket writes
+    # these jq vars and these configs read them back.
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     instability_checks = get_profile_checks(
         CheckProfile.CHURN_STORM,
         ProfileContext(
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
+            precheck_thresholds=precheck_thresholds,
             expected_established_sessions=total_session_count,
+            check_cpu_load_average=False,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
-            exclude_bgp_mon=exclude_bgp_mon,
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
+            bgp_mon=bgp_mon_scope,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_route_storm_playbook",
-        setup_steps=create_bgp_instability_setup_steps(
-            device_name=device_name,
-        ),
-        prechecks=instability_checks.prechecks,
-        postchecks=instability_checks.postchecks,
-        snapshot_checks=instability_checks.snapshot_checks,
-        periodic_tasks=create_standard_periodic_tasks(
-            device_name=device_name,
-            memory_threshold=Gigabyte.GIG_10.value,
-            cpu_util_terminate_on_error=False,
-            memory_terminate_on_error=False,
-        ),
-        stages=[
-            create_bgp_ebb_route_storm_stage(
-                hostname=device_name,
-                ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
-                expected_established_sessions=total_session_count,
-                observer_peer_parent_prefix=observer_peer_parent_prefix,
-                prefix_pool_names={
-                    "ipv4": "PREFIX_POOL_IBGP_IPV4_PLANE_1_REMOTE_EB",
-                    "ipv6": "PREFIX_POOL_IBGP_IPV6_PLANE_1_REMOTE_EB",
-                },
-                peer_count_per_plane=62,
-                selected_peer_rows=[0, 10, 20, 30, 40, 50, 61],
-                routes_per_peer=750,
-                samples_per_block=2,
-                cycles=60,
-                advertise_seconds=30,
-                withdraw_seconds=30,
-                poll_interval_seconds=5,
-                transition_timeout_seconds=30,
-                session_establish_timeout_seconds=300,
-                restore_timeout_seconds=300,
-                quiet_window_seconds=120,
-                max_lookup_concurrency=8,
-                as_path_pool_size=10,
-                as_path_length=255,
-                communities_per_route=32,
-                extended_communities_per_route=1,
+    playbook_name = "bgp_ebb_route_storm_playbook"
+    return create_dice_unified_churn_playbook(
+        restore_topology_baseline=True,
+        spec=route_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=instability_checks.prechecks,
+            postchecks=instability_checks.postchecks,
+            snapshot_checks=instability_checks.snapshot_checks,
+            periodic_tasks=(),
+            action_factory=lambda: _characterized(
+                [
+                    create_bgp_ebb_route_storm_stage(
+                        hostname=device_name,
+                        route_storm=_bgp_ebb_route_storm(
+                            ixia_interface_mimic_ibgp=ixia_interface_mimic_ibgp,
+                            observer_peer_parent_prefix=observer_peer_parent_prefix,
+                            expected_established_sessions=total_session_count,
+                            cycles=cycles,
+                            quiet_window_seconds=quiet_window_seconds,
+                            bounded_validation=bounded_validation,
+                        ),
+                    ),
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_WORKLOAD,
+                device_name=device_name,
+                config=characterization,
             ),
-        ],
+        ),
     )
 
 
@@ -584,12 +1039,17 @@ def get_bgp_ebb_igp_pnh_metric_oscillation_playbook(
     start_ipv6s: t.Optional[t.List[str]] = None,
     count: int = 63,
     step_size: int = 2,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
     duration: int = 2400,
     frequency: int = 30,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
     exclude_bgp_mon: bool = True,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
 ) -> Playbook:
     """
     Build CICD-EBB-07: IGP PNH metric oscillation.
@@ -637,6 +1097,16 @@ def get_bgp_ebb_igp_pnh_metric_oscillation_playbook(
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+
+    # Same phase as the _characterized() bracket below: the bracket writes
+    # these jq vars and these configs read them back.
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     igp_checks = get_profile_checks(
         CheckProfile.IGP_INSTABILITY,
         ProfileContext(
@@ -647,76 +1117,164 @@ def get_bgp_ebb_igp_pnh_metric_oscillation_playbook(
             expected_established_sessions=expected_established_sessions,
             cpu_baseline=cpu_baseline,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=tuple(start_ipv4s),
+            ibgp_pnh_start_ipv6s=tuple(start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
-            exclude_bgp_mon=exclude_bgp_mon,
+            bgp_mon=bgp_mon_scope,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_igp_pnh_metric_oscillation_playbook",
-        setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
-        prechecks=igp_checks.prechecks,
-        postchecks=igp_checks.postchecks,
-        snapshot_checks=igp_checks.snapshot_checks,
-        periodic_tasks=create_standard_periodic_tasks(
-            device_name=device_name,
-            memory_threshold=memory_threshold,
-            cpu_util_terminate_on_error=cpu_util_terminate_on_error,
-            memory_terminate_on_error=memory_terminate_on_error,
-        ),
-        stages=[
-            create_steps_stage(
-                steps=[
-                    create_validated_igp_pnh_metric_oscillation_step(
-                        device_name=device_name,
-                        start_ipv4s=start_ipv4s,
-                        start_ipv6s=start_ipv6s,
-                        local_link=local_link,
-                        other_link=other_link,
-                        count=count,
-                        step=step_size,
-                        duration=duration,
-                        frequency=frequency,
-                    ),
-                ],
-            )
-        ],
-        cleanup_steps=[
-            create_openr_route_action_step(
+    playbook_name = "bgp_ebb_igp_pnh_metric_oscillation_playbook"
+    return create_dice_unified_churn_playbook(
+        spec=igp_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=igp_checks.prechecks,
+            postchecks=igp_checks.postchecks,
+            snapshot_checks=igp_checks.snapshot_checks,
+            periodic_tasks=create_standard_periodic_tasks(
                 device_name=device_name,
-                start_ipv4s=start_ipv4s,
-                start_ipv6s=start_ipv6s,
-                local_link=local_link,
-                other_link=other_link,
-                action=OpenRRouteAction.INJECT.value,
-                count=count,
-                step=step_size,
-                description="Re-inject Open/R routes to restore original metrics",
+                memory_threshold=memory_threshold,
+                cpu_util_terminate_on_error=cpu_util_terminate_on_error,
+                memory_terminate_on_error=memory_terminate_on_error,
             ),
-        ],
+            action_factory=lambda: _characterized(
+                [
+                    create_steps_stage(
+                        steps=[
+                            create_igp_metric_churn_step(
+                                IgpMetricChurn.create(
+                                    hostname=device_name,
+                                    start_ipv4s=start_ipv4s,
+                                    start_ipv6s=start_ipv6s,
+                                    local_link=local_link,
+                                    other_link=other_link,
+                                    count=count,
+                                    step=step_size,
+                                    duration=duration,
+                                    frequency=frequency,
+                                )
+                            ),
+                        ],
+                    )
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_WORKLOAD,
+                device_name=device_name,
+                config=characterization,
+            ),
+            cleanup_steps=[
+                create_openr_route_action_step(
+                    device_name=device_name,
+                    start_ipv4s=start_ipv4s,
+                    start_ipv6s=start_ipv6s,
+                    local_link=local_link,
+                    other_link=other_link,
+                    action=OpenRRouteAction.INJECT.value,
+                    count=count,
+                    step=step_size,
+                    description="Re-inject Open/R routes to restore original metrics",
+                ),
+            ],
+        )
     )
+
+
+def _validate_route_registry_policy_sources(
+    *,
+    baseline: t.Mapping[str, t.Mapping[str, object]] | None,
+    expanded: t.Mapping[str, t.Mapping[str, object]] | None,
+    expected_route_count: int,
+    runtime_prefix_start_index: int,
+    runtime_prefix_end_index: int,
+) -> None:
+    if baseline is None and expanded is None:
+        return
+    if baseline is None or expanded is None:
+        raise ValueError(
+            "baseline and expanded formulaic policy sources must be provided together"
+        )
+    if runtime_prefix_start_index != expected_route_count:
+        raise ValueError("formulaic policy baseline must start at N")
+    delta = runtime_prefix_end_index - runtime_prefix_start_index
+    if delta != 100:
+        raise ValueError("formulaic policy workload must use the N+100 window")
+    if not baseline or set(baseline) != set(expanded):
+        raise ValueError("baseline and expanded formulaic policy statements must match")
+    geometry_fields = {
+        "start_prefix",
+        "prefix_step",
+        "prefix_length",
+        "parent_networks",
+    }
+    for statement in baseline:
+        baseline_source = baseline[statement]
+        expanded_source = expanded[statement]
+        if any(
+            baseline_source.get(field) != expanded_source.get(field)
+            for field in geometry_fields
+        ):
+            raise ValueError(
+                f"formulaic policy geometry differs for statement {statement}"
+            )
+        if baseline_source.get("count") != expected_route_count:
+            raise ValueError(f"formulaic baseline count is not N for {statement}")
+        if expanded_source.get("count") != expected_route_count + delta:
+            raise ValueError(f"formulaic expanded count is not N+100 for {statement}")
 
 
 def get_bgp_ebb_route_registry_runtime_update_playbook(
     device_name: str,
     peergroup_ibgp_v6: str,
     peergroup_ibgp_v4: str,
-    expected_established_sessions: int = 0,
+    expected_established_sessions: t.Optional[int] = None,
     profile: BgpPlusPlusProfile = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
     cpu_baseline: float = 6.0,
     memory_threshold: int = Gigabyte.GIG_5.value,
     cpu_util_terminate_on_error: bool = False,
     memory_terminate_on_error: bool = False,
     ebgp_peer_description: str = "EBGP",
-    prefix_pool_regex: str = ".*EBGP.*",
-    soak_time_seconds: int = 600,
+    prefix_pool_regex: str = r"^PREFIX_POOL_IPV[46]_EBGP$",
+    expected_prefix_pool_names: t.Sequence[str] = (
+        "PREFIX_POOL_IPV4_EBGP",
+        "PREFIX_POOL_IPV6_EBGP",
+    ),
+    exact_ebgp_peer_group_names: t.Sequence[str] = (
+        RUNTIME_UPDATE_EXACT_PEER_GROUP_NAMES
+    ),
+    soak_time_seconds: int = 120,
     expected_route_count: int = 750,
+    expected_route_count_histogram_by_afi: t.Optional[
+        t.Mapping[str, t.Mapping[int, int]]
+    ] = None,
+    expanded_route_count_histogram_by_afi: t.Optional[
+        t.Mapping[str, t.Mapping[int, int]]
+    ] = None,
+    peer_prefix_exclusion_blocks_by_pool: t.Optional[
+        t.Mapping[str, t.Sequence[t.Mapping[str, object]]]
+    ] = None,
     runtime_prefix_start_index: int = 750,
     runtime_prefix_end_index: int = 850,
     baseline_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_750.json",
     expanded_policy_path: str = "taac/test_bgp_policies/ebb_route_registry_prefix_list_850.json",
+    baseline_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
+    expanded_policy_prefix_sources: t.Mapping[str, t.Mapping[str, object]]
+    | None = None,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     exclude_bgp_mon: bool = True,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-12: Route-registry runtime update.
@@ -733,7 +1291,7 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
         device_name: Name of the device under test
         peergroup_ibgp_v6: IPv6 iBGP peer group name for session checks
         peergroup_ibgp_v4: IPv4 iBGP peer group name for session checks
-        expected_established_sessions: Expected number of established BGP sessions
+        expected_established_sessions: Optional positive established-session count
         profile: BGP++ profile (with or without Open/R)
         cpu_baseline: CPU baseline threshold for prechecks (default: 6.0)
         memory_threshold: Memory threshold in bytes (default: 5GB)
@@ -741,9 +1299,17 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
         memory_terminate_on_error: Terminate test on memory threshold breach
         ebgp_peer_description: Deprecated compatibility parameter; ignored
             because CICD-EBB-12 is locked to exact EB-FA peer-group names
-        prefix_pool_regex: Regex to match prefix pool names (default: ".*EBGP.*")
-        soak_time_seconds: Soak duration for BGP stability (default: 600s)
+        prefix_pool_regex: Anchored regex matching the IPv4 and IPv6 eBGP pools
+        exact_ebgp_peer_group_names: Exact eBGP peer-group names in required
+            IPv6, IPv4 order
+        soak_time_seconds: Soak duration for BGP stability (default: 120s)
         expected_route_count: Expected baseline eBGP route count (default: 750)
+        expected_route_count_histogram_by_afi: Optional exact baseline
+            distribution for each address family
+        expanded_route_count_histogram_by_afi: Optional exact expanded and
+            restored distribution for each address family
+        peer_prefix_exclusion_blocks_by_pool: Optional topology-authored sparse
+            activation blocks keyed by IXIA prefix-pool name
         runtime_prefix_start_index: First test prefix index (default: 750)
         runtime_prefix_end_index: Last test prefix index (default: 850)
         baseline_policy_path: Policy that accepts only the baseline route set
@@ -754,12 +1320,44 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
     Returns:
         Playbook configured for BGP route registry prefix-list runtime update testing
     """
+    _validate_route_registry_policy_sources(
+        baseline=baseline_policy_prefix_sources,
+        expanded=expanded_policy_prefix_sources,
+        expected_route_count=expected_route_count,
+        runtime_prefix_start_index=runtime_prefix_start_index,
+        runtime_prefix_end_index=runtime_prefix_end_index,
+    )
     if precheck_thresholds is None:
         precheck_thresholds = get_precheck_thresholds()
 
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    # None intentionally preserves this generic builder's no-exact-cardinality
+    # mode; zero is invalid. The topology-bound full-scale factory always
+    # supplies its positive non-monitor session total.
+    if expected_established_sessions is not None and (
+        isinstance(expected_established_sessions, bool)
+        or not isinstance(expected_established_sessions, int)
+        or expected_established_sessions < 1
+    ):
+        raise ValueError("expected_established_sessions must be a positive integer")
+    if not expected_prefix_pool_names or len(set(expected_prefix_pool_names)) != len(
+        expected_prefix_pool_names
+    ):
+        raise ValueError("expected_prefix_pool_names must be nonempty and unique")
+    if not exact_ebgp_peer_group_names or len(set(exact_ebgp_peer_group_names)) != len(
+        exact_ebgp_peer_group_names
+    ):
+        raise ValueError("exact_ebgp_peer_group_names must be nonempty and unique")
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    parent_prefixes_to_ignore = bgp_mon_scope.ignore_prefixes() or []
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     runtime_update_checks = get_profile_checks(
         CheckProfile.RUNTIME_UPDATE,
         ProfileContext(
@@ -770,20 +1368,44 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
             cpu_baseline=cpu_baseline,
             expected_established_sessions=expected_established_sessions,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
-            exclude_bgp_mon=exclude_bgp_mon,
-            route_count_expected=expected_route_count,
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
+            bgp_mon=bgp_mon_scope,
+            exact_ebgp_peer_group_names=tuple(exact_ebgp_peer_group_names),
+            route_count_expected=(
+                None
+                if expected_route_count_histogram_by_afi is not None
+                else expected_route_count
+            ),
+            route_count_histogram_by_afi=(expected_route_count_histogram_by_afi),
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
     return Playbook(
         name="bgp_ebb_route_registry_runtime_update_playbook",
         setup_steps=create_route_registry_prefix_list_setup_steps(
             device_name=device_name,
-            exact_peer_group_names=[*RUNTIME_UPDATE_EXACT_PEER_GROUP_NAMES],
+            exact_peer_group_names=list(exact_ebgp_peer_group_names),
             prefix_start_index=runtime_prefix_start_index,
             prefix_end_index=runtime_prefix_end_index,
+            prefix_pool_regex=prefix_pool_regex,
+            expected_prefix_pool_names=expected_prefix_pool_names,
             baseline_policy_path=baseline_policy_path,
-            expected_route_count=expected_route_count,
-            convergence_soft_threshold_seconds=60,
+            baseline_policy_prefix_sources=baseline_policy_prefix_sources,
+            verify_trigger_readback=True,
+            verify_policy_readback=True,
+            expected_route_count=(
+                None
+                if expected_route_count_histogram_by_afi is not None
+                else expected_route_count
+            ),
+            expected_route_count_histogram_by_afi=(
+                expected_route_count_histogram_by_afi
+            ),
+            convergence_soft_threshold_seconds=180,
             convergence_hard_timeout_seconds=300,
             convergence_poll_interval_seconds=5,
         ),
@@ -796,35 +1418,69 @@ def get_bgp_ebb_route_registry_runtime_update_playbook(
             cpu_util_terminate_on_error=cpu_util_terminate_on_error,
             memory_terminate_on_error=memory_terminate_on_error,
         ),
-        stages=[
-            create_route_registry_runtime_update_stage(
-                device_name=device_name,
-                exact_peer_group_names=[*RUNTIME_UPDATE_EXACT_PEER_GROUP_NAMES],
-                prefix_pool_regex=prefix_pool_regex,
-                prefix_start_index=runtime_prefix_start_index,
-                prefix_end_index=runtime_prefix_end_index,
-                soak_time_seconds=soak_time_seconds,
-                baseline_route_count=expected_route_count,
-                convergence_soft_threshold_seconds=60,
-                convergence_hard_timeout_seconds=300,
-                convergence_poll_interval_seconds=5,
-                expanded_policy_path=expanded_policy_path,
-                baseline_policy_path=baseline_policy_path,
-            )
-        ],
+        stages=_characterized(
+            [
+                create_route_registry_runtime_update_stage(
+                    device_name=device_name,
+                    exact_peer_group_names=list(exact_ebgp_peer_group_names),
+                    prefix_pool_regex=prefix_pool_regex,
+                    prefix_start_index=runtime_prefix_start_index,
+                    prefix_end_index=runtime_prefix_end_index,
+                    expected_prefix_pool_names=expected_prefix_pool_names,
+                    soak_time_seconds=soak_time_seconds,
+                    baseline_route_count=expected_route_count,
+                    baseline_route_count_histogram_by_afi=(
+                        expected_route_count_histogram_by_afi
+                    ),
+                    expanded_route_count_histogram_by_afi=(
+                        expanded_route_count_histogram_by_afi
+                    ),
+                    peer_prefix_exclusion_blocks_by_pool=(
+                        peer_prefix_exclusion_blocks_by_pool
+                    ),
+                    convergence_soft_threshold_seconds=180,
+                    convergence_hard_timeout_seconds=300,
+                    convergence_poll_interval_seconds=5,
+                    expanded_policy_path=expanded_policy_path,
+                    baseline_policy_path=baseline_policy_path,
+                    expanded_policy_prefix_sources=expanded_policy_prefix_sources,
+                    baseline_policy_prefix_sources=baseline_policy_prefix_sources,
+                    verify_trigger_readback=True,
+                    verify_policy_readback=True,
+                    expected_established_sessions=expected_established_sessions,
+                    parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+                )
+            ],
+            playbook_name="bgp_ebb_route_registry_runtime_update_playbook",
+            phase=PHASE_WORKLOAD,
+            device_name=device_name,
+            config=characterization,
+        ),
         cleanup_steps=[
-            create_advertise_withdraw_prefixes_step(
+            create_route_registry_cleanup_step(
                 device_name=device_name,
-                advertise=True,
-                prefix_pool_regex=prefix_pool_regex,
+                prefix_pool_names=expected_prefix_pool_names,
                 prefix_start_index=runtime_prefix_start_index,
                 prefix_end_index=runtime_prefix_end_index,
-                description=f"Cleanup: Re-advertise {runtime_prefix_end_index - runtime_prefix_start_index} test prefixes ({runtime_prefix_start_index}-{runtime_prefix_end_index}) so next playbook has the full prefix pool",
-            ),
-            create_set_route_filter_step(
-                device_name=device_name,
-                config_path=expanded_policy_path,
-                description="Cleanup: Restore permissive route filter policy so the next playbook receives all prefixes",
+                expanded_policy_path=expanded_policy_path,
+                expanded_policy_prefix_sources=expanded_policy_prefix_sources,
+                expected_route_count=(
+                    None
+                    if expanded_route_count_histogram_by_afi is not None
+                    else expected_route_count
+                    + runtime_prefix_end_index
+                    - runtime_prefix_start_index
+                ),
+                expected_route_count_histogram_by_afi=(
+                    expanded_route_count_histogram_by_afi
+                ),
+                peer_prefix_exclusion_blocks_by_pool=(
+                    peer_prefix_exclusion_blocks_by_pool
+                ),
+                ebgp_peer_description=ebgp_peer_description,
+                exact_peer_group_names=list(exact_ebgp_peer_group_names),
+                expected_established_sessions=expected_established_sessions,
+                parent_prefixes_to_ignore=parent_prefixes_to_ignore,
             ),
         ],
     )
@@ -848,12 +1504,20 @@ def get_bgp_ebb_multipath_group_oscillation_playbook(
     oscillation_interval_seconds: int = 280,
     min_peers_to_stop: int = 1,
     max_peers_to_stop: int = 11,
+    cycle_count: int | None = None,
     expected_min_baseline_width: t.Optional[int] = None,
     expected_max_baseline_width: t.Optional[int] = None,
     min_multipath_width: t.Optional[int] = None,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     exclude_bgp_mon: bool = True,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-09: Multipath-group oscillation.
@@ -866,7 +1530,7 @@ def get_bgp_ebb_multipath_group_oscillation_playbook(
     1. Setting up BGP instability prerequisites
     2. Running standard prechecks
     3. Measuring the live multipath group width as the baseline
-    4. Fluctuating BGP multipath groups by stopping/starting eBGP sessions
+    4. Fluctuating multipath groups by deactivating exact IXIA eBGP rows
     5. Verifying multipath groups reduce/restore relative to the measured baseline
     6. Running standard postchecks (no convergence check)
 
@@ -883,13 +1547,15 @@ def get_bgp_ebb_multipath_group_oscillation_playbook(
         ipv4_peer_regex: Regex to match IPv4 eBGP peers (default: ".*IPV4_EBGP$")
         ipv6_peer_regex: Regex to match IPv6 eBGP peers (default: ".*IPV6_EBGP$")
         ipv4_session_count: Number of IPv4 eBGP sessions on the IXIA side
-            (default: 140). Used only for peer-stop indexing — NOT assumed to
+            (default: 140). Used only for peer-selection indexing — NOT assumed to
             equal the DUT-side multipath group width, which is measured live.
         ipv6_session_count: Number of IPv6 eBGP sessions on the IXIA side.
         test_duration_seconds: Total oscillation test duration (default: 1800s)
         oscillation_interval_seconds: Interval between oscillations (default: 280s)
-        min_peers_to_stop: Minimum peers to stop per cycle (default: 1)
-        max_peers_to_stop: Maximum peers to stop per cycle (default: 11)
+        min_peers_to_stop: Minimum peers to deactivate per cycle (default: 1)
+        max_peers_to_stop: Maximum peers to deactivate per cycle (default: 11)
+        cycle_count: Optional cycle count for a bounded validation run. The
+            cataloged playbook uses six cycles when this value is not set.
         expected_min_baseline_width: Optional sanity lower bound on the measured
             multipath width. Discovery fails if the measurement is below.
         expected_max_baseline_width: Optional sanity upper bound.
@@ -898,6 +1564,7 @@ def get_bgp_ebb_multipath_group_oscillation_playbook(
         postcheck_thresholds: Custom postcheck thresholds (uses defaults if None)
         exclude_bgp_mon: Exclude the BGP-MON parent prefix from session
             inventory checks, including the recovered-state cleanup gate.
+        bgp_mon_parent_network: Bound topology BGP-MON parent network.
 
     Returns:
         Playbook configured for BGP multipath group oscillation testing
@@ -908,6 +1575,16 @@ def get_bgp_ebb_multipath_group_oscillation_playbook(
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+
+    # Same phase as the _characterized() bracket below: the bracket writes
+    # these jq vars and these configs read them back.
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     osc_checks = get_profile_checks(
         CheckProfile.OSCILLATION,
         ProfileContext(
@@ -918,48 +1595,94 @@ def get_bgp_ebb_multipath_group_oscillation_playbook(
             expected_established_sessions=expected_established_sessions,
             cpu_baseline=cpu_baseline,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
-            exclude_bgp_mon=exclude_bgp_mon,
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
+            bgp_mon=bgp_mon_scope,
             snapshot_skip_flap=True,
             snapshot_skip_uptime=True,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_multipath_group_oscillation_playbook",
-        setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
-        prechecks=osc_checks.prechecks,
-        postchecks=osc_checks.postchecks,
-        snapshot_checks=osc_checks.snapshot_checks,
-        periodic_tasks=create_standard_periodic_tasks(
-            device_name=device_name,
-            memory_threshold=memory_threshold,
-            cpu_util_terminate_on_error=cpu_util_terminate_on_error,
-            memory_terminate_on_error=memory_terminate_on_error,
-        ),
-        stages=[
-            create_multipath_group_oscillation_stage(
+    playbook_name = "bgp_ebb_multipath_group_oscillation_playbook"
+    return create_dice_unified_churn_playbook(
+        spec=multipath_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=osc_checks.prechecks,
+            postchecks=osc_checks.postchecks,
+            snapshot_checks=osc_checks.snapshot_checks,
+            periodic_tasks=create_standard_periodic_tasks(
+                device_name=device_name,
+                memory_threshold=memory_threshold,
+                cpu_util_terminate_on_error=cpu_util_terminate_on_error,
+                memory_terminate_on_error=memory_terminate_on_error,
+            ),
+            action_factory=lambda: _characterized(
+                [
+                    create_multipath_group_oscillation_stage(
+                        hostname=device_name,
+                        ipv4_peer_regex=ipv4_peer_regex,
+                        ipv6_peer_regex=ipv6_peer_regex,
+                        ipv4_session_count=ipv4_session_count,
+                        ipv6_session_count=ipv6_session_count,
+                        test_duration_seconds=test_duration_seconds,
+                        oscillation_interval_seconds=oscillation_interval_seconds,
+                        min_peers_to_stop=min_peers_to_stop,
+                        max_peers_to_stop=max_peers_to_stop,
+                        cycle_count=cycle_count,
+                        expected_min_baseline_width=expected_min_baseline_width,
+                        expected_max_baseline_width=expected_max_baseline_width,
+                        min_multipath_width=min_multipath_width,
+                    ),
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_WORKLOAD,
+                device_name=device_name,
+                config=characterization,
+            ),
+            cleanup_steps=create_multipath_group_oscillation_cleanup_steps(
                 ipv4_peer_regex=ipv4_peer_regex,
                 ipv6_peer_regex=ipv6_peer_regex,
-                ipv4_session_count=ipv4_session_count,
-                ipv6_session_count=ipv6_session_count,
-                test_duration_seconds=test_duration_seconds,
-                oscillation_interval_seconds=oscillation_interval_seconds,
-                min_peers_to_stop=min_peers_to_stop,
-                max_peers_to_stop=max_peers_to_stop,
-                expected_min_baseline_width=expected_min_baseline_width,
-                expected_max_baseline_width=expected_max_baseline_width,
-                min_multipath_width=min_multipath_width,
+                ipv4_session_count_to_restore=ipv4_session_count,
+                ipv6_session_count_to_restore=ipv6_session_count,
+                expected_established_sessions=expected_established_sessions,
+                convergence_wait_seconds=oscillation_interval_seconds // 2,
+                parent_prefixes_to_ignore=bgp_mon_scope.ignore_prefixes(),
             ),
-        ],
-        cleanup_steps=create_multipath_group_oscillation_cleanup_steps(
-            ipv4_peer_regex=ipv4_peer_regex,
-            ipv6_peer_regex=ipv6_peer_regex,
-            max_peers_to_restore=max_peers_to_stop,
-            expected_established_sessions=expected_established_sessions,
-            convergence_wait_seconds=oscillation_interval_seconds // 2,
-            parent_prefixes_to_ignore=(
-                [f"{IXIA_BGP_MON_IC_PARENT_NETWORK}::/80"] if exclude_bgp_mon else None
-            ),
-        ),
+        )
+    )
+
+
+def _ebb_drained_prefix_descriptors(
+    prefix_end_index: int,
+    prefix_start_index: int = 0,
+    prefix_pool_regex: str = ".*EBGP.*",
+) -> t.List[t.Dict[str, t.Any]]:
+    """Descriptors for the eBGP prefixes a FAUU drain touches.
+
+    Thin wrapper over the topology helper, which owns the definition so the
+    scale TestConfig builds the identical window. Local import keeps the
+    topology constants off this module's import path.
+
+    Args:
+        prefix_end_index: Exclusive end of the drained window.
+        prefix_start_index: Inclusive start of the drained window.
+        prefix_pool_regex: The same regex the drain uses to select IXIA pools,
+            so a single-AFI drain does not demand coverage of the other pool.
+
+    Returns:
+        One descriptor per matching address family.
+    """
+    from taac.abstractions.topologies.ebb_full_scale import (
+        ebb_drained_prefix_descriptors,
+    )
+
+    return ebb_drained_prefix_descriptors(
+        prefix_end_index, prefix_start_index, prefix_pool_regex
     )
 
 
@@ -968,7 +1691,9 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
     peergroup_ibgp_v6: str,
     peergroup_ibgp_v4: str,
     expected_established_sessions: int = 0,
+    expected_peer_identity: t.Mapping[str, str] | None = None,
     profile: BgpPlusPlusProfile = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
+    precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     memory_threshold: int = Gigabyte.GIG_5.value,
     cpu_util_terminate_on_error: bool = False,
     memory_terminate_on_error: bool = False,
@@ -976,9 +1701,18 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
     prefix_end_index: int = 96,
     tcp_dump_capture_interface_ebgp: str = "",
     tcp_dump_capture_interface_bgpmon: str | None = None,
-    tcp_dump_capture_interface_ibgp: str = "",
+    tcp_dump_capture_interface_ibgp: str | None = None,
     soak_time_seconds: int = 300,
     exclude_bgp_mon: bool = True,
+    bgp_mon_parent_network: str | None = None,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    tcp_dump_capture_interfaces_ibgp: t.Sequence[str] | None = None,
+    ibgp_pnh_start_ipv4s: t.Sequence[str] | None = None,
+    ibgp_pnh_start_ipv6s: t.Sequence[str] | None = None,
+    ibgp_pnh_count: int | None = None,
+    ibgp_pnh_step: int | None = None,
+    require_stable_restoration_baseline: bool = False,
 ) -> Playbook:
     """
     Build CICD-EBB-13: FAUU drain and undrain.
@@ -995,6 +1729,7 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
         peergroup_ibgp_v4: IPv4 iBGP peer group name for session checks
         expected_established_sessions: Expected number of established BGP sessions
         profile: BGP++ profile (with or without Open/R)
+        precheck_thresholds: Custom precheck thresholds (uses defaults if None)
         memory_threshold: Memory threshold in bytes (default: 5GB)
         cpu_util_terminate_on_error: Terminate test on CPU threshold breach
         memory_terminate_on_error: Terminate test on memory threshold breach
@@ -1002,20 +1737,38 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
         prefix_end_index: Ending prefix index (default: 96)
         tcp_dump_capture_interface_ebgp: eBGP interface for PCAP capture
         tcp_dump_capture_interface_bgpmon: Legacy auxiliary interface input; accepted but ignored
-        tcp_dump_capture_interface_ibgp: iBGP interface for PCAP capture
+        tcp_dump_capture_interface_ibgp: Legacy single iBGP capture interface; mutually exclusive with the plural input.
+        tcp_dump_capture_interfaces_ibgp: All iBGP capture interfaces; one preserves legacy capture identities, multiple use ordered suffixes.
+        ibgp_pnh_start_ipv4s: Optional topology-resolved IPv4 PNH range starts.
+        ibgp_pnh_start_ipv6s: Optional topology-resolved IPv6 PNH range starts.
+        ibgp_pnh_count: Optional PNH count per range.
+        ibgp_pnh_step: Optional PNH address stride.
         soak_time_seconds: Soak time in seconds (default: 300)
 
     Returns:
         Playbook configured for BGP FAUU drain/undrain testing
     """
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     drain_checks = get_profile_checks(
         CheckProfile.DRAIN_UNDRAIN,
         ProfileContext(
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
+            precheck_thresholds=precheck_thresholds,
             expected_established_sessions=expected_established_sessions,
-            exclude_bgp_mon=exclude_bgp_mon,
+            bgp_mon=BgpMonScope(
+                exclude=exclude_bgp_mon,
+                parent_network=bgp_mon_parent_network,
+            ),
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
     return Playbook(
@@ -1030,16 +1783,35 @@ def get_bgp_ebb_fauu_drain_undrain_playbook(
             cpu_util_terminate_on_error=cpu_util_terminate_on_error,
             memory_terminate_on_error=memory_terminate_on_error,
         ),
-        stages=[
-            create_fauu_drain_undrain_stage(
-                device_name=device_name,
-                prefix_pool_regex=prefix_pool_regex,
-                prefix_end_index=prefix_end_index,
-                tcp_dump_capture_interface_ebgp=tcp_dump_capture_interface_ebgp,
-                tcp_dump_capture_interface_ibgp=tcp_dump_capture_interface_ibgp,
-                soak_time_seconds=soak_time_seconds,
-            )
-        ],
+        stages=_characterized(
+            [
+                create_fauu_drain_undrain_stage(
+                    device_name=device_name,
+                    prefix_pool_regex=prefix_pool_regex,
+                    prefix_end_index=prefix_end_index,
+                    tcp_dump_capture_interface_ebgp=tcp_dump_capture_interface_ebgp,
+                    tcp_dump_capture_interface_ibgp=tcp_dump_capture_interface_ibgp,
+                    tcp_dump_capture_interfaces_ibgp=tcp_dump_capture_interfaces_ibgp,
+                    soak_time_seconds=soak_time_seconds,
+                    require_stable_restoration_baseline=(
+                        require_stable_restoration_baseline
+                    ),
+                    expected_established_sessions=expected_established_sessions,
+                    expected_peer_addresses=(
+                        tuple(sorted(expected_peer_identity))
+                        if expected_peer_identity is not None
+                        else None
+                    ),
+                    drained_prefix_descriptors=_ebb_drained_prefix_descriptors(
+                        prefix_end_index, prefix_pool_regex=prefix_pool_regex
+                    ),
+                )
+            ],
+            playbook_name="bgp_ebb_fauu_drain_undrain_playbook",
+            phase=PHASE_WORKLOAD,
+            device_name=device_name,
+            config=characterization,
+        ),
     )
 
 
@@ -1049,6 +1821,7 @@ def get_bgp_ebb_plane_drain_undrain_playbook(
     peergroup_ibgp_v4: str,
     expected_established_sessions: int = 0,
     profile: BgpPlusPlusProfile = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
+    precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     memory_threshold: int = Gigabyte.GIG_5.value,
     cpu_util_terminate_on_error: bool = False,
     memory_terminate_on_error: bool = False,
@@ -1058,6 +1831,9 @@ def get_bgp_ebb_plane_drain_undrain_playbook(
     tcp_dump_capture_interface_ibgp: str = "",
     soak_time_seconds: int = 1200,
     exclude_bgp_mon: bool = True,
+    bgp_mon_parent_network: str | None = None,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
 ) -> Playbook:
     """
     Build CICD-EBB-14: Plane drain and undrain.
@@ -1074,6 +1850,7 @@ def get_bgp_ebb_plane_drain_undrain_playbook(
         peergroup_ibgp_v4: IPv4 iBGP peer group name for session checks
         expected_established_sessions: Expected number of established BGP sessions
         profile: BGP++ profile (with or without Open/R)
+        precheck_thresholds: Custom precheck thresholds (uses defaults if None)
         memory_threshold: Memory threshold in bytes (default: 5GB)
         cpu_util_terminate_on_error: Terminate test on CPU threshold breach
         memory_terminate_on_error: Terminate test on memory threshold breach
@@ -1086,14 +1863,23 @@ def get_bgp_ebb_plane_drain_undrain_playbook(
     Returns:
         Playbook configured for BGP plane drain/undrain testing
     """
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     drain_checks = get_profile_checks(
         CheckProfile.DRAIN_UNDRAIN,
         ProfileContext(
             peergroup_ibgp_v6=peergroup_ibgp_v6,
             peergroup_ibgp_v4=peergroup_ibgp_v4,
+            precheck_thresholds=precheck_thresholds,
             expected_established_sessions=expected_established_sessions,
-            exclude_bgp_mon=exclude_bgp_mon,
+            bgp_mon=BgpMonScope(
+                exclude=exclude_bgp_mon,
+                parent_network=bgp_mon_parent_network,
+            ),
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
     return Playbook(
@@ -1108,15 +1894,21 @@ def get_bgp_ebb_plane_drain_undrain_playbook(
             cpu_util_terminate_on_error=cpu_util_terminate_on_error,
             memory_terminate_on_error=memory_terminate_on_error,
         ),
-        stages=[
-            *create_plane_drain_undrain_stage(
-                device_name=device_name,
-                prefix_pool_regex=prefix_pool_regex,
-                tcp_dump_capture_interface_ebgp=tcp_dump_capture_interface_ebgp,
-                tcp_dump_capture_interface_ibgp=tcp_dump_capture_interface_ibgp,
-                soak_time_seconds=soak_time_seconds,
-            )
-        ],
+        stages=_characterized(
+            [
+                *create_plane_drain_undrain_stage(
+                    device_name=device_name,
+                    prefix_pool_regex=prefix_pool_regex,
+                    tcp_dump_capture_interface_ebgp=tcp_dump_capture_interface_ebgp,
+                    tcp_dump_capture_interface_ibgp=tcp_dump_capture_interface_ibgp,
+                    soak_time_seconds=soak_time_seconds,
+                )
+            ],
+            playbook_name="bgp_ebb_plane_drain_undrain_playbook",
+            phase=PHASE_WORKLOAD,
+            device_name=device_name,
+            config=characterization,
+        ),
     )
 
 
@@ -1126,6 +1918,9 @@ def get_bgp_ebb_longevity_playbook(
     community_churn_frequency: int = 60,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     exclude_bgp_mon: bool = True,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
 ) -> Playbook:
     """
     Build CICD-EBB-15: Longevity.
@@ -1149,26 +1944,49 @@ def get_bgp_ebb_longevity_playbook(
     Returns:
         Playbook configured for BGP longevity soak testing
     """
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
     # SOAK_NO_PRECHECK has no prechecks (the prechecks field is left unset).
+    # Same phase as the _characterized() bracket below: the bracket writes
+    # these jq vars and these configs read them back.
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_SOAK, characterization, characterization_gates
+    )
     soak_checks = get_profile_checks(
         CheckProfile.SOAK_NO_PRECHECK,
         ProfileContext(
             postcheck_thresholds=postcheck_thresholds,
             check_bgp_convergence=False,
-            exclude_bgp_mon=exclude_bgp_mon,
+            bgp_mon=bgp_mon_scope,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_longevity_playbook",
-        setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
-        postchecks=soak_checks.postchecks,
-        snapshot_checks=soak_checks.snapshot_checks,
-        stages=[
-            create_longevity_churn_stage(
-                test_duration_seconds=duration,
-                churn_interval_seconds=community_churn_frequency,
-            )
-        ],
+    playbook_name = "bgp_ebb_longevity_playbook"
+    return create_dice_unified_churn_playbook(
+        spec=longevity_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=(),
+            postchecks=soak_checks.postchecks,
+            snapshot_checks=soak_checks.snapshot_checks,
+            periodic_tasks=(),
+            action_factory=lambda: _characterized(
+                [
+                    create_longevity_churn_stage(
+                        test_duration_seconds=duration,
+                        churn_interval_seconds=community_churn_frequency,
+                    )
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_SOAK,
+                device_name=device_name,
+                config=characterization,
+            ),
+        )
     )
 
 
@@ -1183,13 +2001,26 @@ def get_bgp_ebb_ebgp_route_oscillation_playbook(
     cpu_util_terminate_on_error: bool = False,
     memory_terminate_on_error: bool = False,
     prefix_pool_regex: str = r"^PREFIX_POOL_IPV[46]_EBGP$",
+    expected_prefix_pool_names: t.Sequence[str] = (
+        "PREFIX_POOL_IPV4_EBGP",
+        "PREFIX_POOL_IPV6_EBGP",
+    ),
+    prefix_pool_names_by_afi: t.Mapping[str, str] | None = None,
     prefix_start_index: int = 0,
     prefix_end_index: int = 750,
+    advertise_transition_soft_threshold_seconds: float | None = None,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
     exclude_bgp_mon: bool = True,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-05: eBGP route oscillation.
@@ -1205,6 +2036,20 @@ def get_bgp_ebb_ebgp_route_oscillation_playbook(
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    all_parent_prefixes_to_ignore = _all_parent_prefixes_to_ignore(
+        parent_prefixes_to_ignore,
+        bgp_mon_scope,
+    )
+
+    # Same phase as the _characterized() bracket below: the bracket writes
+    # these jq vars and these configs read them back.
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     osc_checks = get_profile_checks(
         CheckProfile.OSCILLATION,
         ProfileContext(
@@ -1215,33 +2060,71 @@ def get_bgp_ebb_ebgp_route_oscillation_playbook(
             expected_established_sessions=expected_established_sessions,
             cpu_baseline=cpu_baseline,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
-            exclude_bgp_mon=exclude_bgp_mon,
-            parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+            bgp_mon=bgp_mon_scope,
+            parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_ebgp_route_oscillation_playbook",
-        setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
-        prechecks=osc_checks.prechecks,
-        postchecks=osc_checks.postchecks,
-        snapshot_checks=osc_checks.snapshot_checks,
-        periodic_tasks=create_standard_periodic_tasks(
-            device_name=device_name,
-            memory_threshold=memory_threshold,
-            cpu_util_terminate_on_error=cpu_util_terminate_on_error,
-            memory_terminate_on_error=memory_terminate_on_error,
-        ),
-        stages=[
-            create_validated_ebgp_route_oscillations_stage(
+    playbook_name = "bgp_ebb_ebgp_route_oscillation_playbook"
+    return create_dice_unified_churn_playbook(
+        spec=route_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=osc_checks.prechecks,
+            postchecks=osc_checks.postchecks,
+            snapshot_checks=osc_checks.snapshot_checks,
+            periodic_tasks=create_standard_periodic_tasks(
                 device_name=device_name,
-                expected_established_sessions=expected_established_sessions,
-                prefix_pool_regex=prefix_pool_regex,
-                prefix_start_index=prefix_start_index,
-                prefix_end_index=prefix_end_index,
-                parent_prefixes_to_ignore=parent_prefixes_to_ignore or (),
-            )
-        ],
+                memory_threshold=memory_threshold,
+                cpu_util_terminate_on_error=cpu_util_terminate_on_error,
+                memory_terminate_on_error=memory_terminate_on_error,
+            ),
+            action_factory=lambda: _characterized(
+                [
+                    create_route_churn_stage(
+                        hostname=device_name,
+                        route_churn=RouteChurn.from_step_params(
+                            {
+                                "scenario_id": "bgp_ebb_ebgp_route_oscillation",
+                                "prefix_pool_regex": prefix_pool_regex,
+                                "expected_prefix_pool_names": (
+                                    expected_prefix_pool_names
+                                ),
+                                "prefix_pool_names_by_afi": (prefix_pool_names_by_afi),
+                                "expected_established_sessions": (
+                                    expected_established_sessions
+                                ),
+                                "prefix_start_index": prefix_start_index,
+                                "prefix_end_index": prefix_end_index,
+                                "advertise_transition_soft_threshold_seconds": (
+                                    advertise_transition_soft_threshold_seconds
+                                ),
+                                "test_duration_seconds": 3600,
+                                "withdraw_time": 60,
+                                "readvertise_time": 60,
+                                "parent_prefixes_to_ignore": (
+                                    all_parent_prefixes_to_ignore
+                                ),
+                            }
+                        ),
+                        description=(
+                            "Run validated dual-stack eBGP route oscillations"
+                        ),
+                    )
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_WORKLOAD,
+                device_name=device_name,
+                config=characterization,
+            ),
+        )
     )
 
 
@@ -1268,11 +2151,19 @@ def get_bgp_ebb_ibgp_route_oscillation_playbook(
     ),
     prefix_start_index: int = 0,
     prefix_end_index: int = 750,
+    advertise_transition_soft_threshold_seconds: float | None = None,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
     exclude_bgp_mon: bool = True,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-06: iBGP route oscillation.
@@ -1288,6 +2179,20 @@ def get_bgp_ebb_ibgp_route_oscillation_playbook(
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    all_parent_prefixes_to_ignore = _all_parent_prefixes_to_ignore(
+        parent_prefixes_to_ignore,
+        bgp_mon_scope,
+    )
+
+    # Same phase as the _characterized() bracket below: the bracket writes
+    # these jq vars and these configs read them back.
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     osc_checks = get_profile_checks(
         CheckProfile.OSCILLATION,
         ProfileContext(
@@ -1298,34 +2203,67 @@ def get_bgp_ebb_ibgp_route_oscillation_playbook(
             expected_established_sessions=expected_established_sessions,
             cpu_baseline=cpu_baseline,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
-            exclude_bgp_mon=exclude_bgp_mon,
-            parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+            bgp_mon=bgp_mon_scope,
+            parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_ibgp_route_oscillation_playbook",
-        setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
-        prechecks=osc_checks.prechecks,
-        postchecks=osc_checks.postchecks,
-        snapshot_checks=osc_checks.snapshot_checks,
-        periodic_tasks=create_standard_periodic_tasks(
-            device_name=device_name,
-            memory_threshold=memory_threshold,
-            cpu_util_terminate_on_error=cpu_util_terminate_on_error,
-            memory_terminate_on_error=memory_terminate_on_error,
-        ),
-        stages=[
-            create_validated_bgp_route_oscillations_stage(
+    playbook_name = "bgp_ebb_ibgp_route_oscillation_playbook"
+    return create_dice_unified_churn_playbook(
+        spec=route_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=osc_checks.prechecks,
+            postchecks=osc_checks.postchecks,
+            snapshot_checks=osc_checks.snapshot_checks,
+            periodic_tasks=create_standard_periodic_tasks(
                 device_name=device_name,
-                expected_established_sessions=expected_established_sessions,
-                prefix_pool_regex=prefix_pool_regex,
-                expected_prefix_pool_names=expected_prefix_pool_names,
-                prefix_start_index=prefix_start_index,
-                prefix_end_index=prefix_end_index,
-                parent_prefixes_to_ignore=parent_prefixes_to_ignore or (),
-            )
-        ],
+                memory_threshold=memory_threshold,
+                cpu_util_terminate_on_error=cpu_util_terminate_on_error,
+                memory_terminate_on_error=memory_terminate_on_error,
+            ),
+            action_factory=lambda: _characterized(
+                [
+                    create_route_churn_stage(
+                        hostname=device_name,
+                        route_churn=RouteChurn.from_step_params(
+                            {
+                                "scenario_id": "bgp_ebb_ibgp_route_oscillation",
+                                "prefix_pool_regex": prefix_pool_regex,
+                                "expected_prefix_pool_names": (
+                                    expected_prefix_pool_names
+                                ),
+                                "expected_established_sessions": (
+                                    expected_established_sessions
+                                ),
+                                "prefix_start_index": prefix_start_index,
+                                "prefix_end_index": prefix_end_index,
+                                "advertise_transition_soft_threshold_seconds": (
+                                    advertise_transition_soft_threshold_seconds
+                                ),
+                                "test_duration_seconds": 3600,
+                                "withdraw_time": 60,
+                                "readvertise_time": 60,
+                                "parent_prefixes_to_ignore": (
+                                    all_parent_prefixes_to_ignore
+                                ),
+                            }
+                        ),
+                    )
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_WORKLOAD,
+                device_name=device_name,
+                config=characterization,
+            ),
+        )
     )
 
 
@@ -1335,7 +2273,7 @@ def get_bgp_ebb_igp_unresolvable_pnh_playbook(
     peergroup_ibgp_v4: str,
     local_link: t.Dict[str, t.Any],
     other_link: t.Dict[str, t.Any],
-    expected_established_sessions: int = 0,
+    expected_in_scope_sessions: int,
     profile: BgpPlusPlusProfile = BgpPlusPlusProfile.BGP_PLUS_PLUS_WITHOUT_OPEN_R,
     cpu_baseline: float = 8.0,
     memory_threshold: int = Gigabyte.GIG_5.value,
@@ -1343,13 +2281,20 @@ def get_bgp_ebb_igp_unresolvable_pnh_playbook(
     memory_terminate_on_error: bool = False,
     start_ipv4s: t.Optional[t.List[str]] = None,
     start_ipv6s: t.Optional[t.List[str]] = None,
+    restore_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    restore_start_ipv6s: t.Optional[t.Sequence[str]] = None,
     count: int = 63,
     step_size: int = 2,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
     precheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     postcheck_thresholds: t.Optional[HardwareCapacityThresholds] = None,
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
     exclude_bgp_mon: bool = True,
+    bgp_mon_parent_network: t.Optional[str] = None,
     tcp_dump_capture_interface: t.Optional[str] = None,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
 ) -> Playbook:
     """
     Build CICD-EBB-08: IGP unresolvable PNH.
@@ -1360,11 +2305,15 @@ def get_bgp_ebb_igp_unresolvable_pnh_playbook(
     1. Setting up BGP instability prerequisites
     2. Running standard prechecks
     3. Executing the unresolvable PNHs stage (deleting Open/R routes)
-    4. Validating BGP++ UPDATE sends, no withdrawals, and sustained stability
+    4. Validating BGP++ UPDATE sends, no non-monitor withdrawals, and sustained stability
     5. Cleanup: re-injecting deleted routes to restore original state
 
     ``tcp_dump_capture_interface`` is retained as an ignored compatibility
     parameter while callers migrate to the counter-based validation.
+
+    ``start_ipv4s`` and ``start_ipv6s`` scope the destructive stimulus, while
+    the corresponding ``restore_start_*`` values carry the complete bound PNH
+    inventory needed by readiness checks and cleanup.
     """
     if start_ipv4s is None:
         start_ipv4s = [DEFAULT_OPENR_START_IPV4S[0]]
@@ -1372,12 +2321,18 @@ def get_bgp_ebb_igp_unresolvable_pnh_playbook(
     if start_ipv6s is None:
         start_ipv6s = [DEFAULT_OPENR_START_IPV6S[0]]
 
-    cleanup_start_ipv4s = list(
-        dict.fromkeys([*DEFAULT_OPENR_START_IPV4S, *start_ipv4s])
-    )
-    cleanup_start_ipv6s = list(
-        dict.fromkeys([*DEFAULT_OPENR_START_IPV6S, *start_ipv6s])
-    )
+    if restore_start_ipv4s is None:
+        restore_start_ipv4s = list(
+            dict.fromkeys([*DEFAULT_OPENR_START_IPV4S, *start_ipv4s])
+        )
+    else:
+        restore_start_ipv4s = list(restore_start_ipv4s)
+    if restore_start_ipv6s is None:
+        restore_start_ipv6s = list(
+            dict.fromkeys([*DEFAULT_OPENR_START_IPV6S, *start_ipv6s])
+        )
+    else:
+        restore_start_ipv6s = list(restore_start_ipv6s)
 
     if precheck_thresholds is None:
         precheck_thresholds = get_precheck_thresholds()
@@ -1385,6 +2340,16 @@ def get_bgp_ebb_igp_unresolvable_pnh_playbook(
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    # Same phase as the _characterized() bracket below: the bracket writes
+    # these jq vars and these configs read them back.
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
+    # Readiness and withdrawal snapshots must count the same scoped peer set.
     igp_checks = get_profile_checks(
         CheckProfile.IGP_INSTABILITY,
         ProfileContext(
@@ -1392,51 +2357,71 @@ def get_bgp_ebb_igp_unresolvable_pnh_playbook(
             peergroup_ibgp_v4=peergroup_ibgp_v4,
             precheck_thresholds=precheck_thresholds,
             postcheck_thresholds=postcheck_thresholds,
-            expected_established_sessions=expected_established_sessions,
+            expected_established_sessions=expected_in_scope_sessions,
             cpu_baseline=cpu_baseline,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=tuple(restore_start_ipv4s),
+            ibgp_pnh_start_ipv6s=tuple(restore_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
-            exclude_bgp_mon=exclude_bgp_mon,
+            bgp_mon=bgp_mon_scope,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_igp_unresolvable_pnh_playbook",
-        setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
-        prechecks=igp_checks.prechecks,
-        postchecks=igp_checks.postchecks,
-        snapshot_checks=igp_checks.snapshot_checks,
-        periodic_tasks=create_standard_periodic_tasks(
-            device_name=device_name,
-            memory_threshold=memory_threshold,
-            cpu_util_terminate_on_error=cpu_util_terminate_on_error,
-            memory_terminate_on_error=memory_terminate_on_error,
-        ),
-        stages=[
-            create_validated_bgp_igp_instability_unresolvable_pnhs_stage(
+    playbook_name = "bgp_ebb_igp_unresolvable_pnh_playbook"
+    return create_dice_unified_churn_playbook(
+        spec=igp_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=igp_checks.prechecks,
+            postchecks=igp_checks.postchecks,
+            snapshot_checks=igp_checks.snapshot_checks,
+            periodic_tasks=create_standard_periodic_tasks(
                 device_name=device_name,
-                start_ipv4s=start_ipv4s,
-                start_ipv6s=start_ipv6s,
-                restore_start_ipv4s=cleanup_start_ipv4s,
-                restore_start_ipv6s=cleanup_start_ipv6s,
-                local_link=local_link,
-                other_link=other_link,
-                count=count,
-                step=step_size,
-            )
-        ],
-        cleanup_steps=[
-            create_openr_route_action_step(
-                device_name=device_name,
-                start_ipv4s=cleanup_start_ipv4s,
-                start_ipv6s=cleanup_start_ipv6s,
-                local_link=local_link,
-                other_link=other_link,
-                action=OpenRRouteAction.INJECT.value,
-                count=count,
-                step=step_size,
-                description="Re-inject Open/R routes to restore deleted routes",
+                memory_threshold=memory_threshold,
+                cpu_util_terminate_on_error=cpu_util_terminate_on_error,
+                memory_terminate_on_error=memory_terminate_on_error,
             ),
-        ],
+            action_factory=lambda: _characterized(
+                [
+                    create_validated_bgp_igp_instability_unresolvable_pnhs_stage(
+                        device_name=device_name,
+                        start_ipv4s=start_ipv4s,
+                        start_ipv6s=start_ipv6s,
+                        restore_start_ipv4s=restore_start_ipv4s,
+                        restore_start_ipv6s=restore_start_ipv6s,
+                        local_link=local_link,
+                        other_link=other_link,
+                        count=count,
+                        step=step_size,
+                        expected_in_scope_sessions=expected_in_scope_sessions,
+                        parent_prefixes_to_ignore=(
+                            bgp_mon_scope.ignore_prefixes() or ()
+                        ),
+                    )
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_WORKLOAD,
+                device_name=device_name,
+                config=characterization,
+            ),
+            cleanup_steps=[
+                create_openr_route_action_step(
+                    device_name=device_name,
+                    start_ipv4s=restore_start_ipv4s,
+                    start_ipv6s=restore_start_ipv6s,
+                    local_link=local_link,
+                    other_link=other_link,
+                    action=OpenRRouteAction.INJECT.value,
+                    count=count,
+                    step=step_size,
+                    description="Re-inject Open/R routes to restore deleted routes",
+                ),
+            ],
+        )
     )
 
 
@@ -1463,6 +2448,13 @@ def get_bgp_ebb_ebgp_session_oscillation_playbook(
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
     exclude_bgp_mon: bool = True,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-03: eBGP session oscillation.
@@ -1477,6 +2469,18 @@ def get_bgp_ebb_ebgp_session_oscillation_playbook(
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    all_parent_prefixes_to_ignore = _all_parent_prefixes_to_ignore(
+        parent_prefixes_to_ignore,
+        bgp_mon_scope,
+    )
+
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     osc_checks = get_profile_checks(
         CheckProfile.OSCILLATION,
         ProfileContext(
@@ -1487,40 +2491,81 @@ def get_bgp_ebb_ebgp_session_oscillation_playbook(
             expected_established_sessions=expected_established_sessions,
             cpu_baseline=cpu_baseline,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
-            parent_prefixes_to_ignore=parent_prefixes_to_ignore,
-            exclude_bgp_mon=exclude_bgp_mon,
+            parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
+            bgp_mon=bgp_mon_scope,
             snapshot_skip_flap=True,
             snapshot_skip_uptime=True,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_ebgp_session_oscillation_playbook",
-        setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
-        prechecks=osc_checks.prechecks,
-        postchecks=osc_checks.postchecks,
-        snapshot_checks=osc_checks.snapshot_checks,
-        periodic_tasks=create_standard_periodic_tasks(
-            device_name=device_name,
-            memory_threshold=memory_threshold,
-            cpu_util_terminate_on_error=cpu_util_terminate_on_error,
-            memory_terminate_on_error=memory_terminate_on_error,
-        ),
-        stages=[
-            create_validated_ebgp_session_oscillation_stage(
+    playbook_name = "bgp_ebb_ebgp_session_oscillation_playbook"
+    return create_dice_unified_churn_playbook(
+        spec=session_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=osc_checks.prechecks,
+            postchecks=osc_checks.postchecks,
+            snapshot_checks=osc_checks.snapshot_checks,
+            periodic_tasks=create_standard_periodic_tasks(
                 device_name=device_name,
-                ipv4_peer_regex=ipv4_peer_regex,
-                ipv6_peer_regex=ipv6_peer_regex,
-                test_duration_seconds=test_duration_seconds,
-                uptime_seconds=uptime_seconds,
-                downtime_seconds=downtime_seconds,
-                sessions_per_cycle=sessions_per_cycle,
-                ipv4_session_count=ipv4_session_count,
-                ipv6_session_count=ipv6_session_count,
-                expected_established_sessions=expected_established_sessions,
-                parent_prefixes_to_ignore=parent_prefixes_to_ignore or (),
+                memory_threshold=memory_threshold,
+                cpu_util_terminate_on_error=cpu_util_terminate_on_error,
+                memory_terminate_on_error=memory_terminate_on_error,
             ),
-        ],
+            action_factory=lambda: _characterized(
+                [
+                    create_session_churn_stage(
+                        hostname=device_name,
+                        session_churn=SessionChurn.from_step_params(
+                            {
+                                "scenario_id": "bgp_ebb_ebgp_session_oscillation",
+                                "session_groups": (
+                                    {
+                                        "name": "ebgp_ipv4",
+                                        "peer_regex": ipv4_peer_regex,
+                                        "session_count": ipv4_session_count,
+                                        "sessions_per_cycle": sessions_per_cycle // 2,
+                                    },
+                                    {
+                                        "name": "ebgp_ipv6",
+                                        "peer_regex": ipv6_peer_regex,
+                                        "session_count": ipv6_session_count,
+                                        "sessions_per_cycle": (
+                                            sessions_per_cycle - sessions_per_cycle // 2
+                                        ),
+                                    },
+                                ),
+                                "cycle_schedule": (("ebgp_ipv4", "ebgp_ipv6"),),
+                                "expected_established_sessions": (
+                                    expected_established_sessions
+                                ),
+                                "test_duration_seconds": test_duration_seconds,
+                                "uptime_seconds": uptime_seconds,
+                                "downtime_seconds": downtime_seconds,
+                                "parent_prefixes_to_ignore": (
+                                    all_parent_prefixes_to_ignore
+                                ),
+                                "ixia_restore_timeout_floor_seconds": 180,
+                            }
+                        ),
+                        description=(
+                            "Run validated dual-stack eBGP session oscillations"
+                        ),
+                    ),
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_WORKLOAD,
+                device_name=device_name,
+                config=characterization,
+            ),
+        )
     )
 
 
@@ -1549,6 +2594,13 @@ def get_bgp_ebb_ibgp_plane_session_oscillation_playbook(
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None,
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
     exclude_bgp_mon: bool = True,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
+    bgp_mon_parent_network: str | None = None,
+    ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
+    ibgp_pnh_count: t.Optional[int] = None,
+    ibgp_pnh_step: t.Optional[int] = None,
 ) -> Playbook:
     """
     Build CICD-EBB-04: iBGP plane session oscillation.
@@ -1566,6 +2618,18 @@ def get_bgp_ebb_ibgp_plane_session_oscillation_playbook(
     if postcheck_thresholds is None:
         postcheck_thresholds = get_postcheck_thresholds()
 
+    bgp_mon_scope = BgpMonScope(
+        exclude=exclude_bgp_mon,
+        parent_network=bgp_mon_parent_network,
+    )
+    all_parent_prefixes_to_ignore = _all_parent_prefixes_to_ignore(
+        parent_prefixes_to_ignore,
+        bgp_mon_scope,
+    )
+
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     osc_checks = get_profile_checks(
         CheckProfile.OSCILLATION,
         ProfileContext(
@@ -1576,71 +2640,199 @@ def get_bgp_ebb_ibgp_plane_session_oscillation_playbook(
             expected_established_sessions=expected_established_sessions,
             cpu_baseline=cpu_baseline,
             check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+            ibgp_pnh_count=ibgp_pnh_count,
+            ibgp_pnh_step=ibgp_pnh_step,
             expected_peer_identity=expected_peer_identity,
-            parent_prefixes_to_ignore=parent_prefixes_to_ignore,
-            exclude_bgp_mon=exclude_bgp_mon,
+            parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
+            bgp_mon=bgp_mon_scope,
             snapshot_skip_flap=True,
             snapshot_skip_uptime=True,
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
-    return Playbook(
-        name="bgp_ebb_ibgp_plane_session_oscillation_playbook",
-        setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
-        prechecks=osc_checks.prechecks,
-        postchecks=osc_checks.postchecks,
-        snapshot_checks=osc_checks.snapshot_checks,
-        periodic_tasks=create_standard_periodic_tasks(
-            device_name=device_name,
-            memory_threshold=memory_threshold,
-            cpu_util_terminate_on_error=cpu_util_terminate_on_error,
-            memory_terminate_on_error=memory_terminate_on_error,
-        ),
-        stages=[
-            create_validated_plane_bgp_session_oscillation_stage(
+    playbook_name = "bgp_ebb_ibgp_plane_session_oscillation_playbook"
+    plane_definitions = generate_tornado_plane_definitions(
+        ipv4_peer_regex=ipv4_peer_regex,
+        ipv6_peer_regex=ipv6_peer_regex,
+        tornado_planes=tornado_planes,
+        session_type=session_type,
+        ipv4_sessions_per_plane=ipv4_sessions_per_plane,
+        ipv6_sessions_per_plane=ipv6_sessions_per_plane,
+    )
+    ipv4_width = sessions_per_plane // 2
+    ipv6_width = sessions_per_plane - ipv4_width
+    session_groups: list[dict[str, t.Any]] = []
+    cycle_schedule: list[list[str]] = []
+    for definition in plane_definitions:
+        plane_num = int(definition["plane_num"])
+        role = str(definition["role"]).lower()
+        group_prefix = f"plane_{plane_num}_{role}"
+        ipv4_name = f"{group_prefix}_ipv4"
+        ipv6_name = f"{group_prefix}_ipv6"
+        session_groups.extend(
+            [
+                {
+                    "name": ipv4_name,
+                    "peer_regex": definition["ipv4_regex"],
+                    "session_count": definition["ipv4_session_count"],
+                    "sessions_per_cycle": ipv4_width,
+                },
+                {
+                    "name": ipv6_name,
+                    "peer_regex": definition["ipv6_regex"],
+                    "session_count": definition["ipv6_session_count"],
+                    "sessions_per_cycle": ipv6_width,
+                },
+            ]
+        )
+        cycle_schedule.append([ipv4_name, ipv6_name])
+    return create_dice_unified_churn_playbook(
+        spec=session_churn_spec(
+            playbook_name=playbook_name,
+            device=device_name,
+            setup_steps=create_bgp_instability_setup_steps(device_name=device_name),
+            prechecks=osc_checks.prechecks,
+            postchecks=osc_checks.postchecks,
+            snapshot_checks=osc_checks.snapshot_checks,
+            periodic_tasks=create_standard_periodic_tasks(
                 device_name=device_name,
-                ipv4_peer_regex=ipv4_peer_regex,
-                ipv6_peer_regex=ipv6_peer_regex,
-                test_duration_seconds=test_duration_seconds,
-                uptime_seconds=uptime_seconds,
-                downtime_seconds=downtime_seconds,
-                sessions_per_cycle=sessions_per_plane,
-                ipv4_sessions_per_plane=ipv4_sessions_per_plane,
-                ipv6_sessions_per_plane=ipv6_sessions_per_plane,
-                tornado_planes=tornado_planes,
-                session_type=session_type,
-                expected_established_sessions=expected_established_sessions,
-                parent_prefixes_to_ignore=parent_prefixes_to_ignore or (),
+                memory_threshold=memory_threshold,
+                cpu_util_terminate_on_error=cpu_util_terminate_on_error,
+                memory_terminate_on_error=memory_terminate_on_error,
             ),
-        ],
+            action_factory=lambda: _characterized(
+                [
+                    create_session_churn_stage(
+                        hostname=device_name,
+                        session_churn=SessionChurn.from_step_params(
+                            {
+                                "scenario_id": (
+                                    "bgp_ebb_ibgp_plane_session_oscillation"
+                                ),
+                                "session_groups": session_groups,
+                                "cycle_schedule": cycle_schedule,
+                                "expected_established_sessions": (
+                                    expected_established_sessions
+                                ),
+                                "test_duration_seconds": test_duration_seconds,
+                                "uptime_seconds": uptime_seconds,
+                                "downtime_seconds": downtime_seconds,
+                                "parent_prefixes_to_ignore": (
+                                    all_parent_prefixes_to_ignore
+                                ),
+                                "ixia_restore_timeout_floor_seconds": 600,
+                            }
+                        ),
+                        description=(
+                            "Run validated per-plane iBGP session oscillations"
+                        ),
+                    ),
+                ],
+                playbook_name=playbook_name,
+                phase=PHASE_WORKLOAD,
+                device_name=device_name,
+                config=characterization,
+            ),
+        )
     )
 
 
 def get_bgp_ebb_nexthop_group_count_threshold_playbook(
     device_name: str,
-    nexthop_group_threshold: int = 100,
-    prefix_pool_regex: str = ".*EBGP.*",
-    prefix_start_index: int = 0,
-    prefix_end_index: int = 5000,
-    test_duration_seconds: int = 1200,
+    expected_established_sessions: int,
+    route_count_expected: int,
+    ixia_items_by_afi: t.Mapping[str, t.Mapping[str, t.Any]],
+    exact_ebgp_peer_group_names: tuple[str, ...] = (
+        RUNTIME_UPDATE_EXACT_PEER_GROUP_NAMES
+    ),
+    prefix_pool_scope_regex: str | None = None,
+    route_count_histogram_by_afi: t.Optional[
+        t.Mapping[str, t.Mapping[int, int]]
+    ] = None,
+    nexthop_group_threshold: int = 8192,
+    seed: int = 160016,
+    target_membership_width: int | None = None,
+    inactive_paths_per_afi: int | None = None,
+    minimum_distinct_memberships_per_afi: int = 750,
+    minimum_changed_paths_per_epoch: int = 5_000,
+    epoch_count: int = 48,
+    epoch_interval_seconds: int = 25,
     soak_duration: int = 300,
     convergence_threshold: int = 600,
+    minimum_observed_bgp_multiway_memberships: int = 1001,
+    minimum_paused_fibagent_samples: int = 1,
+    minimum_confirmed_pause_fap_samples: int = 3,
+    minimum_observed_multiway_groups: int = 1,
+    control_plane_sample_interval_seconds: int = 5,
+    control_plane_read_timeout_seconds: int = 180,
+    nexthop_group_poll_interval_seconds: int = 60,
+    nexthop_group_min_samples: int = 6,
+    nexthop_group_min_consecutive_samples: int = 3,
+    fibagent_nhg_watermark_high: int = 1000,
+    fibagent_nhg_watermark_low: int = 1000,
+    restoration_stage_prefix_count: int | None = None,
+    enable_update_group: bool = True,
     exclude_bgp_mon: bool = True,
+    bgp_mon_parent_network: str | None = None,
+    characterization: CharacterizationConfig = DISABLED,
+    characterization_gates: CharacterizationGates = NO_CHARACTERIZATION_GATES,
 ) -> Playbook:
-    """
-    Build CICD-EBB-17: Nexthop-group count threshold.
+    """Build CICD-EBB-16: High-cardinality nexthop-group random storm.
 
     See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and triage guidance.
 
-    Monitors nexthop group counts during eBGP route oscillations and fails
-    if the count meets or exceeds the configured threshold.
+    Creates independent selected-path membership per prefix, proves the DUT
+    sustained the requested BGP multipath NHG floor, then verifies recovery.
+    Halfway through the storm, restarts FibAgentBgp while it is paused and
+    requires it to come back paused at the high watermark.
+
+    Args:
+        restoration_stage_prefix_count: When set, restore the baseline this
+            many prefixes per AFI at a time instead of all at once. A one-shot
+            restore builds wide per-prefix intermediate groups that can
+            transiently overflow the Jericho2 FecLevel2 table.
     """
-    # SOAK_NO_PRECHECK has no prechecks (the prechecks field is left unset).
+    target_prefix_counts = tuple(
+        items.get("target_prefix_count") for items in ixia_items_by_afi.values()
+    )
+    if (
+        not target_prefix_counts
+        or len(set(target_prefix_counts)) != 1
+        or isinstance(target_prefix_counts[0], bool)
+        or not isinstance(target_prefix_counts[0], int)
+        or target_prefix_counts[0] <= 0
+    ):
+        raise ValueError(
+            "CICD-EBB-16 requires one positive target prefix count per AFI"
+        )
+    if inactive_paths_per_afi is None and target_membership_width is None:
+        inactive_paths_per_afi = 4 * t.cast(int, target_prefix_counts[0])
+    cpu_characterization, rss_delta = _characterization_profile_configs(
+        PHASE_WORKLOAD, characterization, characterization_gates
+    )
     soak_checks = get_profile_checks(
-        CheckProfile.SOAK_NO_PRECHECK,
+        CheckProfile.SOAK_READINESS_GATED,
         ProfileContext(
             check_bgp_convergence=True,
             convergence_threshold=convergence_threshold,
-            exclude_bgp_mon=exclude_bgp_mon,
+            expected_established_sessions=expected_established_sessions,
+            route_count_expected=(
+                None
+                if route_count_histogram_by_afi is not None
+                else route_count_expected
+            ),
+            route_count_histogram_by_afi=route_count_histogram_by_afi,
+            exact_ebgp_peer_group_names=exact_ebgp_peer_group_names,
+            enable_update_group=enable_update_group,
+            bgp_mon=BgpMonScope(
+                exclude=exclude_bgp_mon,
+                parent_network=bgp_mon_parent_network,
+            ),
+            cpu_characterization=cpu_characterization,
+            rss_delta=rss_delta,
         ),
     )
     return Playbook(
@@ -1648,6 +2840,7 @@ def get_bgp_ebb_nexthop_group_count_threshold_playbook(
         setup_steps=create_bgp_instability_setup_steps(
             device_name=device_name,
         ),
+        prechecks=soak_checks.prechecks,
         snapshot_checks=soak_checks.snapshot_checks,
         periodic_tasks=create_standard_periodic_tasks(
             device_name=device_name,
@@ -1656,27 +2849,180 @@ def get_bgp_ebb_nexthop_group_count_threshold_playbook(
             create_nexthop_group_poll_periodic_task(
                 device_name=device_name,
                 threshold=nexthop_group_threshold,
+                interval=nexthop_group_poll_interval_seconds,
+                min_ecmp_width=2,
+                min_observed_groups=fibagent_nhg_watermark_high,
+                min_observed_multiway_groups=minimum_observed_multiway_groups,
+                # No floor on hardware-programmed rows: while paused, FibAgent
+                # keeps NHGs no route uses until reconciliation, and EOS leaves
+                # unreferenced groups out of hardware, so that count stays below
+                # the high watermark. min_observed_groups checks EOS reached it.
+                max_programmed_groups=fibagent_nhg_watermark_high,
+                min_observed_groups_consecutive_samples=(
+                    nexthop_group_min_consecutive_samples
+                ),
+                min_samples=nexthop_group_min_samples,
             ),
         ],
         postchecks=soak_checks.postchecks,
-        stages=[
-            create_route_oscillations_stage(
-                device_name=device_name,
-                prefix_pool_regex=prefix_pool_regex,
-                prefix_start_index=prefix_start_index,
-                prefix_end_index=prefix_end_index,
-                test_duration_seconds=test_duration_seconds,
-                spread=True,
-            ),
-            create_steps_stage(
-                steps=[
-                    create_longevity_step(
-                        duration=soak_duration,
-                        description=f"Soak after final prefix changes for {soak_duration} seconds",
+        stages=_characterized(
+            [
+                create_bgp_nhg_random_storm_stage(
+                    hostname=device_name,
+                    ixia_items_by_afi=ixia_items_by_afi,
+                    prefix_pool_scope_regex=prefix_pool_scope_regex,
+                    seed=seed,
+                    inactive_paths_per_afi=inactive_paths_per_afi,
+                    target_membership_width=target_membership_width,
+                    minimum_distinct_memberships_per_afi=(
+                        minimum_distinct_memberships_per_afi
                     ),
-                ],
-            ),
-        ],
+                    minimum_observed_bgp_multiway_memberships=(
+                        minimum_observed_bgp_multiway_memberships
+                    ),
+                    minimum_paused_fibagent_samples=(minimum_paused_fibagent_samples),
+                    minimum_confirmed_pause_fap_samples=(
+                        minimum_confirmed_pause_fap_samples
+                    ),
+                    fibagent_nhg_watermark_high=fibagent_nhg_watermark_high,
+                    fibagent_nhg_watermark_low=fibagent_nhg_watermark_low,
+                    enable_control_plane_validation=True,
+                    control_plane_sample_interval_seconds=(
+                        control_plane_sample_interval_seconds
+                    ),
+                    control_plane_read_timeout_seconds=(
+                        control_plane_read_timeout_seconds
+                    ),
+                    minimum_changed_paths_per_epoch=minimum_changed_paths_per_epoch,
+                    epoch_count=epoch_count,
+                    epoch_interval_seconds=epoch_interval_seconds,
+                    restoration_stage_prefix_count=restoration_stage_prefix_count,
+                    fibagent_restart_after_epoch=(
+                        epoch_count // 2 if epoch_count > 1 else None
+                    ),
+                ),
+                create_steps_stage(
+                    steps=[
+                        create_longevity_step(
+                            duration=soak_duration,
+                            description=f"Soak after final prefix changes for {soak_duration} seconds",
+                        ),
+                    ],
+                ),
+            ],
+            playbook_name="bgp_ebb_nexthop_group_count_threshold_playbook",
+            phase=PHASE_WORKLOAD,
+            device_name=device_name,
+            config=characterization,
+        ),
+    )
+
+
+def get_bgp_ebb_related_peer_compute_playbook(
+    *,
+    device_name: str,
+    egress_peer_counts: list[int],
+    prefix_count: int,
+    ebgp_peer_count: int,
+    per_iteration_setup_steps_factory: PerIterationSetupStepsFactory | None = None,
+) -> Playbook:
+    """Build CICD-EBB-17: Comp Scale Session Sweep.
+
+    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and current gaps.
+    """
+    return create_performance_scaling_egress_peer_sweep_playbook(
+        device_name=device_name,
+        egress_peer_counts=egress_peer_counts,
+        prefix_count=prefix_count,
+        ebgp_peer_count=ebgp_peer_count,
+        per_iteration_setup_steps_factory=per_iteration_setup_steps_factory,
+    )
+
+
+def get_bgp_ebb_transient_memory_route_scale_playbook(
+    *,
+    description: str,
+    stages: list[Stage],
+) -> Playbook:
+    """Build CICD-EBB-19: Memory Scale Route Sweep.
+
+    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and current gaps.
+    """
+    return build_case2_playbook(
+        name="bgp_plus_plus_sc3_transient_memory_route_scale_test",
+        description=description,
+        stages=stages,
+    )
+
+
+def get_bgp_ebb_transient_memory_peer_scale_playbook(
+    *,
+    device_name: str,
+    ixia_interface_mimic_ebgp: str,
+    ingress_peer_counts: list[int],
+    total_prefix_count: int,
+    prefix_pool_regex: str,
+    prefix_start: str,
+    prefix_length: int,
+    ibgp_peer_count: int,
+    address_families: list[str],
+    stable_sample_window_seconds: int,
+    convergence_wait_seconds: int,
+    acceptance_gate_mode: str | None = None,
+    rib_out_gate_mode: str | None = None,
+    measurement_gate_mode: str | None = None,
+    memory_ceiling_gate_mode: str | None = None,
+    transient_gate_mode: str | None = None,
+    transient_memory_ceiling_mb: float = SC4_TRANSIENT_MEMORY_CEILING_MB,
+    max_peak_memory_mb: float = SC4_MAX_PEAK_MEMORY_MB,
+) -> Playbook:
+    """Build CICD-EBB-20: Memory Scale eBGP Sweep.
+
+    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and current gaps.
+    """
+    return create_transient_memory_ingress_peer_scale_playbook(
+        device_name=device_name,
+        ixia_interface_mimic_ebgp=ixia_interface_mimic_ebgp,
+        ingress_peer_counts=ingress_peer_counts,
+        total_prefix_count=total_prefix_count,
+        prefix_pool_regex=prefix_pool_regex,
+        prefix_start=prefix_start,
+        prefix_length=prefix_length,
+        ibgp_peer_count=ibgp_peer_count,
+        address_families=address_families,
+        stable_sample_window_seconds=stable_sample_window_seconds,
+        convergence_wait_seconds=convergence_wait_seconds,
+        acceptance_gate_mode=acceptance_gate_mode,
+        rib_out_gate_mode=rib_out_gate_mode,
+        measurement_gate_mode=measurement_gate_mode,
+        memory_ceiling_gate_mode=memory_ceiling_gate_mode,
+        transient_gate_mode=transient_gate_mode,
+        transient_memory_ceiling_mb=transient_memory_ceiling_mb,
+        max_peak_memory_mb=max_peak_memory_mb,
+    )
+
+
+def get_bgp_ebb_churn_processing_playbook(
+    *,
+    description: str,
+    snapshot_checks: list[SnapshotHealthCheck],
+    periodic_tasks: list[PeriodicTask],
+    prechecks: list[PointInTimeHealthCheck],
+    postchecks: list[PointInTimeHealthCheck],
+    stages: list[Stage],
+) -> Playbook:
+    """Build CICD-EBB-22: Fixed Batch Route Churn Sweep.
+
+    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and current gaps.
+    """
+    return build_case6_playbook(
+        name="bgp_plus_plus_route_churn_prefix_scaling_test",
+        description=description,
+        snapshot_checks=snapshot_checks,
+        periodic_tasks=periodic_tasks,
+        prechecks=prechecks,
+        postchecks=postchecks,
+        stages=stages,
     )
 
 
@@ -1699,9 +3045,9 @@ def get_bgp_ebb_update_packing_playbook(
     min_advertised_nlri: int = 0,
     restart_bgp_for_complete_view: bool,
 ) -> Playbook:
-    """Build CICD-EBB-18: UPDATE packing.
+    """Build CICD-EBB-21: Update Packing.
 
-    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and triage guidance.
+    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and current gaps.
     """
     return Playbook(
         name="bgp_ebb_update_packing_playbook",
@@ -1744,6 +3090,91 @@ def get_bgp_ebb_update_packing_playbook(
     )
 
 
+def get_bgp_ebb_separable_policy_evaluation_playbook(
+    *,
+    device_name: str,
+    prefix_counts: t.Sequence[int],
+    prefix_capacity: int,
+    prefix_pool_names_by_afi: t.Mapping[str, str],
+    peer_group_names_by_afi: t.Mapping[str, str],
+    peer_counts_by_afi: t.Mapping[str, int],
+    expected_peers: t.Sequence[t.Mapping[str, t.Any]],
+    expected_local_as_4_byte: int,
+    expect_update_group_enabled: bool,
+    max_absolute_overhead_us: float,
+    max_slope_overhead_us_per_10k: float,
+) -> Playbook:
+    """Build CICD-EBB-23: Policy Eval Overhead Sweep.
+
+    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and current gaps.
+    """
+    state_key = "ebb23_policy_evaluation"
+    arm_specs = (
+        (
+            "baseline",
+            "ACCEPT_ALL",
+            "taac/arista_performance_scaling_test_bgpcpp_configs/"
+            "bgpcpp_config_test_case8_accept_all",
+        ),
+        (
+            "candidate",
+            "EB-FA-IN",
+            "taac/arista_performance_scaling_test_bgpcpp_configs/"
+            "bgpcpp_config_test_case8_eb_fa_in_no_prefix",
+        ),
+    )
+    steps = [
+        create_policy_evaluation_sweep_control_step(
+            action="initialize",
+            state_key=state_key,
+            description="Initialize paired EBB23 policy-evaluation evidence",
+        )
+    ]
+    for prefix_index, prefix_count in enumerate(prefix_counts):
+        ordered_arm_specs = (
+            arm_specs if prefix_index % 2 == 0 else tuple(reversed(arm_specs))
+        )
+        for arm, policy_name, policy_configerator_path in ordered_arm_specs:
+            steps.extend(
+                create_policy_evaluation_point_steps(
+                    device_name=device_name,
+                    arm=arm,
+                    policy_name=policy_name,
+                    policy_configerator_path=policy_configerator_path,
+                    prefix_count=prefix_count,
+                    prefix_capacity=prefix_capacity,
+                    prefix_pool_names_by_afi=prefix_pool_names_by_afi,
+                    peer_group_names_by_afi=peer_group_names_by_afi,
+                    peer_counts_by_afi=peer_counts_by_afi,
+                    expected_peers=expected_peers,
+                    expected_local_as_4_byte=expected_local_as_4_byte,
+                    expect_update_group_enabled=expect_update_group_enabled,
+                    allowed_prefix_counts=prefix_counts,
+                    state_key=state_key,
+                    evidence_label_prefix="ebb23",
+                )
+            )
+    steps.append(
+        create_policy_evaluation_sweep_control_step(
+            action="evaluate",
+            state_key=state_key,
+            prefix_counts=prefix_counts,
+            max_absolute_overhead_us=max_absolute_overhead_us,
+            max_slope_overhead_us_per_10k=max_slope_overhead_us_per_10k,
+            check_name="ebb23_policy_evaluation_overhead",
+            description="Gate paired EBB23 absolute overhead and route-scale slope",
+        )
+    )
+    return Playbook(
+        name="bgp_ebb_separable_policy_evaluation_playbook",
+        description=(
+            "Compare accept-all and complex separable-policy processing cost "
+            "across an equal-attribute route-count sweep"
+        ),
+        stages=[create_steps_stage(steps=steps)],
+    )
+
+
 def get_bgp_ebb_constant_attribute_storage_playbook(
     *,
     device_name: str,
@@ -1755,12 +3186,8 @@ def get_bgp_ebb_constant_attribute_storage_playbook(
     unique_combination_counts: list[int],
     test_address_families: list[str],
     soak_time_minutes: int,
-    base_as_path_pool_size: int,
-    base_community_pool_size: int,
-    base_extended_community_pool_size: int,
+    attribute_pool_size: int,
     constant_acceptance_communities: list[str] | None,
-    max_communities_per_route_from_pool: int | None,
-    random_seed: int,
     test_route_withdrawal: bool,
     withdrawal_wait_minutes: int,
     dump_attribute_assignments: bool,
@@ -1780,9 +3207,9 @@ def get_bgp_ebb_constant_attribute_storage_playbook(
     peergroup_ibgp_v4: str | None,
     ssh_password: str,
 ) -> Playbook:
-    """Build CICD-EBB-19: Constant attribute storage.
+    """Build CICD-EBB-18: Storage Scale Attribute Sweep.
 
-    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and triage guidance.
+    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and current gaps.
     """
     return Playbook(
         name="bgp_ebb_constant_attribute_storage_playbook",
@@ -1802,15 +3229,13 @@ def get_bgp_ebb_constant_attribute_storage_playbook(
                             "unique_combination_counts": unique_combination_counts,
                             "test_address_families": test_address_families,
                             "soak_time_minutes": soak_time_minutes,
-                            "base_as_path_pool_size": base_as_path_pool_size,
-                            "base_community_pool_size": base_community_pool_size,
-                            "base_extended_community_pool_size": base_extended_community_pool_size,
-                            "as_path_length": 5,
-                            "communities_per_route": 5,
-                            "extended_communities_per_route": 1,
+                            # Entries in EACH of the three attribute pools. A
+                            # pool entry is one COMPLETE attribute, so the DUT
+                            # stores 3x this many for the whole sweep and at
+                            # most attribute_pool_size**3 distinct
+                            # attribute-sets can be requested.
+                            "attribute_pool_size": attribute_pool_size,
                             "attach_communities_for_ebgp_prefixes": constant_acceptance_communities,
-                            "max_communities_per_route_from_pool": max_communities_per_route_from_pool,
-                            "random_seed": random_seed,
                             "test_route_withdrawal": test_route_withdrawal,
                             "withdrawal_wait_minutes": withdrawal_wait_minutes,
                             "dump_attribute_assignments": dump_attribute_assignments,
@@ -1852,10 +3277,7 @@ def get_bgp_ebb_queue_memory_monitoring_playbook(
     ixia_interface_mimic_ebgp: str,
     monitor_cpu_stress: bool,
 ) -> Playbook:
-    """Build CICD-EBB-16: Queue and memory monitoring.
-
-    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and triage guidance.
-    """
+    """Build the deferred queue and memory monitoring playbook."""
     return Playbook(
         name="bgp_ebb_queue_memory_monitoring_playbook",
         description="Monitor BGP++ queue and memory under route churn",
@@ -1897,10 +3319,7 @@ def get_bgp_ebb_bounded_ecmp_sets_playbook(
     *,
     device_name: str,
 ) -> Playbook:
-    """Build CICD-EBB-20: Bounded ECMP sets.
-
-    See `fbcode/neteng/test_infra/routing_qualification/catalogs/taac/bgp_ebb_catalog.yaml` for the test contract and triage guidance.
-    """
+    """Build the deferred bounded-ECMP-sets playbook."""
     profile_checks = get_profile_checks(
         CheckProfile.PERF_SCALING_BOUNDED_ECMP, ProfileContext()
     )

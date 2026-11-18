@@ -11,6 +11,11 @@ from taac.utils.oss_taac_lib_utils import (
     get_root_logger,
 )
 
+# Re-exported for the callers that have always imported it from here. It lives
+# in result_rendering so that module can stay a leaf the bastion spec server
+# can import without the taac runtime.
+from taac.utils.result_rendering import format_duration
+
 
 SECTION_WIDTH: int = 80
 SECTION_CHAR: str = "="
@@ -101,7 +106,7 @@ def log_results_table(
           LLDP_CHECK                          PASS
           IXIA_PACKET_LOSS_CHECK              FAIL        Packet loss > 0.01%
           ---------------------------------------------------------------------------
-          Overall: 2 PASSED, 1 FAILED
+          Overall: 2 PASSED, 1 FAILED, 1 SKIPPED  (SKIPPED shown only when nonzero)
     """
     _logger = logger or get_root_logger()
     if not results:
@@ -120,24 +125,32 @@ def log_results_table(
     _logger.info(border)
 
     # Table header
-    header = f"  {'Check Name':<35} {'Status':<10} {'Message'}"
+    # Fit the widest check name (rows may be "<device>: <check>") with a
+    # 35-char floor so short tables keep the historical layout.
+    name_w = max([35] + [len(str(r.get("check_name", "Unknown"))) for r in results])
+    header = f"  {'Check Name':<{name_w}} {'Status':<10} {'Message'}"
     _logger.info(header)
     _logger.info("  " + "-" * (width - 4))
 
     passed = 0
     failed = 0
+    skipped = 0
     for result in results:
         check_name = result.get("check_name", "Unknown")
         status = result.get("status", "UNKNOWN")
         message = result.get("message", "")
-        _logger.info(f"  {check_name:<35} {status:<10} {message}")
+        _logger.info(f"  {check_name:<{name_w}} {status:<10} {message}")
         if status.upper() in ("PASS", "PASSED", "SUCCESS"):
             passed += 1
+        elif status.upper() in ("SKIP", "SKIPPED"):
+            skipped += 1
         else:
             failed += 1
 
     _logger.info("  " + "-" * (width - 4))
     overall = f"Overall: {passed} PASSED, {failed} FAILED"
+    if skipped:
+        overall += f", {skipped} SKIPPED"
     _logger.info(f"  {overall}")
     _logger.info("")
 
@@ -216,19 +229,6 @@ def log_health_check_info(
     _logger = logger or get_root_logger()
     device_part = f" | Device: {device_name}" if device_name else ""
     _logger.info(f"  [HC] {check_name}: {status}{device_part}")
-
-
-def format_duration(seconds: float) -> str:
-    """Format seconds into a human-readable duration string."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    minutes = int(seconds // 60)
-    remaining_secs = seconds % 60
-    if minutes < 60:
-        return f"{minutes}m {remaining_secs:.0f}s"
-    hours = int(minutes // 60)
-    remaining_mins = minutes % 60
-    return f"{hours}h {remaining_mins}m {remaining_secs:.0f}s"
 
 
 @contextmanager

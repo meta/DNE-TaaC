@@ -26,6 +26,7 @@ class _BgpPeer:
     def __init__(self, name: str = "BGP_PEER_IPV6_EBGP", count: int = 140) -> None:
         self.Name = name
         self.Count = count
+        self.parent: MagicMock = MagicMock()
         self.start_calls: list[str] = []
         self.stop_calls: list[str] = []
 
@@ -70,9 +71,7 @@ def _ixia_with_pools(pools: list[_PrefixPool]) -> tuple[Ixia, MagicMock]:
         ixia = Ixia()
     ixia.logger = MagicMock()
     get_pools = MagicMock(return_value=pools)
-    # pyre-ignore[8]
     ixia.get_prefix_pools_by_regexes = get_pools
-    # pyre-ignore[8]
     ixia.apply_changes = MagicMock()
     return ixia, get_pools
 
@@ -81,7 +80,6 @@ def _ixia(peers: list[_BgpPeer]) -> Ixia:
     with patch.object(Ixia, "__init__", lambda self: None):
         ixia = Ixia()
     ixia.logger = MagicMock()
-    # pyre-ignore[8]
     ixia.find_bgp_peers = MagicMock(return_value=peers)
     return ixia
 
@@ -200,3 +198,17 @@ class BgpSessionIndicesTest(later.unittest.TestCase):
 
         self.assertEqual(["1-140"], v6.route_property.stop_calls)
         self.assertEqual(["1-70"], v4.route_property.stop_calls)
+
+    def test_restart_bgp_sessions_sends_semicolon_ranges(self) -> None:
+        """IxNetwork rejects "3,4,5"; the stuck indices must go out as runs."""
+        peer = _BgpPeer(count=8)
+        peer.parent.Address.Values = [f"2001:db8::{i:x}" for i in range(1, 9)]
+        ixia = _ixia([peer])
+
+        restarted = ixia.restart_bgp_sessions(
+            ".*", ["2001:db8::3", "2001:db8::4", "2001:db8::5", "2001:db8::8"]
+        )
+
+        self.assertEqual(["3-5;8"], peer.stop_calls)
+        self.assertEqual(["3-5;8"], peer.start_calls)
+        self.assertEqual({peer.Name: [3, 4, 5, 8]}, restarted)

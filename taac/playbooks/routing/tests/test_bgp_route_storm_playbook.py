@@ -6,7 +6,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from taac.abstractions.churn.route import RouteStorm
+from taac.abstractions.topologies.ebb_full_scale import (
+    EBB_OPENR_INJECTED_START_IPV4S_IXIA03,
+    EBB_OPENR_INJECTED_START_IPV6S_IXIA03,
+)
 from taac.constants import BgpPlusPlusProfile
+from taac.playbooks.routing import (
+    bgp_ebb_playbooks as _bgp_ebb_playbooks,
+)
 from taac.playbooks.routing.bgp_ebb_playbooks import (
     get_bgp_ebb_route_storm_playbook,
 )
@@ -24,83 +32,106 @@ EXPECTED_POOLS = {
     "ipv6": "PREFIX_POOL_IBGP_IPV6_PLANE_1_REMOTE_EB",
 }
 EXPECTED_ROWS = [0, 10, 20, 30, 40, 50, 61]
+_FROZEN_ROUTE_STORM_PARAMS = {
+    "ixia_interface_mimic_ibgp": "Ethernet2",
+    "observer_peer_parent_prefix": "2401:db00:e50d:22:a::/80",
+    "prefix_pool_names": EXPECTED_POOLS,
+    "selected_peer_rows": EXPECTED_ROWS,
+    "expected_established_sessions": 1272,
+    "peer_count_per_plane": 62,
+    "routes_per_peer": 750,
+    "samples_per_block": 2,
+    "cycles": 60,
+    "advertise_seconds": 30,
+    "withdraw_seconds": 30,
+    "poll_interval_seconds": 5,
+    "convergence_hard_timeout_seconds": 300,
+    "heavy_setup_hard_timeout_seconds": 1_800,
+    "heavy_route_batch_rows": 15_750,
+    "session_establish_timeout_seconds": 300,
+    "restore_timeout_seconds": 300,
+    "quiet_window_seconds": 120,
+    "max_lookup_concurrency": 1,
+    "as_path_pool_size": 10,
+    "as_path_length": 255,
+    "as_set_length": 255,
+    "communities_per_route": 32,
+    "extended_communities_per_route": 16,
+}
+_FROZEN_ROUTE_STORM_PAYLOAD = {
+    "custom_step_name": "bgp_route_storm",
+    "hostname": "dut.example.com",
+    **_FROZEN_ROUTE_STORM_PARAMS,
+}
 
 
-def _locked_step_kwargs() -> dict:
-    return {
-        "hostname": "dut.example.com",
-        "ixia_interface_mimic_ibgp": "Ethernet2",
-        "expected_established_sessions": 1272,
-        "observer_peer_parent_prefix": "2401:db00:e50d:22:a::/80",
-        "prefix_pool_names": EXPECTED_POOLS,
-        "peer_count_per_plane": 62,
-        "selected_peer_rows": EXPECTED_ROWS,
-        "routes_per_peer": 750,
-        "samples_per_block": 2,
-        "cycles": 60,
-        "advertise_seconds": 30,
-        "withdraw_seconds": 30,
-        "poll_interval_seconds": 5,
-        "transition_timeout_seconds": 30,
-        "convergence_hard_timeout_seconds": 300,
-        "session_establish_timeout_seconds": 300,
-        "restore_timeout_seconds": 300,
-        "quiet_window_seconds": 120,
-        "max_lookup_concurrency": 8,
-        "as_path_pool_size": 10,
-        "as_path_length": 255,
-        "communities_per_route": 32,
-        "extended_communities_per_route": 1,
-    }
+def _locked_route_storm(**overrides: object) -> RouteStorm:
+    params = {**_FROZEN_ROUTE_STORM_PARAMS, **overrides}
+    return RouteStorm.from_step_params(params)
 
 
-def _step_payload(step: taac_types.Step) -> dict:
+def _step_json_params(step: taac_types.Step) -> str:
     params = step.step_params
     if params is None or params.json_params is None:
         raise AssertionError("custom step is missing serialized parameters")
-    return json.loads(params.json_params)
+    return params.json_params
+
+
+def _step_payload(step: taac_types.Step) -> dict:
+    return json.loads(_step_json_params(step))
 
 
 class BgpRouteStormPlaybookTest(unittest.TestCase):
+    def test_typed_route_storm_round_trips_flat_contract(self) -> None:
+        self.assertEqual(
+            _FROZEN_ROUTE_STORM_PARAMS,
+            _locked_route_storm().to_step_params(),
+        )
+
     def test_step_factory_serializes_locked_contract(self) -> None:
-        step = create_bgp_route_storm_step(**_locked_step_kwargs())
+        step = create_bgp_route_storm_step(
+            hostname="dut.example.com",
+            route_storm=_locked_route_storm(),
+        )
 
         self.assertEqual(taac_types.StepName.CUSTOM_STEP, step.name)
-        payload = _step_payload(step)
-        self.assertEqual("bgp_route_storm", payload["custom_step_name"])
-        self.assertEqual(EXPECTED_POOLS, payload["prefix_pool_names"])
-        self.assertEqual(EXPECTED_ROWS, payload["selected_peer_rows"])
-        self.assertEqual(60, payload["cycles"])
-        self.assertEqual(255, payload["as_path_length"])
-        self.assertEqual(32, payload["communities_per_route"])
-        self.assertEqual(1, payload["extended_communities_per_route"])
-        self.assertEqual(300, payload["convergence_hard_timeout_seconds"])
+        self.assertEqual(_FROZEN_ROUTE_STORM_PAYLOAD, _step_payload(step))
+        self.assertEqual(
+            json.dumps(_FROZEN_ROUTE_STORM_PAYLOAD),
+            _step_json_params(step),
+        )
+        self.assertEqual("Run audited dual-stack BGP route storm", step.description)
 
-    def test_step_factory_rejects_silent_extended_community_reduction(self) -> None:
-        kwargs = _locked_step_kwargs()
-        kwargs["extended_communities_per_route"] = 16
+    def test_typed_route_storm_rejects_heavy_attribute_shape_reduction(self) -> None:
+        with self.assertRaisesRegex(ValueError, "16 extended communities"):
+            _locked_route_storm(extended_communities_per_route=1)
 
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            create_bgp_route_storm_step(**kwargs)
+    def test_typed_route_storm_requires_positive_hard_timeout(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            _locked_route_storm(convergence_hard_timeout_seconds=0)
 
-    def test_step_factory_requires_hard_timeout_above_transition_timeout(
-        self,
-    ) -> None:
-        kwargs = _locked_step_kwargs()
-        kwargs["convergence_hard_timeout_seconds"] = 30
+    def test_bounded_validation_preserves_optional_payload_position(self) -> None:
+        params = _locked_route_storm(bounded_validation=True).to_step_params()
 
-        with self.assertRaisesRegex(ValueError, "must exceed"):
-            create_bgp_route_storm_step(**kwargs)
+        keys = list(params)
+        self.assertEqual(
+            keys.index("selected_peer_rows") + 1,
+            keys.index("bounded_validation"),
+        )
+        self.assertTrue(params["bounded_validation"])
 
     def test_stage_contains_only_the_failure_safe_custom_step(self) -> None:
-        stage = create_bgp_ebb_route_storm_stage(**_locked_step_kwargs())
+        stage = create_bgp_ebb_route_storm_stage(
+            hostname="dut.example.com",
+            route_storm=_locked_route_storm(),
+        )
 
         self.assertEqual(1, len(stage.steps))
         self.assertEqual(
             "bgp_route_storm", _step_payload(stage.steps[0])["custom_step_name"]
         )
 
-    def test_playbook_wires_exact_geometry_and_supported_shape(self) -> None:
+    def test_playbook_wires_exact_typed_route_storm_contract(self) -> None:
         playbook = get_bgp_ebb_route_storm_playbook(
             device_name="dut.example.com",
             peergroup_ibgp_v6="IBGP_V6",
@@ -111,43 +142,25 @@ class BgpRouteStormPlaybookTest(unittest.TestCase):
             profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
         )
 
+        self.assertTrue(playbook.restore_topology_baseline)
         self.assertEqual(1, len(playbook.stages))
         self.assertEqual(1, len(playbook.stages[0].steps))
-        payload = _step_payload(playbook.stages[0].steps[0])
-        self.assertEqual(EXPECTED_POOLS, payload["prefix_pool_names"])
-        self.assertEqual(EXPECTED_ROWS, payload["selected_peer_rows"])
-        self.assertEqual(10_500, len(EXPECTED_ROWS) * payload["routes_per_peer"] * 2)
+        step = playbook.stages[0].steps[0]
+        self.assertEqual(_FROZEN_ROUTE_STORM_PAYLOAD, _step_payload(step))
         self.assertEqual(
-            {
-                "cycles": 60,
-                "advertise_seconds": 30,
-                "withdraw_seconds": 30,
-                "convergence_hard_timeout_seconds": 300,
-                "as_path_pool_size": 10,
-                "as_path_length": 255,
-                "communities_per_route": 32,
-                "extended_communities_per_route": 1,
-            },
-            {
-                key: payload[key]
-                for key in (
-                    "cycles",
-                    "advertise_seconds",
-                    "withdraw_seconds",
-                    "convergence_hard_timeout_seconds",
-                    "as_path_pool_size",
-                    "as_path_length",
-                    "communities_per_route",
-                    "extended_communities_per_route",
-                )
-            },
+            json.dumps(_FROZEN_ROUTE_STORM_PAYLOAD),
+            _step_json_params(step),
         )
 
     def test_openr_profile_enables_ibgp_pnh_check(self) -> None:
-        target = (
-            "neteng.test_infra.dne.taac.playbooks.routing."
-            "bgp_ebb_playbooks.get_profile_checks"
-        )
+        # Patch the module under the name this test imported it as, so the
+        # patch lands on the same module object the factory calls through.
+        # ShipIt rewrites import statements but not string literals, so a
+        # hardcoded dotted path is only correct in one of the two worlds; read
+        # the name off the imported module instead.
+        target = f"{_bgp_ebb_playbooks.__name__}.get_profile_checks"
+        start_ipv4s = EBB_OPENR_INJECTED_START_IPV4S_IXIA03[:1]
+        start_ipv6s = EBB_OPENR_INJECTED_START_IPV6S_IXIA03[:1]
         with patch(target) as get_checks:
             get_checks.return_value = SimpleNamespace(
                 prechecks=[],
@@ -162,6 +175,12 @@ class BgpRouteStormPlaybookTest(unittest.TestCase):
                 ixia_interface_mimic_ibgp="Ethernet2",
                 observer_peer_parent_prefix="2401:db00:e50d:22:a::/80",
                 profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+                ibgp_pnh_start_ipv4s=start_ipv4s,
+                ibgp_pnh_start_ipv6s=start_ipv6s,
             )
 
-        self.assertTrue(get_checks.call_args.args[1].check_ibgp_pnh)
+        context = get_checks.call_args.args[1]
+        self.assertTrue(context.check_ibgp_pnh)
+        self.assertFalse(context.check_cpu_load_average)
+        self.assertEqual(start_ipv4s, context.ibgp_pnh_start_ipv4s)
+        self.assertEqual(start_ipv6s, context.ibgp_pnh_start_ipv6s)

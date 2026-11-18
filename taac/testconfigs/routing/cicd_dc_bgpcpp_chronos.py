@@ -2,7 +2,7 @@
 # pyre-unsafe
 """BGP-DC chronos_node CICD lifecycle bindings (Wave 3B).
 
-Sole source of the four BGP-DC chronos_node bindings scheduled on the
+Sole source of the three BGP-DC chronos_node bindings scheduled on the
 CICD conveyor. Each binding calls
 :func:`create_bgp_dc_chronos_node_test_config` with the target physical_inventory +
 per-binding overrides (playbook selection, framework-validation scale
@@ -45,27 +45,8 @@ CHRONOS_NODE_FSW_FUJI_TEST_CONFIG = create_bgp_dc_chronos_node_test_config(
     ],
 )
 
-# ─── CHRONOS_NODE_FULL_SCALE_SSW_ELBERT_QZD1 ──────────────────────────────
-# Full-scale longevity mix on the Elbert SSW.
-CHRONOS_NODE_FULL_SCALE_SSW_ELBERT_QZD1_TEST_CONFIG = (
-    create_bgp_dc_chronos_node_test_config(
-        SSW_ELBERT_QZD1,
-        name="CHRONOS_NODE_FULL_SCALE_SSW_ELBERT_QZD1",
-        playbooks_selected=[
-            "test_longevity_prefix_flap_all_prefixes",
-            "test_longevity_activate_deactivate_all_prefixes",
-            "test_longevity_session_flap_all_prefixes",
-            "test_longevity_prefix_flap_all_prefixes_plus_bgp_restart",
-            "test_longevity_session_flap_all_prefixes_plus_bgp_restart",
-            "test_longevity_rogue_prefix_session_enable",
-            "test_longevity_no_prefix_no_session_flap",
-            "test_longevity_continuous_toggle_device_group",
-        ],
-    )
-)
-
 # ─── CHRONOS_NODE_FULL_SCALE_SSW_ELBERT_RESTART_QZD1 ──────────────────────
-# Elbert SSW restart-only sibling — same topology as the QZD1 variant above.
+# Elbert SSW restart-only binding.
 CHRONOS_NODE_FULL_SCALE_SSW_ELBERT_RESTART_QZD1_TEST_CONFIG = (
     create_bgp_dc_chronos_node_test_config(
         SSW_ELBERT_QZD1,
@@ -118,6 +99,5 @@ CHRONOS_NODE_FRAMEWORK_VALIDATION_AGENT_RESTART_QZD1_TEST_CONFIG = (
 __all__ = [
     "CHRONOS_NODE_FRAMEWORK_VALIDATION_AGENT_RESTART_QZD1_TEST_CONFIG",
     "CHRONOS_NODE_FSW_FUJI_TEST_CONFIG",
-    "CHRONOS_NODE_FULL_SCALE_SSW_ELBERT_QZD1_TEST_CONFIG",
     "CHRONOS_NODE_FULL_SCALE_SSW_ELBERT_RESTART_QZD1_TEST_CONFIG",
 ]

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 
 from taac.abstractions.compilation.eb_policy_presets import (
@@ -12,9 +13,14 @@ from taac.abstractions.compilation.ixia_planner import plan_ixia
 from taac.abstractions.compilation.legacy_ixia_identity import (
     LegacyIxiaIdentitySidecar,
 )
+from taac.abstractions.compilation.lifecycle import LifecyclePlan
+from taac.abstractions.compilation.lifecycle_projection import (
+    project_lifecycle,
+)
 from taac.abstractions.compilation.model import (
     AddressFamily,
     BgpAdjacencyPlan,
+    ComponentPlan,
     DesiredPresence,
     DutLinkPlan,
     DutPlan,
@@ -23,6 +29,7 @@ from taac.abstractions.compilation.model import (
     InterfacePlan,
     OpenRDesiredMode,
     OpenRPlan,
+    PhysicalInterfacePlan,
     PolicyBinding,
     PolicyDirection,
     PolicyPlan,
@@ -38,20 +45,35 @@ from taac.abstractions.compilation.report import (
 )
 from taac.abstractions.compilation.resource_ids import (
     adjacency_resource_id,
+    component_resource_id,
     endpoint_resource_id,
     interface_resource_id,
     is_dut_endpoint,
     link_resource_id,
     openr_resource_id,
+    physical_interface_resource_id,
     policy_binding_resource_id,
     policy_resource_id,
     role_policy_resource_id,
     routing_config_resource_id,
 )
+from taac.abstractions.component_semantics import (
+    ComponentDesiredState,
+    ComponentReadinessRequirement,
+    ComponentReconcileMode,
+    ComponentRole,
+)
+from taac.abstractions.physical_interface_semantics import (
+    PhysicalInterfaceGroupKind,
+    PhysicalInterfaceProfile,
+)
 from taac.abstractions.topology.model import (
     BoundDeviceGroup,
+    BoundRoutingConfig,
     BoundTopology,
     EndpointSpec,
+    resolve_endpoint_routing_drivers,
+    ResolvedIxiaPortAssignment,
     RoutingDeviceConfig,
 )
 
@@ -63,14 +85,26 @@ class PlanningResult:
     legacy_ixia_identity: LegacyIxiaIdentitySidecar = field(
         default_factory=LegacyIxiaIdentitySidecar
     )
+    lifecycle: LifecyclePlan = field(default_factory=LifecyclePlan)
 
     def __post_init__(self) -> None:
         self.report.validate(self.plan.iter_resource_ids())
         self.legacy_ixia_identity.validate(self.plan.ixia.iter_resource_ids())
-
-
-class UnsupportedTrafficFlowIntentError(ValueError):
-    pass
+        if not isinstance(self.lifecycle, LifecyclePlan):
+            raise TypeError("planning lifecycle must be a LifecyclePlan")
+        plan_resource_ids = frozenset(self.plan.iter_resource_ids())
+        unexpected_lifecycle_ids = tuple(
+            operation.resource_id
+            for operation in self.lifecycle.operations
+            if operation.resource_id not in plan_resource_ids
+        )
+        if unexpected_lifecycle_ids:
+            raise ValueError(
+                "lifecycle operations target resources absent from the plan: "
+                + ", ".join(
+                    str(resource_id) for resource_id in unexpected_lifecycle_ids
+                )
+            )
 
 
 @dataclass
@@ -80,6 +114,7 @@ class _InterfaceAccumulator:
     logical_port_role: str
     afi: AddressFamily
     bound_interface: str | None
+    physical_interface_id: ResourceId | None
     link_ids: list[ResourceId]
     addresses: list[str]
 
@@ -87,6 +122,7 @@ class _InterfaceAccumulator:
         self,
         link_id: ResourceId,
         bound_interface: str | None,
+        physical_interface_id: ResourceId | None,
         addresses: tuple[str, ...],
     ) -> None:
         if (
@@ -100,6 +136,11 @@ class _InterfaceAccumulator:
             )
         if self.bound_interface is None:
             self.bound_interface = bound_interface
+        if self.physical_interface_id != physical_interface_id:
+            raise ValueError(
+                f"logical interface {self.resource_id} resolves to multiple "
+                "physical interface owners"
+            )
         if link_id not in self.link_ids:
             self.link_ids.append(link_id)
         for address in addresses:
@@ -115,6 +156,43 @@ class _InterfaceAccumulator:
             afi=self.afi,
             addresses=tuple(self.addresses),
             bound_interface=self.bound_interface,
+            physical_interface_id=self.physical_interface_id,
+        )
+
+
+@dataclass
+class _PhysicalInterfaceAccumulator:
+    resource_id: ResourceId
+    endpoint_id: ResourceId
+    group_kind: PhysicalInterfaceGroupKind
+    logical_key: str
+    bound_interface: str
+    profile: PhysicalInterfaceProfile
+    link_ids: list[ResourceId]
+
+    def add(
+        self,
+        bound_interface: str,
+        profile: PhysicalInterfaceProfile,
+        link_id: ResourceId,
+    ) -> None:
+        if (bound_interface, profile) != (self.bound_interface, self.profile):
+            raise ValueError(
+                f"physical interface {self.resource_id} has conflicting bindings "
+                "or profiles"
+            )
+        if link_id not in self.link_ids:
+            self.link_ids.append(link_id)
+
+    def freeze(self) -> PhysicalInterfacePlan:
+        return PhysicalInterfacePlan(
+            resource_id=self.resource_id,
+            endpoint_id=self.endpoint_id,
+            group_kind=self.group_kind,
+            logical_key=self.logical_key,
+            link_ids=tuple(self.link_ids),
+            bound_interface=self.bound_interface,
+            profile=self.profile,
         )
 
 
@@ -122,16 +200,13 @@ class BoundTopologyPlanner:
     """Builds common semantic plans without invoking a compiler or renderer."""
 
     def plan(self, bound: BoundTopology) -> PlanningResult:
-        if bound.logical_topology.traffic_flows:
-            raise UnsupportedTrafficFlowIntentError(
-                "traffic-flow compilation is outside the Phase 1.5 IXIA lane"
-            )
         endpoint_specs = {
             endpoint.name: endpoint for endpoint in bound.logical_topology.endpoints
         }
         endpoints = _endpoint_plans(bound)
         links = _link_plans(bound)
         interfaces = _interface_plans(bound, endpoint_specs)
+        physical_interfaces = _physical_interface_plans(bound, endpoint_specs)
         adjacencies = _adjacency_plans(bound, endpoint_specs)
         declared_policies = tuple(
             PolicyPlan(
@@ -145,6 +220,7 @@ class BoundTopologyPlanner:
             endpoint_specs,
         )
         routing_configs = _routing_config_plans(bound, endpoint_specs)
+        components = _component_plans(routing_configs)
         openr = _openr_plans(bound, endpoint_specs)
         ixia = plan_ixia(bound, endpoint_specs)
 
@@ -152,12 +228,13 @@ class BoundTopologyPlanner:
             dut=DutPlan(
                 endpoints=endpoints,
                 links=links,
+                physical_interfaces=physical_interfaces,
                 interfaces=interfaces,
                 adjacencies=adjacencies,
                 policies=(*declared_policies, *role_policies),
                 policy_bindings=policy_bindings,
                 routing_configs=routing_configs,
-                components=(),
+                components=components,
                 openr=openr,
             ),
             ixia=ixia.plan,
@@ -166,6 +243,7 @@ class BoundTopologyPlanner:
             plan=plan,
             report=_compile_report(plan),
             legacy_ixia_identity=ixia.legacy_identity,
+            lifecycle=project_lifecycle(plan),
         )
 
 
@@ -219,6 +297,10 @@ def _interface_plans(
         )
         afi = _address_family(device_group.afi)
         logical_port_role = _logical_port_role(device_group)
+        physical_interface_id = _physical_interface_id(
+            endpoint_name,
+            device_group.port_assignment,
+        )
         key = (endpoint_name, logical_port_role, afi)
         accumulator = accumulators.get(key)
         if accumulator is None:
@@ -232,6 +314,7 @@ def _interface_plans(
                 logical_port_role=logical_port_role,
                 afi=afi,
                 bound_interface=bound_interface,
+                physical_interface_id=physical_interface_id,
                 link_ids=[],
                 addresses=[],
             )
@@ -239,9 +322,113 @@ def _interface_plans(
         accumulator.add(
             link_resource_id(device_group.name),
             bound_interface,
+            physical_interface_id,
             addresses,
         )
     return tuple(accumulator.freeze() for accumulator in accumulators.values())
+
+
+def _physical_interface_plans(
+    bound: BoundTopology,
+    endpoint_specs: dict[str, EndpointSpec],
+) -> tuple[PhysicalInterfacePlan, ...]:
+    accumulators: dict[ResourceId, _PhysicalInterfaceAccumulator] = {}
+    connection_owners: dict[tuple[ResourceId, str], ResourceId] = {}
+    for device_group in bound.device_groups:
+        _add_physical_interface(
+            accumulators,
+            connection_owners,
+            device_group,
+            endpoint_specs,
+        )
+    return tuple(accumulator.freeze() for accumulator in accumulators.values())
+
+
+def _add_physical_interface(
+    accumulators: dict[ResourceId, _PhysicalInterfaceAccumulator],
+    connection_owners: dict[tuple[ResourceId, str], ResourceId],
+    device_group: BoundDeviceGroup,
+    endpoint_specs: dict[str, EndpointSpec],
+) -> None:
+    assignment = device_group.port_assignment
+    if assignment is None:
+        return
+    endpoint_name, bound_interface, _, _ = _dut_side(
+        device_group,
+        endpoint_specs,
+    )
+    if bound_interface is None:
+        raise ValueError(
+            f"device group {device_group.name!r} has no bound DUT interface"
+        )
+    endpoint_id = endpoint_resource_id(endpoint_name)
+    group_kind, logical_key = _physical_interface_group(assignment)
+    resource_id = physical_interface_resource_id(
+        endpoint_id,
+        group_kind,
+        logical_key,
+    )
+    _claim_physical_connection(
+        connection_owners,
+        endpoint_id,
+        bound_interface,
+        resource_id,
+    )
+    accumulator = accumulators.get(resource_id)
+    if accumulator is None:
+        accumulator = _PhysicalInterfaceAccumulator(
+            resource_id=resource_id,
+            endpoint_id=endpoint_id,
+            group_kind=group_kind,
+            logical_key=logical_key,
+            bound_interface=bound_interface,
+            profile=assignment.physical_interface_profile,
+            link_ids=[],
+        )
+        accumulators[resource_id] = accumulator
+    accumulator.add(
+        bound_interface,
+        assignment.physical_interface_profile,
+        link_resource_id(device_group.name),
+    )
+
+
+def _claim_physical_connection(
+    owners: dict[tuple[ResourceId, str], ResourceId],
+    endpoint_id: ResourceId,
+    bound_interface: str,
+    resource_id: ResourceId,
+) -> None:
+    connection = (endpoint_id, bound_interface)
+    prior_owner = owners.get(connection)
+    if prior_owner is not None and prior_owner != resource_id:
+        raise ValueError(
+            f"physical connection {connection!r} resolves to multiple logical "
+            "interface groups"
+        )
+    owners[connection] = resource_id
+
+
+def _physical_interface_id(
+    endpoint_name: str,
+    assignment: ResolvedIxiaPortAssignment | None,
+) -> ResourceId | None:
+    if assignment is None:
+        return None
+    group_kind, logical_key = _physical_interface_group(assignment)
+    return physical_interface_resource_id(
+        endpoint_resource_id(endpoint_name),
+        group_kind,
+        logical_key,
+    )
+
+
+def _physical_interface_group(
+    assignment: ResolvedIxiaPortAssignment,
+) -> tuple[PhysicalInterfaceGroupKind, str]:
+    if assignment.reuse_group is not None:
+        return PhysicalInterfaceGroupKind.REUSE_GROUP, assignment.reuse_group
+    return PhysicalInterfaceGroupKind.LOGICAL_ROLE, assignment.logical_role
 
 
 def _adjacency_plans(
@@ -328,28 +515,71 @@ def _routing_config_plans(
     bound: BoundTopology,
     endpoint_specs: dict[str, EndpointSpec],
 ) -> tuple[RoutingConfigPlan, ...]:
+    _validate_bound_routing_configs(bound, endpoint_specs)
     config = bound.device_config or bound.logical_topology.device_config
     plans: list[RoutingConfigPlan] = []
     for endpoint in bound.logical_topology.endpoints:
         if not is_dut_endpoint(endpoint):
             continue
-        drivers = _endpoint_routing_drivers(bound, endpoint.name)
+        drivers = resolve_endpoint_routing_drivers(
+            endpoint.name,
+            bound.device_groups,
+            bound.routing_drivers,
+        )
         if not drivers:
+            if endpoint.name in bound.routing_configs:
+                raise ValueError(
+                    f"DUT endpoint {endpoint.name!r} has a bound routing config "
+                    "but no routing driver"
+                )
             continue
         if len(drivers) != 1:
             raise ValueError(
                 f"DUT endpoint {endpoint.name!r} resolves to multiple routing "
                 f"drivers: {drivers!r}"
             )
+        bound_config = bound.routing_configs.get(endpoint.name)
+        if bound_config is None:
+            raise ValueError(
+                f"DUT endpoint {endpoint.name!r} has no bound routing config"
+            )
+        if bound_config.routing_driver != drivers[0]:
+            raise ValueError(
+                f"DUT endpoint {endpoint.name!r} bound routing config driver "
+                f"{bound_config.routing_driver!r} does not match {drivers[0]!r}"
+            )
         plans.append(
             RoutingConfigPlan(
                 resource_id=routing_config_resource_id(endpoint.name),
                 endpoint_id=endpoint_resource_id(endpoint.name),
                 routing_driver=drivers[0],
+                source=bound_config.source,
                 required_features=_required_routing_features(config),
             )
         )
     return tuple(plans)
+
+
+def _validate_bound_routing_configs(
+    bound: BoundTopology,
+    endpoint_specs: dict[str, EndpointSpec],
+) -> None:
+    if any(not isinstance(name, str) for name in bound.routing_configs):
+        raise TypeError("bound routing config endpoint names must be strings")
+    dut_endpoint_names = {
+        name for name, endpoint in endpoint_specs.items() if is_dut_endpoint(endpoint)
+    }
+    unknown_endpoint_names = tuple(
+        sorted(set(bound.routing_configs) - dut_endpoint_names)
+    )
+    if unknown_endpoint_names:
+        raise ValueError(
+            "bound routing configs target unknown or non-DUT endpoints: "
+            f"{unknown_endpoint_names!r}"
+        )
+    for endpoint_name, routing_config in bound.routing_configs.items():
+        if not isinstance(routing_config, BoundRoutingConfig):
+            raise TypeError(f"bound routing config for {endpoint_name!r} must be typed")
 
 
 def _openr_plans(
@@ -367,6 +597,24 @@ def _openr_plans(
         )
         for endpoint in bound.logical_topology.endpoints
         if is_dut_endpoint(endpoint)
+    )
+
+
+def _component_plans(
+    routing_configs: tuple[RoutingConfigPlan, ...],
+) -> tuple[ComponentPlan, ...]:
+    role = ComponentRole.ROUTING_CONTROL_PLANE
+    return tuple(
+        ComponentPlan(
+            resource_id=component_resource_id(routing_config.endpoint_id, role),
+            endpoint_id=routing_config.endpoint_id,
+            role=role,
+            desired_state=ComponentDesiredState.RUNNING,
+            reconcile_mode=ComponentReconcileMode.RESTART_AFTER_CONFIGURATION,
+            readiness=ComponentReadinessRequirement.ACKNOWLEDGED,
+            depends_on=(routing_config.resource_id,),
+        )
+        for routing_config in routing_configs
     )
 
 
@@ -423,47 +671,88 @@ def _dut_side(
         return (
             a_endpoint.name,
             device_group.a_interface,
-            device_group.a_ips,
+            _dut_interface_cidrs(
+                device_group,
+                dut_is_a=True,
+                require_prefix=a_endpoint.setup_mode == "full",
+            ),
             True,
         )
     if device_group.z_interface is not None:
         return (
             z_endpoint.name,
             device_group.z_interface,
-            device_group.z_ips,
+            _dut_interface_cidrs(
+                device_group,
+                dut_is_a=False,
+                require_prefix=z_endpoint.setup_mode == "full",
+            ),
             False,
         )
     if is_dut_endpoint(a_endpoint) and not is_dut_endpoint(z_endpoint):
-        return a_endpoint.name, None, device_group.a_ips, True
+        return (
+            a_endpoint.name,
+            None,
+            _dut_interface_cidrs(
+                device_group,
+                dut_is_a=True,
+                require_prefix=a_endpoint.setup_mode == "full",
+            ),
+            True,
+        )
     if is_dut_endpoint(z_endpoint) and not is_dut_endpoint(a_endpoint):
-        return z_endpoint.name, None, device_group.z_ips, False
+        return (
+            z_endpoint.name,
+            None,
+            _dut_interface_cidrs(
+                device_group,
+                dut_is_a=False,
+                require_prefix=z_endpoint.setup_mode == "full",
+            ),
+            False,
+        )
     raise ValueError(
         f"device group {device_group.name!r} does not identify one DUT endpoint"
     )
 
 
+def _dut_interface_cidrs(
+    device_group: BoundDeviceGroup,
+    *,
+    dut_is_a: bool,
+    require_prefix: bool,
+) -> tuple[str, ...]:
+    cidrs: list[str] = []
+    peers = device_group.peers
+    if not require_prefix and any(peer.peer_cidr is None for peer in peers):
+        return ()
+    for peer in peers:
+        if peer.peer_cidr is None:
+            raise ValueError(
+                f"device group {device_group.name!r} has no exact peer prefix"
+            )
+        network = ipaddress.ip_network(peer.peer_cidr, strict=False)
+        address = peer.a_ip if dut_is_a else peer.z_ip
+        interface = ipaddress.ip_interface(f"{address}/{network.prefixlen}")
+        if interface.version != network.version:
+            raise ValueError(
+                f"device group {device_group.name!r} address {address!r} and "
+                f"peer prefix {peer.peer_cidr!r} have different families"
+            )
+        if interface.ip not in network:
+            raise ValueError(
+                f"device group {device_group.name!r} address {address!r} is not in "
+                f"peer prefix {peer.peer_cidr!r}"
+            )
+        cidr = str(interface)
+        if cidr not in cidrs:
+            cidrs.append(cidr)
+    return tuple(cidrs)
+
+
 def _logical_port_role(device_group: BoundDeviceGroup) -> str:
     assignment = device_group.port_assignment
     return assignment.logical_role if assignment is not None else device_group.role
-
-
-def _endpoint_routing_drivers(
-    bound: BoundTopology,
-    endpoint_name: str,
-) -> tuple[str, ...]:
-    drivers: list[str] = []
-    for device_group in bound.device_groups:
-        if endpoint_name not in {
-            device_group.spec.a_endpoint,
-            device_group.spec.z_endpoint,
-        }:
-            continue
-        driver = device_group.routing_driver or bound.routing_drivers.get(
-            device_group.name
-        )
-        if driver is not None and driver not in drivers:
-            drivers.append(driver)
-    return tuple(drivers)
 
 
 def _required_routing_features(config: RoutingDeviceConfig) -> tuple[str, ...]:

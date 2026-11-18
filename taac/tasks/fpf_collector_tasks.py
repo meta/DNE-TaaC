@@ -4,9 +4,10 @@
 
 """Setup/teardown tasks for long-lived FPF hardening collectors.
 
-FpfStartCollectorsTask: Starts 3 collectors (FSDB ribMap, HRT bulk, BGP RIB),
-    waits 2 min for baseline data collection, then registers collectors in the
-    module-level registry so health checks can query them.
+FpfStartCollectorsTask: Starts the FSDB ribMap, HRT, and BGP RIB collectors,
+    waits 2 min for baseline data collection, then registers them in the
+    module-level registry. FSDB expands to all local plane GTSWs while BGP polls
+    only the explicitly supplied observer GTSWs.
 
 FpfStopCollectorsTask: Stops all collectors, withdraws prefixes, and clears
     the registry.
@@ -20,6 +21,7 @@ Usage in TestConfig:
 """
 
 import asyncio
+import re
 import typing as t
 
 from taac.internal.driver.fboss_switch_internal import (
@@ -33,8 +35,13 @@ from taac.libs.fpf.fpf_collector_registry import (
     register_collector,
 )
 from taac.libs.fpf.fpf_hrt_bulk_tracker import NUM_LANES
+from taac.libs.fpf.fpf_prod_switch_prefix import (
+    ProdSwitchPrefixCollector,
+    production_gtsws,
+)
 from taac.libs.fpf.fpf_stress_checks import (
     BgpRibCollector,
+    FibRouteCollector,
     FsdbRibmapCollector,
     HrtBulkCollector,
     HrtFsdbSessionCollector,
@@ -57,8 +64,8 @@ BASELINE_COLLECTION_SEC = 120
 
 def _all_plane_gtsws(gtsws: t.List[str]) -> t.List[str]:
     """Expand the observer GTSW list to ALL plane GTSWs (gtsw001..gtsw{NUM_LANES})
-    so the BGP-RIB and FSDB-ribMap collectors observe every plane's switch, not
-    just the observer subset (gtsw001/002). The naming suffix (e.g.
+    so the FSDB-ribMap collector observes every plane's switch, not just the
+    observer subset (gtsw001/002). The naming suffix (e.g.
     ``.l1002.c087.mwg2``) is taken from the first GTSW; returns the input
     unchanged if it can't be parsed.
     """
@@ -66,6 +73,23 @@ def _all_plane_gtsws(gtsws: t.List[str]) -> t.List[str]:
         return gtsws
     suffix = gtsws[0][gtsws[0].index(".") :]
     return [f"gtsw{i:03d}{suffix}" for i in range(1, NUM_LANES + 1)]
+
+
+def _collector_gtsw_scopes(
+    gtsws: t.List[str],
+) -> t.Tuple[t.List[str], t.List[str]]:
+    """Return ``(fsdb_gtsws, bgp_gtsws)`` for the collector task.
+
+    FSDB ribMap needs all local plane switches plus any explicit remote-pod
+    observer. BGP health checks consume only the explicitly supplied observer
+    GTSWs, so polling the expanded plane list adds latency and timeout noise
+    without adding coverage.
+    """
+    fsdb_gtsws = _all_plane_gtsws(gtsws)
+    for gtsw in gtsws:
+        if gtsw not in fsdb_gtsws:
+            fsdb_gtsws.append(gtsw)
+    return fsdb_gtsws, list(dict.fromkeys(gtsws))
 
 
 class FpfStartCollectorsTask(BaseTask):
@@ -76,6 +100,8 @@ class FpfStartCollectorsTask(BaseTask):
         hosts: t.List[str] = params["hosts"]
         subnet_prefix: str = params.get("subnet_prefix", "5000:dd::/32")
         poll_interval_sec: float = params.get("poll_interval_sec", 5.0)
+        hrt_device_ids: t.List[int] = params.get("hrt_device_ids", [0])
+        hrt_plane_ids: t.List[int] = params.get("hrt_plane_ids", list(range(NUM_LANES)))
         baseline_collection_sec: int = params.get(
             "baseline_collection_sec", BASELINE_COLLECTION_SEC
         )
@@ -93,24 +119,26 @@ class FpfStartCollectorsTask(BaseTask):
 
         set_allow_baseline_failures(bool(params.get("allow_baseline_failures", False)))
 
-        # BGP-RIB + FSDB-ribMap collectors observe ALL plane GTSWs (not just the
-        # observer subset gtsw001/002) so every plane's switch is tracked.
+        # FSDB-ribMap observes ALL plane GTSWs (not just the observer subset
+        # gtsw001/002) so every plane's switch is tracked.
         # _all_plane_gtsws() expands only gtsws[0]'s pod suffix (e.g. .l1002),
         # so any explicitly-listed observer in a DIFFERENT pod (e.g. the
         # remote-pod observer gtsw001.l1001) must be unioned back in — otherwise
         # the collector never polls it and its FSDB/BGP-RIB convergence check
         # reads "no data collected" (FAIL) even though the switch is healthy.
-        collector_gtsws = _all_plane_gtsws(gtsws)
-        for g in gtsws:
-            if g not in collector_gtsws:
-                collector_gtsws.append(g)
+        # BGP is intentionally narrower: its HCs consume only the supplied
+        # observer GTSWs. Polling all plane switches serialized unnecessary
+        # 30-second RPC deadlines into an otherwise healthy TC41 window.
+        fsdb_gtsws, bgp_gtsws = _collector_gtsw_scopes(gtsws)
         logger.info(
-            f"[FpfStartCollectors] Starting collectors: bgp/fsdb over "
-            f"{len(collector_gtsws)} plane GTSWs, hrt over {len(hosts)} hosts"
+            f"[FpfStartCollectors] Starting collectors: FSDB over "
+            f"{len(fsdb_gtsws)} plane/observer GTSWs, BGP over "
+            f"{len(bgp_gtsws)} supplied observer GTSWs, "
+            f"HRT over {len(hosts)} hosts"
         )
 
         fsdb_collector = FsdbRibmapCollector(
-            gtsws=collector_gtsws,
+            gtsws=fsdb_gtsws,
             subnet_prefix=subnet_prefix,
             interval_sec=poll_interval_sec,
             fsdb_mode=fsdb_mode,
@@ -119,13 +147,15 @@ class FpfStartCollectorsTask(BaseTask):
 
         hrt_collector = HrtBulkCollector(
             hosts=hosts,
+            device_ids=hrt_device_ids,
+            plane_ids=hrt_plane_ids,
             supernet=subnet_prefix,
             interval_sec=poll_interval_sec,
         )
         hrt_collector.set_append_mode(True)
 
         bgp_collector = BgpRibCollector(
-            gtsws=collector_gtsws,
+            gtsws=bgp_gtsws,
             subnet_prefix=subnet_prefix,
             interval_sec=poll_interval_sec,
         )
@@ -135,6 +165,8 @@ class FpfStartCollectorsTask(BaseTask):
         hrt_collector.start()
         hrt_remote_failure_collector = HrtRemoteFailureCollector(
             hosts=hosts,
+            device_ids=hrt_device_ids,
+            plane_ids=hrt_plane_ids,
             supernet=subnet_prefix,
             interval_sec=poll_interval_sec,
         )
@@ -161,6 +193,8 @@ class FpfStartCollectorsTask(BaseTask):
             group_subnet = group["subnet"]
             group_rf_collector = HrtRemoteFailureCollector(
                 hosts=hosts,
+                device_ids=group.get("device_ids", [0]),
+                plane_ids=hrt_plane_ids,
                 supernet=group_subnet,
                 interval_sec=poll_interval_sec,
             )
@@ -169,7 +203,95 @@ class FpfStartCollectorsTask(BaseTask):
             register_collector(f"hrt_remote_failure_{suffix}", group_rf_collector)
             logger.info(
                 f"[FpfStartCollectors] Per-VF-group remote-failure collector "
-                f"'hrt_remote_failure_{suffix}' started (subnet {group_subnet})"
+                f"'hrt_remote_failure_{suffix}' started (subnet {group_subnet}, "
+                f"devices {group.get('device_ids', [0])})"
+            )
+
+        # Optional additional filtered namespaces. These collectors retain the
+        # existing row/JSONL schemas but use distinct registry keys and files,
+        # allowing one test to observe its canonical A routes and an independent
+        # remote B namespace without either count masking the other.
+        additional_namespaces: t.List[t.Dict[str, t.Any]] = (
+            params.get("additional_namespaces", []) or []
+        )
+        for namespace in additional_namespaces:
+            name = str(namespace["name"])
+            if re.fullmatch(r"[a-z0-9_]+", name) is None:
+                raise ValueError(
+                    f"additional collector namespace has unsafe name {name!r}"
+                )
+            subnet = str(namespace["subnet_prefix"])
+            ns_interval = float(namespace.get("poll_interval_sec", poll_interval_sec))
+
+            def _start_named(key: str, collector: t.Any) -> None:
+                collector.set_append_mode(True)
+                collector.start()
+                register_collector(key, collector)
+
+            fsdb_targets = list(namespace.get("fsdb_gtsws", []))
+            if fsdb_targets:
+                _start_named(
+                    f"fsdb_{name}",
+                    FsdbRibmapCollector(
+                        gtsws=fsdb_targets,
+                        subnet_prefix=subnet,
+                        tmp_path=f"/tmp/fpf_{name}_fsdb_ribmap.log",
+                        interval_sec=ns_interval,
+                        fsdb_mode=str(namespace.get("fsdb_mode", fsdb_mode)),
+                    ),
+                )
+            bgp_targets = list(namespace.get("bgp_gtsws", []))
+            if bgp_targets:
+                _start_named(
+                    f"bgp_{name}",
+                    BgpRibCollector(
+                        gtsws=bgp_targets,
+                        subnet_prefix=subnet,
+                        tmp_path=f"/tmp/fpf_{name}_bgp_rib.log",
+                        interval_sec=ns_interval,
+                    ),
+                )
+            fib_targets = list(namespace.get("fib_gtsws", []))
+            if fib_targets:
+                _start_named(
+                    f"fib_{name}",
+                    FibRouteCollector(
+                        gtsws=fib_targets,
+                        subnet_prefix=subnet,
+                        tmp_path=f"/tmp/fpf_{name}_fib.log",
+                        interval_sec=ns_interval,
+                    ),
+                )
+            ns_hosts = list(namespace.get("hosts", []))
+            if ns_hosts:
+                ns_device_ids = list(namespace.get("device_ids", hrt_device_ids))
+                ns_plane_ids = list(namespace.get("plane_ids", hrt_plane_ids))
+                _start_named(
+                    f"hrt_{name}",
+                    HrtBulkCollector(
+                        hosts=ns_hosts,
+                        device_ids=ns_device_ids,
+                        plane_ids=ns_plane_ids,
+                        supernet=subnet,
+                        tmp_path=f"/tmp/fpf_{name}_hrt_bulk.log",
+                        interval_sec=ns_interval,
+                    ),
+                )
+                if bool(namespace.get("include_remote_failure", False)):
+                    _start_named(
+                        f"hrt_remote_failure_{name}",
+                        HrtRemoteFailureCollector(
+                            hosts=ns_hosts,
+                            device_ids=ns_device_ids,
+                            plane_ids=ns_plane_ids,
+                            supernet=subnet,
+                            tmp_path=f"/tmp/fpf_{name}_hrt_remote_failure.log",
+                            interval_sec=ns_interval,
+                        ),
+                    )
+            logger.info(
+                f"[FpfStartCollectors] Additional namespace {name!r} started "
+                f"for {subnet}"
             )
 
         # HRT FSDB-session-count collector (getFsdbSessions CONNECTED census):
@@ -180,7 +302,11 @@ class FpfStartCollectorsTask(BaseTask):
         # every 3s (independent of poll_interval_sec) so a sub-minute drop +
         # recovery is captured. One collector keyed off the monitored GPU host.
         enable_fsdb_session = bool(params.get("enable_fsdb_session_collector", True))
-        gpu_hosts = [h for h in hosts if str(h).startswith("rtptest")]
+        gpu_hosts = [
+            h
+            for h in hosts
+            if str(h).startswith("rtptest") or str(h).startswith("twshared")
+        ]
         if enable_fsdb_session and gpu_hosts:
             session_poll_sec: float = float(
                 params.get("fsdb_session_poll_interval_sec", 3.0)
@@ -206,18 +332,18 @@ class FpfStartCollectorsTask(BaseTask):
                 f"poll {session_poll_sec:.0f}s)"
             )
 
-        # Production-prefix reachability + HRT plane-status collectors — ONE
-        # instance each, holding ALL monitored hosts (one file with a host
-        # column). Each host monitors its OWN prefixes via
-        # ``prefixes_by_host``. Wiring inputs:
+        # Production-prefix reachability collector. This remains an explicitly
+        # selected single-device canary, not whole-host device coverage. Each
+        # host monitors its configured query prefixes via ``prefixes_by_host``;
+        # multiple hosts may observe the same route. Wiring inputs:
         #
-        #   ``prod_prefixes_by_host`` ({host: [prefixes]}): the per-host prefix
+        #   ``prod_prefixes_by_host`` ({host: [prefixes]}): the per-host query
         #     map, preferred. Every host in the map is monitored.
         #   Legacy (``prod_prefixes`` + ``prod_prefix_host``): a single host's
         #     prefixes, folded into a one-entry prefixes_by_host map.
         #
-        # FpfProdHrtPrefixStabilityHealthCheck / FpfHrtPlaneStatusHealthCheck read
-        # the single collector and iterate its hosts internally.
+        # FpfProdHrtPrefixStabilityHealthCheck reads the single collector and
+        # iterates its hosts internally.
         prod_device_id: int = params.get("prod_prefix_device_id", 0)
         prod_by_host: t.Dict[str, t.List[str]] = (
             params.get("prod_prefixes_by_host") or {}
@@ -250,19 +376,46 @@ class FpfStartCollectorsTask(BaseTask):
             prod_collector.set_append_mode(True)
             prod_collector.start()
             register_collector("prod_hrt_prefix", prod_collector)
+            route_gtsws = params.get("prod_prefix_gtsws") or production_gtsws(gtsws)
+            route_prefixes = [
+                prefix for prefixes in prod_by_host.values() for prefix in prefixes
+            ]
+            for protocol in ("bgp", "fsdb"):
+                route_collector = ProdSwitchPrefixCollector(
+                    route_gtsws,
+                    route_prefixes,
+                    protocol,
+                    interval_sec=float(
+                        params.get("prod_prefix_poll_interval_sec", poll_interval_sec)
+                    ),
+                    fsdb_mode=fsdb_mode,
+                )
+                route_collector.set_append_mode(True)
+                route_collector.start()
+                register_collector(f"prod_{protocol}_prefix", route_collector)
 
+            logger.info(
+                f"[FpfStartCollectors] Production-prefix dev{prod_device_id} canary "
+                f"started on {prod_hosts} dev{prod_device_id} "
+                f"({sum(len(p) for p in prod_by_host.values())} prefix(es) total)"
+            )
+
+        # Plane-status is whole-host topology coverage, independent of the
+        # production-prefix dev0 canary. New paired-device MWG2 uses dev0..7,
+        # each with local planes 0..3; the legacy default remains dev0/planes0..7.
+        if gpu_hosts:
             plane_status_collector = HrtPlaneStatusCollector(
-                hosts=prod_hosts,
-                device_id=prod_device_id,
+                hosts=gpu_hosts,
+                device_ids=hrt_device_ids,
                 interval_sec=poll_interval_sec,
+                num_planes=len(hrt_plane_ids),
             )
             plane_status_collector.set_append_mode(True)
             plane_status_collector.start()
             register_collector("hrt_plane_status", plane_status_collector)
             logger.info(
-                f"[FpfStartCollectors] Production-prefix + plane-status collectors "
-                f"started on {prod_hosts} dev{prod_device_id} "
-                f"({sum(len(p) for p in prod_by_host.values())} prefix(es) total)"
+                f"[FpfStartCollectors] HRT plane-status collector started on "
+                f"{gpu_hosts}, devices={hrt_device_ids}"
             )
 
         logger.info(

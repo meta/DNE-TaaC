@@ -4,14 +4,16 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from later.unittest import TestCase
 from taac.tasks.periodic_tasks import ThriftStressPeriodicTask
 from taac.tasks.thrift_stress_payloads import (
-    fboss_with_qsfp_flaps,
+    fboss_qsfp_flaps_only,
     PAYLOAD_BUILDERS,
     READ_ONLY_FBOSS_APIS,
     ThriftStressCall,
 )
 from taac.health_check.health_check import types as hc_types
+from thrift.python.exceptions import TransportError, TransportErrorType
 
 
 PERIODIC_TASKS_PATH = "neteng.test_infra.dne.taac.tasks.periodic_tasks"
@@ -78,48 +80,54 @@ class ThriftStressPayloadCatalogTest(unittest.TestCase):
             self.assertEqual(call.args, ())
             self.assertEqual(call.requests_per_burst, 10000)
 
-    def test_fboss_with_qsfp_flaps_appends_flap_entry(self) -> None:
-        interfaces = ["eth1/13/1", "eth1/13/3"]
-        payload = fboss_with_qsfp_flaps(interfaces)
-        # All 7 baseline + 1 flap = 8
-        self.assertEqual(len(payload), 8)
-        # First 7 == baseline
-        self.assertEqual(payload[:7], list(READ_ONLY_FBOSS_APIS))
-        # Last is the flap entry. Defaults match Pavan's original —
-        # interval_to_link_up=4s, total_flaps=100 (~6.7 min of continuous
-        # flapping per burst).
-        flap = payload[-1]
+    def test_fboss_qsfp_flaps_only_has_no_thrift_baseline(self) -> None:
+        """The flap-only builder backs THFT's dedicated flap periodic task, so
+        it must carry the flap and NOTHING else — any read-only API leaking in
+        would re-couple the two workloads under one burst timeout, which is the
+        exact bug the split removed (flap ~720s vs rate-limited thrift calls in
+        microseconds; no single timeout serves both)."""
+        payload = fboss_qsfp_flaps_only(["eth1/5/1", "eth1/8/1"])
+        self.assertEqual(len(payload), 1)
+        flap = payload[0]
         self.assertEqual(flap.method, "async_do_rapid_interface_flaps")
-        self.assertEqual(flap.args, (("eth1/13/1", "eth1/13/3"), 4, 100))
+        # The hardening cadence is 6s for both NPI and CI/CD.
+        # total_flaps=100, requests_per_burst=1 ("one outer call that
+        # internally flaps 100 times").
+        self.assertEqual(flap.args, (("eth1/5/1", "eth1/8/1"), 6, 100))
         self.assertEqual(flap.requests_per_burst, 1)
+        methods = {c.method for c in payload}
+        self.assertEqual(methods & {c.method for c in READ_ONLY_FBOSS_APIS}, set())
 
-    def test_fboss_with_qsfp_flaps_overrides(self) -> None:
-        payload = fboss_with_qsfp_flaps(
+    def test_fboss_qsfp_flaps_only_overrides(self) -> None:
+        payload = fboss_qsfp_flaps_only(
             ["eth1/1/1"], interval_to_link_up=8, total_flaps=50
         )
-        flap = payload[-1]
-        self.assertEqual(flap.args, (("eth1/1/1",), 8, 50))
+        self.assertEqual(payload[0].args, (("eth1/1/1",), 8, 50))
 
-    def test_fboss_with_qsfp_flaps_works_for_any_platform(self) -> None:
-        """Universality: same builder works for IcePack/STSW/MP3/KO3 etc."""
+    def test_fboss_qsfp_flaps_only_works_for_any_platform(self) -> None:
+        """Universality: same builder works for IcePack/STSW/MP3/KO3 etc.
+        Platform-specificity lives entirely in the `interfaces` argument."""
         icepack_ports = ["eth1/3/1", "eth1/3/3"]  # IcePack STSW-adjacent
-        stsw_ports = ["eth1/5/1", "eth1/5/3"]  # STSW GTSW-adjacent
-        ipayload = fboss_with_qsfp_flaps(icepack_ports)
-        spayload = fboss_with_qsfp_flaps(stsw_ports)
-        # Same structure, different interface tuples in the flap entry
-        self.assertEqual(ipayload[:7], spayload[:7])
-        self.assertEqual(ipayload[-1].args[0], tuple(icepack_ports))
-        self.assertEqual(spayload[-1].args[0], tuple(stsw_ports))
+        ko3_ports = ["eth1/5/1", "eth1/8/1"]  # Kodiak3 RBB fabric uplinks
+        ipayload = fboss_qsfp_flaps_only(icepack_ports)
+        kpayload = fboss_qsfp_flaps_only(ko3_ports)
+        self.assertEqual(ipayload[0].method, kpayload[0].method)
+        self.assertEqual(ipayload[0].args[0], tuple(icepack_ports))
+        self.assertEqual(kpayload[0].args[0], tuple(ko3_ports))
 
     def test_payload_builders_keys(self) -> None:
         self.assertIn("fboss_readonly", PAYLOAD_BUILDERS)
-        self.assertIn("fboss_with_qsfp_flaps", PAYLOAD_BUILDERS)
+        self.assertIn("fboss_qsfp_flaps_only", PAYLOAD_BUILDERS)
+        # The combined `fboss_with_qsfp_flaps` builder was deliberately
+        # removed — it put the flap and the thrift storm in one gather under
+        # one burst timeout, which cannot work. Guard against reintroduction.
+        self.assertNotIn("fboss_with_qsfp_flaps", PAYLOAD_BUILDERS)
         # All builders are callable
         for k, builder in PAYLOAD_BUILDERS.items():
             self.assertTrue(callable(builder), f"{k} builder not callable")
 
 
-class ThriftStressPeriodicTaskTest(unittest.IsolatedAsyncioTestCase):
+class ThriftStressPeriodicTaskTest(TestCase):
     """Unit tests for ThriftStressPeriodicTask burst + final-check behavior."""
 
     def setUp(self) -> None:
@@ -165,6 +173,309 @@ class ThriftStressPeriodicTaskTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(burst["total"], 5)
         self.assertEqual(burst["success"], 5)
         self.assertEqual(burst["failures"], 0)
+
+    async def test_dynamic_flap_discovers_all_non_ixia_lldp_interfaces(self) -> None:
+        """Each flap cycle refreshes LLDP and excludes IXIA-facing ports."""
+        driver = _make_fboss_driver(
+            extra_apis=[
+                "async_get_lldp_neighbors",
+                "async_do_rapid_interface_flaps",
+            ]
+        )
+        peer_a = MagicMock(remote_device_name="ssw001.s001.f01.qzd1")
+        peer_b = MagicMock(remote_device_name="fsw002.p001.f01.qzd1")
+        ixia_peer = MagicMock(remote_device_name="ixia-lab-001")
+        driver.async_get_lldp_neighbors.return_value = {
+            "eth1/3/1": peer_a,
+            "eth1/4/1": ixia_peer,
+            "eth1/5/1": peer_b,
+        }
+        payload = fboss_qsfp_flaps_only([], total_flaps=1)
+
+        with patch(
+            f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+            AsyncMock(return_value=driver),
+        ):
+            await self.task.run(
+                {
+                    "hostname": "gtsw001.l1001.c085.ash6",
+                    "calls": [c.to_dict() for c in payload],
+                    "resolve_flap_interfaces_from_lldp": True,
+                }
+            )
+
+        driver.async_get_lldp_neighbors.assert_awaited_once()
+        driver.async_do_rapid_interface_flaps.assert_awaited_once_with(
+            ["eth1/3/1", "eth1/5/1"], 6, 1
+        )
+        burst = next(iter(self.task._data.values()))
+        self.assertEqual(burst["flap_interfaces"], ["eth1/3/1", "eth1/5/1"])
+        self.assertEqual(burst["hostname"], "gtsw001.l1001.c085.ash6")
+
+    async def test_dynamic_flap_recovers_after_lldp_transport_failure(self) -> None:
+        driver = _make_fboss_driver(
+            extra_apis=["async_get_lldp_neighbors", "async_do_rapid_interface_flaps"]
+        )
+        driver.async_get_lldp_neighbors.side_effect = [
+            TransportError(
+                TransportErrorType.INTERNAL_ERROR, "Connection refused", 111, 0
+            ),
+            {"eth1/3/1": MagicMock(remote_device_name="fsw001.p001.m001.qzr1")},
+        ]
+        with (
+            patch(
+                f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+                AsyncMock(return_value=driver),
+            ),
+            patch(f"{PERIODIC_TASKS_PATH}.asyncio.sleep", AsyncMock()),
+        ):
+            await self.task.run(
+                {
+                    "hostname": "gtsw001.l1001.c085.ash6",
+                    "calls": [
+                        c.to_dict() for c in fboss_qsfp_flaps_only([], total_flaps=1)
+                    ],
+                    "resolve_flap_interfaces_from_lldp": True,
+                }
+            )
+        driver.async_do_rapid_interface_flaps.assert_awaited_once_with(
+            ["eth1/3/1"], 6, 1
+        )
+        burst = next(iter(self.task._data.values()))
+        self.assertEqual(burst["success"], 1)
+        self.assertEqual(burst["flap_interfaces"], ["eth1/3/1"])
+
+    async def test_dynamic_flap_lldp_transport_retry_has_deadline(self) -> None:
+        driver = _make_fboss_driver(
+            extra_apis=["async_get_lldp_neighbors", "async_do_rapid_interface_flaps"]
+        )
+        driver.async_get_lldp_neighbors.side_effect = TransportError(
+            TransportErrorType.INTERNAL_ERROR, "Connection refused", 111, 0
+        )
+        with patch(
+            f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+            AsyncMock(return_value=driver),
+        ):
+            with self.assertRaises(TimeoutError):
+                await self.task.run(
+                    {
+                        "hostname": "gtsw001.l1001.c085.ash6",
+                        "calls": [
+                            c.to_dict()
+                            for c in fboss_qsfp_flaps_only([], total_flaps=1)
+                        ],
+                        "resolve_flap_interfaces_from_lldp": True,
+                        "burst_timeout_s": 0.01,
+                    }
+                )
+        driver.async_do_rapid_interface_flaps.assert_not_awaited()
+        self.assertFalse(self.task._data)
+
+    async def test_dynamic_flap_waits_for_lldp_after_transport_recovers(self) -> None:
+        driver = _make_fboss_driver(
+            extra_apis=["async_get_lldp_neighbors", "async_do_rapid_interface_flaps"]
+        )
+        driver.async_get_lldp_neighbors.side_effect = [
+            TransportError(
+                TransportErrorType.INTERNAL_ERROR, "Connection refused", 111, 0
+            ),
+            {},
+            {"eth1/4/1": MagicMock(remote_device_name="ixia-lab-001")},
+            {"eth1/3/1": MagicMock(remote_device_name="fsw001.p001.m001.qzr1")},
+        ]
+        with (
+            patch(
+                f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+                AsyncMock(return_value=driver),
+            ),
+            patch(f"{PERIODIC_TASKS_PATH}.asyncio.sleep", AsyncMock()),
+        ):
+            await self.task.run(
+                {
+                    "hostname": "gtsw001.l1001.c085.ash6",
+                    "calls": [
+                        c.to_dict() for c in fboss_qsfp_flaps_only([], total_flaps=1)
+                    ],
+                    "resolve_flap_interfaces_from_lldp": True,
+                }
+            )
+        driver.async_do_rapid_interface_flaps.assert_awaited_once_with(
+            ["eth1/3/1"], 6, 1
+        )
+        burst = next(iter(self.task._data.values()))
+        self.assertEqual(burst["flap_interfaces"], ["eth1/3/1"])
+        self.assertEqual(burst["success"], 1)
+
+    async def test_dynamic_flap_lldp_deadline_cancels_hung_rpc(self) -> None:
+        driver = _make_fboss_driver(
+            extra_apis=["async_get_lldp_neighbors", "async_do_rapid_interface_flaps"]
+        )
+        pending = asyncio.Future()
+
+        async def hung_lldp():
+            return await pending
+
+        driver.async_get_lldp_neighbors.side_effect = hung_lldp
+        with patch(
+            f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+            AsyncMock(return_value=driver),
+        ):
+            with self.assertRaises(TimeoutError):
+                await self.task.run(
+                    {
+                        "hostname": "gtsw001.l1001.c085.ash6",
+                        "calls": [
+                            c.to_dict()
+                            for c in fboss_qsfp_flaps_only([], total_flaps=1)
+                        ],
+                        "resolve_flap_interfaces_from_lldp": True,
+                        "burst_timeout_s": 0.01,
+                    }
+                )
+        self.assertTrue(pending.cancelled())
+        driver.async_do_rapid_interface_flaps.assert_not_awaited()
+
+    async def test_dynamic_flap_lldp_other_errors_and_cancellation_propagate(
+        self,
+    ) -> None:
+        driver = _make_fboss_driver(
+            extra_apis=["async_get_lldp_neighbors", "async_do_rapid_interface_flaps"]
+        )
+        for error in (ValueError("Invalid LLDP"), asyncio.CancelledError()):
+            with self.subTest(error=type(error).__name__):
+                driver.async_get_lldp_neighbors.side_effect = error
+                with patch(
+                    f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+                    AsyncMock(return_value=driver),
+                ):
+                    with self.assertRaises(type(error)) as raised:
+                        await self.task.run(
+                            {
+                                "hostname": "gtsw001.l1001.c085.ash6",
+                                "calls": [
+                                    c.to_dict()
+                                    for c in fboss_qsfp_flaps_only([], total_flaps=1)
+                                ],
+                                "resolve_flap_interfaces_from_lldp": True,
+                            }
+                        )
+                self.assertIs(raised.exception, error)
+        driver.async_do_rapid_interface_flaps.assert_not_awaited()
+
+    async def test_final_check_fails_when_dynamically_flapped_port_is_down(
+        self,
+    ) -> None:
+        driver = _make_fboss_driver(
+            extra_apis=["async_get_all_interfaces_operational_status"]
+        )
+        driver.async_get_all_interfaces_operational_status.return_value = {
+            "eth1/3/1": True,
+            "eth1/5/1": False,
+        }
+        self.task.add_data(
+            {
+                "hostname": "gtsw001.l1001.c085.ash6",
+                "flap_interfaces": ["eth1/3/1", "eth1/5/1"],
+                "total": 1,
+                "success": 1,
+                "failures": 0,
+                "timed_out": 0,
+                "elapsed_s": 1.0,
+            }
+        )
+
+        with patch(
+            f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+            AsyncMock(return_value=driver),
+        ):
+            result = await self.task.run_final_check()
+
+        assert result is not None
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("eth1/5/1", result.message or "")
+
+    async def test_final_check_passes_when_all_dynamically_flapped_ports_are_up(
+        self,
+    ) -> None:
+        driver = _make_fboss_driver(
+            extra_apis=["async_get_all_interfaces_operational_status"]
+        )
+        driver.async_get_all_interfaces_operational_status.return_value = {
+            "eth1/3/1": True,
+            "eth1/5/1": True,
+        }
+        self.task.add_data(
+            {
+                "hostname": "gtsw001.l1001.c085.ash6",
+                "flap_interfaces": ["eth1/3/1", "eth1/5/1"],
+                "total": 1,
+                "success": 1,
+                "failures": 0,
+                "timed_out": 0,
+                "elapsed_s": 1.0,
+            }
+        )
+
+        with patch(
+            f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+            AsyncMock(return_value=driver),
+        ):
+            result = await self.task.run_final_check()
+
+        assert result is not None
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
+        self.assertIn(
+            "all 2 dynamically flapped interfaces are UP", result.message or ""
+        )
+
+    async def test_final_check_fails_when_dynamic_flap_rpc_fails(self) -> None:
+        self.task.add_data(
+            {
+                "hostname": "gtsw001.l1001.c085.ash6",
+                "flap_interfaces": ["eth1/3/1"],
+                "total": 1,
+                "success": 0,
+                "failures": 1,
+                "timed_out": 0,
+                "elapsed_s": 1.0,
+            }
+        )
+
+        result = await self.task.run_final_check()
+
+        assert result is not None
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("flap RPC", result.message or "")
+
+    async def test_dynamic_flap_fails_closed_when_lldp_has_no_non_ixia_ports(
+        self,
+    ) -> None:
+        driver = _make_fboss_driver(
+            extra_apis=[
+                "async_get_lldp_neighbors",
+                "async_do_rapid_interface_flaps",
+            ]
+        )
+        driver.async_get_lldp_neighbors.return_value = {
+            "eth1/4/1": MagicMock(remote_device_name="IXIA-LAB-001")
+        }
+        payload = fboss_qsfp_flaps_only([], total_flaps=1)
+
+        with patch(
+            f"{PERIODIC_TASKS_PATH}.async_get_device_driver",
+            AsyncMock(return_value=driver),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "non-IXIA LLDP"):
+                await self.task.run(
+                    {
+                        "hostname": "gtsw001.l1001.c085.ash6",
+                        "calls": [c.to_dict() for c in payload],
+                        "resolve_flap_interfaces_from_lldp": True,
+                        "burst_timeout_s": 0.01,
+                    }
+                )
+
+        driver.async_do_rapid_interface_flaps.assert_not_awaited()
 
     # ---- Legacy apis-shape path ------------------------------------------
 

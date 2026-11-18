@@ -14,20 +14,82 @@ from taac.libs.fpf.fpf_collector_registry import (
     DEFAULT_SIGNAL1_E2E_MAX_SEC,
     DEFAULT_SIGNAL2_LOCAL_MAX_SEC,
     DEFAULT_SIGNAL3_STABILITY_DURATION_SEC,
-    evaluate_restart_reconverge,
+    enforce_final_exact,
     evaluate_three_signals,
     everpaste_details_suffix,
     get_collector,
     get_disruption_time,
+    get_mutation_time,
     get_test_case_start_time,
+    wait_for_restart_reconverge,
+    wait_for_target_rib_rows,
 )
-from taac.libs.fpf.fpf_stress_checks import _parse_ts
+from taac.libs.fpf.fpf_prod_switch_prefix_health import (
+    check_production_routes,
+)
+from taac.libs.fpf.fpf_stress_checks import (
+    _parse_ts,
+    BLIP_MODE_SKIP_NULL_STRICT,
+)
 from taac.libs.fpf.fpf_thresholds import (
     ACTIVE as FPF_ACTIVE_THRESHOLDS,
 )
 from taac.health_check.health_check import types as hc_types
 
 JSONL_PATH = "/tmp/fpf_stress_bgp_rib.jsonl"
+
+
+def _target_timeout_attribution(
+    collector: t.Any,
+    target_devices: t.Iterable[str],
+    window_start: float,
+    window_end: float,
+) -> t.Tuple[t.Dict[str, int], t.List[str]]:
+    """Attribute completed BGP timeouts by request start, not row publication.
+
+    A request that started before the current playbook but completed inside its
+    window belongs to the previous boundary and is excluded. A request that
+    started inside the window is charged to the current playbook. Collectors
+    without request telemetry retain the legacy completion-timestamp fallback.
+    """
+    targets = set(target_devices)
+    counts = dict.fromkeys(targets, 0)
+    telemetry_hosts: t.Set[str] = set()
+    boundary_notes: t.List[str] = []
+    for row in getattr(collector, "rows", []):
+        device = str(getattr(row, "gtsw", ""))
+        notes = str(getattr(row, "notes", "") or "")
+        if device not in targets or not notes.startswith("error: poll timeout"):
+            continue
+        request_start = float(getattr(row, "request_start_epoch", 0.0) or 0.0)
+        request_end = float(getattr(row, "request_end_epoch", 0.0) or 0.0)
+        if request_start <= 0:
+            continue
+        telemetry_hosts.add(device)
+        if window_start <= request_start <= window_end:
+            counts[device] += 1
+            boundary_notes.append(
+                f"charged {device} timeout to current window "
+                f"({request_start:.3f}->{request_end:.3f})"
+            )
+        elif request_start < window_start <= request_end:
+            boundary_notes.append(
+                f"excluded {device} timeout started before window "
+                f"({request_start:.3f}->{request_end:.3f})"
+            )
+
+    host_timeout_timestamps = getattr(collector, "host_timeout_timestamps", {})
+    if not isinstance(host_timeout_timestamps, dict):
+        host_timeout_timestamps = {}
+    for device in targets - telemetry_hosts:
+        counts[device] = len(
+            [
+                ts
+                for ts in host_timeout_timestamps.get(device, [])
+                if window_start <= ts <= window_end
+            ]
+        )
+    return counts, boundary_notes
 
 
 class FpfBgpRibConvergenceHealthCheck(
@@ -52,6 +114,9 @@ class FpfBgpRibConvergenceHealthCheck(
         input: hc_types.BaseHealthCheckIn,
         check_params: t.Dict[str, t.Any],
     ) -> hc_types.HealthCheckResult:
+        if check_params.get("production_prefixes"):
+            return check_production_routes("bgp", check_params)
+
         lane_map: t.Dict[int, str] = {
             int(k): v for k, v in check_params.get("lane_map", {}).items()
         }
@@ -65,11 +130,20 @@ class FpfBgpRibConvergenceHealthCheck(
             )
 
         if use_live:
-            return await self._evaluate_from_live_collector(
+            result = await self._evaluate_from_live_collector(
                 lane_map, expected, check_params
             )
+        else:
+            result = self._evaluate_from_jsonl(lane_map, expected, check_params)
 
-        return self._evaluate_from_jsonl(lane_map, expected, check_params)
+        if check_params.get("informational") and (
+            result.status == hc_types.HealthCheckStatus.FAIL
+        ):
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.PASS,
+                message=f"[INFORMATIONAL] {result.message or ''}",
+            )
+        return result
 
     async def _evaluate_from_live_collector(
         self,
@@ -93,24 +167,30 @@ class FpfBgpRibConvergenceHealthCheck(
                 default_sla_sec=FPF_ACTIVE_THRESHOLDS.bgp_restart_reconverge_sla_sec,
             )
 
-        window_end = check_params.get("window_end", time.time())
+        explicit_window_end = check_params.get("window_end")
+        window_end = (
+            float(explicit_window_end)
+            if explicit_window_end is not None
+            else time.time()
+        )
         tc_start = get_test_case_start_time()
         lookback_sec = check_params.get("lookback_sec", 900)
-        window_start = check_params.get(
-            "window_start", tc_start if tc_start else window_end - lookback_sec
-        )
+        default_start = tc_start if tc_start else window_end - lookback_sec
+        if check_params.get("use_mutation_time"):
+            mutation_time = get_mutation_time()
+            if mutation_time <= 0:
+                return hc_types.HealthCheckResult(
+                    status=hc_types.HealthCheckStatus.FAIL,
+                    message="No FPF scale mutation timestamp was recorded",
+                )
+            default_start = max(default_start, mutation_time)
+        window_start = check_params.get("window_start", default_start)
         # settle_sec: skip the first N seconds (restore/recovery phase) so the
         # GTSW RIB re-converge transient on undrain/re-enable isn't measured as
         # post-convergence instability.
         settle_sec = float(check_params.get("settle_sec", 0))
         if settle_sec > 0:
             window_start = min(window_start + settle_sec, window_end)
-
-        self.logger.info(
-            f"  [BGP RIB live] Evaluating window: "
-            f"{window_start:.0f} to {window_end:.0f} "
-            f"({window_end - window_start:.0f}s span)"
-        )
 
         signal1_max = check_params.get(
             "signal1_e2e_max_sec", DEFAULT_SIGNAL1_E2E_MAX_SEC
@@ -122,6 +202,23 @@ class FpfBgpRibConvergenceHealthCheck(
             "signal3_stability_duration_sec", DEFAULT_SIGNAL3_STABILITY_DURATION_SEC
         )
         stability_mode = check_params.get("stability_mode", "strict")
+
+        if stability_mode == BLIP_MODE_SKIP_NULL_STRICT and explicit_window_end is None:
+            window_end = await wait_for_target_rib_rows(
+                collector=collector,
+                target_devices=lane_map.values(),
+                window_start=float(window_start),
+                deadline=float(window_start) + float(signal1_max),
+                poll_interval_sec=float(
+                    check_params.get("target_row_poll_interval_sec", 1.0)
+                ),
+            )
+
+        self.logger.info(
+            f"  [BGP RIB live] Evaluating window: "
+            f"{window_start:.0f} to {window_end:.0f} "
+            f"({window_end - window_start:.0f}s span)"
+        )
 
         per_lane_results = collector.evaluate_per_device_window(
             window_start=window_start,
@@ -142,6 +239,8 @@ class FpfBgpRibConvergenceHealthCheck(
                 signal3_stability_duration_sec=signal3_duration,
                 stability_mode=stability_mode,
             )
+            if check_params.get("require_final_exact"):
+                per_lane_results[i] = enforce_final_exact(per_lane_results[i], expected)
 
         for r in per_lane_results:
             overall = "PASS" if r.passed else "FAIL"
@@ -183,20 +282,61 @@ class FpfBgpRibConvergenceHealthCheck(
             )[:300],
         )
 
-        timeout_count = collector.timeout_count_in_window(window_start, window_end)
-        if timeout_count > 0:
+        global_timeout_count = collector.timeout_count_in_window(
+            window_start, window_end
+        )
+        target_timeouts, boundary_notes = _target_timeout_attribution(
+            collector,
+            lane_map.values(),
+            window_start,
+            window_end,
+        )
+        for note in boundary_notes:
+            self.logger.info(f"  [BGP RIB live] timeout boundary: {note}")
+        timeout_count = global_timeout_count + sum(target_timeouts.values())
+        if timeout_count > 0 and stability_mode != BLIP_MODE_SKIP_NULL_STRICT:
+            attribution = (
+                f"; request attribution: {'; '.join(boundary_notes)}"
+                if boundary_notes
+                else ""
+            )
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.FAIL,
                 message=(
-                    f"Got null data — {timeout_count} poll timeout(s) in window "
-                    f"[{window_start:.0f}, {window_end:.0f}]{details}"
+                    f"Got null data — {timeout_count} target/global poll "
+                    f"timeout(s) in window "
+                    f"[{window_start:.0f}, {window_end:.0f}]"
+                    f"{attribution}{details}"
                 ),
             )
+        if stability_mode == BLIP_MODE_SKIP_NULL_STRICT:
+            observed_target_timeouts = {
+                device: count for device, count in target_timeouts.items() if count
+            }
+            if observed_target_timeouts:
+                self.logger.info(
+                    "  [BGP RIB live] tolerated target-device null polls in "
+                    f"skip_null_strict mode: {observed_target_timeouts}"
+                )
 
         if failures:
+            missing_targets: t.List[str] = []
+            if stability_mode == BLIP_MODE_SKIP_NULL_STRICT:
+                observed_targets = {
+                    str(getattr(row, "gtsw", ""))
+                    for row in collector.get_rows_in_window(window_start, window_end)
+                    if getattr(row, "matched", None) is not None
+                    and not str(getattr(row, "notes", "") or "").startswith("error:")
+                }
+                missing_targets = sorted(set(lane_map.values()) - observed_targets)
             fail_summary = "; ".join(
                 f"Lane {r.lane} {r.device}: {r.detail}" for r in failures
             )
+            if missing_targets:
+                fail_summary = (
+                    "INSUFFICIENT MEASUREMENT — no valid BGP RIB sample for "
+                    f"target(s) {', '.join(missing_targets)}; {fail_summary}"
+                )
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.FAIL,
                 message=fail_summary + details,
@@ -223,7 +363,7 @@ class FpfBgpRibConvergenceHealthCheck(
         """mode="restart": tolerate the null/unresponsive polls during a service
         restart and assert each device's RIB returns to ``expected`` within the
         reconverge SLA, measured from the recorded restart moment."""
-        window_end = check_params.get("window_end", time.time())
+        window_end = check_params.get("window_end")
         disruption_ts = check_params.get("disruption_ts")
         if disruption_ts is None:
             recorded = get_disruption_time()
@@ -231,16 +371,18 @@ class FpfBgpRibConvergenceHealthCheck(
         reconverge_sla = float(check_params.get("reconverge_sla_sec", default_sla_sec))
 
         self.logger.info(
-            f"  [BGP RIB restart] reconverge window {disruption_ts:.0f} to "
-            f"{window_end:.0f}; SLA {reconverge_sla:.0f}s from restart"
+            f"  [BGP RIB restart] waiting through "
+            f"{float(disruption_ts) + reconverge_sla:.0f}; "
+            f"SLA {reconverge_sla:.0f}s from restart"
         )
-        results = evaluate_restart_reconverge(
+        results, window_end = await wait_for_restart_reconverge(
             collector=collector,
             lane_map=lane_map,
             expected=expected,
             disruption_ts=float(disruption_ts),
-            window_end=float(window_end),
             reconverge_sla_sec=reconverge_sla,
+            window_end=float(window_end) if window_end is not None else None,
+            poll_interval_sec=float(check_params.get("restart_poll_interval_sec", 1.0)),
         )
         for lane_id, device, passed, _sec, _null, detail in results:
             self.logger.info(

@@ -17,6 +17,7 @@ from taac.health_checks.constants import (
 from taac.utils.health_check_utils import (
     async_find_critical_core_dumps,
     format_timestamp,
+    is_fboss_core_dump_from_process,
 )
 from taac.health_check.health_check import types as hc_types
 
@@ -51,6 +52,13 @@ def _format_core_dump_details(core_dumps: t.Dict[str, int]) -> str:
         else:
             details.append(f"  - {filename} (time={format_timestamp(ts)})")
     return "\n".join(details)
+
+
+def _core_dump_is_ignored(filename: str, ignored: t.Collection[str]) -> bool:
+    if filename in ignored:
+        return True
+    match = EOS_CORE_DUMP_FILENAME_REGEX.match(filename)
+    return bool(match and match.group("exec_name") in ignored)
 
 
 class CoreDumpsHealthCheck(
@@ -89,7 +97,22 @@ class CoreDumpsHealthCheck(
             parts = line.split()
             if len(parts) < 9:
                 continue
-            filename = parts[-1]
+            # Take the NAME column, not the last token. On EOS most entries under
+            # /var/core are symlinks into /mnt/flash/archive/current/var/core/, so
+            # the line ends "<name> -> <target>" and the last token is the TARGET.
+            # Keying on it made the name fail EOS_CORE_DUMP_FILENAME_REGEX, so
+            # _parse_eos_core_dump_timestamp fell through to int(time.time()) and
+            # stamped the core with the snapshot time -- i.e. every rotated core
+            # looked like it had just been produced. Observed on bag013 rel 191:
+            # 33 of 37 cores reported with a fabricated mtime and no process/pid,
+            # which is exactly the evidence a new-vs-pre-existing triage depends on.
+            name_tokens = parts[8:]
+            if "->" in name_tokens:
+                name_tokens = name_tokens[: name_tokens.index("->")]
+            # Basename so a symlink and a plain file for the same core produce the
+            # same key; otherwise the pre/post set difference reports a rotation
+            # as a brand-new core.
+            filename = " ".join(name_tokens).strip().rsplit("/", 1)[-1]
             if not filename:
                 continue
             # Extract the real timestamp from the filename pattern
@@ -148,13 +171,21 @@ class CoreDumpsHealthCheck(
         pre_snapshot: Snapshot,
         post_snapshot: Snapshot,
     ) -> hc_types.HealthCheckResult:
-        core_dumps_to_ignore = json.loads(
-            check_params.get("core_dumps_to_ignore", "[]")
+        raw_core_dumps_to_ignore = check_params.get("core_dumps_to_ignore", [])
+        # ParameterEvaluator normally decodes json_params before invoking the
+        # check, while a few legacy callers still pass the encoded JSON string.
+        core_dumps_to_ignore = (
+            json.loads(raw_core_dumps_to_ignore)
+            if isinstance(raw_core_dumps_to_ignore, str)
+            else raw_core_dumps_to_ignore
         )
         new_core_dumps = {
             k: post_snapshot.data[k]
             for k in set(post_snapshot.data) - set(pre_snapshot.data)
-            if k not in core_dumps_to_ignore
+            if not _core_dump_is_ignored(k, core_dumps_to_ignore)
+            and not is_fboss_core_dump_from_process(
+                k, check_params.get("core_dump_processes_to_ignore", [])
+            )
         }
         if new_core_dumps:
             details = _format_core_dump_details(new_core_dumps)

@@ -1,26 +1,75 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # pyre-unsafe
+import ipaddress
 import json
 import unittest
 
+from taac.abstractions.compatibility.legacy_ebb_binding import (
+    IXIA03_EBGP_IC_PARENT_NETWORK_V4,
+    IXIA03_EBGP_IC_PARENT_NETWORK_V6,
+    IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+    IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+    IXIA_EBGP_IC_PARENT_NETWORK_V4,
+    IXIA_EBGP_IC_PARENT_NETWORK_V6,
+    IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+    IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+)
 from taac.health_checks.healthcheck_definitions import (
+    create_bgp_convergence_check,
+    create_bgp_rib_fib_consistency_check,
     create_bgp_route_count_verification_check,
+    create_bgp_session_establish_check,
     create_core_dumps_snapshot_check,
 )
-from taac.health_checks.retry_policy import DEFAULT_RETRY_SPEC
+from taac.health_checks.retry_policy import (
+    DEFAULT_RETRY_SPEC,
+    get_retry_kwargs,
+)
 from taac.testconfigs.routing.util.bgp_ebb_check_profiles import (
     CheckProfile,
     get_profile_checks,
+    IBGP_MIMIC_PARENTS,
     ProfileChecks,
     ProfileContext,
 )
 from taac.testconfigs.routing.util.bgp_ebb_health_checks import (
+    bgp_mon_ignore_prefix,
+    BgpMonScope,
     create_standard_postchecks,
     create_standard_prechecks,
     create_standard_snapshot_checks,
 )
+from taac.utils.hardware_capacity_utils import (
+    HardwareCapacityThresholds,
+)
 from taac.health_check.health_check import types as hc_types
+
+# The prefix a default (ixia11) BgpMonScope resolves to.
+DEFAULT_BGP_MON_PREFIX = bgp_mon_ignore_prefix()
+
+
+def _ignored_parent_prefixes(checks) -> list[str]:
+    """Collect every ``parent_prefixes_to_ignore`` entry across a phase's checks.
+
+    Reads the serialized params rather than the factory kwargs, so the
+    assertion survives a reshaping of how the scope is plumbed through.
+
+    Args:
+        checks: The resolved checks for one phase (pre, post or snapshot).
+
+    Returns:
+        Every ignored parent prefix found, in check order (may repeat when
+        several checks in the phase ignore the same prefix).
+    """
+    prefixes: list[str] = []
+    for check in checks:
+        params = getattr(check, "check_params", None)
+        raw = getattr(params, "json_params", None) if params else None
+        if not raw:
+            continue
+        prefixes.extend(json.loads(raw).get("parent_prefixes_to_ignore", []))
+    return prefixes
 
 
 class CheckProfileRegistryTest(unittest.TestCase):
@@ -46,6 +95,30 @@ class CheckProfileRegistryTest(unittest.TestCase):
         self.assertEqual(
             checks.snapshot_checks[0].name, hc_types.CheckName.CORE_DUMPS_CHECK
         )
+
+    def test_sc9_does_not_gate_on_boot_lifetime_ecmp_watermark(self):
+        checks = get_profile_checks(CheckProfile.SC9_BOUNDED_ECMP, ProfileContext())
+        hardware_checks = [
+            check
+            for check in [*checks.prechecks, *checks.postchecks]
+            if check.check_id
+            in {
+                "sc9_precheck_hw_capacity_baseline",
+                "sc9_postcheck_hw_capacity",
+            }
+        ]
+
+        self.assertEqual(
+            [
+                "sc9_precheck_hw_capacity_baseline",
+                "sc9_postcheck_hw_capacity",
+            ],
+            [check.check_id for check in hardware_checks],
+        )
+        for check in hardware_checks:
+            payload = json.loads(check.check_params.json_params)
+            self.assertFalse(payload["check_watermarks"])
+            self.assertIsNone(payload.get("ecmp_high_watermark_threshold"))
 
     def test_retry_is_baked_from_ssot(self):
         # Every postcheck must carry the uniform SSOT retry spec (P1/P3): the
@@ -118,7 +191,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             expected_peer_identity={"2401:db00::a": "2401:db00::b"},
             parent_prefixes_to_ignore=["10.0.0.0/24"],
             expected_established_sessions=42,
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
         )
         checks = get_profile_checks(CheckProfile.DAEMON_RESTART, ctx)
 
@@ -131,7 +204,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 expected_established_sessions=42,
                 cpu_baseline=8.0,
                 check_ibgp_pnh=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
@@ -140,9 +213,9 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 postcheck_thresholds=None,
                 convergence_hard_timeout_seconds=1200,
                 expected_established_session_count=42,
-                expected_restarted_services=["Bgp"],
+                expected_restarted_services=["Bgpcpp"],
                 restart_start_time_jq_var="daemon_restart_time",
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
@@ -152,7 +225,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 skip_uptime_check=True,
                 expected_peer_identity={"2401:db00::a": "2401:db00::b"},
                 parent_prefixes_to_ignore=["10.0.0.0/24"],
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
 
@@ -167,7 +240,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             check_ibgp_pnh=False,
             expected_peer_identity={"2401:db00::a": "2401:db00::b"},
             expected_established_sessions=42,
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
             fail_on_eor_expired=False,
         )
         checks = get_profile_checks(CheckProfile.COLD_START, ctx)
@@ -180,7 +253,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 precheck_thresholds=None,
                 cpu_baseline=8.0,
                 check_ibgp_pnh=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
@@ -190,16 +263,16 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 convergence_hard_timeout_seconds=1200,
                 fail_on_eor_expired=False,
                 expected_established_session_count=42,
-                expected_restarted_services=["Bgp"],
+                expected_restarted_services=["Bgpcpp"],
                 restart_start_time_jq_var="daemon_restart_time",
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
             checks.snapshot_checks,
             create_standard_snapshot_checks(
                 expected_peer_identity={"2401:db00::a": "2401:db00::b"},
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
 
@@ -214,7 +287,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             check_ibgp_pnh=False,
             expected_peer_identity={"2401:db00::a": "2401:db00::b"},
             parent_prefixes_to_ignore=["10.0.0.0/24"],
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
             snapshot_skip_flap=True,
             snapshot_skip_uptime=True,
         )
@@ -229,7 +302,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 expected_established_sessions=42,
                 cpu_baseline=8.0,
                 check_ibgp_pnh=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
@@ -237,7 +310,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             create_standard_postchecks(
                 postcheck_thresholds=None,
                 check_bgp_convergence=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
@@ -247,7 +320,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 skip_uptime_check=True,
                 expected_peer_identity={"2401:db00::a": "2401:db00::b"},
                 parent_prefixes_to_ignore=["10.0.0.0/24"],
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
 
@@ -258,7 +331,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             peergroup_ibgp_v6="PG_IBGP_V6",
             peergroup_ibgp_v4="PG_IBGP_V4",
             cpu_baseline=8.0,
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
         )
         checks = get_profile_checks(CheckProfile.OSCILLATION, ctx)
 
@@ -266,18 +339,20 @@ class CheckProfileRegistryTest(unittest.TestCase):
             checks.snapshot_checks,
             create_standard_snapshot_checks(
                 expected_peer_identity=None,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
 
     def test_drain_undrain_matches_factory(self):
         """DRAIN_UNDRAIN reproduces the fauu/plane drain playbooks' calls
         (iBGP-PNH off, convergence OFF, snapshot skips flap only)."""
+        precheck_thresholds = HardwareCapacityThresholds(fec_threshold=15_000)
         ctx = ProfileContext(
             peergroup_ibgp_v6="PG_IBGP_V6",
             peergroup_ibgp_v4="PG_IBGP_V4",
+            precheck_thresholds=precheck_thresholds,
             expected_established_sessions=12,
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
         )
         checks = get_profile_checks(CheckProfile.DRAIN_UNDRAIN, ctx)
 
@@ -286,34 +361,56 @@ class CheckProfileRegistryTest(unittest.TestCase):
             create_standard_prechecks(
                 peergroup_ibgp_v6="PG_IBGP_V6",
                 peergroup_ibgp_v4="PG_IBGP_V4",
+                precheck_thresholds=precheck_thresholds,
                 expected_established_sessions=12,
                 check_ibgp_pnh=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
             checks.postchecks,
             create_standard_postchecks(
                 check_bgp_convergence=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
             checks.snapshot_checks,
             create_standard_snapshot_checks(
                 skip_flap_check=True,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
 
+    def test_drain_pnh_readiness_requires_both_profile_and_explicit_range(self) -> None:
+        for enabled, count, expected in (
+            (True, None, False),
+            (False, 100, False),
+            (True, 100, True),
+        ):
+            with self.subTest(enabled=enabled, count=count):
+                checks = get_profile_checks(
+                    CheckProfile.DRAIN_UNDRAIN,
+                    ProfileContext(check_ibgp_pnh=enabled, ibgp_pnh_count=count),
+                )
+                pnh = [
+                    check
+                    for check in checks.prechecks
+                    if check.check_id == "startup_ibgp_pnh_verification"
+                ]
+                self.assertEqual(expected, bool(pnh))
+
     def test_churn_storm_route_storm_matches_factory(self):
         """CICD-EBB-11 uses final session checks and in-workflow stability gates."""
+        precheck_thresholds = HardwareCapacityThresholds(fec_threshold=15_000)
         ctx = ProfileContext(
             peergroup_ibgp_v6="PG_IBGP_V6",
             peergroup_ibgp_v4="PG_IBGP_V4",
+            precheck_thresholds=precheck_thresholds,
             expected_established_sessions=42,
+            check_cpu_load_average=False,
             check_ibgp_pnh=True,
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
         )
         checks = get_profile_checks(CheckProfile.CHURN_STORM, ctx)
 
@@ -322,9 +419,11 @@ class CheckProfileRegistryTest(unittest.TestCase):
             create_standard_prechecks(
                 peergroup_ibgp_v6="PG_IBGP_V6",
                 peergroup_ibgp_v4="PG_IBGP_V4",
+                precheck_thresholds=precheck_thresholds,
                 expected_established_sessions=42,
+                check_cpu_load_average=False,
                 check_ibgp_pnh=True,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
@@ -332,7 +431,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             create_standard_postchecks(
                 check_bgp_convergence=False,
                 expected_established_session_count=42,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         # Core-dumps ONLY — no bgp-session snapshot for this profile.
@@ -349,7 +448,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             check_ibgp_pnh=True,
             expected_peer_identity={"2401:db00::a": "2401:db00::b"},
             parent_prefixes_to_ignore=["10.0.0.0/24"],
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
             full_session_snapshot=True,
         )
 
@@ -362,7 +461,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 peergroup_ibgp_v4="PG_IBGP_V4",
                 expected_established_sessions=42,
                 check_ibgp_pnh=True,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
@@ -370,7 +469,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             create_standard_postchecks(
                 check_bgp_convergence=False,
                 expected_established_session_count=42,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
@@ -378,7 +477,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             create_standard_snapshot_checks(
                 expected_peer_identity={"2401:db00::a": "2401:db00::b"},
                 parent_prefixes_to_ignore=["10.0.0.0/24"],
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
 
@@ -391,7 +490,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             cpu_baseline=8.0,
             check_ibgp_pnh=False,
             expected_peer_identity={"2401:db00::a": "2401:db00::b"},
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
         )
         checks = get_profile_checks(CheckProfile.IGP_INSTABILITY, ctx)
 
@@ -403,21 +502,21 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 expected_established_sessions=42,
                 cpu_baseline=8.0,
                 check_ibgp_pnh=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
             checks.postchecks,
             create_standard_postchecks(
                 check_bgp_convergence=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
             checks.snapshot_checks,
             create_standard_snapshot_checks(
                 expected_peer_identity={"2401:db00::a": "2401:db00::b"},
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
 
@@ -430,7 +529,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             cpu_baseline=8.0,
             check_ibgp_pnh=False,
             expected_peer_identity={"2401:db00::a": "2401:db00::b"},
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
         )
         checks = get_profile_checks(CheckProfile.IGP_INSTABILITY, ctx)
 
@@ -438,28 +537,70 @@ class CheckProfileRegistryTest(unittest.TestCase):
             checks.postchecks,
             create_standard_postchecks(
                 check_bgp_convergence=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
 
-    def test_soak_no_precheck_nexthop_matches_factory(self):
-        """SOAK_NO_PRECHECK with convergence ON reproduces the nexthop-group-count
-        threshold playbook (no prechecks, convergence postcheck at the threshold,
-        snapshot skips flap + uptime)."""
+    def test_soak_readiness_gated_nexthop_matches_factory(self):
+        """CICD-EBB-16 blocks stimulus on sessions, EOR, routes, and RIB/FIB."""
         ctx = ProfileContext(
             check_bgp_convergence=True,
             convergence_threshold=600,
-            exclude_bgp_mon=True,
+            expected_established_sessions=1272,
+            route_count_expected=750,
+            exact_ebgp_peer_group_names=("TOPOLOGY-V6", "TOPOLOGY-V4"),
+            bgp_mon=BgpMonScope(
+                exclude=True,
+                parent_network="2401:db00:e50d:22:a",
+            ),
         )
-        checks = get_profile_checks(CheckProfile.SOAK_NO_PRECHECK, ctx)
+        checks = get_profile_checks(CheckProfile.SOAK_READINESS_GATED, ctx)
 
-        # No prechecks — the playbook leaves the optional field unset.
-        self.assertEqual(checks.prechecks, [])
+        self.assertEqual(
+            checks.prechecks,
+            [
+                create_bgp_session_establish_check(
+                    expected_established_sessions_static=1272,
+                    parent_prefixes_to_ignore=["2401:db00:e50d:22:a::/80"],
+                    check_id="startup_bgp_session_verification",
+                    **get_retry_kwargs(hc_types.CheckName.BGP_SESSION_ESTABLISH_CHECK),
+                ),
+                create_bgp_convergence_check(
+                    convergence_threshold=600,
+                    hard_timeout_seconds=600,
+                    stability_window_seconds=30.0,
+                    fail_on_eor_expired=False,
+                    validate_sequence=False,
+                    extra_json_params={"start_event": "3", "end_event": "4"},
+                    check_id="startup_all_eor_received",
+                ),
+                create_bgp_route_count_verification_check(
+                    json_params={
+                        "exact_peer_group_names": ["TOPOLOGY-V6", "TOPOLOGY-V4"],
+                        "direction": "received",
+                        "expected_count": 750,
+                        "policy_type": "post_policy",
+                    },
+                    check_id="startup_bgp_route_count_verification",
+                ),
+                create_bgp_rib_fib_consistency_check(
+                    check_id="rib_fib_consistency_precheck",
+                    **get_retry_kwargs(
+                        hc_types.CheckName.BGP_RIB_FIB_CONSISTENCY_CHECK
+                    ),
+                ),
+            ],
+        )
         self.assertEqual(
             checks.postchecks,
             create_standard_postchecks(
                 convergence_threshold=600,
-                exclude_bgp_mon=True,
+                fail_on_eor_expired=False,
+                expected_established_session_count=1272,
+                bgp_mon=BgpMonScope(
+                    exclude=True,
+                    parent_network="2401:db00:e50d:22:a",
+                ),
             ),
         )
         self.assertEqual(
@@ -467,9 +608,82 @@ class CheckProfileRegistryTest(unittest.TestCase):
             create_standard_snapshot_checks(
                 skip_flap_check=True,
                 skip_uptime_check=True,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(
+                    exclude=True,
+                    parent_network="2401:db00:e50d:22:a",
+                ),
             ),
         )
+
+    def test_soak_readiness_gated_no_ug_uses_initialized(self):
+        """CICD-EBB-16 NO_UG gates on its guaranteed startup milestone."""
+        checks = get_profile_checks(
+            CheckProfile.SOAK_READINESS_GATED,
+            ProfileContext(
+                expected_established_sessions=1272,
+                route_count_expected=750,
+                enable_update_group=False,
+            ),
+        )
+
+        self.assertEqual(
+            checks.prechecks[1],
+            create_bgp_convergence_check(
+                convergence_threshold=600,
+                hard_timeout_seconds=600,
+                stability_window_seconds=30.0,
+                fail_on_eor_expired=False,
+                validate_sequence=False,
+                extra_json_params={"start_event": "3", "end_event": "9"},
+                check_id="startup_bgp_initialized",
+            ),
+        )
+
+    def test_route_count_histogram_is_serialized_for_affected_profiles(self):
+        histogram = {
+            "ipv4": {720: 50, 750: 90},
+            "ipv6": {720: 50, 750: 90},
+        }
+        for profile in (
+            CheckProfile.SOAK_READINESS_GATED,
+            CheckProfile.RUNTIME_UPDATE,
+        ):
+            with self.subTest(profile=profile):
+                checks = get_profile_checks(
+                    profile,
+                    ProfileContext(
+                        expected_established_sessions=1272,
+                        route_count_histogram_by_afi=histogram,
+                    ),
+                )
+                route_check = next(
+                    check
+                    for check in checks.prechecks
+                    if check.name
+                    == hc_types.CheckName.BGP_ROUTE_COUNT_VERIFICATION_CHECK
+                )
+                self.assertEqual(
+                    {
+                        "ipv4": {"720": 50, "750": 90},
+                        "ipv6": {"720": 50, "750": 90},
+                    },
+                    json.loads(route_check.check_params.json_params)[
+                        "expected_count_histogram_by_afi"
+                    ],
+                )
+
+    def test_route_count_expectations_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            get_profile_checks(
+                CheckProfile.RUNTIME_UPDATE,
+                ProfileContext(
+                    route_count_expected=750,
+                    route_count_histogram_by_afi={
+                        "ipv4": {720: 50, 750: 90},
+                        "ipv6": {720: 50, 750: 90},
+                    },
+                ),
+            )
 
     def test_runtime_update_matches_factory(self):
         """RUNTIME_UPDATE reproduces the route-registry prefix-list runtime-update
@@ -481,8 +695,9 @@ class CheckProfileRegistryTest(unittest.TestCase):
             cpu_baseline=6.0,
             expected_established_sessions=42,
             check_ibgp_pnh=False,
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
             route_count_expected=650,
+            exact_ebgp_peer_group_names=("TOPOLOGY-V6", "TOPOLOGY-V4"),
         )
         checks = get_profile_checks(CheckProfile.RUNTIME_UPDATE, ctx)
 
@@ -494,7 +709,52 @@ class CheckProfileRegistryTest(unittest.TestCase):
                 cpu_baseline=6.0,
                 expected_established_sessions=42,
                 check_ibgp_pnh=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
+            )
+            + [
+                create_bgp_route_count_verification_check(
+                    json_params={
+                        "exact_peer_group_names": ["TOPOLOGY-V6", "TOPOLOGY-V4"],
+                        "direction": "received",
+                        "expected_count": 650,
+                        "policy_type": "post_policy",
+                    },
+                    check_id="startup_bgp_session_verification",
+                ),
+            ],
+        )
+        self.assertEqual(
+            checks.postchecks,
+            create_standard_postchecks(
+                fail_on_eor_expired=False,
+                expected_established_session_count=42,
+                bgp_mon=BgpMonScope(exclude=True),
+            ),
+        )
+        self.assertEqual(
+            checks.snapshot_checks,
+            create_standard_snapshot_checks(
+                bgp_mon=BgpMonScope(exclude=True),
+            ),
+        )
+
+    def test_runtime_update_omits_unset_exact_session_count(self):
+        checks = get_profile_checks(
+            CheckProfile.RUNTIME_UPDATE,
+            ProfileContext(
+                peergroup_ibgp_v6="PG_IBGP_V6",
+                peergroup_ibgp_v4="PG_IBGP_V4",
+                route_count_expected=650,
+            ),
+        )
+
+        self.assertEqual(
+            checks.prechecks,
+            create_standard_prechecks(
+                peergroup_ibgp_v6="PG_IBGP_V6",
+                peergroup_ibgp_v4="PG_IBGP_V4",
+                cpu_baseline=8.0,
+                expected_established_sessions=None,
             )
             + [
                 create_bgp_route_count_verification_check(
@@ -512,13 +772,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             checks.postchecks,
             create_standard_postchecks(
                 fail_on_eor_expired=False,
-                exclude_bgp_mon=True,
-            ),
-        )
-        self.assertEqual(
-            checks.snapshot_checks,
-            create_standard_snapshot_checks(
-                exclude_bgp_mon=True,
+                expected_established_session_count=None,
             ),
         )
 
@@ -528,7 +782,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
         uptime)."""
         ctx = ProfileContext(
             check_bgp_convergence=False,
-            exclude_bgp_mon=True,
+            bgp_mon=BgpMonScope(exclude=True),
         )
         checks = get_profile_checks(CheckProfile.SOAK_NO_PRECHECK, ctx)
 
@@ -537,7 +791,7 @@ class CheckProfileRegistryTest(unittest.TestCase):
             checks.postchecks,
             create_standard_postchecks(
                 check_bgp_convergence=False,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
         self.assertEqual(
@@ -545,6 +799,115 @@ class CheckProfileRegistryTest(unittest.TestCase):
             create_standard_snapshot_checks(
                 skip_flap_check=True,
                 skip_uptime_check=True,
-                exclude_bgp_mon=True,
+                bgp_mon=BgpMonScope(exclude=True),
             ),
         )
+
+    def test_secondary_chassis_reaches_every_standard_phase(self):
+        """A non-default BGP-MON chassis must reach the pre, post AND snapshot
+        checks of every standard-shape profile.
+
+        This is the regression that motivated binding the exclusion flag and the
+        parent network into one ``BgpMonScope``: when they were two independent
+        kwargs, ``_soak_no_precheck`` threaded ``exclude_bgp_mon`` into its
+        postchecks but not the parent network, so those postchecks silently
+        excluded the default chassis' prefix instead of the configured one. It
+        was latent only because no config paired that profile with a secondary
+        chassis. Asserting on the resolved prefix (not on the kwargs) keeps the
+        guarantee even if the plumbing is reshaped again.
+        """
+        secondary = "2401:db00:eeee:e80d:33"
+        expected_prefix = f"{secondary}::/80"
+        ctx = ProfileContext(
+            peergroup_ibgp_v6="EB-FA-V6",
+            peergroup_ibgp_v4="EB-FA-V4",
+            expected_established_sessions=1272,
+            route_count_expected=750,
+            bgp_mon=BgpMonScope(exclude=True, parent_network=secondary),
+        )
+
+        # The bounded-ECMP characteristic profiles are the exception, and both
+        # for the same reason: their playbooks build them from a bare
+        # `ProfileContext()`, so no BGP-MON chassis is ever configured for the
+        # checks to thread. They scope to the eBGP population via
+        # IBGP_MIMIC_PARENTS instead, which is why their phases DO carry ignored
+        # parent prefixes and so cannot simply be skipped by the `not ignored`
+        # guard below. Every other profile is standard-shape and must honour a
+        # configured secondary chassis.
+        bounded_ecmp_profiles = {
+            CheckProfile.PERF_SCALING_BOUNDED_ECMP,
+            CheckProfile.SC9_BOUNDED_ECMP,
+        }
+        standard_profiles = [p for p in CheckProfile if p not in bounded_ecmp_profiles]
+        for profile in standard_profiles:
+            with self.subTest(profile=profile):
+                checks = get_profile_checks(profile, ctx)
+                phases = {
+                    "prechecks": checks.prechecks,
+                    "postchecks": checks.postchecks,
+                    "snapshot_checks": checks.snapshot_checks,
+                }
+                for phase_name, phase_checks in phases.items():
+                    ignored = _ignored_parent_prefixes(phase_checks)
+                    if not ignored:
+                        # Phases that legitimately carry no session check (e.g.
+                        # SOAK_NO_PRECHECK has no prechecks at all).
+                        continue
+                    self.assertIn(
+                        expected_prefix,
+                        ignored,
+                        f"{profile} {phase_name} ignores {ignored}, not the "
+                        f"configured secondary chassis {expected_prefix}",
+                    )
+                    self.assertNotIn(
+                        DEFAULT_BGP_MON_PREFIX,
+                        ignored,
+                        f"{profile} {phase_name} still ignores the default "
+                        f"chassis prefix despite a secondary chassis",
+                    )
+
+
+def _bounded_ecmp_peer_addresses(v6_parent: str, v4_parent: str) -> list[str]:
+    # Mirrors the IXIA address pattern: 128 peers from .11 / ::11 stepping by 2,
+    # so v4 rolls past the /24 boundary while v6 stays inside the fifth hextet.
+    v4_base = ipaddress.ip_address(f"{v4_parent}.11")
+    return [f"{v6_parent}::{0x11 + 2 * i:x}" for i in range(128)] + [
+        str(v4_base + 2 * i) for i in range(128)
+    ]
+
+
+def _in_scope(address: str) -> bool:
+    # Same semantics as health_check_utils.is_parent_prefix (strict=False).
+    network = ipaddress.ip_network(address)
+    return not any(
+        network.network_address in parent and network.prefixlen >= parent.prefixlen
+        for parent in (
+            ipaddress.ip_network(mask, strict=False) for mask in IBGP_MIMIC_PARENTS
+        )
+    )
+
+
+class IbgpMimicParentsTest(unittest.TestCase):
+    def test_only_ebgp_sessions_stay_in_scope_on_every_chassis(self) -> None:
+        chassis = {
+            "ixia": (
+                (IXIA_EBGP_IC_PARENT_NETWORK_V6, IXIA_EBGP_IC_PARENT_NETWORK_V4),
+                (
+                    IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+                    IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+                ),
+            ),
+            "ixia03": (
+                (IXIA03_EBGP_IC_PARENT_NETWORK_V6, IXIA03_EBGP_IC_PARENT_NETWORK_V4),
+                (
+                    IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
+                    IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+                ),
+            ),
+        }
+        for name, (ebgp, ibgp) in chassis.items():
+            with self.subTest(chassis=name):
+                ebgp_peers = _bounded_ecmp_peer_addresses(*ebgp)
+                ibgp_peers = _bounded_ecmp_peer_addresses(*ibgp)
+                self.assertEqual(256, sum(map(_in_scope, ebgp_peers)))
+                self.assertEqual(0, sum(map(_in_scope, ibgp_peers)))

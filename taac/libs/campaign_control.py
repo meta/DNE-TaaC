@@ -87,6 +87,8 @@ class HostActionSpec:
     continue_on_failure: bool = False
     interfaces: tuple[str, ...] = ()
     host_patterns: tuple[str, ...] = ()
+    binary_source: str | None = None
+    binary_path: str | None = None
 
     def __post_init__(self) -> None:  # noqa: C901
         if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", self.action_id) is None:
@@ -106,9 +108,11 @@ class HostActionSpec:
             "stop_dls",
             "coldboot_via_dls",
             "reboot_host",
+            "install_ib_binary",
         }:
             raise CampaignProtocolError(f"unsupported host action kind {self.kind!r}")
         self._validate_host()
+        self._validate_binary_paths()
         if type(self.expected_sessions) is not int or self.expected_sessions < 1:
             raise CampaignProtocolError("expected_sessions must be a positive integer")
         if (
@@ -157,6 +161,29 @@ class HostActionSpec:
             or self.max_hold_seconds <= 0
         ):
             raise CampaignProtocolError("max_hold_seconds must be finite and positive")
+
+    def _validate_binary_paths(self) -> None:
+        if self.kind != "install_ib_binary":
+            if self.binary_source is not None or self.binary_path is not None:
+                raise CampaignProtocolError(
+                    "binary paths apply only to install_ib_binary"
+                )
+            return
+        if (
+            not isinstance(self.binary_source, str)
+            or not self.binary_source.startswith("/")
+            or any(
+                part in ("", ".", "..") for part in self.binary_source.split("/")[1:]
+            )
+            or "\x00" in self.binary_source
+        ):
+            raise CampaignProtocolError(
+                "binary_source must be a normalized absolute file path"
+            )
+        if self.binary_path not in ("/usr/bin/ib_write_bw", "/root/ib_write_bw"):
+            raise CampaignProtocolError(
+                "binary_path must be /usr/bin/ib_write_bw or /root/ib_write_bw"
+            )
 
     def _validate_interfaces(self) -> None:
         if not isinstance(self.interfaces, (list, tuple)):
@@ -225,6 +252,8 @@ class HostActionSpec:
             "continue_on_failure": False,
             "interfaces": (),
             "host_patterns": (),
+            "binary_source": None,
+            "binary_path": None,
         }
         missing = expected - set(payload)
         unexpected = set(payload) - expected

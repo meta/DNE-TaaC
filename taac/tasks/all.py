@@ -1695,7 +1695,6 @@ class InjectBgpPolicyStatements(BaseTask):
     async def fetch_policy_from_configerator(
         self,
         config_path: str,
-        # pyrefly: ignore [bad-return]
     ) -> t.Dict[str, t.Any]:
         """
         Fetch BGP policy from configerator.

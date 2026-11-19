@@ -1218,6 +1218,63 @@ WEDGE800BACT_STANDALONE_TEST_CONFIG_200G = gen_snake_test_config(
     ],
 )
 
+ICEPACK_7808_CROSS_DEVICE_ICEPACK_TEST_CONFIG = gen_snake_test_config(
+    name="ICEPACK_7808_CROSS_DEVICE_ICEPACK_TEST_CONFIG",
+    basset_pool="dne.standalone",
+    snake_configs=[
+        taac_types.SnakeConfig(
+            source="bag003.qzq1:Ethernet5/7/1",
+            destination="bag003.qzq1:Ethernet6/7/1",
+            source_ip="5000:1::1/64",
+            destination_ip="5000:1::2/64",
+        ),
+    ],
+    direct_ixia_connections=[
+        taac_types.DirectIxiaConnection(
+            interface="Ethernet5/7/1",
+            ixia_chassis_ip="2401:db00:2066:3223:21a:c5ff:fe01:72b6",
+            ixia_port="1/1",
+        ),
+        taac_types.DirectIxiaConnection(
+            interface="Ethernet6/7/1",
+            ixia_chassis_ip="2401:db00:2066:3223:21a:c5ff:fe01:72b6",
+            ixia_port="1/2",
+        ),
+    ],
+    hostname="bag003.qzq1",
+    additional_dut_hostnames=["fboss336219714.ash6"],
+    primary_endpoint_is_dut=False,
+    precheck_packet_loss_clear_stats=True,
+    skip_lldp_check=True,
+    ixia_ports=["Ethernet5/7/1", "Ethernet6/7/1"],
+    playbooks_to_include=[
+        "test_snake_interface_toggle_with_thrift_api",
+        "test_snake_half_interface_toggle_with_thrift_api",
+        "test_snake_interface_toggle_with_qsfp_util_disable",
+        "test_snake_interface_toggle_with_qsfp_util_low_power",
+        "test_snake_interface_reset_with_qsfp_reset",
+        "test_snake_agent_warmboot",
+        "test_snake_qsfp_service_restart",
+        "test_snake_agent_coldboot",
+        "test_snake_agent_crash",
+        "test_snake_qsfp_service_crash",
+        "test_snake_system_reboot_bmc_full",
+        "test_snake_system_reboot_bmc_microserver",
+        "test_snake_system_reboot_microserver",
+        "test_snake_link_flap_with_longevity",
+        "test_snake_rapid_a_end_flap_stress",
+    ],
+    use_cross_device_half_interface_toggle=True,
+    postcheck_port_state_retry_count=6,
+    qsfp_service_restart_use_recovery_window=True,
+    include_link_flap_longevity=True,
+    include_rapid_a_end_flap_stress=True,
+    rapid_a_end_flap_neighbor_hostnames=["bag003.qzq1"],
+    flap_recovery_check_retry_count=6,
+    iteration=5,
+)
+
+
 SNAKE_TEST_CONFIGS = [
     MINIPACK3_STANDALONE_TEST_CONFIG_FBOSS159_800G_DR4_GEARBOX,
     MINIPACK3_STANDALONE_TEST_CONFIG,
@@ -1239,5 +1296,6 @@ SNAKE_TEST_CONFIGS = [
     ICEPACK_MP3_CROSS_DEVICE_MP3_THRIFT_FLAP_TEST_CONFIG,
     ICEPACK_STANDALONE_TEST_CONFIG_FR4_400G,
     ICEPACK_STANDALONE_TEST_CONFIG_FR4_800G,
+    ICEPACK_7808_CROSS_DEVICE_ICEPACK_TEST_CONFIG,
     WEDGE800BACT_STANDALONE_TEST_CONFIG_200G,
 ]

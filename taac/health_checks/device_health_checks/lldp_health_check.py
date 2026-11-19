@@ -150,7 +150,10 @@ class LldpHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn]):
     ) -> hc_types.HealthCheckResult:
         return await self._async_validate_or_skip(obj, check_params)
 
-    @async_retryable(retries=3, sleep_time=2, exceptions=(Exception,))
+    # A port's first LLDP frame can arrive several seconds after link-up.
+    # 9 tries 2 s apart give a 16 s window; retries stop after 24 s so slow
+    # failing reads (agent down) don't run all 9.
+    @async_retryable(retries=9, sleep_time=2, max_duration=24, exceptions=(Exception,))
     async def async_validate_lldp_neighbors(
         self,
         enabled_interfaces: t.List[taac_types.TestInterface],

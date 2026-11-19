@@ -4,7 +4,6 @@
 
 import asyncio
 import collections.abc
-import threading
 import time
 import typing as t
 import unittest
@@ -13,7 +12,7 @@ from unittest.mock import MagicMock, patch
 from taac.ixia.abstract_traffic_generator import (
     AbstractTrafficGenerator,
 )
-from taac.ixia.otg_traffic_gen import _nonempty_sequence
+from taac.ixia.otg_traffic_gen import _nonempty_sequence, _normalized_config
 
 
 def _make_ixia_config(port_configs=None, traffic_items=None):
@@ -91,6 +90,7 @@ def _create_otg_tgen(**kwargs):
     mock_config.ports = MagicMock()
     mock_config.devices = MagicMock()
     mock_config.flows = []
+    mock_config.serialize.return_value = "{}"
     mock_snappi.api.return_value = mock_api
     mock_api.config.return_value = mock_config
 
@@ -385,6 +385,17 @@ class TestEnableTraffic(unittest.TestCase):
         self.tgen._enable_traffic(regexes=["nonexistent"], enable=False)
         self.assertEqual(self.tgen._disabled_flows, set())
 
+    def test_anchored_regex_matches_traffic_item_name(self):
+        self.tgen._flow_traffic_item = {
+            "routed_flow_p1_0_to_0": "routed_flow",
+            "routed_flow_p2_0_to_0": "routed_flow",
+        }
+        self.tgen._enable_traffic(regexes=["^routed_flow$"], enable=False)
+        self.assertEqual(
+            self.tgen._disabled_flows,
+            {"routed_flow_p1_0_to_0", "routed_flow_p2_0_to_0"},
+        )
+
 
 # -- start/stop traffic: guard clauses + timestamp ----------------------------
 
@@ -440,6 +451,143 @@ class TestBeginEndTestCase(unittest.TestCase):
         self.tgen.end_test_case(traffic_regexes=None)
         self.assertTrue(self.tgen.paused)
         self.assertEqual(self.tgen._disabled_flows, {"flow1"})
+
+
+# -- Config re-push after setup -----------------------------------------------
+
+
+CFG_A = '{"ports": [{"name": "p1", "location": "eth1"}]}'
+CFG_B = '{"ports": [{"name": "p1", "location": "eth2"}]}'
+
+
+class TestConfigRepush(unittest.TestCase):
+    """set_config replaces emulated devices, so a re-push drops BGP sessions."""
+
+    @staticmethod
+    def _normalized(serialized):
+        from taac.ixia.otg_traffic_gen import _normalized_config
+
+        return _normalized_config(serialized)
+
+    def _make_tgen(self, pushed, current, bgp_peer_names=()):
+        tgen = _create_otg_tgen()
+        tgen._last_pushed_config = self._normalized(pushed) if pushed else None
+        tgen.config.serialize.return_value = current
+        tgen._bgp_peer_names = list(bgp_peer_names)
+        return tgen
+
+    def test_prepare_traffic_ignores_materialized_empty_collections(self):
+        # snappi adds "flows": [] to serialize() once config.flows is read.
+        current = '{"flows": [], "ports": [{"name": "p1", "location": "eth1"}]}'
+        tgen = self._make_tgen(pushed=CFG_A, current=current, bgp_peer_names=["p"])
+        with (
+            patch.object(tgen, "_start_protocols") as mock_start,
+            patch.object(tgen, "_wait_for_bgp"),
+        ):
+            tgen._prepare_traffic()
+        tgen.api.set_config.assert_not_called()
+        mock_start.assert_not_called()
+
+    def test_prepare_traffic_skips_unchanged_config(self):
+        tgen = self._make_tgen(pushed=CFG_A, current=CFG_A, bgp_peer_names=["p"])
+        with (
+            patch.object(tgen, "_start_protocols") as mock_start,
+            patch.object(tgen, "_wait_for_bgp") as mock_wait,
+        ):
+            tgen._prepare_traffic()
+        tgen.api.set_config.assert_not_called()
+        mock_start.assert_not_called()
+        mock_wait.assert_not_called()
+
+    def test_prepare_traffic_repush_reestablishes_bgp(self):
+        tgen = self._make_tgen(pushed=CFG_A, current=CFG_B, bgp_peer_names=["p"])
+        with (
+            patch.object(tgen, "_start_protocols") as mock_start,
+            patch.object(tgen, "_wait_for_bgp") as mock_wait,
+        ):
+            tgen._prepare_traffic()
+        tgen.api.set_config.assert_called_once_with(tgen.config)
+        mock_start.assert_called_once()
+        mock_wait.assert_called_once()
+        self.assertEqual(tgen._last_pushed_config, self._normalized(CFG_B))
+
+    def test_prepare_traffic_repush_without_bgp_restarts_protocols(self):
+        # set_config replaces the devices; ARP/ND need protocols started again.
+        tgen = self._make_tgen(pushed=CFG_A, current=CFG_B)
+        with (
+            patch.object(tgen, "_start_protocols") as mock_start,
+            patch.object(tgen, "_wait_for_bgp") as mock_wait,
+        ):
+            tgen._prepare_traffic()
+        tgen.api.set_config.assert_called_once_with(tgen.config)
+        mock_start.assert_called_once()
+        mock_wait.assert_not_called()
+
+    def test_prepare_traffic_without_bgp_skips_unchanged_config(self):
+        tgen = self._make_tgen(pushed=CFG_A, current=CFG_A)
+        with patch.object(tgen, "_start_protocols") as mock_start:
+            tgen._prepare_traffic()
+        tgen.api.set_config.assert_not_called()
+        mock_start.assert_not_called()
+
+    def _with_flows(self, tgen, *names):
+        flows = []
+        for name in names:
+            flow = MagicMock()
+            flow.name = name
+            flows.append(flow)
+        tgen.config.flows = flows
+        return tgen
+
+    def test_configure_traffic_item_with_bgp_defers_push_to_prepare_traffic(self):
+        tgen = self._make_tgen(pushed=CFG_A, current=CFG_B, bgp_peer_names=["p"])
+        self._with_flows(tgen, "flow1", "flow2")
+        with (
+            patch.object(tgen, "_apply_flow_rate"),
+            patch.object(tgen, "_start_protocols") as mock_start,
+            patch.object(tgen, "_wait_for_bgp") as mock_wait,
+        ):
+            tgen.configure_traffic_item("flow1", line_rate=10)
+            tgen.configure_traffic_item("flow2", line_rate=20)
+            tgen.api.set_config.assert_not_called()
+            mock_start.assert_not_called()
+
+            tgen._prepare_traffic()
+        tgen.api.set_config.assert_called_once_with(tgen.config)
+        mock_start.assert_called_once()
+        mock_wait.assert_called_once()
+
+    def test_configure_traffic_item_without_bgp_pushes(self):
+        tgen = self._make_tgen(pushed=CFG_A, current=CFG_A)
+        self._with_flows(tgen, "flow1")
+        with patch.object(tgen, "_apply_flow_rate"):
+            tgen.configure_traffic_item("flow1", line_rate=10)
+        tgen.api.set_config.assert_called_once_with(tgen.config)
+
+    def test_configure_traffic_item_applies_to_all_item_flows(self):
+        tgen = self._make_tgen(pushed=CFG_A, current=CFG_A)
+        self._with_flows(tgen, "L3_p1_0_to_0", "L3_p2_0_to_0", "other")
+        tgen._flow_traffic_item = {"L3_p1_0_to_0": "L3", "L3_p2_0_to_0": "L3"}
+        with patch.object(tgen, "_apply_flow_rate") as mock_rate:
+            tgen.configure_traffic_item("L3", line_rate=10)
+        configured = [c.args[0].name for c in mock_rate.call_args_list]
+        self.assertEqual(sorted(configured), ["L3_p1_0_to_0", "L3_p2_0_to_0"])
+        tgen.api.set_config.assert_called_once_with(tgen.config)
+
+    def test_setup_records_pushed_config(self):
+        tgen = self._make_tgen(pushed=None, current=CFG_A, bgp_peer_names=["p"])
+        with (
+            patch.object(tgen, "_start_protocols"),
+            patch.object(tgen, "_wait_for_bgp"),
+        ):
+            tgen.setup()
+        self.assertEqual(tgen._last_pushed_config, self._normalized(CFG_A))
+
+    def test_tear_down_forgets_pushed_config(self):
+        tgen = self._make_tgen(pushed=CFG_A, current=CFG_A)
+        with patch("taac.ixia.otg_traffic_gen.snappi"):
+            tgen.tear_down()
+        self.assertIsNone(tgen._last_pushed_config)
 
 
 # -- find_bgp_peers: pure list filtering --------------------------------------
@@ -504,6 +652,31 @@ class TestFlowMetricsToStats(unittest.TestCase):
         metrics = [{"name": "f1", "frames_tx": 100, "frames_rx": 100, "loss": 0}]
         stats = self.tgen._flow_metrics_to_stats(metrics)
         self.assertAlmostEqual(stats[0]["packet_loss_duration"], 2500.0, places=0)
+
+    def test_flows_aggregate_per_traffic_item(self):
+        # Matches IxNetwork's Traffic Item Statistics view: one row per item.
+        self.tgen._flow_traffic_item = {"L3_p1_0_to_0": "L3", "L3_p2_0_to_0": "L3"}
+        self.tgen._flow_loss_accumulated = {"L3_p1_0_to_0": 1.0, "L3_p2_0_to_0": 3.0}
+        metrics = [
+            {"name": "L3_p1_0_to_0", "frames_tx": 100, "frames_rx": 90, "loss": 10.0},
+            {"name": "L3_p2_0_to_0", "frames_tx": 100, "frames_rx": 80, "loss": 20.0},
+            {"name": "other", "frames_tx": 50, "frames_rx": 50, "loss": 0.0},
+        ]
+        stats = {s["identifier"]: s for s in self.tgen._flow_metrics_to_stats(metrics)}
+        self.assertEqual(sorted(stats), ["L3", "other"])
+        self.assertEqual(stats["L3"]["frame_delta"], 30.0)
+        self.assertAlmostEqual(stats["L3"]["packet_loss_percentage"], 15.0)
+        self.assertAlmostEqual(stats["L3"]["packet_loss_duration"], 3000.0, places=0)
+        self.assertEqual(stats["other"]["frame_delta"], 0.0)
+
+    def test_aggregate_with_no_tx_reports_zero_loss(self):
+        self.tgen._flow_traffic_item = {"L3_a": "L3", "L3_b": "L3"}
+        metrics = [
+            {"name": "L3_a", "frames_tx": 0, "frames_rx": 0, "loss": None},
+            {"name": "L3_b", "frames_tx": 0, "frames_rx": 0, "loss": None},
+        ]
+        stats = self.tgen._flow_metrics_to_stats(metrics)
+        self.assertEqual(stats[0]["packet_loss_percentage"], 0.0)
 
 
 # -- _update_flow_loss_state: loss duration state machine ---------------------
@@ -696,6 +869,9 @@ class TestBuildTrafficFlows(unittest.TestCase):
         names = [c.kwargs["name"] for c in tgen.config.flows.flow.call_args_list]
         self.assertIn("flow1", names)
         self.assertIn("flow1_reverse", names)
+        self.assertEqual(
+            tgen._flow_traffic_item, {"flow1": "flow1", "flow1_reverse": "flow1"}
+        )
 
     def test_no_traffic_items_is_noop(self):
         tgen = _create_otg_tgen()
@@ -854,13 +1030,21 @@ class TestConfigureFlowDuration(unittest.TestCase):
 
 class TestBgpConfigBuilders(unittest.TestCase):
     def _make_bgp_peer_config(
-        self, peer_type=None, local_as=65000, local_ip="10.0.1.1", remote_ip="10.0.1.2"
+        self,
+        peer_type=None,
+        local_as=65000,
+        local_ip="10.0.1.1",
+        remote_ip="10.0.1.2",
+        local_as_4_bytes=None,
+        enable_4_byte_local_as=False,
     ):
         from ixia.ixia import types as ixia_types
 
         cfg = MagicMock()
         cfg.peer_type = peer_type or ixia_types.BgpPeerType.EBGP
         cfg.local_as = local_as
+        cfg.local_as_4_bytes = local_as_4_bytes
+        cfg.enable_4_byte_local_as = enable_4_byte_local_as
         cfg.local_peer_starting_ip = local_ip
         cfg.remote_peer_starting_ip = remote_ip
         return cfg
@@ -914,6 +1098,45 @@ class TestBgpConfigBuilders(unittest.TestCase):
         bgp_info = self._make_bgp_info(v6_peer_config=peer_cfg)
         tgen._build_bgp_config(device, "p1_DG0", bgp_info, port_name="p1")
         self.assertIn("p1_DG0_bgp_v6", tgen._bgp_peer_names)
+
+    def test_4_byte_local_as_v4(self):
+        tgen = _create_otg_tgen()
+        device = MagicMock()
+        peer_cfg = self._make_bgp_peer_config(
+            local_as=None, local_as_4_bytes=65001, enable_4_byte_local_as=True
+        )
+        bgp_info = self._make_bgp_info(v4_peer_config=peer_cfg)
+        tgen._build_bgp_config(device, "p1_DG0", bgp_info, port_name="p1")
+        peer = device.bgp.ipv4_interfaces.v4interface.return_value[
+            -1
+        ].peers.v4peer.return_value[-1]
+        self.assertEqual(peer.as_number, 65001)
+
+    def test_4_byte_local_as_v6(self):
+        tgen = _create_otg_tgen()
+        device = MagicMock()
+        peer_cfg = self._make_bgp_peer_config(
+            local_as=None, local_as_4_bytes=4200000001, enable_4_byte_local_as=True
+        )
+        bgp_info = self._make_bgp_info(v6_peer_config=peer_cfg)
+        tgen._build_bgp_config(device, "p1_DG0", bgp_info, port_name="p1")
+        peer = device.bgp.ipv6_interfaces.v6interface.return_value[
+            -1
+        ].peers.v6peer.return_value[-1]
+        self.assertEqual(peer.as_number, 4200000001)
+
+    def test_4_byte_enabled_falls_back_to_local_as(self):
+        tgen = _create_otg_tgen()
+        device = MagicMock()
+        peer_cfg = self._make_bgp_peer_config(
+            local_as=65002, local_as_4_bytes=None, enable_4_byte_local_as=True
+        )
+        bgp_info = self._make_bgp_info(v4_peer_config=peer_cfg)
+        tgen._build_bgp_config(device, "p1_DG0", bgp_info, port_name="p1")
+        peer = device.bgp.ipv4_interfaces.v4interface.return_value[
+            -1
+        ].peers.v4peer.return_value[-1]
+        self.assertEqual(peer.as_number, 65002)
 
     def test_v6_only_peer_gets_derived_ipv4_router_id(self):
         """A v6 local IP cannot be a router_id; a v4 one must be derived."""
@@ -1560,6 +1783,8 @@ class TestTwoPhaseSetup(unittest.TestCase):
         tgen.config.flows = flows_mock
         tgen._build_explicit_flows([ti], gw_macs)
         self.assertEqual(flows_mock.flow.call_count, 2)
+        names = [c.kwargs["name"] for c in flows_mock.flow.call_args_list]
+        self.assertEqual(tgen._flow_traffic_item, {n: "flow1" for n in names})
 
     def test_explicit_flows_skips_unresolved_gw(self):
         tgen = _create_otg_tgen()
@@ -2139,6 +2364,30 @@ class TestEnableTrafficPublicApi(unittest.TestCase):
         stopped = [names for names, state in calls if names and "HIGH" in names[0]]
         self.assertTrue(stopped, "the flood must be transmit-stopped, not left running")
 
+    def test_anchored_item_regex_enables_that_items_flows(self):
+        """enable_traffic matches the traffic item name, like begin_test_case."""
+        self.tgen._flow_traffic_item = {
+            "NO_PACKET_LOSS_EXPECTED_V4_p1_0_to_0": "NO_PACKET_LOSS_EXPECTED_V4",
+            "NO_PACKET_LOSS_EXPECTED_V6_p1_0_to_0": "NO_PACKET_LOSS_EXPECTED_V6",
+            "HIGH_QUEUE_BGP_CP_TRAFFIC_p1_0_to_0": "HIGH_QUEUE_BGP_CP_TRAFFIC",
+        }
+        with patch.object(self.tgen.logger, "warning") as warning:
+            self.tgen.enable_traffic(regexes=["^NO_PACKET_LOSS_EXPECTED_V4$"])
+        warning.assert_not_called()
+        self.assertEqual(
+            self.tgen._disabled_flows,
+            {
+                "NO_PACKET_LOSS_EXPECTED_V6_p1_0_to_0",
+                "HIGH_QUEUE_BGP_CP_TRAFFIC_p1_0_to_0",
+            },
+        )
+        started = [
+            names
+            for names, state in self._transmit_calls()
+            if names and "V4" in names[0]
+        ]
+        self.assertEqual(started, [["NO_PACKET_LOSS_EXPECTED_V4_p1_0_to_0"]])
+
     def test_enabling_one_flow_disables_the_rest(self):
         """Matches restpy: enabling a subset stops every non-matching item."""
         self.tgen.enable_traffic(regexes=["HIGH_QUEUE_BGP_CP_TRAFFIC"], enable=True)
@@ -2181,8 +2430,9 @@ class TestEnableTrafficPublicApi(unittest.TestCase):
     def test_prepare_traffic_skips_repush_after_enable_traffic(self):
         """End-to-end of the above: the serialized config is unchanged, so
         _prepare_traffic() short-circuits."""
-        self.tgen.config.serialize.return_value = "SERIALIZED"
-        self.tgen._last_pushed_config = "SERIALIZED"
+        serialized = '{"ports": [{"name": "p1"}]}'
+        self.tgen.config.serialize.return_value = serialized
+        self.tgen._last_pushed_config = _normalized_config(serialized)
         self.tgen.enable_traffic(regexes=["HIGH_QUEUE_BGP_CP_TRAFFIC"], enable=True)
         self.tgen._prepare_traffic()
         self.tgen.api.set_config.assert_not_called()

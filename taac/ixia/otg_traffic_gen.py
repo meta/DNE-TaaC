@@ -8,6 +8,7 @@ translates it to snappi's declarative model (set_config, get_metrics, polling).
 
 import collections.abc
 import ipaddress
+import json
 import logging
 import re
 import threading
@@ -133,6 +134,24 @@ _PACKET_HEADER_FIELD_MAP: t.Dict[str, t.Dict[str, str]] = {
 }
 
 
+def _normalized_config(serialized: str) -> str:
+    """Canonical form of a serialized snappi config for change detection.
+
+    snappi materializes empty collections on read (iterating config.flows adds
+    "flows": []), so raw serialize() output changes without a real edit.
+    """
+
+    def prune(node: t.Any) -> t.Any:
+        if isinstance(node, dict):
+            pruned = {k: prune(v) for k, v in node.items()}
+            return {k: v for k, v in pruned.items() if v not in ({}, [])}
+        if isinstance(node, list):
+            return [prune(v) for v in node]
+        return node
+
+    return json.dumps(prune(json.loads(serialized)), sort_keys=True)
+
+
 class OtgTrafficGen(AbstractTrafficGenerator):
     """
     Idiomatic OTG traffic generator for TAAC tests.
@@ -168,6 +187,8 @@ class OtgTrafficGen(AbstractTrafficGenerator):
 
         self.api: "snappi.Api" = snappi.api(location=self._location)
         self.config: "snappi.Config" = self.api.config()
+        # OTG flow name -> traffic item it was built from.
+        self._flow_traffic_item: t.Dict[str, str] = {}
 
         # Built during _build_config
         self._bgp_peer_names: t.List[str] = []
@@ -283,6 +304,7 @@ class OtgTrafficGen(AbstractTrafficGenerator):
         """Two-phase setup: resolve ARP first, then rebuild with explicit flows."""
         saved_traffic_items = self.ixia_config.traffic_items or []
         self.config.flows.clear()
+        self._flow_traffic_item.clear()
 
         self.logger.info("[OTG] Phase 1: pushing device groups (no flows) for ARP...")
         self._push_config()
@@ -407,6 +429,7 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                         flow_name = f"{ti.name or 'flow'}_{tx['port']}_{tx['dg_idx']}_to_{rx['dg_idx']}"
                         self._assert_unique_flow_name(flow_name)
                         flow = self.config.flows.flow(name=flow_name)[-1]
+                        self._flow_traffic_item[flow_name] = ti.name or "flow"
                         flow.tx_rx.port.tx_name = tx["port"]
                         flow.tx_rx.port.rx_names = [rx["port"]]
 
@@ -505,6 +528,7 @@ class OtgTrafficGen(AbstractTrafficGenerator):
             self.api.set_config(snappi.Config())
         except Exception as e:
             self.logger.warning(f"[OTG] Teardown error: {e}")
+        self._last_pushed_config = None
 
     # Alias for callers that use the underscore-free name
     teardown = tear_down
@@ -554,23 +578,26 @@ class OtgTrafficGen(AbstractTrafficGenerator):
             else:
                 self._disabled_flows = {f.name for f in self.config.flows}
         else:
-            matched: t.Set[str] = set()
-            for flow in self.config.flows:
-                for regex in regexes:
-                    if re.search(regex, flow.name):
-                        matched.add(flow.name)
-                        break
+            matched = self._match_flows(regexes)
             if enable:
                 self._disabled_flows -= matched
             else:
                 self._disabled_flows |= matched
 
     def _match_flows(self, regexes: t.Optional[t.List[str]]) -> t.Set[str]:
-        """Flow names matching any regex, or all flow names when None."""
+        """Flow names whose own name or traffic item matches any regex, or all
+        flow names when None."""
         names = [f.name for f in self.config.flows]
         if regexes is None:
             return set(names)
-        return {n for n in names for r in regexes if re.search(r, n)}
+        return {
+            n
+            for n in names
+            if any(
+                re.search(r, n) or re.search(r, self._traffic_item_of(n))
+                for r in regexes
+            )
+        }
 
     def enable_traffic(
         self,
@@ -623,7 +650,7 @@ class OtgTrafficGen(AbstractTrafficGenerator):
         push — so every push of self.config goes through here.
         """
         self._log_api_warnings(self.api.set_config(self.config), "set_config")
-        self._last_pushed_config = self.config.serialize()
+        self._last_pushed_config = _normalized_config(self.config.serialize())
 
     def _log_api_warnings(self, response, action: str) -> None:
         """Surface warnings the controller returned.
@@ -648,7 +675,7 @@ class OtgTrafficGen(AbstractTrafficGenerator):
         devices, BGP peers, or route ranges — so structural changes still
         require set_config.
         """
-        current = self.config.serialize()
+        current = _normalized_config(self.config.serialize())
         if current == self._last_pushed_config:
             self.logger.info("[OTG] Config unchanged, skipping re-push")
             return
@@ -1098,15 +1125,15 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                 "supported by the OTG backend; set it on the flow's "
                 "traffic_flow_config so _configure_flow_duration() applies it."
             )
-        flow = next((f for f in self.config.flows if f.name == traffic_item_name), None)
-        if flow is None:
+        flows = self._flows_for_traffic_item(traffic_item_name)
+        if not flows:
             self.logger.debug(f"[OTG] Flow {traffic_item_name} not found. Skipping...")
             return
 
-        self._apply_flow_rate(flow, line_rate, line_rate_type)
-
-        if frame_size_setting is not None:
-            self._apply_flow_frame_size(flow, frame_size_setting)
+        for flow in flows:
+            self._apply_flow_rate(flow, line_rate, line_rate_type)
+            if frame_size_setting is not None:
+                self._apply_flow_frame_size(flow, frame_size_setting)
 
         if qos_config is not None:
             self.logger.debug(
@@ -1114,9 +1141,11 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                 "yet supported — skipping QoS update"
             )
 
-        self.logger.info(
-            f"[OTG] Reconfigured flow {traffic_item_name}, pushing config..."
-        )
+        self.logger.info(f"[OTG] Reconfigured flow {traffic_item_name}")
+        if self._bgp_peer_names:
+            # TaacRunner calls begin_test_case() next; its _prepare_traffic()
+            # pushes once for all reconfigured flows, so BGP restarts once.
+            return
         self._push_config()
 
     # ------------------------------------------------------------------
@@ -1125,6 +1154,17 @@ class OtgTrafficGen(AbstractTrafficGenerator):
 
     def has_traffic_items(self) -> bool:
         return bool(self.config.flows)
+
+    def _traffic_item_of(self, flow_name: str) -> str:
+        """Traffic item a flow was built from; unknown flows stand for themselves."""
+        return self._flow_traffic_item.get(flow_name, flow_name)
+
+    def _flows_for_traffic_item(self, traffic_item_name: str) -> t.List[t.Any]:
+        return [
+            f
+            for f in self.config.flows
+            if self._traffic_item_of(f.name) == traffic_item_name
+        ]
 
     def get_traffic_items(self) -> t.List[str]:
         """Return flow names. OTG returns strings (restpy returns restpy objects)."""
@@ -1172,22 +1212,36 @@ class OtgTrafficGen(AbstractTrafficGenerator):
         """
         Convert OTG flow metrics to the dict format that health checks expect:
         {identifier, packet_loss_duration, packet_loss_percentage, frame_delta}
+
+        One row per traffic item, like IxNetwork's Traffic Item Statistics
+        view: a bidirectional item, or one rebuilt as per-port flows, spans
+        several OTG flows. Loss duration is the max over the item's flows.
         """
         now = time.time()
-        stats = []
+        by_item: t.Dict[str, t.List[t.Dict[str, t.Any]]] = {}
         for m in metrics:
-            name = m["name"]
-            tx = int(m.get("frames_tx") or 0)
-            rx = int(m.get("frames_rx") or 0)
-            loss_pct = float(m["loss"]) if m.get("loss") is not None else 0.0
-            accumulated = self._flow_loss_accumulated.get(name, 0.0)
-            loss_start = self._flow_loss_start.get(name)
-            if loss_start is not None:
-                accumulated += now - loss_start
+            by_item.setdefault(self._traffic_item_of(m["name"]), []).append(m)
+
+        stats = []
+        for item, flows in by_item.items():
+            tx = sum(int(m.get("frames_tx") or 0) for m in flows)
+            rx = sum(int(m.get("frames_rx") or 0) for m in flows)
+            if len(flows) == 1:
+                loss = flows[0].get("loss")
+                loss_pct = float(loss) if loss is not None else 0.0
+            else:
+                loss_pct = (tx - rx) / tx * 100.0 if tx > 0 else 0.0
+            durations = []
+            for m in flows:
+                accumulated = self._flow_loss_accumulated.get(m["name"], 0.0)
+                loss_start = self._flow_loss_start.get(m["name"])
+                if loss_start is not None:
+                    accumulated += now - loss_start
+                durations.append(accumulated)
             stats.append(
                 {
-                    "identifier": name,
-                    "packet_loss_duration": accumulated * 1000.0,
+                    "identifier": item,
+                    "packet_loss_duration": max(durations) * 1000.0,
                     "packet_loss_percentage": loss_pct,
                     "frame_delta": float(tx - rx),
                 }
@@ -1648,6 +1702,11 @@ class OtgTrafficGen(AbstractTrafficGenerator):
             as_type = (
                 "ebgp" if peer_cfg.peer_type == ixia_types.BgpPeerType.EBGP else "ibgp"
             )
+            # Same precedence as the RESTPY backend (ixia.py LocalAs4Bytes).
+            if peer_cfg.enable_4_byte_local_as:
+                local_as = peer_cfg.local_as_4_bytes or peer_cfg.local_as or 0
+            else:
+                local_as = peer_cfg.local_as or 0
             self._bgp_peer_names.append(peer_name)
 
             if af_label == "v4":
@@ -1657,7 +1716,7 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                 peer.name = peer_name
                 peer.peer_address = peer_cfg.remote_peer_starting_ip
                 peer.as_type = as_type
-                peer.as_number = peer_cfg.local_as or peer_cfg.local_as_4_bytes or 0
+                peer.as_number = local_as
             else:
                 iface = device.bgp.ipv6_interfaces.v6interface()[-1]
                 iface.ipv6_name = f"{device_name}_ipv6"
@@ -1665,7 +1724,7 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                 peer.name = peer_name
                 peer.peer_address = peer_cfg.remote_peer_starting_ip
                 peer.as_type = as_type
-                peer.as_number = peer_cfg.local_as or peer_cfg.local_as_4_bytes or 0
+                peer.as_number = local_as
 
             if hasattr(peer, "advanced"):
                 adv = peer.advanced
@@ -1688,10 +1747,9 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                     if hasattr(cap, attr):
                         setattr(cap, attr, attr in requested)
 
-            effective_as = peer_cfg.local_as or peer_cfg.local_as_4_bytes or 0
             self.logger.info(
                 f"[OTG]   BGP peer {peer_name}: "
-                f"AS {effective_as} -> {peer_cfg.remote_peer_starting_ip}"
+                f"AS {local_as} -> {peer_cfg.remote_peer_starting_ip}"
             )
 
             if bgp_cfg.bgp_prefix_configs:
@@ -1942,6 +2000,7 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                 suffix = "" if i == 0 else "_reverse"
                 flow_name = f"{ti.name or 'flow'}{suffix}"
                 flow = self.config.flows.flow(name=flow_name)[-1]
+                self._flow_traffic_item[flow_name] = ti.name or "flow"
 
                 flow.tx_rx.device.tx_names = tx
                 flow.tx_rx.device.rx_names = rx

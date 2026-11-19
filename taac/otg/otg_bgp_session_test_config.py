@@ -1,3 +1,4 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
 """OTG BGP session establishment + forwarding test config.
 
@@ -27,8 +28,9 @@ Logical topology (two ports, two subnets, eBGP):
     advertises 203.0.113.0/24 (10 prefixes)
 
 DUT requirements:
-  - bgpcpp.conf with two IPv4 eBGP peer entries matching the OTG addresses
-    (see taac/otg/configs/otg_bgp_session_bgpcpp.conf for a reference config)
+  - bgpcpp.conf with IPv4 eBGP peer entries for the two OTG addresses above
+    (taac/otg/configs/otg_bgp_session_bgpcpp.conf is a reference config; its
+    nine peers also cover the OTG hardening profiles)
   - Interface A: 10.0.1.2/24
   - Interface B: 10.0.2.2/24
   - L3 forwarding enabled between the two subnets
@@ -132,12 +134,19 @@ def test_config(topology: ConfigTopology) -> TestConfig:
     for i, (_, _, _, tgen_port) in enumerate(tgen_links):
         endpoint_str = f"{device_name}:{tgen_port}"
 
+        # `port_location` is passed only when the schema defines it.  Without it
+        # the OTG port config falls back to `interface`, which is the same value.
+        location_kwarg = (
+            {"port_location": tgen_port}
+            if hasattr(DirectIxiaConnection, "port_location")
+            else {}
+        )
         direct_ixia_connections.append(
             DirectIxiaConnection(
                 interface=tgen_port,
                 ixia_port=f"1/{i + 1}",
                 is_logical_port=True,
-                port_location=tgen_port,
+                **location_kwarg,
             )
         )
 

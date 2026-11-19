@@ -115,7 +115,9 @@ top-level fields on the check, not part of any payload.
 Ports, interface addressing, the seven BGP peers, advertised prefixes, the
 required DUT MAC, and CPU-queue provisioning are in
 **[`HARDENING_SETUP.md`](HARDENING_SETUP.md)**, along with two known gaps that
-affect what the tests actually exercise.
+affect what the tests actually exercise. The reference
+`configs/otg_bgp_session_bgpcpp.conf` defines nine peers: those seven plus the
+two ECMP peers on port 2, for running the ECMP groups on both ports.
 
 ## BGP and OTG: classes of limitation
 

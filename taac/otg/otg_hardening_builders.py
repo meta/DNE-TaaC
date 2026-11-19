@@ -1,3 +1,4 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
 """Shared builders for the OTG hardening conveyor profiles.
 
@@ -93,11 +94,10 @@ ECMP_DEVICE_HOST_OFFSET = 0x10
 
 # -- Traffic ------------------------------------------------------------------
 
-# Absolute pps, like the CP flood.  A live ixia-c run at 10% line rate showed
-# ~34% STEADY loss on every measured flow (per-second tx ~122k vs rx ~84k): the
-# engine transmits faster than it can receive and count, so the 0.1% threshold
-# was unsatisfiable regardless of DUT health.  1000 pps per flow is well inside
-# a software engine while still resolving a restart outage.
+# Absolute pps, like the CP flood.  A software engine at a line-rate percentage
+# can transmit faster than it can receive and count, which makes a 0.1%
+# threshold unsatisfiable.  1000 pps per flow is well inside a software engine
+# while still resolving a restart outage.
 MEASURED_FLOW_PPS = 1000
 
 # Absolute pps, not a line-rate percentage: what this overloads is the CPU punt
@@ -314,6 +314,23 @@ def _ecmp_device_group(
     )
 
 
+def direct_otg_connection(interface: str, ixia_port: str) -> DirectIxiaConnection:
+    """A DirectIxiaConnection whose OTG port location is `interface`.
+
+    `port_location` is passed only when the schema defines it.  Without it the
+    OTG port config falls back to `interface`, which is the same value.
+    """
+    kwargs = {}
+    if hasattr(DirectIxiaConnection, "port_location"):
+        kwargs["port_location"] = interface
+    return DirectIxiaConnection(
+        interface=interface,
+        ixia_port=ixia_port,
+        is_logical_port=True,
+        **kwargs,
+    )
+
+
 # Host part of the malformed speaker's address within its port's v4 subnet.
 # Distinct from the measured group's .1 so both can coexist on one port.
 MALFORMED_PEER_HOST = 10
@@ -517,7 +534,7 @@ def _device_group_multiplier(dg) -> int:
     """Simulated devices in a group — each is a real interface and session.
 
     Counting groups instead of devices under-reports the licence cost by this
-    factor, which once made a 67-device config look like 9 interfaces.
+    factor.
     """
     return max(1, int(getattr(dg, "multiplier", 1) or 1))
 
@@ -612,12 +629,7 @@ def build_hardening_test_config(
 
     for i, (_, _, _, tgen_port) in enumerate(tgen_links):
         direct_ixia_connections.append(
-            DirectIxiaConnection(
-                interface=tgen_port,
-                ixia_port=f"1/{i + 1}",
-                is_logical_port=True,
-                port_location=tgen_port,
-            )
+            direct_otg_connection(interface=tgen_port, ixia_port=f"1/{i + 1}")
         )
 
         addr_afs = (
@@ -819,9 +831,9 @@ def build_hardening_test_config(
         basic_traffic_item_configs=flows,
         # Start ONLY the measured flows.  Without this,
         # begin_test_case(traffic_regexes=None) CLEARS _disabled_flows, wiping the
-        # CP flood's `enabled=False` — a live run had it transmitting through all
-        # four restart playbooks at 100% loss (it is punted to the CPU, never
-        # forwarded), failing the packet-loss check too.
+        # CP flood's `enabled=False` — it would then transmit through every
+        # playbook at 100% loss (it is punted to the CPU, never forwarded) and
+        # fail the packet-loss check.
         #
         # Upstream's idiom is a negative lookahead. Do NOT copy it: restpy uses
         # re.match while _enable_traffic uses re.search, under which a negative

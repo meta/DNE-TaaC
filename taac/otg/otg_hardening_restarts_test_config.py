@@ -1,3 +1,4 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
 """OTG hardening profile: process restarts + CPU-queue overload.
 

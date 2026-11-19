@@ -1,10 +1,11 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
 """Unit tests for the OTG hardening playbook factories
 (``taac/otg/otg_hardening_playbooks.py``).
 
 Each factory is verified for:
 - Expected playbook ``name`` (including the two deliberate deviations from
-  upstream — see the design doc's fidelity analysis).
+  upstream — see the fidelity analysis in `taac/otg/README.md`).
 - Stage and cleanup step composition.
 - Required postcheck CheckNames present.
 - ixia API step names and args propagated into the JSON params.

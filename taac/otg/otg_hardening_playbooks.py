@@ -1,3 +1,4 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
 """Playbook factories for the OTG FBOSS BGP + platform hardening conveyor.
 
@@ -70,9 +71,8 @@ CPU_QUEUE_SETTLE_STEP_ID = "sleep_120_secs_after_disabling_bgp_cp_traffic"
 # Services SERVICE_RESTART_CHECK asserts stayed ACTIVE during a restart.
 #
 # Deliberately NOT taac.health_checks.constants.SERVICES_TO_MONITOR_DURING_* —
-# those are Meta-internal sets including `coop`, `openr`, `wedge_agent` and
-# `fboss_hw_agent@0`, which need not exist on an OSS box; using them verbatim
-# failed a live run on `coop`.  Override per DUT via `monitored_services`.
+# those are sets that include services an OSS box may not run (`coop`, `openr`,
+# `wedge_agent`, `fboss_hw_agent@0`).  Override per DUT via `monitored_services`.
 DEFAULT_MONITORED_SERVICES = (
     "fboss_sw_agent",
     "bgpd",

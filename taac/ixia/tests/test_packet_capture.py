@@ -301,3 +301,53 @@ class BgpSessionAddressBulkLookupTest(unittest.TestCase):
             )
 
         self.ixia.find_bgp_peers.assert_not_called()
+
+
+class BgpSessionStatusesForNetworkGroupsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        with patch.object(Ixia, "__init__", lambda self: None):
+            self.ixia: Any = Ixia()
+        self.ixia.logger = MagicMock()
+        self.ixia.find_network_groups = MagicMock(
+            return_value=[SimpleNamespace(parent=SimpleNamespace(href="/deviceGroup/1"))]
+        )
+
+    @staticmethod
+    def _peer(dg_href, addresses, statuses):
+        ethernet = SimpleNamespace(parent=SimpleNamespace(href=dg_href))
+        stack = SimpleNamespace(parent=ethernet, Address=SimpleNamespace(Values=addresses))
+        return SimpleNamespace(parent=stack, SessionStatus=statuses, refresh=MagicMock())
+
+    def test_returns_sessions_of_the_device_groups_owning_the_network_groups(self) -> None:
+        main = self._peer("/deviceGroup/1", ["2001:db8::b"], ["down"])
+        other = self._peer("/deviceGroup/2", ["2001:db8::c"], ["up"])
+        # find_bgp_peers returns restpy containers; iterating one yields its items.
+        self.ixia.find_bgp_peers = MagicMock(return_value=[[main], [other]])
+
+        self.assertEqual(
+            self.ixia.get_bgp_session_statuses_for_network_groups(".*MAIN.*"),
+            [("2001:db8::b", "down")],
+        )
+        self.ixia.find_network_groups.assert_called_once_with(".*MAIN.*")
+        main.refresh.assert_called_once_with()
+
+    def test_reads_every_item_of_a_multi_item_container(self) -> None:
+        # restpy attribute reads on a container see one item only.
+        first = self._peer("/deviceGroup/1", ["2001:db8::b"], ["down"])
+        second = self._peer("/deviceGroup/1", ["2001:db8::d"], ["up"])
+        self.ixia.find_bgp_peers = MagicMock(return_value=[[first, second]])
+
+        self.assertEqual(
+            self.ixia.get_bgp_session_statuses_for_network_groups(".*MAIN.*"),
+            [("2001:db8::b", "down"), ("2001:db8::d", "up")],
+        )
+
+    def test_keeps_every_status_when_addresses_run_short(self) -> None:
+        # zip() would drop the trailing "up" and report the peer down.
+        peer = self._peer("/deviceGroup/1", ["2001:db8::b"], ["down", "up"])
+        self.ixia.find_bgp_peers = MagicMock(return_value=[[peer]])
+
+        self.assertEqual(
+            self.ixia.get_bgp_session_statuses_for_network_groups(".*MAIN.*"),
+            [("2001:db8::b", "down"), ("unknown", "up")],
+        )

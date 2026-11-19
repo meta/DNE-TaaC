@@ -4,6 +4,7 @@
 import gzip
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,9 +27,13 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
         """Set up test fixtures."""
         self.logger = MagicMock(spec=ConsoleFileLogger)
         self.mock_ixia = MagicMock()
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.return_value = [
+            ("2001:db8::b", "up")
+        ]
         self.health_check = RouteConvergenceTimeHealthCheck(
             logger=self.logger, ixia=self.mock_ixia
         )
+        self.health_check._SESSION_POLL_INTERVAL_S = 0
         self.health_check.driver = AsyncMock()
         self.health_check.driver.async_get_log_source_command = AsyncMock(
             side_effect=lambda path, **_kwargs: f"zcat -f {path}"
@@ -48,6 +53,15 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
         command = self.health_check.driver.async_run_cmd_on_shell.call_args.args[0]
         self.assertIn("test -r", command)
         self.assertIn("/var/facebook/logs/wedge_agent.log", command)
+        self.assertIn(path, command)
+
+    async def test_resolve_default_log_file_fboss_dir_legacy_name(self):
+        self.health_check.driver.async_run_cmd_on_shell.return_value = (
+            "/var/facebook/logs/fboss/wedge_agent.log\n"
+        )
+        path = await self.health_check._resolve_log_file(None)
+        self.assertEqual(path, "/var/facebook/logs/fboss/wedge_agent.log")
+        command = self.health_check.driver.async_run_cmd_on_shell.call_args.args[0]
         self.assertIn(path, command)
 
     async def test_resolve_explicit_log_file(self):
@@ -78,6 +92,20 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
         )
         command = self.health_check.driver.async_run_cmd_on_shell.call_args.args[0]
         self.assertIn("fboss_sw_agent.log-* ", command)
+
+    async def test_find_oss_archive_logs_includes_zst(self):
+        archive_dir = "/var/facebook/logs/fboss/archive"
+        gz = f"{archive_dir}/fboss_sw_agent.log-202601021235.gz"
+        zst = f"{archive_dir}/fboss_sw_agent.log-202601021236.zst"
+        snapshot = f"{archive_dir}/fboss_sw_agent.log-202601021237.tmp"
+        self.health_check.driver.async_run_cmd_on_shell.return_value = (
+            f"{zst}\n{snapshot}\n{gz}"
+        )
+        live = "/var/facebook/logs/fboss/fboss_sw_agent.log"
+        self.assertEqual(
+            await self.health_check._find_log_files("202601021234", live),
+            [gz, zst, live],
+        )
 
     async def test_real_log_parser_filters_operation_date_and_fraction(self):
         cases = [
@@ -472,6 +500,115 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
         self.assertIn("PASSED", result.message)
+
+    async def test_run_stops_when_the_ixia_session_is_not_established(self):
+        """A down peer fails once with diagnostics, not once per operation."""
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.return_value = [
+            ("2001:db8::b", "down")
+        ]
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            side_effect=["/var/facebook/logs/wedge_agent.log", "BGP state = Idle"]
+        )
+
+        result = await self.health_check._run(
+            self.device,
+            self.health_check_input,
+            {"network_group_regex": ".*CONTIGUOUS.*", "iterations": 5, "wait_time_seconds": 0},
+        )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("not Established", result.message)
+        self.assertIn("2001:db8::b (down)", result.message)
+        self.assertNotIn("No DELETE operations found", result.message)
+        self.mock_ixia.activate_deactivate_bgp_prefix.assert_not_called()
+        # Polled before giving up, so a session that is mid-flap is not failed.
+        self.assertEqual(
+            self.mock_ixia.get_bgp_session_statuses_for_network_groups.call_count,
+            self.health_check._SESSION_POLLS,
+        )
+        self.assertGreater(self.health_check._SESSION_POLLS, 1)
+        diag = self.health_check.driver.async_run_cmd_on_shell.await_args_list[1].args[0]
+        self.assertIn("timeout 20 fboss2 show bgp neighbors 2001:db8::b", diag)
+        self.assertIn("timeout 20 tail", diag)
+        self.assertIn("timeout 20 journalctl -u bgpd", diag)
+        self.assertTrue(
+            any("BGP state = Idle" in str(c) for c in self.logger.error.call_args_list)
+        )
+
+    async def test_session_reads_run_off_the_event_loop(self):
+        loop_thread = threading.get_ident()
+        threads = []
+
+        def _read(regex):
+            threads.append(threading.get_ident())
+            return [("2001:db8::b", "up")]
+
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.side_effect = _read
+        self.assertIsNone(await self.health_check._bgp_session_not_established(".*X.*"))
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], loop_thread)
+
+    async def test_message_and_diagnostics_name_the_same_peers(self):
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.return_value = [
+            ("2001:db8::c", "down"),
+            ("2001:db8::b", "notStarted"),
+            ("2001:db8::b", "down"),
+        ]
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(return_value="diag")
+
+        message = await self.health_check._bgp_session_not_established(".*X.*")
+
+        self.assertTrue(message.endswith("2001:db8::b (notStarted), 2001:db8::c (down)"), message)
+        diag = self.health_check.driver.async_run_cmd_on_shell.await_args.args[0]
+        self.assertLess(diag.index("neighbors 2001:db8::b"), diag.index("neighbors 2001:db8::c"))
+        self.assertEqual(diag.count("show bgp neighbors"), 2)
+
+    async def test_run_proceeds_when_the_session_comes_up_while_polling(self):
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.side_effect = [
+            [("2001:db8::b", "down")],
+            [("2001:db8::b", "up")],
+        ]
+        self.health_check._run_single_operation = AsyncMock(
+            return_value={"passed": True, "time": 1.0, "routes": 1}
+        )
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            return_value="/var/facebook/logs/wedge_agent.log"
+        )
+
+        result = await self.health_check._run(
+            self.device,
+            self.health_check_input,
+            {"network_group_regex": ".*CONTIGUOUS.*", "iterations": 1, "wait_time_seconds": 0},
+        )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
+
+    async def test_session_check_never_leaves_the_groups_withdrawn(self):
+        """Checked before DELETE only, so a failure never lands between a
+        DELETE and its ADD."""
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.side_effect = [
+            [("2001:db8::b", "up")],
+        ] + [[("2001:db8::b", "down")]] * self.health_check._SESSION_POLLS
+        ops = []
+
+        async def _op(**kwargs):
+            ops.append(kwargs["operation_type"])
+            return {"passed": True, "time": 1.0, "routes": 1}
+
+        self.health_check._run_single_operation = _op
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            side_effect=["/var/facebook/logs/wedge_agent.log", "diag"]
+        )
+
+        result = await self.health_check._run(
+            self.device,
+            self.health_check_input,
+            {"network_group_regex": ".*CONTIGUOUS.*", "iterations": 3, "wait_time_seconds": 0},
+        )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("before Iter2-DELETE", result.message)
+        self.assertEqual(ops, ["DELETE", "ADD"])
 
     async def test_run_fails_when_threshold_exceeded(self):
         """Test _run returns FAIL when convergence time exceeds threshold."""

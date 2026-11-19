@@ -86,6 +86,9 @@ class RouteConvergenceTimeHealthCheck(
 
     # Default path where toggle start time is stored
     DEFAULT_START_TIME_FILE = "/tmp/toggle_start_time"
+    # IXIA session reads before declaring the peer down, about 30 s in all.
+    _SESSION_POLLS = 4
+    _SESSION_POLL_INTERVAL_S = 10
 
     async def _run(
         self,
@@ -173,6 +176,21 @@ class RouteConvergenceTimeHealthCheck(
             # Run DELETE then ADD for this iteration
             # This ensures routes end in ADD (enabled) state after all iterations
             for operation_type in ["DELETE", "ADD"]:
+                # Before DELETE only: the previous ADD has re-advertised the
+                # routes, so failing here never leaves them withdrawn on IXIA.
+                down = (
+                    await self._bgp_session_not_established(network_group_regex)
+                    if operation_type == "DELETE"
+                    else None
+                )
+                if down:
+                    return hc_types.HealthCheckResult(
+                        status=hc_types.HealthCheckStatus.FAIL,
+                        message=(
+                            f"{context_prefix} Route convergence FAILED before "
+                            f"Iter{iteration}-{operation_type}: {down}"
+                        ),
+                    )
                 result = await self._run_single_operation(
                     operation_type=operation_type,
                     network_group_regex=network_group_regex,
@@ -245,12 +263,65 @@ class RouteConvergenceTimeHealthCheck(
             ),
         )
 
+    async def _bgp_session_not_established(
+        self, network_group_regex: str
+    ) -> t.Optional[str]:
+        """Why the IXIA peer behind the network groups cannot move routes, or None.
+
+        Fails only when no session is up across _SESSION_POLLS reads: a down
+        peer has nothing to withdraw or re-advertise, so every operation would
+        just report no routes in the log. Logs the DUT's view of the peers and
+        the bgpd log tail when it fails.
+        """
+        for poll in range(self._SESSION_POLLS):
+            if poll:
+                await asyncio.sleep(self._SESSION_POLL_INTERVAL_S)
+            try:
+                # Blocking restpy reads, so keep them off the event loop.
+                sessions = list(
+                    await asyncio.to_thread(
+                        self.ixia.get_bgp_session_statuses_for_network_groups,
+                        network_group_regex,
+                    )
+                    or []
+                )
+            except Exception as ex:
+                self.logger.warning(f"Cannot read IXIA BGP session state: {ex!r}")
+                return None
+            if not sessions or any(status == "up" for _, status in sessions):
+                return None
+        # First status seen per peer; the message and the diagnostics name
+        # the same sorted peers.
+        states = {}
+        for peer, status in sessions:
+            states.setdefault(peer, status)
+        peers = sorted(states)[:3]
+        # Bounded, because a wedged bgpd is when these are needed.
+        cmd = "; ".join(
+            f"timeout 20 fboss2 show bgp neighbors {shlex.quote(peer)}"
+            for peer in peers
+        ) + (
+            "; timeout 20 tail -n 50 /var/facebook/logs/bgp/bgpd.log 2>/dev/null"
+            " || timeout 20 journalctl -u bgpd -n 50 --no-pager"
+        )
+        try:
+            dump = await self.driver.async_run_cmd_on_shell(cmd)
+        except Exception as ex:
+            dump = f"diagnostics failed: {ex!r}"
+        self.logger.error(f"IXIA BGP session diagnostics ({cmd}):\n{dump}")
+        return (
+            f"IXIA BGP session behind '{network_group_regex}' not Established: "
+            + ", ".join(f"{peer} ({states[peer]})" for peer in peers)
+        )
+
     async def _resolve_log_file(self, log_file: t.Optional[str]) -> str:
         if log_file is not None:
             return log_file
         candidates = (
             "/var/facebook/logs/wedge_agent.log",
             "/var/facebook/logs/fboss/fboss_sw_agent.log",
+            # Some images log the agent here instead of either path above.
+            "/var/facebook/logs/fboss/wedge_agent.log",
         )
         paths = " ".join(shlex.quote(path) for path in candidates)
         # Resolve once, so a missing log gives one error, not ten failures.
@@ -855,7 +926,7 @@ END {{
         rotated archives whose window covers `start_stamp`, in chronological
         order, followed by the current (live) log.
 
-        Rotated archives are named `<log basename>-YYYYMMDDHHMM.gz`, where the
+        Rotated archives are named `<log basename>-YYYYMMDDHHMM.gz`/`.zst`, where the
         stamp is the time of the LAST line in that archive. An archive is
         relevant when that stamp is >= our start (its tail reaches into the
         operation window). The live log is always included, so the common
@@ -865,7 +936,7 @@ END {{
         Args:
             start_stamp: YYYYMMDDHHMM start stamp, or None.
             log_file: Path to the current (live) log file.
-            archive_dir: Directory holding rotated `.gz` archives.
+            archive_dir: Directory holding rotated `.gz`/`.zst` archives.
 
         Returns:
             Ordered list of file paths (archives first, live log last).

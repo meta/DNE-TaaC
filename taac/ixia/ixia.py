@@ -9143,6 +9143,35 @@ class Ixia:
             )
         return bgp_peers
 
+    @external_api
+    def get_bgp_session_statuses_for_network_groups(
+        self, network_group_regex: str
+    ) -> t.List[t.Tuple[str, str]]:
+        """``(peer address, SessionStatus)`` for every BGP session in the device
+        groups that own the network groups matching ``network_group_regex``.
+        SessionStatus is IxNetwork's "up" / "down" / "notStarted"."""
+        owners = {
+            network_group.parent.href
+            for network_group in self.find_network_groups(network_group_regex)
+        }
+        sessions = []
+        for container in self.find_bgp_peers():
+            # A restpy attribute read sees one item, so walk every peer in it.
+            for bgp_peer in container:
+                # BGP peer -> IP stack -> Ethernet -> device group.
+                if bgp_peer.parent.parent.parent.href not in owners:
+                    continue
+                # restpy serves the snapshot taken at fetch time without refresh().
+                bgp_peer.refresh()
+                addresses = [str(a) for a in bgp_peer.parent.Address.Values]
+                # Keep every status even if the address list is shorter, so a
+                # dropped "up" can never read as a down peer.
+                for i, status in enumerate(bgp_peer.SessionStatus):
+                    sessions.append(
+                        (addresses[i] if i < len(addresses) else "unknown", status)
+                    )
+        return sessions
+
     @staticmethod
     def _validate_bgp_session_address_range(
         session_start_index: int,

@@ -7,7 +7,7 @@ A test is a `TestConfig` containing one or more **playbooks**; a playbook runs a
 
 ## Quick start
 
-Smoke-tested via [facebook/fboss](https://github.com/facebook/fboss)'s public Docker images on **CentOS Stream 9**. Docker is the only host-side dependency.
+Smoke-tested via [meta/fboss](https://github.com/meta/fboss)'s public Docker images on **CentOS Stream 9**. Docker is the only host-side dependency.
 
 ```bash
 # Build the vendor-shippable TAAC image (auto-builds base image if missing)
@@ -59,6 +59,24 @@ For iterative work on TAAC source or thrift schemas in a bind-mounted workspace 
 ### Build cost
 
 First build takes ~22 min cold (mostly the deps compile). Docker's layer cache makes subsequent rebuilds after TAAC-only source changes finish in ~30 sec. See [`docker/README.md`](docker/README.md) for the layer cache contract and when to rebuild what.
+
+## Python packages
+
+TAAC also has a Python package build that uses standard `pyproject.toml`
+metadata. The existing Docker build is another supported workflow.
+
+The initial package artifacts target Linux x86_64 and CPython 3.12. Until the
+native runtime wheel is published, install from a release wheelhouse:
+
+```bash
+python -m pip install --find-links /path/to/wheelhouse dne-taac
+# Or, in an activated environment:
+uv pip install --find-links /path/to/wheelhouse dne-taac
+tictaac --help
+```
+
+See [Python packaging](docs/python-packaging.md) for source installation,
+running Python configs, and the current config-exporter limitation.
 
 ## Outputs
 

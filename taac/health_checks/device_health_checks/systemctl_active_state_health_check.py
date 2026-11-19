@@ -45,15 +45,22 @@ class SystemctlActiveStateHealthCheck(
         if TAAC_OSS:
             return await self._run_oss(obj, service_names, check_params)
 
+        # A crash-looping unit is briefly "active" on every restart, so an
+        # optional stability window requires each unit to have stayed active
+        # for at least min_active_seconds.
+        min_active_seconds = check_params.get("min_active_seconds")
+        uptime_seconds = (
+            await self._async_get_uptime_seconds() if min_active_seconds else None
+        )
         results = await asyncio.gather(
             *[
-                self.async_is_systemctl_service_active(obj.name, service)
+                self.async_get_inactive_reason(
+                    obj.name, service, min_active_seconds, uptime_seconds
+                )
                 for service in service_names
             ]
         )
-        inactive_services = [
-            service for service, result in zip(service_names, results) if not result
-        ]
+        inactive_services = [reason for reason in results if reason]
         if inactive_services:
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.FAIL,
@@ -204,9 +211,19 @@ class SystemctlActiveStateHealthCheck(
             ),
         )
 
-    async def async_is_systemctl_service_active(
-        self, hostname: str, service: str
-    ) -> bool:
+    async def _async_get_uptime_seconds(self) -> float:
+        # pyrefly: ignore [missing-attribute]
+        output = await self.driver.async_run_cmd_on_shell("cat /proc/uptime")
+        return float(output.split()[0])
+
+    async def async_get_inactive_reason(
+        self,
+        hostname: str,
+        service: str,
+        min_active_seconds: t.Optional[int] = None,
+        uptime_seconds: t.Optional[float] = None,
+    ) -> t.Optional[str]:
+        """Return why the unit is not healthy, or None if it is."""
         # FBOSS service names are stable inside Classic/NSPAWN, but native
         # NetOS exposes units such as netos.service.fboss_bgp. Keep the health
         # check on the driver's canonical service-name resolution path.
@@ -224,14 +241,30 @@ class SystemctlActiveStateHealthCheck(
             self.logger.debug(
                 "Systemctl service is disabled on the device. Skipping..."
             )
-            return True
+            return None
         if systemctl_unit_data["LoadState"] != "loaded":
             self.logger.debug(
                 f"Systemctl service {service} is not loaded on {hostname}... Skipping"
             )
-            return True
+            return None
 
+        active_state = systemctl_unit_data["ActiveState"]
         self.logger.debug(
-            f"The active state of the systemctl service {service} is: {systemctl_unit_data['ActiveState']}"
+            f"The active state of the systemctl service {service_name} is: {active_state}"
         )
-        return systemctl_unit_data["ActiveState"] == "active"
+        if active_state != "active":
+            return f"{service_name}: {active_state}"
+        if min_active_seconds and uptime_seconds is not None:
+            active_enter_timestamp = systemctl_unit_data.get(
+                "ActiveEnterTimestampMonotonic", ""
+            )
+            if (
+                not active_enter_timestamp.isdecimal()
+                or int(active_enter_timestamp) == 0
+            ):
+                return f"{service_name}: active with missing or invalid ActiveEnterTimestampMonotonic"
+            active_enter_us = int(active_enter_timestamp)
+            active_for = int(uptime_seconds - active_enter_us / 1_000_000)
+            if active_for < min_active_seconds:
+                return f"{service_name}: active for {active_for}s (< {min_active_seconds}s)"
+        return None

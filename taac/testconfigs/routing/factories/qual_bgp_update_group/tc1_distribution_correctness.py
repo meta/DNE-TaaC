@@ -23,10 +23,11 @@ import typing as t
 from taac.abstractions.physical_inventory import PhysicalInventory
 from taac.abstractions.topologies.ebb_full_scale import (
     EBB_AS_NUMBERS,
-    EBB_FULL_SCALE_PORT_MAP,
-    ebb_full_scale_topology,
+    EBB_FY26_SCALE,
     EBB_PARENT_NETWORKS,
     EBB_PEER_GROUPS,
+    EBB_PORT_MAP,
+    ebb_topology,
 )
 from taac.abstractions.topology import (
     OpenRMode,
@@ -169,17 +170,13 @@ def build_bag_conveyor_test_config(
     builder wires only the eBGP + iBGP topology (``include_bgp_mon=False``)
     and defaults ``profile`` to ``WITHOUT_OPEN_R``.
 
-    DUT-agnostic across the bag010/011/012/013 EBB conveyor nodes: every
+    DUT-agnostic across compatible EBB inventories: every
     value is read from ``physical_inventory`` (device_name, dut_bgp_as, ixia_ports,
     bgpcpp_configerator_path), so cloning to a new bag node is a one-line
     lifecycle-binding change. Renamed from ``build_bag013_conveyor_test_config``
     (formerly bag013-hardcoded) during the tc9 edge-cases work;
     behavior-preserving, so existing bag013 goldens stay byte-identical.
     """
-    assert physical_inventory.device_name.startswith("bag"), (
-        f"bag conveyor topology builder targets bag* EBB conveyor nodes; "
-        f"got physical_inventory.device_name={physical_inventory.device_name!r}."
-    )
     assert physical_inventory.dut_bgp_as is not None, (
         "PhysicalInventory must have dut_bgp_as set"
     )
@@ -199,7 +196,8 @@ def build_bag_conveyor_test_config(
         if profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R
         else OpenRMode.NONE
     )
-    bound = ebb_full_scale_topology(
+    bound = ebb_topology(
+        scale=EBB_FY26_SCALE,
         openr_mode=openr_mode,
         include_bgpmon=False,
         ebgp_graceful_restart=ebgp_graceful_restart,
@@ -208,7 +206,7 @@ def build_bag_conveyor_test_config(
         extra_advertisements=extra_prefix_advertisements,
     ).bind_to_inventory(
         physical_inventory=physical_inventory,
-        port_map=EBB_FULL_SCALE_PORT_MAP,
+        port_map=EBB_PORT_MAP,
         parent_networks=EBB_PARENT_NETWORKS,
         peer_groups=EBB_PEER_GROUPS,
         as_numbers=EBB_AS_NUMBERS,
@@ -429,13 +427,14 @@ def _create_eb03_distribution_correctness_test_config(
     lab_admin_username = physical_inventory.extras.get("lab_admin_username", "admin")
     lab_password = get_lab_device_password(lab_password_env)
     compiled = (
-        ebb_full_scale_topology(
+        ebb_topology(
+            scale=EBB_FY26_SCALE,
             openr_mode=OpenRMode.NONE,
             include_bgpmon=False,
         )
         .bind_to_inventory(
             physical_inventory=physical_inventory,
-            port_map=EBB_FULL_SCALE_PORT_MAP,
+            port_map=EBB_PORT_MAP,
             parent_networks=EBB_PARENT_NETWORKS,
             peer_groups=EBB_PEER_GROUPS,
             as_numbers=EBB_AS_NUMBERS,

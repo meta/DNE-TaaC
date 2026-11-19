@@ -8,6 +8,7 @@ exercise BGPd/wedge_agent restart, mass session toggle, NDP/ARP/MAC stress, and 
 overflow on Wedge100S/Wedge400C platforms.
 """
 
+import ipaddress
 import json
 import logging
 
@@ -22,6 +23,7 @@ from taac.constants import (
 )
 from taac.health_checks.healthcheck_definitions import (
     create_bgp_peer_route_snapshot_check,
+    create_bgp_session_establish_check,
     create_bgp_session_snapshot_check,
     create_core_dumps_snapshot_check,
     create_cpu_utilization_check,
@@ -528,6 +530,8 @@ def build_bgp_dc_setup_tasks(
                 is_confed_peer=is_uplink_peer_confed,
                 per_peer_max_route_limit=per_peer_max_route_limit,
                 policy_entries_json=json.dumps([_PERMIT_ALL_POLICY_TERM]),
+                hold_time_seconds="30",
+                keep_alive_seconds="10",
             )
             + create_allow_all_v4_peer_group_patcher_tasks(
                 hostname=device_name,
@@ -536,6 +540,8 @@ def build_bgp_dc_setup_tasks(
                 is_confed_peer=is_downlink_peer_confed,
                 per_peer_max_route_limit=per_peer_max_route_limit,
                 policy_entries_json=json.dumps([_PERMIT_ALL_POLICY_TERM]),
+                hold_time_seconds="30",
+                keep_alive_seconds="10",
             )
             if allow_all_v4_policies
             else [
@@ -1567,6 +1573,10 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
     include_cgroup_memory_setup=True,
     include_bgp_peer_route_snapshot_check=False,
     stress_static_routes=True,
+    validate_test_bgp_sessions=False,
+    fsdb_memory_threshold_bytes=None,
+    fail_on_bgp_route_collection_error=False,
+    configure_induced_ecmp_2_peers=True,
 ):
     """Build the conveyor TestConfig for combined BGP++ and FBOSS platform hardening.
 
@@ -1656,11 +1666,49 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
         stress_static_routes: When ``False``, omit the add_stress_static_routes
             setup task (platforms whose good_ndp_entries_uplink is too small to
             reach ecmp_member_limit).
+        validate_test_bgp_sessions: Require exactly the generated good downlink
+            and uplink IPv4/IPv6 peer addresses to be Established. Intentionally
+            flapping rogue peers are excluded. Defaults to the legacy filter.
+        fsdb_memory_threshold_bytes: Optional positive FSDB ceiling shared by
+            pre- and postchecks. With None, retain the legacy 7/5 GiB limits.
+        fail_on_bgp_route_collection_error: Opt into raising filtered-RIB
+            collection failures when peer-route snapshots are enabled. Defaults
+            to the legacy zero-count fallback.
+        configure_induced_ecmp_2_peers: Configure the DUT peers for the
+            UPLINK_BGP_INDUCED_ECMP_2 IXIA device group, which only the ECMP
+            overload playbooks enable. Leave it off when those playbooks are not
+            selected: a peer that never establishes keeps bgpd waiting the full
+            EoR timer after an ungraceful restart.
 
     Returns:
         TestConfig: The fully-built conveyor TestConfig.
     """
     ixia_downlink_source_ipv6 = f"{ixia_downlink_ic_parent_network_v6}::11"
+    bgp_session_check = BGP_SESSION_HEALTHCHECK_NO_V6_LOSS_EXPECTED
+    if validate_test_bgp_sessions:
+        if l2_overload_only or downlink_peer_count <= 0 or uplink_peer_count <= 0:
+            raise ValueError(
+                "BGP session validation requires positive good peer counts"
+            )
+        good_peer_addresses = [
+            str(ipaddress.ip_address(starting_ip) + 2 * index)
+            for starting_ip, peer_count in (
+                (f"{ixia_downlink_ic_parent_network_v6}::11", downlink_peer_count),
+                (f"{ixia_uplink_ic_parent_network_v6}::11", uplink_peer_count),
+                (f"{ixia_downlink_ic_parent_network_v4}.1", downlink_peer_count),
+                (f"{ixia_uplink_ic_parent_network_v4}.1", uplink_peer_count),
+            )
+            for index in range(peer_count)
+        ]
+        if len(set(good_peer_addresses)) != len(good_peer_addresses):
+            raise ValueError("Good BGP peer address ranges must not overlap")
+        bgp_session_check = create_bgp_session_establish_check(
+            ignore_all_prefixes_except=good_peer_addresses,
+            expected_established_sessions=len(good_peer_addresses),
+            verbose=True,
+        )
+    if fsdb_memory_threshold_bytes is not None and fsdb_memory_threshold_bytes <= 0:
+        raise ValueError("FSDB memory threshold must be positive")
     ptp_configs = (
         []
         if l2_overload_only
@@ -1696,6 +1744,7 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
                         f"{v6_prefix_flapping_prefix}:f::/32",
                         f"{v4_session_flapping_prefix}.0.0.0/8",
                     ],
+                    fail_on_collection_error=fail_on_bgp_route_collection_error,
                 )
             ]
             if include_bgp_peer_route_snapshot_check
@@ -1711,7 +1760,7 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
             else [
                 get_ixia_healthcheck_stable_state(device_name),
                 create_prefix_limit_check(prefix_limit=prefix_limit),
-                BGP_SESSION_HEALTHCHECK_NO_V6_LOSS_EXPECTED,
+                bgp_session_check,
             ]
         ),
         create_unclean_exit_check(),
@@ -1719,7 +1768,9 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
             threshold=5 * (1024**3),
             threshold_by_service={
                 "bgpd": 4.5 * (1024**3),
-                "fsdb": 5 * (1024**3),
+                "fsdb": fsdb_memory_threshold_bytes
+                if fsdb_memory_threshold_bytes is not None
+                else 5 * (1024**3),
                 "qsfp_service": 2 * (1024**3),
                 "fboss_sw_agent": 9 * (1024**3),
                 "fboss_hw_agent@0": 8 * (1024**3),
@@ -1754,14 +1805,16 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
             threshold=5 * (1024**3),
             threshold_by_service={
                 "bgpd": 4.5 * (1024**3),
-                "fsdb": 7 * (1024**3),
+                "fsdb": fsdb_memory_threshold_bytes
+                if fsdb_memory_threshold_bytes is not None
+                else 7 * (1024**3),
                 "qsfp_service": 2 * (1024**3),
                 "fboss_sw_agent": 12 * (1024**3),
                 "fboss_hw_agent@0": 8 * (1024**3),
             },
             start_time_jq_var="test_case_start_time",
         ),
-        *([] if l2_overload_only else [BGP_SESSION_HEALTHCHECK_NO_V6_LOSS_EXPECTED]),
+        *([] if l2_overload_only else [bgp_session_check]),
     ]
 
     return TestConfig(
@@ -1947,6 +2000,8 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
                         is_confed_peer=is_uplink_peer_confed,
                         per_peer_max_route_limit=per_peer_max_route_limit,
                         policy_entries_json=json.dumps([_PERMIT_ALL_POLICY_TERM]),
+                        hold_time_seconds="30",
+                        keep_alive_seconds="10",
                     )
                     + create_allow_all_v4_peer_group_patcher_tasks(
                         hostname=device_name,
@@ -1955,6 +2010,8 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
                         is_confed_peer=is_downlink_peer_confed,
                         per_peer_max_route_limit=per_peer_max_route_limit,
                         policy_entries_json=json.dumps([_PERMIT_ALL_POLICY_TERM]),
+                        hold_time_seconds="30",
+                        keep_alive_seconds="10",
                     )
                     if allow_all_v4_policies
                     else [
@@ -2165,18 +2222,24 @@ def test_config_for_bgp_and_fboss_platform_hardening_in_conveyor(
                                             "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::401",
                                             "gateway_increment_ip": "0:0:0:0::2",
                                         },
-                                        {
-                                            "starting_ip": f"{ixia_uplink_ic_parent_network_v6}::500",
-                                            "increment_ip": "0:0:0:0::2",
-                                            "prefix_length": 127,
-                                            "description": "Uplink IPv6 Peers - for BGP Induced ECMP - 2",
-                                            "peer_group_name": peergroup_uplink_mimic_v6,
-                                            "num_sessions": bgp_induced_ecmp_group_count,
-                                            "remote_as_4_byte": remote_uplink_as_4byte,
-                                            "remote_as_4_byte_step": 0,
-                                            "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::501",
-                                            "gateway_increment_ip": "0:0:0:0::2",
-                                        },
+                                        *(
+                                            [
+                                                {
+                                                    "starting_ip": f"{ixia_uplink_ic_parent_network_v6}::500",
+                                                    "increment_ip": "0:0:0:0::2",
+                                                    "prefix_length": 127,
+                                                    "description": "Uplink IPv6 Peers - for BGP Induced ECMP - 2",
+                                                    "peer_group_name": peergroup_uplink_mimic_v6,
+                                                    "num_sessions": bgp_induced_ecmp_group_count,
+                                                    "remote_as_4_byte": remote_uplink_as_4byte,
+                                                    "remote_as_4_byte_step": 0,
+                                                    "gateway_starting_ip": f"{ixia_uplink_ic_parent_network_v6}::501",
+                                                    "gateway_increment_ip": "0:0:0:0::2",
+                                                },
+                                            ]
+                                            if configure_induced_ecmp_2_peers
+                                            else []
+                                        ),
                                     ]
                                 ),
                                 {

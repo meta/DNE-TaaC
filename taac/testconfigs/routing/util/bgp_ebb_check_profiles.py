@@ -42,6 +42,8 @@ import enum
 import typing as t
 
 from taac.abstractions.compatibility.legacy_ebb_binding import (
+    IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
+    IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
     IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1,
     IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1,
 )
@@ -103,25 +105,24 @@ from taac.test_as_a_config.types import PointInTimeHealthCheck, SnapshotHealthCh
 # entirely inside the fifth hextet -- so /80 is exact there.
 #
 # Net effect of the two masks: exactly the 256 eBGP sessions stay in scope.
+#
+# Both chassis are listed because SC9 runs on bag013 (ixia) and nrqeb009
+# (ixia03), and the profile is built without knowing which one it is bound to.
+# With only the ixia masks, nrqeb009 kept its 256 ixia03 iBGP mimic sessions in
+# scope and the drain failed its baseline with "512, expected 256". The ixia03
+# ranges have the same shape, so the same /80 and /23 masks apply, and neither
+# chassis' masks overlap the other's eBGP range.
 IBGP_MIMIC_PARENTS: t.List[str] = [
     f"{IXIA_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1}::/80",
     f"{IXIA_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1}.0/23",
+    f"{IXIA03_IBGP_IC_PARENT_NETWORK_V6_DC_PLANE1}::/80",
+    f"{IXIA03_IBGP_IC_PARENT_NETWORK_V4_DC_PLANE1}.0/23",
 ]
 
 # 128 eBGP peers per AFI, both AFIs -- the population the masks above leave in
 # scope. Shared with the playbook's drain stage so the session count the drain
 # asserts and the count the postcheck asserts cannot drift apart.
 SC9_EBGP_SESSION_COUNT = 256
-
-# Absolute bound on the device-maintained ECMP peak. DNE's already-sanctioned
-# bar (health_checks/constants.py) rather than a number invented here, and it
-# has to be ABSOLUTE: the watermark cannot be reset in-test, so bag013 carried a
-# pre-existing peak of 416 into the first SC9 run and will carry one into every
-# run until it is reloaded. A bound below that would fail on lab history rather
-# than on anything SC9 did.
-# Applied at BOTH the precheck and the postcheck, at the same value, so a peak
-# the box arrived with is attributed to the testbed instead of to SC9's drain.
-_SC9_MAX_ECMP_HIGH_WATERMARK = 1000
 
 _LIFECYCLE_CONVERGENCE_HARD_TIMEOUT_SECONDS = 1200
 _SOAK_READINESS_STABILITY_WINDOW_SECONDS = 30.0
@@ -142,8 +143,8 @@ class CheckProfile(enum.Enum):
     # BGP route/session oscillation & multipath churn: convergence OFF; which
     # snapshot sub-checks to skip varies by sub-shape (carried in the context).
     OSCILLATION = "oscillation"
-    # FA/plane drain-undrain: convergence OFF, iBGP-PNH precheck off, snapshot
-    # skips flap only (uptime still checked).
+    # FA/plane drain-undrain: convergence OFF; PNH readiness opts in with a
+    # resolved range; snapshot skips flap only (uptime still checked).
     DRAIN_UNDRAIN = "drain_undrain"
     # CICD-EBB-11 route storm: convergence OFF, expected established-session count
     # enforced, and a context-selected snapshot shape. The custom steps own
@@ -246,6 +247,11 @@ class ProfileContext:
     check_ibgp_pnh: bool = False
     ibgp_pnh_start_ipv4s: t.Optional[tuple[str, ...]] = None
     ibgp_pnh_start_ipv6s: t.Optional[tuple[str, ...]] = None
+    # Count and stride of the resolved Open/R injection, carried beside the
+    # starts so readiness describes the whole injected range. Left None by a
+    # caller with no plan, which serializes the pre-existing payload.
+    ibgp_pnh_count: t.Optional[int] = None
+    ibgp_pnh_step: t.Optional[int] = None
     expected_peer_identity: t.Optional[t.Dict[str, str]] = None
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None
     # Whether to exclude BGP-MON peers from the session checks, and which
@@ -338,6 +344,8 @@ def _daemon_restart(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
@@ -348,7 +356,7 @@ def _daemon_restart(ctx: ProfileContext) -> ProfileChecks:
             expected_established_session_count=(
                 ctx.expected_established_sessions or None
             ),
-            expected_restarted_services=["Bgp"],
+            expected_restarted_services=["Bgpcpp"],
             restart_start_time_jq_var="daemon_restart_time",
             bgp_mon=ctx.bgp_mon,
         ),
@@ -417,6 +425,8 @@ def _cold_start(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
@@ -428,7 +438,7 @@ def _cold_start(ctx: ProfileContext) -> ProfileChecks:
             expected_established_session_count=(
                 ctx.expected_established_sessions or None
             ),
-            expected_restarted_services=["Bgp"],
+            expected_restarted_services=["Bgpcpp"],
             restart_start_time_jq_var="daemon_restart_time",
             bgp_mon=ctx.bgp_mon,
         ),
@@ -454,6 +464,8 @@ def _oscillation(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
@@ -472,9 +484,9 @@ def _oscillation(ctx: ProfileContext) -> ProfileChecks:
 
 
 def _drain_undrain(ctx: ProfileContext) -> ProfileChecks:
-    """FA/plane drain-undrain: standard prechecks with the iBGP-PNH check OFF
-    (drain tests don't assert PNH metric), postchecks with convergence OFF, and
-    a snapshot that skips only the flap check (uptime is still validated).
+    """Drain profiles retain legacy checks unless a PNH range is explicitly supplied.
+
+    Postchecks keep convergence off; snapshots skip only flap checks.
     """
     return ProfileChecks(
         prechecks=create_standard_prechecks(
@@ -482,7 +494,20 @@ def _drain_undrain(ctx: ProfileContext) -> ProfileChecks:
             peergroup_ibgp_v4=ctx.peergroup_ibgp_v4,
             precheck_thresholds=ctx.precheck_thresholds,
             expected_established_sessions=ctx.expected_established_sessions,
-            check_ibgp_pnh=False,
+            check_ibgp_pnh=ctx.check_ibgp_pnh
+            and any(
+                value is not None
+                for value in (
+                    ctx.ibgp_pnh_start_ipv4s,
+                    ctx.ibgp_pnh_start_ipv6s,
+                    ctx.ibgp_pnh_count,
+                    ctx.ibgp_pnh_step,
+                )
+            ),
+            ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
+            ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
@@ -514,6 +539,8 @@ def _churn_storm(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=create_standard_postchecks(
@@ -565,6 +592,8 @@ def _igp_instability(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         ),
         postchecks=postchecks,
@@ -691,6 +720,8 @@ def _runtime_update(ctx: ProfileContext) -> ProfileChecks:
             check_ibgp_pnh=ctx.check_ibgp_pnh,
             ibgp_pnh_start_ipv4s=ctx.ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ctx.ibgp_pnh_start_ipv6s,
+            ibgp_pnh_count=ctx.ibgp_pnh_count,
+            ibgp_pnh_step=ctx.ibgp_pnh_step,
             bgp_mon=ctx.bgp_mon,
         )
         + [
@@ -777,31 +808,14 @@ def _sc9_bounded_ecmp(ctx: ProfileContext) -> ProfileChecks:
     """
     return ProfileChecks(
         prechecks=[
-            # Hardware headroom BEFORE the drain, recorded so a postcheck
-            # breach can be read against where the device started.
-            #
-            # Nothing in the framework compares the two readings -- each
-            # hardware-capacity check is independent and stateless -- so this is
-            # documentation of the starting point, not half of a delta. An
-            # earlier revision of this profile claimed it "establishes the floor
-            # the post reading is compared against"; that mechanism does not
-            # exist. check_watermarks=False keeps the within-reading delta check
-            # off, because bag013 carries a large stale FEC peak that no SC9 run
-            # can reset or influence.
-            #
-            # The ECMP high-watermark bound is applied HERE TOO, at the same
-            # value as the postcheck. That watermark is monotonic within a boot
-            # and no SC9 step resets it, so a box arriving with a peak left by a
-            # previous full-scale run would fail the postcheck and read as
-            # "SC9's drain exhausted the ECMP table" when SC9 never touched it.
-            # Asserting it before the run attributes that state to the testbed,
-            # where it belongs. The delta step in the playbook covers the same
-            # counter immune to staleness, by comparing against SC9's own
-            # capture rather than against an absolute.
+            # Check instantaneous hardware headroom before the drain. Do not
+            # gate the boot-lifetime ECMP high watermark here: Conveyor runs
+            # SC9 after the full-scale workloads on the same boot, so that
+            # counter legitimately includes predecessor activity. Stage A
+            # captures SC9's own baseline for the Stage C delta comparison.
             create_hardware_capacity_check(
                 check_id="sc9_precheck_hw_capacity_baseline",
                 check_watermarks=False,
-                ecmp_high_watermark_threshold=_SC9_MAX_ECMP_HIGH_WATERMARK,
             ),
         ],
         postchecks=[
@@ -843,36 +857,13 @@ def _sc9_bounded_ecmp(ctx: ProfileContext) -> ProfileChecks:
                 use_discovered_width=True,
                 peers_stopped_delta=0,
             ),
-            # Hardware headroom AFTER the drain.
-            #
-            # This deliberately does NOT use watermark_delta_threshold, which an
-            # earlier revision set to the topology's structural max. That knob
-            # does not mean what the name suggests: validate_hardware_capacity
-            # computes abs(high_watermark - used) WITHIN A SINGLE READING, so it
-            # never compares the precheck to the postcheck, and the same knob
-            # gates FEC as well as ECMP. The first bag013 run failed on exactly
-            # that -- "FEC high watermark delta (19398) exceeds threshold (258)"
-            # -- where 19398 is a stale FEC peak (hwm 24271 vs 4873 used) that
-            # was identical at precheck and postcheck and has nothing to do with
-            # SC9. check_watermarks=False turns the delta checks off.
-            #
-            # `ecmp_high_watermark_threshold` IS load-bearing and stays: unlike
-            # every neighbouring threshold, HardwareCapacityThresholds.from_dict
-            # reads it with a bare params.get() and applies NO default, so
-            # passing it is the only thing that enables the bound at all. Its
-            # value coinciding with ARISTA_DEFAULT_ECMP_THRESHOLD is a red
-            # herring -- that default belongs to `ecmp_threshold`, a different
-            # counter. It is evaluated outside the check_watermarks block.
-            #
-            # `max_ecmp_level2` was dropped: it was set to 500, which is exactly
-            # ARISTA_DEFAULT_MAX_ECMP_LEVEL2 and IS applied by from_dict on
-            # None, so it was a no-op dressed as a deliberate SC9 bound -- and
-            # sitting beside a genuinely load-bearing parameter it implied both
-            # were chosen. The framework default still applies.
+            # Check instantaneous hardware headroom after the drain. The
+            # boot-lifetime watermark remains excluded for the same reason as
+            # the precheck; the Stage C delta comparison owns SC9-attributable
+            # watermark growth.
             create_hardware_capacity_check(
                 check_id="sc9_postcheck_hw_capacity",
                 check_watermarks=False,
-                ecmp_high_watermark_threshold=_SC9_MAX_ECMP_HIGH_WATERMARK,
             ),
         ],
         snapshot_checks=[

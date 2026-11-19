@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from later.unittest import TestCase
-from taac.abstractions.physical_inventory import BAG012_ASH6
+from taac.abstractions.physical_inventory import NRQEB008_ASH6
 from taac.testconfigs.routing.factories import (
     bgp_ebb_full_scale as factory,
     bgp_ug_2_7_suite as suite,
@@ -108,14 +108,14 @@ def _setup_task_params(task) -> dict:
 
 
 class BgpUg27SharedTopologyTest(TestCase):
-    def test_selected_link_flap_derives_exact_bag012_cohorts(self) -> None:
+    def test_selected_link_flap_derives_exact_nrqeb008_cohorts(self) -> None:
         with mock.patch.object(
             factory,
             "create_bgp_ug_link_flap_recovery_playbook",
             wraps=factory.create_bgp_ug_link_flap_recovery_playbook,
         ) as playbook_factory:
             config = factory.create_bgp_ebb_full_scale_test_config(
-                BAG012_ASH6,
+                NRQEB008_ASH6,
                 name="BAG012_UG_2_7_1_TEST",
                 playbooks_selected=[_PLAYBOOK_NAME],
             )
@@ -125,8 +125,8 @@ class BgpUg27SharedTopologyTest(TestCase):
         )
         playbook_factory.assert_called_once()
         kwargs = playbook_factory.call_args.kwargs
-        self.assertEqual("bag012.ash6", kwargs["device_name"])
-        self.assertEqual("Ethernet3/36/1", kwargs["interface"])
+        self.assertEqual("nrqeb008.ash6", kwargs["device_name"])
+        self.assertEqual("Ethernet3/35/1", kwargs["interface"])
         self.assertEqual(280, len(set(kwargs["target_peer_subnets"])))
         self.assertEqual(140, len(set(kwargs["recovered_ebgp_peer_addrs"])))
         self.assertEqual(
@@ -153,7 +153,7 @@ class BgpUg27SharedTopologyTest(TestCase):
 
     def test_unrelated_selection_does_not_add_recovery_route_intent(self) -> None:
         config = factory.create_bgp_ebb_full_scale_test_config(
-            BAG012_ASH6,
+            NRQEB008_ASH6,
             name="BAG012_UNRELATED_TEST",
             playbooks_selected=["bgp_ebb_longevity_playbook"],
         )
@@ -162,7 +162,7 @@ class BgpUg27SharedTopologyTest(TestCase):
 
     def test_runtime_route_pools_remain_compact(self) -> None:
         config = factory.create_bgp_ebb_full_scale_test_config(
-            BAG012_ASH6,
+            NRQEB008_ASH6,
             name="BAG012_UG_2_7_1_TEST",
             playbooks_selected=[_PLAYBOOK_NAME],
         )
@@ -174,7 +174,7 @@ class BgpUg27SharedTopologyTest(TestCase):
 
     def test_bgp_restart_uses_two_port_all_peer_stability_contract(self) -> None:
         config = factory.create_bgp_ebb_full_scale_test_config(
-            BAG012_ASH6,
+            NRQEB008_ASH6,
             name="BAG012_UG_2_7_4_TEST",
             playbooks_selected=["bgp_ug_bgp_daemon_restart"],
         )
@@ -258,7 +258,7 @@ class BgpUg27SharedTopologyTest(TestCase):
 
     def test_fibagent_restart_uses_two_port_continuity_contract(self) -> None:
         config = factory.create_bgp_ebb_full_scale_test_config(
-            BAG012_ASH6,
+            NRQEB008_ASH6,
             name="BAG012_UG_2_7_6_TEST",
             playbooks_selected=["bgp_ug_fibagent_restart"],
         )
@@ -302,9 +302,9 @@ class BgpUg27SharedTopologyTest(TestCase):
         self.assertEqual(2, len(config.basic_port_configs or []))
         self.assertEqual(18, len(_device_groups(config)))
 
-    def test_sustained_flap_derives_exact_bag012_heartbeat_matrix(self) -> None:
+    def test_sustained_flap_derives_exact_nrqeb008_heartbeat_matrix(self) -> None:
         config = factory.create_bgp_ebb_full_scale_test_config(
-            BAG012_ASH6,
+            NRQEB008_ASH6,
             name="BAG012_UG_2_7_2_TEST",
             playbooks_selected=["update_group_sustained_link_flap"],
         )
@@ -320,7 +320,7 @@ class BgpUg27SharedTopologyTest(TestCase):
             )
         )
         self.assertEqual(
-            ["Ethernet3/36/1", "Ethernet3/36/2"],
+            ["Ethernet3/35/1", "Ethernet3/35/2"],
             [track["interface"] for track in disruption["port_tracks"]],
         )
         self.assertEqual(["IDLE"], disruption["expected_recovered_group_states"])
@@ -395,9 +395,9 @@ class BgpUg27SharedTopologyTest(TestCase):
         self.assertEqual([], _hardware_capacity_checks(config.playbooks[0].prechecks))
         self.assertEqual([], _hardware_capacity_checks(config.playbooks[0].postchecks))
 
-    def test_cold_start_owns_exact_bag012_zero_to_formation_trigger(self) -> None:
+    def test_cold_start_owns_exact_nrqeb008_zero_to_formation_trigger(self) -> None:
         config = factory.create_bgp_ebb_full_scale_test_config(
-            BAG012_ASH6,
+            NRQEB008_ASH6,
             name="BAG012_UG_2_7_5_TEST",
             playbooks_selected=["bgp_ug_cold_start"],
         )
@@ -421,7 +421,7 @@ class BgpUg27SharedTopologyTest(TestCase):
         self.assertTrue(enable["enable"])
         self.assertEqual(18, enable["expected_match_count"])
         self.assertEqual(
-            ["Ethernet3/36/1", "Ethernet3/36/2"],
+            ["Ethernet3/35/1", "Ethernet3/35/2"],
             wire_start["capture_interfaces"],
         )
         wire_sources = wire_start["dut_source_addresses"]
@@ -430,7 +430,7 @@ class BgpUg27SharedTopologyTest(TestCase):
         self.assertEqual(636, sum(":" not in address for address in wire_sources))
         self.assertEqual(636, sum(":" in address for address in wire_sources))
         self.assertEqual(
-            ["Ethernet3/36/2"],
+            ["Ethernet3/35/2"],
             quiet_rebaseline["runtime_update_interfaces"],
         )
         validation = playbook.stages[3]
@@ -462,7 +462,7 @@ class BgpUg27SharedTopologyTest(TestCase):
             "bgp_ug_cold_start",
         ]
         config = factory.create_bgp_ebb_full_scale_test_config(
-            BAG012_ASH6,
+            NRQEB008_ASH6,
             name="BAG012_UG_2_7_FULL_SUITE_TEST",
             playbooks_selected=expected_order,
         )
@@ -476,7 +476,7 @@ class BgpUg27SharedTopologyTest(TestCase):
 
     def test_peer_flapping_derives_exact_bag012_contract(self) -> None:
         config = factory.create_bgp_ebb_full_scale_test_config(
-            BAG012_ASH6,
+            NRQEB008_ASH6,
             name="BAG012_UG_2_7_3_TEST",
             playbooks_selected=["bgp_ug_bgp_peer_flapping"],
         )

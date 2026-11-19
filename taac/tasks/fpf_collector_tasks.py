@@ -35,6 +35,10 @@ from taac.libs.fpf.fpf_collector_registry import (
     register_collector,
 )
 from taac.libs.fpf.fpf_hrt_bulk_tracker import NUM_LANES
+from taac.libs.fpf.fpf_prod_switch_prefix import (
+    ProdSwitchPrefixCollector,
+    production_gtsws,
+)
 from taac.libs.fpf.fpf_stress_checks import (
     BgpRibCollector,
     FibRouteCollector,
@@ -372,6 +376,23 @@ class FpfStartCollectorsTask(BaseTask):
             prod_collector.set_append_mode(True)
             prod_collector.start()
             register_collector("prod_hrt_prefix", prod_collector)
+            route_gtsws = params.get("prod_prefix_gtsws") or production_gtsws(gtsws)
+            route_prefixes = [
+                prefix for prefixes in prod_by_host.values() for prefix in prefixes
+            ]
+            for protocol in ("bgp", "fsdb"):
+                route_collector = ProdSwitchPrefixCollector(
+                    route_gtsws,
+                    route_prefixes,
+                    protocol,
+                    interval_sec=float(
+                        params.get("prod_prefix_poll_interval_sec", poll_interval_sec)
+                    ),
+                    fsdb_mode=fsdb_mode,
+                )
+                route_collector.set_append_mode(True)
+                route_collector.start()
+                register_collector(f"prod_{protocol}_prefix", route_collector)
 
             logger.info(
                 f"[FpfStartCollectors] Production-prefix dev{prod_device_id} canary "

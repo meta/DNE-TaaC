@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# pyre-unsafe
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,6 +7,7 @@ from taac.tasks.eos import (
     BackupRunningConfigTask,
     CreateEosBgpPeerGroup,
     RestoreRunningConfigTask,
+    WaitForEosInterfacesTask,
 )
 
 
@@ -15,6 +15,7 @@ ARISTA_SWITCH_PATH = (
     "neteng.test_infra.dne.taac.internal.driver.arista_switch.AristaSwitch"
 )
 ARISTA_UTILS_PATH = "neteng.test_infra.dne.taac.utils.arista_utils"
+EOS_TASK_PATH = "neteng.test_infra.dne.taac.tasks.eos"
 
 
 class CreateEosBgpPeerGroupTest(unittest.IsolatedAsyncioTestCase):
@@ -407,6 +408,75 @@ class BackupRunningConfigTest(unittest.IsolatedAsyncioTestCase):
         mock_save.assert_called_once_with(
             mock_driver, backup_name=None, logger_instance=self.logger
         )
+
+
+class WaitForEosInterfacesTaskTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.logger = MagicMock()
+        self.task = WaitForEosInterfacesTask(
+            hostname="bag001.qzq1",
+            logger=self.logger,
+        )
+
+    @patch(ARISTA_SWITCH_PATH)
+    async def test_polls_until_all_interfaces_materialize(
+        self, mock_switch_cls
+    ) -> None:
+        driver = MagicMock()
+        driver.async_execute_show_json_on_shell = AsyncMock(
+            side_effect=[
+                {
+                    "interfaceStatuses": {
+                        "Ethernet4/36/1": {},
+                    }
+                },
+                {
+                    "interfaceStatuses": {
+                        "Ethernet4/36/1": {},
+                        "Ethernet4/36/5": {},
+                    }
+                },
+            ]
+        )
+        mock_switch_cls.return_value = driver
+
+        with patch(f"{EOS_TASK_PATH}.asyncio.sleep", new_callable=AsyncMock):
+            await self.task.run(
+                {
+                    "hostname": "bag001.qzq1",
+                    "interfaces": ["Ethernet4/36/1", "Ethernet4/36/5"],
+                    "timeout_seconds": 30,
+                    "poll_interval_seconds": 1,
+                }
+            )
+
+        self.assertEqual(driver.async_execute_show_json_on_shell.await_count, 2)
+        mock_switch_cls.assert_called_once_with("bag001.qzq1", logger=self.logger)
+
+    @patch(ARISTA_SWITCH_PATH)
+    async def test_timeout_reports_missing_interfaces(self, mock_switch_cls) -> None:
+        driver = MagicMock()
+        driver.async_execute_show_json_on_shell = AsyncMock(
+            return_value={"interfaceStatuses": {"Ethernet4/36/1": {}}}
+        )
+        mock_switch_cls.return_value = driver
+
+        with (
+            patch(
+                f"{EOS_TASK_PATH}.time.monotonic",
+                side_effect=[0.0, 0.0, 2.0],
+            ),
+            patch(f"{EOS_TASK_PATH}.asyncio.sleep", new_callable=AsyncMock),
+            self.assertRaisesRegex(TimeoutError, "Ethernet4/36/5"),
+        ):
+            await self.task.run(
+                {
+                    "hostname": "bag001.qzq1",
+                    "interfaces": ["Ethernet4/36/1", "Ethernet4/36/5"],
+                    "timeout_seconds": 1,
+                    "poll_interval_seconds": 1,
+                }
+            )
 
 
 class RestoreRunningConfigTest(unittest.IsolatedAsyncioTestCase):

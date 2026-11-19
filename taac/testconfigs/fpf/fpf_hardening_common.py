@@ -43,6 +43,60 @@ def skip_ib_traffic() -> bool:
     )
 
 
+def external_ib_traffic() -> bool:
+    """Whether a separately running supervisor owns ib_write_bw lifecycle.
+
+    Unlike ``skip_ib_traffic``, this mode retains ODS host-spray checks while
+    omitting every TAAC start/stop/recovery action for ib_write_bw.
+    """
+    return os.environ.get("TAAC_FPF_EXTERNAL_IB_TRAFFIC", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def preinjected_prefixes() -> bool:
+    """Whether the VF prefix groups are externally provisioned and persistent."""
+    return os.environ.get("TAAC_FPF_PREINJECTED_PREFIXES", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def fpf_collector_baseline_sec(default: int = 120) -> int:
+    """Return the bounded setup-time collector baseline window."""
+    raw = os.environ.get("TAAC_FPF_COLLECTOR_BASELINE_SEC", "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "TAAC_FPF_COLLECTOR_BASELINE_SEC must be an integer"
+        ) from error
+    if not 10 <= value <= 900:
+        raise ValueError(
+            "TAAC_FPF_COLLECTOR_BASELINE_SEC must be between 10 and 900 seconds"
+        )
+    return value
+
+
+def skip_twshared_ssh() -> bool:
+    """Whether external orchestration owns all twshared host shell operations.
+
+    This narrow mode keeps GTSW/STSW SSH, HRT Thrift collectors, and ODS checks
+    enabled while preventing TAAC from starting, stopping, or probing
+    ib_write_bw over SSH on the GPU hosts.
+    """
+    return os.environ.get("TAAC_FPF_SKIP_TWSHARED_SSH", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 DEFAULT_IB_DEVICE: str = "mlx5_34"
 DEFAULT_IB_BINARY: str = "/usr/bin/ib_write_bw"
 DEFAULT_IB_GID_IFACE: str = "bveth0"
@@ -498,7 +552,7 @@ def fpf_ib_traffic_tasks(
     while omitting only ib_write_bw. Imported lazily to avoid an import cycle
     with task_definitions.
     """
-    if skip_ssh or skip_ib:
+    if skip_ssh or skip_ib or skip_twshared_ssh():
         return [], []
     from taac.task_definitions import (
         create_fpf_start_ib_traffic_task,

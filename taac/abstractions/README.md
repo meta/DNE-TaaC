@@ -220,8 +220,8 @@ Factories should import concrete topology instances from:
 
 ```python
 from taac.abstractions.topologies.ebb_full_scale import (
-    EBB_FULL_SCALE_NO_BGPMON,
-    EBB_FULL_SCALE_WITH_BGPMON,
+    EBB_FY26_TOPOLOGY_NO_BGPMON,
+    EBB_FY26_TOPOLOGY_WITH_BGPMON,
 )
 ```
 
@@ -339,6 +339,13 @@ Adjacencies are NOT learned — they are injected into KvStore via
 graph and programs FibAgent normally. From FibAgent's perspective the
 synthetic routes are indistinguishable from real ones.
 
+The EBB full-scale TestConfig factory also translates `OpenRMode.STANDALONE`
+into the `testbed_isolation:bypass` lifecycle-policy tag. The setup
+orchestrator honors that tag like an explicit `--skip-testbed-isolation`
+request during both setup and teardown. This preserves the physical helper
+link that brings up the synthetic OpenR Port-Channel without relying on DUT
+hostnames or callers remembering an extra CLI flag.
+
 ### 4.3. Component call-chain
 
 How each `PhysicalInventory` field is consumed by the STANDALONE
@@ -361,7 +368,90 @@ moves platform realization behind the EOS/BGP++ backend and prohibits
 `abstractions/**` from importing `testconfigs/**`. Other backends implementing
 STANDALONE must satisfy the same field-to-role mapping above.
 
-### 4.4. Single-ownership invariant
+### 4.4. Injection scale and ownership
+
+How much synthetic reachability a STANDALONE topology injects is intent, not a
+renderer constant. Three types carry it, and each owns exactly one decision:
+
+| Type | Owns | Lives in |
+|---|---|---|
+| `OpenRInjectionScale` | How many synthetic nodes per range, and their address stride. No addresses. | `abstractions/topology/model.py` |
+| `OpenRInjectionPlan` | A resolved injection: the per-range start addresses plus that scale. | `abstractions/topology/model.py` |
+| `OpenRInjectionExpansion` | The exact KvStore keys and prefixes one plan owns on one DUT. Pure; no device. | `abstractions/topology/model.py` |
+
+A family-level profile sits above them and is owned by the family, not by
+DICE. EBB's is `EbbScaleProfile` in `topologies/ebb_full_scale.py`, which
+expresses a fiscal-year fleet target as HE sites per DC plane:
+
+| Profile | HE sites per range | Ranges | Synthetic nodes | Injected prefixes | KvStore keys |
+|---|---|---|---|---|---|
+| `EBB_FY26_SCALE` | 63 | 4 | 252 | 504 (252 v4 /32 + 252 v6 /128) | 757 |
+| `EBB_FY27_SCALE` | 100 | 4 | 400 | 800 (400 v4 /32 + 400 v6 /128) | 1,201 |
+
+Every scheduled EBB binding runs `EBB_FY26_SCALE`. `EBB_FY27_SCALE` is defined
+and unit-tested but deliberately unscheduled, so the FY27 target is a
+reviewable number before a testbed is committed to it. The key total is
+`1 + 3n` for `n` synthetic nodes: one adjacency database per node, one v4 and
+one v6 prefix database per node, and the owner's own `adj:<DUT>` database
+listing all of them.
+
+**Addresses come from the bound topology, never from a constant.** A device
+group declares `openr_injection_range_ordinal` to say that its advertised
+route next hops form range N. `BoundTopology.resolve_openr_injection_plan()`
+reads each range's start back out of the bound advertisements and pairs it
+with the scale from `RoutingDeviceConfig.openr_injection_scale`. Nothing reads
+IXIA session peer addresses, and a group that declares no ordinal contributes
+nothing — which is how EBB's MP planes stay out of the injection while its
+four DC planes define it. Expressing the advertised and injected sets
+separately is what previously let a secondary chassis advertise one next-hop
+space while injecting another: the routes still arrive and still sit in the
+RIB, so nothing errors and the shadow RIB silently collapses.
+
+**Advertised next hops are evidence, not input.** The resolver requires every
+advertised next hop of every declared range to fall inside the injected host
+routes, and rejects the topology otherwise. At FY26 that is 62 emulated peers
+per plane covered by 63 injected routes, and at FY27 100 covered by exactly
+100. The check only ever reads the bound advertisements; it never widens the
+injection to make a topology pass.
+
+**The advertised population is carried separately from the injection.** The
+resolver records how many leading rows of each range the peers advertise as
+`OpenRInjectionPlan.advertised_pnh_count`, rejecting gaps and ranges that
+disagree. Anything that observes injected rows through BGP must be bounded by
+it, never by `count`: FY26 injects 63 rows per range for 62 advertised next
+hops, so row 62 carries no BGP path, while FY27 injects exactly its 100
+advertised rows, so rows 0-99 all do.
+
+**Setup and teardown are rendered from one plan.** The same resolved
+`OpenRInjectionPlan` produces the `inject` task and the `delete` task, so the
+withdrawal cannot address a different range, count, or stride than the
+injection did. The compiler and the playbook factories both resolve it through
+`resolve_validated_openr_injection_plan()`, so an unusable range declaration
+fails as one `unresolvable_openr_injection` topology issue whichever layer
+reaches it first.
+
+Scale parameterization does **not** make teardown delete every injected
+KvStore key, and nothing here should be read as claiming it does. The
+withdrawal task passes no `delete_count`, so the runtime applies its own
+default; the effective cleanup boundary is still stopping the Open/R daemon
+and tearing down the port channel, exactly as before. Making teardown
+withdraw each injected key explicitly is separate work with its own
+behavioral risk, and is deliberately not part of this parameterization.
+
+Two capacity notes, because both have been misapplied to this path:
+
+- TAAC's guard of 500 DUT-side addresses per EOS interface and AFI
+  (`_EOS_SECONDARY_IP_LIMIT_PER_INTERFACE_AFI` in `topology/binding.py`)
+  constrains *interface addressing*. It is a TAAC binding check, not a
+  documented Arista EOS limit. It has no bearing on KvStore injection:
+  synthetic nodes carry their prefixes in KvStore, not as addresses on an
+  interface, so the injected scale is not bounded by it.
+- No KvStore capacity ceiling is asserted here. The FY27 figures above are
+  what the model resolves to, not an observed limit. Any claim about how much
+  KvStore content a DUT sustains needs measurement on hardware, and none has
+  been taken for this change.
+
+### 4.5. Single-ownership invariant
 
 Framework contract enforced by every consumer of `OpenRStandaloneLink`:
 
@@ -380,7 +470,7 @@ for `port_channel_id` (e.g. the EBB BAG family's `po1003NN → bag0NN`
 rule). Those conventions live in the owning testbed module's docstring,
 not here.
 
-### 4.5. Enforcement
+### 4.6. Enforcement
 
 `OpenRStandaloneLink.__post_init__` in `abstractions/topology/model.py`
 rejects, at import time:
@@ -469,7 +559,7 @@ factory has durable authored, bound, compiled, and catalog assertions.
 
 The checked production topologies are:
 
-- `EBB_FULL_SCALE_NO_BGPMON` and `EBB_FULL_SCALE_WITH_BGPMON`
+- `EBB_FY26_TOPOLOGY_NO_BGPMON` and `EBB_FY26_TOPOLOGY_WITH_BGPMON`
 - `UG_NEW_PEER_JOIN` and `UG_BACKPRESSURE`
 - `IPV6_UPDATE_PACKING`, `EGRESS_PEER_SCALE`, and `BOUNDED_ECMP`
 

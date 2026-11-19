@@ -88,36 +88,69 @@ class TestServiceConvergenceStep(TestCase):
 
     async def test_run_qsfp_service_convergence(self):
         """Test convergence waiting for QSFP_SERVICE."""
+        self.driver_mock.async_get_service_status.side_effect = [
+            SystemctlServiceStatus.TRANSITIONING,
+            SystemctlServiceStatus.ACTIVE,
+        ]
         input_data = taac_types.ServiceConvergenceInput(
             services=[taac_types.Service.QSFP_SERVICE],
             timeout=120,
         )
-        await self.sc_step.run(input_data, {})
+        with patch.object(step_definitions.asyncio, "sleep", AsyncMock()):
+            await self.sc_step.run(input_data, {})
+
         self.driver_mock.async_wait_for_qsfp_service_state_active.assert_called_once_with(
             120
         )
+        self.driver_mock.async_get_service_status.assert_called_with(
+            FbossSystemctlServiceName.QSFP
+        )
+        self.assertEqual(2, self.driver_mock.async_get_service_status.call_count)
 
     async def test_run_fsdb_convergence(self):
         """Test convergence waiting for FSDB service."""
+        self.driver_mock.async_get_service_status.side_effect = [
+            SystemctlServiceStatus.TRANSITIONING,
+            SystemctlServiceStatus.ACTIVE,
+        ]
         input_data = taac_types.ServiceConvergenceInput(
             services=[taac_types.Service.FSDB],
             timeout=120,
         )
-        await self.sc_step.run(input_data, {})
+        with patch.object(step_definitions.asyncio, "sleep", AsyncMock()):
+            await self.sc_step.run(input_data, {})
+
         self.driver_mock.async_wait_for_fsdb_state_active.assert_called_once_with(120)
+        self.driver_mock.async_get_service_status.assert_called_with(
+            FbossSystemctlServiceName.FSDB
+        )
+        self.assertEqual(2, self.driver_mock.async_get_service_status.call_count)
 
     async def test_run_openr_convergence(self):
         """Test convergence waiting for OpenR."""
+        self.driver_mock.async_get_service_status.side_effect = [
+            SystemctlServiceStatus.TRANSITIONING,
+            SystemctlServiceStatus.ACTIVE,
+        ]
         input_data = taac_types.ServiceConvergenceInput(
             services=[taac_types.Service.OPENR],
             timeout=120,
         )
-        await self.sc_step.run(input_data, {})
+        with patch.object(step_definitions.asyncio, "sleep", AsyncMock()):
+            await self.sc_step.run(input_data, {})
+
         self.driver_mock.async_wait_for_openr_initialized.assert_called_once_with()
+        self.driver_mock.async_get_service_status.assert_called_with(
+            FbossSystemctlServiceName.OPENR
+        )
+        self.assertEqual(2, self.driver_mock.async_get_service_status.call_count)
 
     async def test_run_openr_before_bgp_convergence(self):
         """Test that OpenR initializes before BGP convergence is checked."""
         call_order = []
+        self.driver_mock.async_get_service_status.return_value = (
+            SystemctlServiceStatus.ACTIVE
+        )
 
         async def record_openr() -> None:
             call_order.append(taac_types.Service.OPENR)
@@ -206,6 +239,9 @@ class TestServiceConvergenceStep(TestCase):
 
     async def test_run_fsdb_with_per_service_timeout(self):
         """Test that per-service timeout overrides the default timeout for FSDB."""
+        self.driver_mock.async_get_service_status.return_value = (
+            SystemctlServiceStatus.ACTIVE
+        )
         input_data = taac_types.ServiceConvergenceInput(
             services=[taac_types.Service.FSDB],
             timeout=120,

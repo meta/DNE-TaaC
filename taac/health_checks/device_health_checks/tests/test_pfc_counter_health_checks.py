@@ -24,12 +24,14 @@ from taac.utils.oss_taac_lib_utils import ConsoleFileLogger
 from taac.health_check.health_check import types as hc_types
 
 
-def _make_device(name: str = "gtsw001.example", os: str = "FBOSS") -> TestDevice:
+def _make_device(
+    name: str = "gtsw001.example", os: str = "FBOSS", role: str = "GTSW"
+) -> TestDevice:
     device = MagicMock(spec=TestDevice)
     device.name = name
     device.attributes = MagicMock()
     device.attributes.operating_system = os
-    device.attributes.role = "GTSW"
+    device.attributes.role = role
     return device
 
 
@@ -1433,6 +1435,16 @@ class TestPfcCounterHealthChecks(TestCase):
         check.driver.async_get_multiple_port_stats.assert_awaited_once_with(
             ["eth1/1/1"]
         )
+
+    async def test_port_counters_check_runs_on_rb_devices(self) -> None:
+        device = _make_device(name="rb001-02.qzd1", role="RB")
+
+        should_skip, reason = await PortCountersHealthCheck(
+            logger=self.logger
+        ).skip_check(device)
+
+        self.assertFalse(should_skip)
+        self.assertIsNone(reason)
 
     @patch(
         "neteng.test_infra.dne.taac.health_checks.device_health_checks."

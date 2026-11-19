@@ -54,6 +54,97 @@ class IxiaFallbackErrorTest(unittest.TestCase):
 
         self.assertIs(context.exception.__cause__, original_error)
         port_map.Connect.assert_called_once_with(ForceOwnership=True)
+        self.assertIn(
+            "Hardware port state: unavailable (AttributeError", str(context.exception)
+        )
+
+    def _assign_with_hardware_port(
+        self, chassis_hostname: str, owner: str, busy: bool, link_up: bool
+    ) -> tuple[IxiaPortUnavailableError, MagicMock]:
+        ixia = self._make_ixia()
+        port_map = MagicMock()
+        port_map.Connect.side_effect = RuntimeError(
+            "Condition: [Link State ^Link Up$] has not been met after 300 seconds"
+        )
+        ixia.session = SimpleNamespace(
+            PortMapAssistant=MagicMock(return_value=port_map)
+        )
+        cards = MagicMock()
+        cards.Port.find.return_value = [
+            SimpleNamespace(Owner=owner, IsBusy=busy, IsLinkUp=link_up)
+        ]
+        chassis = SimpleNamespace(
+            Hostname=chassis_hostname, Card=SimpleNamespace(find=MagicMock())
+        )
+        chassis.Card.find.return_value = cards
+        ixia.ixnetwork = SimpleNamespace(
+            Vport=MagicMock(),
+            AvailableHardware=SimpleNamespace(
+                Chassis=SimpleNamespace(find=MagicMock(return_value=[chassis]))
+            ),
+        )
+        port_config = ixia_types.PortConfig(
+            port_name="dut1:eth1/1/1",
+            phy_port_config=ixia_types.PhyPortConfig(
+                chassis_ip="2001:db8::23", slot_number=1, port_number=37
+            ),
+        )
+        with self.assertRaises(IxiaPortUnavailableError) as context:
+            ixia.assign_ports([port_config])
+        chassis.Card.find.assert_called_once_with(CardId=1)
+        return context.exception, cards
+
+    def test_port_held_by_another_session_reports_owner(self) -> None:
+        error, cards = self._assign_with_hardware_port(
+            chassis_hostname="2001:db8:0:0:0:0:0:23",
+            owner="IxNetwork/ixnetworkweb/admin-1589-801604",
+            busy=True,
+            link_up=True,
+        )
+
+        cards.Port.find.assert_called_once_with(PortId=37)
+        message = str(error)
+        self.assertIn(
+            "2001:db8::23 1/37: owner=IxNetwork/ixnetworkweb/admin-1589-801604 "
+            "busy=True link_up=True",
+            message,
+        )
+        self.assertIn("held by another IxNetwork session", message)
+        self.assertIn("compare its owner", message)
+        self.assertNotIn("physical link", message)
+
+    def test_port_state_lookup_never_raises(self) -> None:
+        ixia = self._make_ixia()
+        ixia.ixnetwork = SimpleNamespace(
+            AvailableHardware=SimpleNamespace(
+                Chassis=SimpleNamespace(
+                    find=MagicMock(return_value=[SimpleNamespace(Hostname=None)])
+                )
+            )
+        )
+        port_config = ixia_types.PortConfig(
+            port_name="dut1:eth1/1/1",
+            phy_port_config=ixia_types.PhyPortConfig(
+                chassis_ip="ixia.example.com", slot_number=1, port_number=37
+            ),
+        )
+
+        self.assertIn(
+            "unavailable (AttributeError", ixia._hardware_port_states([port_config])
+        )
+
+    def test_physical_link_down_is_reported(self) -> None:
+        error, _ = self._assign_with_hardware_port(
+            chassis_hostname="2001:db8::23",
+            owner="",
+            busy=False,
+            link_up=False,
+        )
+
+        message = str(error)
+        self.assertIn("1/37: owner=none busy=False link_up=False", message)
+        self.assertIn("check the physical link and optics", message)
+        self.assertNotIn("another IxNetwork session", message)
 
     def test_typed_setup_failure_and_orchestrator_cleanup_delete_once(self) -> None:
         ixia = self._make_ixia()

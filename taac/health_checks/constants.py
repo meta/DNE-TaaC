@@ -70,7 +70,8 @@ _ALL_SERVICES: t.Set[str] = {
 _CORE_SERVICES_EXCLUDING_AGENT_ROUTING_PROTOCOL_SERVICES: t.Set[str] = {
     "fsdb",
     "qsfp_service",
-    "coop",
+    # "coop" is left out: chef / fb-coop slowroll restart it on lab DUTs
+    # independently of the test. Speed flip covers coop explicitly.
 }
 
 

@@ -77,7 +77,7 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
             [archive, live],
         )
         command = self.health_check.driver.async_run_cmd_on_shell.call_args.args[0]
-        self.assertIn("fboss_sw_agent.log-*.gz", command)
+        self.assertIn("fboss_sw_agent.log-* ", command)
 
     async def test_real_log_parser_filters_operation_date_and_fraction(self):
         cases = [

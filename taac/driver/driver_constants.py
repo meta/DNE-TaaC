@@ -326,6 +326,7 @@ NET_AI_DSF = "netcastle.lab.dsf"
 NET_AI_LAB_SMC_TIER = "networkai.test"
 NET_AI_LAB_REGRESSION_SMC_TIER = "networkai.test.regression"
 FBOSS_LAB_SMC_TIER = "netcastle.lab.fboss"
+FBOSS_DSF_LAB_SMC_TIER = "netcastle.lab.fboss.dsf"
 
 SYSTEM_DATE_THRESHOLD = 300
 

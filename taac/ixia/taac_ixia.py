@@ -74,6 +74,7 @@ VIEW_TO_IDENTIFIER: t.Dict[str, str] = {
 }
 
 TRAFFIC_ITEM_VIEW = "Traffic Item Statistics"
+FLOW_STATISTICS_VIEW = "Flow Statistics"
 
 PTP_DRILL_DOWN_VIEW = "PTP Drill Down"
 
@@ -399,6 +400,40 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 raw = row[column]
                 stat[key] = float(t.cast(t.Any, raw)) if raw != "" else 0.0
         return stat
+
+    def get_flow_packet_loss_statistics(self) -> t.List[t.Dict[str, object]]:
+        """Return cumulative loss per tracked flow from "Flow Statistics".
+
+        Each row is one traffic item and destination address when the item
+        tracks by destination; the caller diffs readings to attribute loss.
+        """
+        view = self.get_or_create_stat_view(FLOW_STATISTICS_VIEW, timeout=120)
+        stats: t.List[t.Dict[str, object]] = []
+        with self.stat_view_snapshot():
+            for row in self._get_stat_view_rows(view):
+                # IPv4 and IPv6 items share the view, so each row carries both
+                # destination columns and only its own family's is populated.
+                destination = next(
+                    (
+                        row[column]
+                        for column in row.Columns
+                        if column.endswith("Destination Address") and row[column]
+                    ),
+                    None,
+                )
+                if destination is None:
+                    continue
+                stats.append(
+                    {
+                        "traffic_item": row["Traffic Item"],
+                        "destination": destination,
+                        "frame_delta": float(row["Frames Delta"] or 0),
+                        "packet_loss_duration": float(
+                            row["Packet Loss Duration (ms)"] or 0
+                        ),
+                    }
+                )
+        return stats
 
     # No retry — sampler-only; the next tick is the retry. See
     # `get_packet_loss_statistics`.
@@ -2119,6 +2154,105 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 self.logger.warning(f"ng.Stop() failed: {e}")
         self.logger.info(f"[toggle_dlb_pool_enabled] {pool_name} → enabled={enabled}")
 
+    def set_dlb_route_pools_active(
+        self,
+        pool_names: t.Sequence[str],
+        active: bool,
+        expected_route_cells: int,
+        settle_time_after_start: int = 10,
+    ) -> t.Dict[str, t.Dict[str, int]]:
+        """Atomically advertise or withdraw exact DLB BGP route pools.
+
+        Whole-DeviceGroup flaps conflate peer lifecycle with route lifecycle.
+        Case 18 needs the narrower operation: stop only the route-bearing
+        components, update each BGP route property's ``Active`` multivalue,
+        apply all pools once, and fail closed unless every expanded cell reads
+        back the requested value. Components restart only after verification.
+        """
+        self._validate_dlb_route_pool_toggle_args(
+            pool_names,
+            expected_route_cells,
+            settle_time_after_start,
+        )
+
+        shells = {
+            pool_name: self._find_dlb_ng_dg(pool_name) for pool_name in pool_names
+        }
+        for device_group, network_group, _pool, _route in shells.values():
+            device_group.Stop()
+            network_group.Stop()
+        for _device_group, _network_group, _pool, route in shells.values():
+            route.Active.Single(active)
+        self.apply_changes()
+
+        state: t.Dict[str, t.Dict[str, int]] = {}
+        for pool_name in pool_names:
+            route = self._find_dlb_ng_dg(pool_name)[3]
+            state[pool_name] = self._read_dlb_route_pool_active_state(
+                pool_name,
+                route,
+                active,
+                expected_route_cells,
+            )
+
+        for device_group, network_group, _pool, _route in shells.values():
+            network_group.Start()
+            device_group.Start()
+        if settle_time_after_start:
+            time.sleep(settle_time_after_start)
+        if active:
+            for device_group, _network_group, _pool, _route in shells.values():
+                self._send_arp_ns_on_device_group(device_group)
+        self.logger.info(
+            "Verified DLB route-pool Active state active=%s: %s", active, state
+        )
+        return state
+
+    @staticmethod
+    def _validate_dlb_route_pool_toggle_args(
+        pool_names: t.Sequence[str],
+        expected_route_cells: int,
+        settle_time_after_start: int,
+    ) -> None:
+        if not pool_names:
+            raise ValueError("pool_names must contain at least one exact pool name")
+        if len(set(pool_names)) != len(pool_names):
+            raise ValueError("pool_names must not contain duplicates")
+        if expected_route_cells <= 0:
+            raise ValueError("expected_route_cells must be positive")
+        if settle_time_after_start < 0:
+            raise ValueError("settle_time_after_start must be non-negative")
+
+    def _read_dlb_route_pool_active_state(
+        self,
+        pool_name: str,
+        route: t.Any,
+        active: bool,
+        expected_route_cells: int,
+    ) -> t.Dict[str, int]:
+        route.refresh()
+        values = list(route.Active.Values)
+        if len(values) != expected_route_cells:
+            raise RuntimeError(
+                f"DLB pool {pool_name!r} Active readback has {len(values)} "
+                f"cells; expected {expected_route_cells}"
+            )
+        mismatches = [
+            (index, value)
+            for index, value in enumerate(values)
+            if not self._enabled_readback_matches(value, active)
+        ]
+        if mismatches:
+            index, value = mismatches[0]
+            raise RuntimeError(
+                f"DLB pool {pool_name!r} Active readback mismatch at cell "
+                f"{index}: expected {active!r}, got {value!r}"
+            )
+        return {
+            "route_cells": len(values),
+            "active_cells": len(values) if active else 0,
+        }
+
     def configure_traffic_item(
         self,
         traffic_item_name: str,
@@ -2149,6 +2283,30 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         if self.ixia_config is None:
             return []
         return list(self.ixia_config.traffic_items or [])
+
+    def is_traffic_running(self) -> bool:
+        """Treat Keysight's statistics-start transition as running traffic.
+
+        On high-scale traffic, IxNetwork can report the global
+        ``IsTrafficRunning`` flag as false for several minutes while every
+        enabled item is already in ``startedWaitingForStats``. Retrying the
+        whole start path in that state re-applies and restarts the items,
+        preventing the statistics view from ever becoming ready.
+        """
+        if super().is_traffic_running():
+            return True
+        enabled_items = [item for item in self.get_traffic_items() if item.Enabled]
+        if enabled_items and all(
+            item.State in {"started", "startedWaitingForStats"}
+            for item in enabled_items
+        ):
+            self.logger.debug(
+                "Treating enabled IXIA traffic items in %s as running while "
+                "statistics initialize",
+                [item.State for item in enabled_items],
+            )
+            return True
+        return False
 
     def apply_traffic(self) -> None:
         """Serialize `Traffic.Apply()` against chassis CSV snapshots.

@@ -1421,6 +1421,75 @@ class NexthopGroupUnprogrammedToleranceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("without max_unprogrammed", result.message)
 
 
+class NexthopGroupConvergedUnprogrammedTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.task = NexthopGroupPoll(hostname="bag013.ash6", logger=MagicMock())
+        self._plot = patch(_PLOT, new=AsyncMock(return_value=None))
+        self._plot.start()
+        self.addCleanup(self._plot.stop)
+
+    async def _check(self, values: list[int]):
+        self.task._params.update(
+            {
+                "hostname": "bag013.ash6",
+                "threshold": 10_000,
+                "max_converged_unprogrammed": 0,
+                "converged_window_samples": 31,
+            }
+        )
+        for index, value in enumerate(values):
+            self.task.add_data(
+                _summary(2, unprogrammed=value), timestamp=1000 + index * 6
+            )
+        result = await self.task.run_final_check()
+        assert result is not None
+        return result
+
+    async def test_ignores_intentional_transition_bursts(self) -> None:
+        result = await self._check(([0, 8, 8, 8, 0] * 4) + ([0] * 31))
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status, result.message)
+        self.assertIn("converged unprogrammed OK", result.message)
+
+    async def test_fails_when_closing_window_is_not_programmed(self) -> None:
+        result = await self._check(([0, 8, 8, 0] * 4) + ([0] * 30) + [1])
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("converged unprogrammed BREACH", result.message)
+
+    async def test_short_closing_window_refuses_to_evaluate(self) -> None:
+        result = await self._check([0] * 30)
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("NOT EVALUATED", result.message)
+
+    async def test_negative_ceiling_is_a_config_breach(self) -> None:
+        self.task._params.update(
+            {
+                "hostname": "bag013.ash6",
+                "threshold": 10_000,
+                "max_converged_unprogrammed": -1,
+            }
+        )
+        self.task.add_data(_summary(2), timestamp=1000)
+
+        result = await self.task.run_final_check()
+        assert result is not None
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("config BREACH", result.message)
+
+    async def test_default_does_not_add_a_converged_verdict(self) -> None:
+        self.task._params.update({"hostname": "bag013.ash6", "threshold": 10_000})
+        self.task.add_data(_summary(2), timestamp=1000)
+
+        result = await self.task.run_final_check()
+        assert result is not None
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertNotIn("converged unprogrammed", result.message)
+
+
 class BgpNexthopGroupParsingTest(unittest.TestCase):
     def test_keeps_only_named_bgp_groups_and_their_widths(self) -> None:
         data = {
@@ -1891,6 +1960,17 @@ class BgpNexthopGroupVerdictTest(unittest.TestCase):
 
 
 class NexthopGroupTaskDefinitionTest(unittest.TestCase):
+    def test_serializes_opt_in_converged_unprogrammed_ceiling(self) -> None:
+        task = create_nexthop_group_poll_periodic_task(
+            device_name="bag010.ash6",
+            max_converged_unprogrammed=0,
+        )
+        params_list = task.params_list or []
+        json_params = params_list[0].json_params
+        assert json_params is not None
+
+        self.assertEqual(0, json.loads(json_params)["max_converged_unprogrammed"])
+
     def test_serializes_opt_in_global_eos_ceiling(self) -> None:
         task = create_nexthop_group_poll_periodic_task(
             device_name="bag010.ash6",
@@ -1912,3 +1992,4 @@ class NexthopGroupTaskDefinitionTest(unittest.TestCase):
 
         self.assertNotIn("max_programmed_groups", json.loads(json_params))
         self.assertNotIn("min_programmed_groups", json.loads(json_params))
+        self.assertNotIn("max_converged_unprogrammed", json.loads(json_params))

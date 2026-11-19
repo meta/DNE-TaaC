@@ -1,4 +1,3 @@
-# pyre-unsafe
 """
 Centralized Playbook factory definitions.
 
@@ -13,6 +12,7 @@ The runner-side abstract base class lives in `playbooks/playbook.py`.
 import json
 import math
 import re
+import shlex
 import typing as t
 import uuid
 from enum import Enum
@@ -84,6 +84,7 @@ from taac.health_checks.healthcheck_definitions import (
     create_port_channel_state_snapshot_check,
     create_port_counters_check,
     create_port_queue_rate_check,
+    create_port_speed_check,
     create_port_state_check,
     create_port_transceiver_check,
     create_port_tx_rx_check,
@@ -134,10 +135,12 @@ from taac.stages.stage_definitions import (
 )
 from taac.steps.step_definitions import (
     create_bgp_instability_setup_steps,
+    create_cbag_acacia_transceiver_reset_step,
     create_multipath_nexthop_count_health_check_step,
     create_allocate_cgroup_memory_step,
     create_clear_port_stats_step,
     create_clear_traffic_stats_step,
+    create_bgp_ixia_session_recovery_step,
     create_custom_step,
     create_drain_undrain_step,
     create_ecmp_member_static_route_step,
@@ -1381,6 +1384,7 @@ def add_common_checks_to_cpu_queue_playbooks(
     unique_prefix_limit: int,
     ixia_packet_loss_threshold: str = "0.1",
     service_restart_services: list[str] | None = None,
+    systemctl_services: list[hc_types.Service] | None = None,
 ) -> list[Playbook]:
     """Add former TestConfig-level checks to each playbook from create_cpu_queue_playbooks().
 
@@ -1399,11 +1403,15 @@ def add_common_checks_to_cpu_queue_playbooks(
     qsfp_service, wedge_agent). Set explicitly to drop services not present on
     a given DUT — e.g. IcePack backend GTSWs don't run openr, so omitting it
     here avoids a postcheck false-fail on INACTIVE.
+
+    `systemctl_services` scopes the precheck `SYSTEMCTL_ACTIVE_STATE_CHECK`.
+    Default (None) checks every service, including `fboss_hw_agent@1`, which
+    raises on single-ASIC native NetOS DUTs such as MINIPACK3NM.
     """
     common_prechecks = [
         create_drain_state_check(),
         create_bgp_session_establish_check(),
-        create_systemctl_active_state_check(),
+        create_systemctl_active_state_check(services=systemctl_services),
         create_prefix_limit_check(prefix_limit=unique_prefix_limit),
         create_memory_utilization_check(
             threshold=5 * (1024**3),  # 5gb
@@ -1812,6 +1820,7 @@ def create_thft_playbooks(
     flap_burst_timeout_s: float = 60.0,
     include_kitchen_sink: bool = False,
     kitchen_sink_test_duration_s: int | None = None,
+    agent_restart_service: Service = Service.AGENT,
 ) -> list[Playbook]:
     """Return the standard NPI THFT playbook set for any FBOSS DUT.
 
@@ -1827,6 +1836,7 @@ def create_thft_playbooks(
     and `kitchen_sink_test_duration_s` can independently set the optional
     kitchen-sink duration. Omitting it preserves the existing behavior of
     using `test_duration_s` for the kitchen sink.
+    `agent_restart_service` selects the foreground target of THFT_002.
     """
     playbooks: list[Playbook] = []
     playbooks.append(
@@ -1845,6 +1855,9 @@ def create_thft_playbooks(
         service,
         service_label,
     ) in _THFT_RESTART_VARIANTS:
+        if playbook_number == 2:
+            service = agent_restart_service
+            service_label = taac_types.SERVICE_NAME_MAP[agent_restart_service]
         playbooks.append(
             create_thft_restart_playbook(
                 device_name=device_name,
@@ -1880,6 +1893,9 @@ def add_common_checks_to_thft_playbooks(
     require_all_bgp_sessions_established: bool = True,
     expected_established_bgp_sessions: int | None = None,
     compare_bgp_peer_routes: bool = True,
+    systemctl_active_services: list[str] | None = None,
+    check_scope: hc_types.Scope | None = None,
+    expected_restart_cascades: dict[str, list[str]] | None = None,
 ) -> list[Playbook]:
     """Add THFT validation chain (BGP-only mirror of cpu_queue's chain).
 
@@ -1897,6 +1913,9 @@ def add_common_checks_to_thft_playbooks(
     to drop services not present on a given DUT — e.g. IcePack backend
     GTSWs don't run openr, so omitting it here avoids a postcheck
     false-fail on INACTIVE.
+
+    `expected_restart_cascades` supplies device-specific replacements for
+    the restart expectations keyed by playbook name suffix.
 
     `SERVICE_RESTART_CHECK` semantics per playbook:
       - THFT_001 (baseline, no foreground restart): plain check, any
@@ -1938,7 +1957,7 @@ def add_common_checks_to_thft_playbooks(
                 else []
             )
         ),
-        create_systemctl_active_state_check(),
+        create_systemctl_active_state_check(services_json=systemctl_active_services),
         create_memory_utilization_check(
             threshold=5 * (1024**3),  # 5 GiB
             start_time_jq_var="test_case_start_time",
@@ -1968,10 +1987,12 @@ def add_common_checks_to_thft_playbooks(
     # propagate and don't need to be listed here.
     _restart_suffix_to_daemons: dict[str, list[str]] = {
         "_with_restart_wedge_agent": WEDGE_AGENT_BINDS_TO_CASCADE,
+        "_with_restart_fboss_sw_agent": ["fboss_sw_agent"],
         "_with_restart_bgpd": ["bgpd"],
         "_with_restart_qsfp_service": ["qsfp_service"],
         "_with_restart_fsdb": ["fsdb"],
     }
+    _restart_suffix_to_daemons.update(expected_restart_cascades or {})
     result = []
     for pb in playbooks:
         expected_restarted = None
@@ -2003,6 +2024,13 @@ def add_common_checks_to_thft_playbooks(
                 threshold=400.0, start_time_jq_var="test_case_start_time"
             ),
         ]
+        prechecks = list(pb.prechecks or []) + common_prechecks
+        postchecks = per_playbook_postchecks + list(pb.postchecks or [])
+        snapshot_checks = list(pb.snapshot_checks or []) + common_snapshot_checks
+        if check_scope is not None:
+            prechecks = [check(check_scope=check_scope) for check in prechecks]
+            postchecks = [check(check_scope=check_scope) for check in postchecks]
+            snapshot_checks = [check(check_scope=check_scope) for check in snapshot_checks]
         result.append(
             Playbook(
                 name=pb.name,
@@ -2012,9 +2040,9 @@ def add_common_checks_to_thft_playbooks(
                 traffic_items_to_start=pb.traffic_items_to_start,
                 enabled=pb.enabled,
                 backup_and_restore_ixia_config=pb.backup_and_restore_ixia_config,
-                prechecks=list(pb.prechecks or []) + common_prechecks,
-                postchecks=per_playbook_postchecks + list(pb.postchecks or []),
-                snapshot_checks=list(pb.snapshot_checks or []) + common_snapshot_checks,
+                prechecks=prechecks,
+                postchecks=postchecks,
+                snapshot_checks=snapshot_checks,
                 skip_test_config_prechecks=pb.skip_test_config_prechecks,
                 skip_test_config_postchecks=pb.skip_test_config_postchecks,
                 skip_test_config_snapshot_checks=pb.skip_test_config_snapshot_checks,
@@ -2555,7 +2583,7 @@ def create_case1_tcp_socket_data_collection_playbook(
                         task_name="arista_daemon_control",
                         params_dict={
                             "hostname": bgpcpp_device,
-                            "daemon_name": "Bgp",
+                            "daemon_name": "Bgpcpp",
                             "action": "disable",
                         },
                     ),
@@ -2563,7 +2591,7 @@ def create_case1_tcp_socket_data_collection_playbook(
                         task_name="arista_daemon_control",
                         params_dict={
                             "hostname": bgpcpp_device,
-                            "daemon_name": "Bgp",
+                            "daemon_name": "Bgpcpp",
                             "action": "enable",
                         },
                     ),
@@ -3514,7 +3542,7 @@ def create_case2_tcp_socket_data_collection_playbook(
                         task_name="arista_daemon_control",
                         params_dict={
                             "hostname": bgpcpp_device,
-                            "daemon_name": "Bgp",
+                            "daemon_name": "Bgpcpp",
                             "action": "disable",
                         },
                     ),
@@ -3522,7 +3550,7 @@ def create_case2_tcp_socket_data_collection_playbook(
                         task_name="arista_daemon_control",
                         params_dict={
                             "hostname": bgpcpp_device,
-                            "daemon_name": "Bgp",
+                            "daemon_name": "Bgpcpp",
                             "action": "enable",
                         },
                     ),
@@ -4471,6 +4499,213 @@ def create_bidirectional_speed_flip_playbook(
     )
 
 
+class SpeedFlipPatcherSpec(t.NamedTuple):
+    """One named speed patcher used by a stateful transition playbook."""
+
+    name: str
+    endpoints: t.Dict[str, t.List[str]]
+    speed_in_gbps: int
+
+
+class SpeedFlipPortStateVariant(t.NamedTuple):
+    """Initial administrative state applied before one transition cycle."""
+
+    name: str
+    initially_up_endpoints: t.Optional[t.Dict[str, t.List[str]]] = None
+    initially_down_endpoints: t.Optional[t.Dict[str, t.List[str]]] = None
+
+
+def create_stateful_bidirectional_speed_flip_playbook(  # noqa: C901
+    name: str,
+    initial_patchers: t.List[SpeedFlipPatcherSpec],
+    target_patchers: t.List[SpeedFlipPatcherSpec],
+    initial_health_check_params: t.Dict[str, t.Any],
+    target_health_check_params: t.Dict[str, t.Any],
+    target_port_cage_count: int,
+    restored_health_check_params: t.Optional[t.Dict[str, t.Any]] = None,
+    target_oper_down_endpoints: t.Optional[t.Dict[str, t.List[str]]] = None,
+    state_variants: t.Optional[t.List[SpeedFlipPortStateVariant]] = None,
+    target_trigger_stages: t.Optional[t.List[taac_types.Stage]] = None,
+    initial_trigger_stages: t.Optional[t.List[taac_types.Stage]] = None,
+    prechecks: t.Optional[t.List[taac_types.PointInTimeHealthCheck]] = None,
+    postchecks: t.Optional[t.List[taac_types.PointInTimeHealthCheck]] = None,
+    snapshot_checks: t.Optional[t.List[taac_types.SnapshotHealthCheck]] = None,
+    traffic_items_to_start: t.Optional[t.List[str]] = None,
+    iteration: int = 1,
+) -> Playbook:
+    """Build repeatable initial-state, target-state, and reverse transitions.
+
+    Each cycle registers every initial-state patcher, validates that state,
+    registers the target-state patchers, validates the target, and then removes
+    patchers in LIFO order to prove the reverse transition. Registration and
+    unregistration use the existing speed-patcher step, which warmboots the
+    agent after applying Coop configuration.
+
+    ``state_variants`` lets a caller repeat the cycle with different explicit
+    initial port states. This is useful for reduced-topology subsumption tests,
+    where one physical cage exercises an initially-up and initially-down
+    subsumable port in separate cycles.
+    """
+    if not initial_patchers:
+        raise ValueError("At least one initial-state patcher is required")
+    if not target_patchers:
+        raise ValueError("At least one target-state patcher is required")
+
+    variants = state_variants or [SpeedFlipPortStateVariant(name="default")]
+    target_down = target_oper_down_endpoints or {}
+
+    def patcher_step(
+        spec: SpeedFlipPatcherSpec, register_patcher: bool
+    ) -> taac_types.Step:
+        return create_register_speed_flip_patcher_step(
+            register_patcher=register_patcher,
+            port_state_change=False,
+            patcher_name=spec.name,
+            endpoints=spec.endpoints,
+            speed_in_gbps=spec.speed_in_gbps,
+            target_port_cage_count=target_port_cage_count,
+        )
+
+    def patcher_stages(
+        specs: t.Iterable[SpeedFlipPatcherSpec], register_patcher: bool
+    ) -> t.List[taac_types.Stage]:
+        return [
+            create_steps_stage(steps=[patcher_step(spec, register_patcher)])
+            for spec in specs
+        ]
+
+    def health_check_endpoints(
+        params: t.Dict[str, t.Any],
+    ) -> t.Dict[str, t.List[str]]:
+        return {
+            hostname: [
+                interface["interface_name"]
+                for interface in device_params["interfaces"]
+            ]
+            for hostname, device_params in params.items()
+        }
+
+    def validation_stage(
+        health_check_params: t.Dict[str, t.Any],
+        down_endpoints: t.Optional[t.Dict[str, t.List[str]]] = None,
+    ) -> taac_types.Stage:
+        down = down_endpoints or {}
+        expected_endpoints = health_check_endpoints(health_check_params)
+        steps: t.List[taac_types.Step] = []
+        for hostname, interfaces in expected_endpoints.items():
+            up_interfaces = [
+                interface
+                for interface in interfaces
+                if interface not in down.get(hostname, [])
+            ]
+            if up_interfaces:
+                steps.append(
+                    create_verify_port_operational_state_step(
+                        interfaces=up_interfaces,
+                        operational_state=True,
+                        device_regexes=[hostname],
+                    )
+                )
+        for hostname, interfaces in down.items():
+            if interfaces:
+                steps.append(
+                    create_verify_port_operational_state_step(
+                        interfaces=interfaces,
+                        operational_state=False,
+                        device_regexes=[hostname],
+                    )
+                )
+        steps.append(create_port_speed_validation_step(health_check_params))
+        return create_steps_stage(steps=steps)
+
+    def admin_state_stages(
+        endpoints: t.Optional[t.Dict[str, t.List[str]]], enable: bool
+    ) -> t.List[taac_types.Stage]:
+        if not endpoints:
+            return []
+        return [
+            create_steps_stage(
+                steps=[
+                    create_interface_flap_step(
+                        enable=enable,
+                        interfaces=interfaces,
+                        interface_flap_method=(
+                            taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE
+                        ),
+                        device_name=hostname,
+                        start_traffic=False,
+                    )
+                    for hostname, interfaces in endpoints.items()
+                    if interfaces
+                ]
+            )
+        ]
+
+    stages: t.List[taac_types.Stage] = []
+    cleanup_steps: t.List[taac_types.Step] = []
+    cleanup_down_endpoints: t.Dict[str, t.List[str]] = {}
+    for variant in variants:
+        initial_down = variant.initially_down_endpoints or {}
+        for hostname, interfaces in initial_down.items():
+            cleanup_down_endpoints.setdefault(hostname, []).extend(
+                interface
+                for interface in interfaces
+                if interface not in cleanup_down_endpoints.get(hostname, [])
+            )
+        stages.extend(patcher_stages(initial_patchers, register_patcher=True))
+        stages.extend(admin_state_stages(variant.initially_up_endpoints, enable=True))
+        stages.extend(admin_state_stages(initial_down, enable=False))
+        stages.append(validation_stage(initial_health_check_params, initial_down))
+        stages.extend(patcher_stages(target_patchers, register_patcher=True))
+        stages.append(validation_stage(target_health_check_params, target_down))
+        stages.extend(target_trigger_stages or [])
+        stages.extend(
+            patcher_stages(reversed(target_patchers), register_patcher=False)
+        )
+        stages.append(validation_stage(initial_health_check_params, initial_down))
+        stages.extend(initial_trigger_stages or [])
+        stages.extend(admin_state_stages(initial_down, enable=True))
+        if initial_down:
+            stages.append(validation_stage(initial_health_check_params))
+        stages.extend(
+            patcher_stages(reversed(initial_patchers), register_patcher=False)
+        )
+        if restored_health_check_params:
+            stages.append(validation_stage(restored_health_check_params))
+
+    cleanup_steps.extend(
+        patcher_step(spec, register_patcher=False)
+        for spec in reversed(target_patchers)
+    )
+    cleanup_steps.extend(
+        patcher_step(spec, register_patcher=False)
+        for spec in reversed(initial_patchers)
+    )
+    for hostname, interfaces in cleanup_down_endpoints.items():
+        cleanup_steps.append(
+            create_interface_flap_step(
+                enable=True,
+                interfaces=interfaces,
+                interface_flap_method=(
+                    taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE
+                ),
+                device_name=hostname,
+                start_traffic=False,
+            )
+        )
+
+    return Playbook(
+        name=name,
+        stages=stages,
+        iteration=iteration,
+        prechecks=prechecks,
+        postchecks=postchecks,
+        snapshot_checks=snapshot_checks,
+        traffic_items_to_start=traffic_items_to_start,
+        cleanup_steps=cleanup_steps,
+    )
+
+
 def create_speed_flip_test_config_playbook(
     built_playbook: Playbook,
     snapshot_checks: t.List,
@@ -4852,6 +5087,128 @@ def get_cbag_agent_interruption_playbook(
         ],
         traffic_items_to_start=traffic_items_to_start,
         iteration=iteration,
+    )
+
+
+def create_cbag_acacia_transceiver_reset_playbook(
+    reset_device: str = "cbag001.qzp1",
+    traffic_items_to_start: t.Optional[t.List[str]] = None,
+    measured_interfaces_by_device: t.Optional[t.Dict[str, t.List[str]]] = None,
+    expected_bgp_sessions_by_device: t.Optional[t.Dict[str, int]] = None,
+    bgp_sessions_blocking: bool = False,
+    iteration: int = 50,
+    removal_hold_seconds: int = 120,
+    recovery_timeout_seconds: int = 600,
+    recovery_poll_interval_seconds: int = 10,
+    stability_window_seconds: int = 30,
+    traffic_observation_seconds: int = 240,
+    loss_settle_seconds: int = 60,
+) -> Playbook:
+    """Build the fail-fast CBAG Acacia simulated-removal endurance playbook."""
+    if not reset_device:
+        raise ValueError("reset_device must be non-empty")
+    if isinstance(iteration, bool) or not 1 <= iteration <= 50:
+        raise ValueError("iteration must be an integer in [1, 50]")
+    traffic_items = traffic_items_to_start or [
+        "RDMA_CBAG001_TO_BAG001",
+        "RDMA_CBAG001_TO_BAG002",
+    ]
+    measured_interfaces = measured_interfaces_by_device or {
+        hostname: [
+            "Ethernet4/32/1",
+            "Ethernet4/32/5",
+            "Ethernet4/36/1",
+            "Ethernet4/36/5",
+        ]
+        for hostname in ("cbag001.qzp1", "bag001.qzq1", "bag002.qzq1")
+    }
+    expected_bgp_sessions = expected_bgp_sessions_by_device or {
+        "cbag001.qzp1": 404,
+        "bag001.qzq1": 204,
+        "bag002.qzq1": 204,
+    }
+    if not traffic_items or any(not item for item in traffic_items):
+        raise ValueError("traffic_items_to_start must contain non-empty names")
+
+    return Playbook(
+        name="test_cbag_bag_acacia_transceiver_reset",
+        device_regexes=[reset_device],
+        prechecks=[
+            create_port_state_check(
+                retry_count=12,
+                retry_delay_seconds=10,
+                retry_delay_multiplier=1.0,
+            ),
+            create_port_speed_check(
+                json_params={
+                    hostname: {
+                        "interfaces": [
+                            {"interface_name": interface, "expected_speed": 400}
+                            for interface in interfaces
+                        ]
+                    }
+                    for hostname, interfaces in measured_interfaces.items()
+                }
+            ),
+        ],
+        stages=[
+            create_steps_stage(
+                steps=[
+                    create_cbag_acacia_transceiver_reset_step(
+                        reset_device=reset_device,
+                        traffic_items=traffic_items,
+                        measured_interfaces_by_device=measured_interfaces,
+                        expected_bgp_sessions_by_device=expected_bgp_sessions,
+                        bgp_sessions_blocking=bgp_sessions_blocking,
+                        removal_hold_seconds=removal_hold_seconds,
+                        recovery_timeout_seconds=recovery_timeout_seconds,
+                        recovery_poll_interval_seconds=recovery_poll_interval_seconds,
+                        stability_window_seconds=stability_window_seconds,
+                        traffic_observation_seconds=traffic_observation_seconds,
+                        loss_settle_seconds=loss_settle_seconds,
+                        iteration_count=iteration,
+                    )
+                ],
+                description="Reset CBAG Acacia optics and verify lossless recovery",
+            )
+        ],
+        postchecks=[
+            create_port_state_check(
+                retry_count=12,
+                retry_delay_seconds=10,
+                retry_delay_multiplier=1.0,
+            ),
+            create_port_speed_check(
+                json_params={
+                    hostname: {
+                        "interfaces": [
+                            {"interface_name": interface, "expected_speed": 400}
+                            for interface in interfaces
+                        ]
+                    }
+                    for hostname, interfaces in measured_interfaces.items()
+                }
+            ),
+            create_cpu_utilization_check(
+                threshold=40.0,
+                start_time_jq_var="test_case_start_time",
+            ),
+            create_memory_utilization_check(
+                threshold=Gigabyte.GIG_4_POINT_3.value,
+                start_time_jq_var="test_case_start_time",
+            ),
+        ],
+        snapshot_checks=[
+            create_bgp_session_snapshot_check(
+                skip_flap_check=True,
+                skip_uptime_check=True,
+            ),
+            create_core_dumps_snapshot_check(),
+        ],
+        traffic_items_to_start=traffic_items,
+        # Keep every reset in one test case so the first loss/PCS failure
+        # aborts the loop instead of allowing later parameterized cases to run.
+        iteration=1,
     )
 
 
@@ -11973,8 +12330,14 @@ def create_longevity_no_prefix_no_session_flap_playbook(
 def create_longevity_continuous_toggle_device_group_playbook(
     cycles: int = 12,
     state_duration_s: int = 120,
+    device_group_name_regex: str = "ROGUE|NO_PACKET_LOSS_EXPECTED|ECMP_1|ARP|NDP",
 ) -> Playbook:
-    """BGP_DC longevity playbook: continuously toggle rogue device groups."""
+    """BGP_DC longevity playbook: continuously toggle rogue device groups.
+
+    Args:
+        device_group_name_regex: IXIA device groups to toggle. Override it when a
+            port carries an `NDP_HANDLER` group, which the default `NDP` matches.
+    """
     return Playbook(
         name="test_longevity_continuous_toggle_device_group",
         postchecks=[
@@ -11986,7 +12349,7 @@ def create_longevity_continuous_toggle_device_group_playbook(
                 api_name="toggle_device_groups",
                 args_dict={
                     "enable": True,
-                    "device_group_name_regex": "ROGUE|NO_PACKET_LOSS_EXPECTED|ECMP_1|ARP|NDP",
+                    "device_group_name_regex": device_group_name_regex,
                 },
             ),
         ],
@@ -12000,7 +12363,7 @@ def create_longevity_continuous_toggle_device_group_playbook(
                             api_name="toggle_device_groups",
                             args_dict={
                                 "enable": True,
-                                "device_group_name_regex": "ROGUE|NO_PACKET_LOSS_EXPECTED|ECMP_1|ARP|NDP",
+                                "device_group_name_regex": device_group_name_regex,
                             },
                         ),
                         create_longevity_step(duration=state_duration_s),
@@ -12008,7 +12371,7 @@ def create_longevity_continuous_toggle_device_group_playbook(
                             api_name="toggle_device_groups",
                             args_dict={
                                 "enable": False,
-                                "device_group_name_regex": "ROGUE|NO_PACKET_LOSS_EXPECTED|ECMP_1|ARP|NDP",
+                                "device_group_name_regex": device_group_name_regex,
                             },
                         ),
                         create_longevity_step(duration=state_duration_s),
@@ -14739,6 +15102,64 @@ def create_spillover_testing_playbooks(
 # the first hardware run on a given platform (W400/IcePack derived theirs
 # empirically).
 # =============================================================================
+def _ecmp_post_churn_recovery_stage(
+    main_traffic: str, rouge_traffic: str, settle_seconds: int
+) -> Stage:
+    """Strict recovery check for the overcommit churn playbooks.
+
+    Their postcheck loss thresholds are record-only. This stage runs after
+    flapping is disarmed, waits ``settle_seconds``, snapshots the hardware ECMP
+    table, and requires the steady state the plain overcommit playbook asserts
+    on freshly cleared counters: Main 0% loss and Rouge fully rejected.
+    """
+    recovery_loss_check = create_ixia_packet_loss_check(
+        clear_traffic_stats=True,
+        sleep_time=30,
+        thresholds=[
+            hc_types.PacketLossThreshold(
+                names=[main_traffic],
+                str_value="0",
+                metric=hc_types.PacketLossMetric.PERCENTAGE,
+            ),
+            hc_types.PacketLossThreshold(
+                names=[rouge_traffic],
+                str_value="100",
+                metric=hc_types.PacketLossMetric.PERCENTAGE,
+                comparison=hc_types.ComparisonType.GREATER_THAN_EQUAL_TO,
+            ),
+        ],
+    )
+    return create_steps_stage(
+        stage_id="post_churn_recovery",
+        steps=[
+            create_longevity_step(
+                duration=settle_seconds, description="Post-churn recovery settle"
+            ),
+            create_run_ssh_command_step(
+                cmd=(
+                    "o=$(fboss2 show hw-object NEXT_HOP_GROUP 2>/dev/null); "
+                    'echo "post-churn groups=$(echo "$o" | grep -c '
+                    "'^NextHopGroupSaiId') members=$(echo \"$o\" | grep -c "
+                    "'^NextHopGroupMemberSaiId')\""
+                ),
+                description="Snapshot hardware ECMP table after churn",
+                log_output=True,
+            ),
+            create_validation_step(
+                point_in_time_checks=[recovery_loss_check],
+                description="Post-churn recovery: Main 0% loss, Rouge fully rejected",
+                fail_on_failure=True,
+            ),
+            # The loss check stops traffic; the playbook postchecks need it.
+            create_ixia_api_step(
+                api_name="start_traffic",
+                args_dict={},
+                description="Restart traffic for postchecks",
+            ),
+        ],
+    )
+
+
 def create_ecmp_only_groups_playbooks(
     source_interface: str,
     asic: EcmpAsic = EcmpAsic.G200,
@@ -14747,6 +15168,7 @@ def create_ecmp_only_groups_playbooks(
     disruptive_iterations: int = 5,
     disruptive_settle_seconds: int = 300,
     overflow_settle_seconds: int = 180,
+    post_churn_recovery_seconds: int | None = None,
 ) -> list[Playbook]:
     """ECMP-ONLY Group-utilization playbooks (fill the GROUP table).
 
@@ -14868,7 +15290,9 @@ def create_ecmp_only_groups_playbooks(
         # full complement of groups with ZERO members, because their next-hops
         # never re-resolved. Gating on groups only would green-light a device
         # that forwards nothing, so require resolved next-hops too.
-        expected = profile.max_ecmp_groups
+        # The dump also holds the DUT's own fabric groups and next-hops, so
+        # both are lower bounds.
+        expected = profile.main_ecmp_groups
         nh = profile.ndp_pool_multiplier
         return create_run_ssh_command_step(
             cmd=(
@@ -14877,7 +15301,7 @@ def create_ecmp_only_groups_playbooks(
                 "g=$(echo \"$o\" | grep -c '^NextHopGroupSaiId'); "
                 "m=$(echo \"$o\" | grep -c '^NextHopGroupMemberSaiId'); "
                 "h=$(echo \"$o\" | grep -oE 'NextHopId: [0-9]+' | sort -u | wc -l); "
-                f'if [ "$g" -eq {expected} ] && [ "$m" -gt 0 ] && [ "$h" -eq {nh} ]; '
+                f'if [ "$g" -ge {expected} ] && [ "$m" -gt 0 ] && [ "$h" -ge {nh} ]; '
                 f'then echo "Main programmed: groups=$g/{expected} members=$m '
                 f'next_hops=$h/{nh}"; exit 0; fi; '
                 "sleep 10; done; "
@@ -15059,7 +15483,16 @@ def create_ecmp_only_groups_playbooks(
             setup_steps=_configure_steps(overcommit),
             stages=_admit_overflow_stages(overcommit)
             + ra_stages
-            + _disruptive_stages(service, cold_boot),
+            + _disruptive_stages(service, cold_boot)
+            + (
+                [
+                    _ecmp_post_churn_recovery_stage(
+                        main_traffic, rouge_traffic, post_churn_recovery_seconds
+                    )
+                ]
+                if overcommit and post_churn_recovery_seconds is not None
+                else []
+            ),
             skip_test_config_snapshot_checks=True,
             # Only overcommit churns: Full_Utilization flaps too, but with Rouge
             # disabled there is no second pool to contend for the freed
@@ -15099,6 +15532,7 @@ def create_ecmp_only_members_playbooks(
     disruptive_iterations: int = 5,
     disruptive_settle_seconds: int = 300,
     overflow_settle_seconds: int = 180,
+    post_churn_recovery_seconds: int | None = None,
 ) -> list[Playbook]:
     """ECMP-ONLY Member-utilization playbooks (fill the MEMBER table).
 
@@ -15194,11 +15628,11 @@ def create_ecmp_only_members_playbooks(
             args_dict={
                 "network_group_name_regex": ".*MAIN_ECMP_PREFIXES.*",
                 "ecmp_width": profile.member_util_width,
-                "network_group_multiplier": profile.max_ecmp_members,
+                "network_group_multiplier": profile.main_ecmp_members,
             },
             description=(
                 f"Set Main ECMP group to width {profile.member_util_width} / "
-                f"multiplier {profile.max_ecmp_members} "
+                f"multiplier {profile.main_ecmp_members} "
                 "for Member-util testing (fills member table)"
             ),
         )
@@ -15229,7 +15663,8 @@ def create_ecmp_only_members_playbooks(
         # because the dump is large and intermittently comes back empty.
         # See the Group-util gate: member count on its own can be satisfied
         # while next-hops are unresolved, so require the full next-hop pool too.
-        expected = profile.max_ecmp_members
+        # Lower bounds, as in the Group-util gate.
+        expected = profile.main_ecmp_members
         nh = profile.ndp_pool_multiplier
         return create_run_ssh_command_step(
             cmd=(
@@ -15237,7 +15672,7 @@ def create_ecmp_only_members_playbooks(
                 "o=$(fboss2 show hw-object NEXT_HOP_GROUP 2>/dev/null); "
                 "m=$(echo \"$o\" | grep -c '^NextHopGroupMemberSaiId'); "
                 "h=$(echo \"$o\" | grep -oE 'NextHopId: [0-9]+' | sort -u | wc -l); "
-                f'if [ "$m" -eq {expected} ] && [ "$h" -eq {nh} ]; then '
+                f'if [ "$m" -ge {expected} ] && [ "$h" -ge {nh} ]; then '
                 f'echo "Main programmed: members=$m/{expected} '
                 f'next_hops=$h/{nh}"; exit 0; fi; '
                 "sleep 10; done; "
@@ -15410,7 +15845,16 @@ def create_ecmp_only_members_playbooks(
             setup_steps=_configure_steps(overcommit),
             stages=_admit_overflow_stages(overcommit)
             + ra_stages
-            + _disruptive_stages(service, cold_boot),
+            + _disruptive_stages(service, cold_boot)
+            + (
+                [
+                    _ecmp_post_churn_recovery_stage(
+                        main_traffic, rouge_traffic, post_churn_recovery_seconds
+                    )
+                ]
+                if overcommit and post_churn_recovery_seconds is not None
+                else []
+            ),
             skip_test_config_snapshot_checks=True,
             # Only overcommit churns: Full_Utilization flaps too, but with Rouge
             # disabled there is no second pool to contend for the freed
@@ -16389,6 +16833,525 @@ def create_system_reboot_playbooks(
     ]
 
 
+def create_rbb_3x200g_zr_playbooks(
+    *,
+    devices: t.List[t.Dict[str, t.Any]],
+    ixia_peer_addresses: t.List[str],
+    traffic_item_name: str,
+    iteration: int = 10,
+    qsfp_reset_error_monitoring_iteration: int = 50,
+    qsfp_reset_error_monitoring_targets: t.Optional[t.Dict[str, str]] = None,
+    recovery_wait_s: int = 300,
+    control_plane_settle_s: int = 120,
+    error_monitoring_observation_s: int = 180,
+    longevity_duration_s: int = 12 * 60 * 60,
+    max_packet_loss_duration_ms: str = "25",
+) -> t.List[Playbook]:
+    """Build non-system-reboot qualification playbooks for a 3x200G ZR LAG.
+
+    ``devices`` contains one entry per RBB with ``hostname``,
+    ``zr_port_channel``, ``zr_members`` and ``non_zr_interface``. Every
+    disruptive case is generated once per device. Dedicated QSFP-reset error
+    monitoring playbooks are additionally generated for entries in
+    ``qsfp_reset_error_monitoring_targets``. Device health checks remain
+    topology-scoped and therefore validate both ends after each disruption.
+
+    TAAC testbed isolation removes links to devices outside the declared
+    topology. ``PORT_STATE_CHECK`` only treats links between declared endpoints
+    as its implicit enabled set; the three ZR members are added explicitly and
+    the non-ZR interface is explicitly expected down. Other isolated ports do
+    not participate in this check.
+    """
+
+    def _device_tag(device: t.Dict[str, t.Any]) -> str:
+        return device["hostname"].replace(".", "_").replace("-", "_")
+
+    def _disabled_interfaces() -> t.List[t.Dict[str, str]]:
+        return [
+            {
+                "switch_name": device["hostname"],
+                "interface_name": device["non_zr_interface"],
+            }
+            for device in devices
+        ]
+
+    def _zr_member_interfaces() -> t.List[t.Dict[str, str]]:
+        return [
+            {"switch_name": device["hostname"], "interface_name": member}
+            for device in devices
+            for member in device["zr_members"]
+        ]
+
+    def _port_channel_names() -> t.Dict[str, t.List[str]]:
+        return {
+            device["hostname"]: [device["zr_port_channel"]]
+            for device in devices
+        }
+
+    def _port_speed_params() -> t.Dict[str, t.Dict[str, t.Any]]:
+        return {
+            device["hostname"]: {
+                "interfaces": [
+                    {"interface_name": member, "expected_speed": 200}
+                    for member in device["zr_members"]
+                ]
+            }
+            for device in devices
+        }
+
+    def _link_recovery_checks() -> t.List[PointInTimeHealthCheck]:
+        return [
+            create_port_state_check(
+                additional_interfaces=_zr_member_interfaces(),
+                disabled_interfaces=_disabled_interfaces(),
+                retry_count=30,
+                retry_delay_seconds=10,
+                retry_delay_multiplier=1.0,
+            ),
+            create_port_speed_check(json_params=_port_speed_params()),
+            create_port_channel_expected_state_check(
+                json_params={
+                    "port_channel_names": _port_channel_names(),
+                    "expected_up": True,
+                    "retry_count": 30,
+                    "retry_delay_seconds": 10,
+                    "retry_delay_multiplier": 1.0,
+                }
+            ),
+        ]
+
+    def _control_plane_checks() -> t.List[PointInTimeHealthCheck]:
+        return [
+            create_openr_spark_neighbor_check(
+                expected_neighbor_count=1,
+                retry_count=30,
+                retry_delay_seconds=10,
+                retry_delay_multiplier=1.0,
+            ),
+            create_bgp_session_establish_check(
+                ignore_all_prefixes_except=ixia_peer_addresses,
+                expected_established_sessions=1,
+                retry_count=30,
+                retry_delay_seconds=10,
+                retry_delay_multiplier=1.0,
+            ),
+        ]
+
+    def _recovery_checks() -> t.List[PointInTimeHealthCheck]:
+        return _link_recovery_checks() + _control_plane_checks()
+
+    def _routing_recovery_stage() -> Stage:
+        return create_steps_stage(
+            steps=[
+                create_validation_step(
+                    point_in_time_checks=_link_recovery_checks(),
+                    stage=ValidationStage.MID_TEST,
+                    description=(
+                        "Wait for both ends of the 3x200G ZR LAG to recover"
+                    ),
+                    fail_on_failure=True,
+                ),
+                create_longevity_step(
+                    duration=control_plane_settle_s,
+                    description=(
+                        "Allow Open/R, BGP, and IXIA forwarding to stabilize "
+                        "after ZR link recovery"
+                    ),
+                ),
+            ]
+        )
+
+    def _packet_loss_check(
+        *, clear_traffic_stats: bool
+    ) -> PointInTimeHealthCheck:
+        # At ~400G, stopping a bidirectional IXIA traffic item leaves a small
+        # Tx/Rx statistics skew. On rb001-03 this was 13-18 ms while every ZR
+        # member had zero uncorrected FEC codewords and zero ASIC input errors.
+        # Gate on loss duration so the check remains strict without treating
+        # the traffic-stop measurement artifact as product packet loss.
+        return create_ixia_packet_loss_check(
+            thresholds=[
+                hc_types.PacketLossThreshold(
+                    names=[traffic_item_name],
+                    str_value=max_packet_loss_duration_ms,
+                    metric=hc_types.PacketLossMetric.DURATION,
+                )
+            ],
+            clear_traffic_stats=clear_traffic_stats,
+        )
+
+    def _zr_input_error_check() -> PointInTimeHealthCheck:
+        return create_port_counters_check(
+            thresholds=[
+                hc_types.PortCountersThreshold(
+                    interfaces=[
+                        f"{device['hostname']}:{member}"
+                        for device in devices
+                        for member in device["zr_members"]
+                    ],
+                    in_error=0,
+                    comparison=hc_types.ComparisonType.EQUAL_TO,
+                )
+            ]
+        )
+
+    def _prechecks() -> t.List[PointInTimeHealthCheck]:
+        return _recovery_checks() + [
+            _packet_loss_check(clear_traffic_stats=False)
+        ]
+
+    def _postchecks(
+        *, clear_traffic_stats: bool = True
+    ) -> t.List[PointInTimeHealthCheck]:
+        return _recovery_checks() + [
+            _packet_loss_check(clear_traffic_stats=clear_traffic_stats)
+        ]
+
+    def _member_flap_steps(
+        device: t.Dict[str, t.Any], method: taac_types.InterfaceFlapMethod
+    ) -> t.List[Step]:
+        steps: t.List[Step] = []
+        for member in device["zr_members"]:
+            steps.extend(
+                [
+                    create_interface_flap_step(
+                        enable=False,
+                        interfaces=[member],
+                        interface_flap_method=method,
+                        device_name=device["hostname"],
+                        delay=10,
+                        description=f"Disable {device['hostname']}:{member}",
+                    ),
+                    create_interface_flap_step(
+                        enable=True,
+                        interfaces=[member],
+                        interface_flap_method=method,
+                        device_name=device["hostname"],
+                        delay=recovery_wait_s,
+                        description=(
+                            f"Enable {device['hostname']}:{member} and wait for ZR relock"
+                        ),
+                    ),
+                ]
+            )
+        return steps
+
+    def _member_flap_playbook(
+        name: str,
+        device: t.Dict[str, t.Any],
+        method: taac_types.InterfaceFlapMethod,
+    ) -> Playbook:
+        return Playbook(
+            name=f"{name}_{_device_tag(device)}",
+            iteration=iteration,
+            prechecks=_prechecks(),
+            stages=[
+                create_steps_stage(steps=_member_flap_steps(device, method)),
+                _routing_recovery_stage(),
+            ],
+            postchecks=_postchecks(),
+            traffic_items_to_start=[traffic_item_name],
+        )
+
+    def _qsfp_reset_playbook(device: t.Dict[str, t.Any]) -> Playbook:
+        return Playbook(
+            name=f"test_rbb_zr_qsfp_reset_{_device_tag(device)}",
+            iteration=iteration,
+            prechecks=_prechecks(),
+            stages=[
+                create_steps_stage(
+                    steps=[
+                        create_interface_flap_step(
+                            enable=False,
+                            interfaces=[member],
+                            interface_flap_method=(
+                                taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_RESET
+                            ),
+                            device_name=device["hostname"],
+                            delay=recovery_wait_s,
+                            description=(
+                                f"Reset the transceiver for {device['hostname']}:{member}"
+                            ),
+                        )
+                        for member in device["zr_members"]
+                    ]
+                ),
+                _routing_recovery_stage(),
+            ],
+            postchecks=_postchecks(),
+            traffic_items_to_start=[traffic_item_name],
+        )
+
+    def _qsfp_reset_error_monitoring_playbook(
+        device: t.Dict[str, t.Any], reset_member: str
+    ) -> Playbook:
+        return Playbook(
+            name=(
+                "test_rbb_zr_qsfp_reset_error_monitoring_"
+                f"{_device_tag(device)}"
+            ),
+            iteration=qsfp_reset_error_monitoring_iteration,
+            prechecks=_prechecks(),
+            stages=[
+                create_steps_stage(
+                    steps=[
+                        create_interface_flap_step(
+                            enable=False,
+                            interfaces=[reset_member],
+                            interface_flap_method=(
+                                taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_RESET
+                            ),
+                            device_name=device["hostname"],
+                            delay=recovery_wait_s,
+                            description=(
+                                "Reset the shared physical transceiver for "
+                                f"{device['hostname']}:{reset_member}"
+                            ),
+                        )
+                    ]
+                ),
+                create_steps_stage(
+                    steps=[
+                        create_validation_step(
+                            point_in_time_checks=_recovery_checks(),
+                            stage=taac_types.ValidationStage.MID_TEST,
+                            fail_on_failure=True,
+                            description=(
+                                "Verify ZR links, Open/R, and BGP recovered after "
+                                "the qsfp reset"
+                            ),
+                        ),
+                        create_longevity_step(
+                            duration=control_plane_settle_s,
+                            description=(
+                                "Let BGP routes and IXIA traffic settle after recovery"
+                            ),
+                        ),
+                    ]
+                ),
+                create_steps_stage(
+                    steps=[
+                        create_clear_traffic_stats_step(),
+                        create_clear_port_stats_step(
+                            device_regexes=[
+                                topology_device["hostname"]
+                                for topology_device in devices
+                            ],
+                            description=(
+                                "Clear interface counters on both RBB endpoints "
+                                "before the clean error window"
+                            ),
+                        ),
+                        create_longevity_step(
+                            duration=error_monitoring_observation_s,
+                            description=(
+                                "Run ZR traffic and observe for new input/PCS/CRC errors"
+                            ),
+                        ),
+                    ]
+                ),
+            ],
+            postchecks=_recovery_checks()
+            + [
+                _zr_input_error_check(),
+                _packet_loss_check(clear_traffic_stats=False),
+            ],
+            traffic_items_to_start=[traffic_item_name],
+        )
+
+    def _service_playbook(
+        name: str,
+        device: t.Dict[str, t.Any],
+        service: Service,
+        trigger: ServiceInterruptionTrigger,
+        cold_boot: bool = False,
+        clear_traffic_stats: bool = True,
+    ) -> Playbook:
+        services = [Service.AGENT]
+        if service == Service.QSFP_SERVICE:
+            services.append(Service.QSFP_SERVICE)
+
+        return Playbook(
+            name=f"{name}_{_device_tag(device)}",
+            iteration=iteration,
+            prechecks=_prechecks(),
+            stages=[
+                create_steps_stage(
+                    steps=[
+                        create_service_interruption_step(
+                            service=service,
+                            trigger=trigger,
+                            create_cold_boot_file=cold_boot,
+                            device_regexes=[device["hostname"]],
+                        ),
+                        create_service_convergence_step(
+                            services=services,
+                            timeout=recovery_wait_s,
+                            device_regexes=[device["hostname"]],
+                        ),
+                        create_longevity_step(
+                            duration=recovery_wait_s,
+                            description=(
+                                "Wait for the ZR optics to relock"
+                            ),
+                        ),
+                    ]
+                ),
+                _routing_recovery_stage(),
+            ],
+            postchecks=_postchecks(clear_traffic_stats=clear_traffic_stats),
+            traffic_items_to_start=[traffic_item_name],
+        )
+
+    def _port_channel_flap_playbook(device: t.Dict[str, t.Any]) -> Playbook:
+        port_channel = shlex.quote(device["zr_port_channel"])
+        disable_cmd = f"fboss2 set port state {port_channel} disable"
+        enable_cmd = f"fboss2 set port state {port_channel} enable"
+        return Playbook(
+            name=f"test_rbb_zr_port_channel_flap_{_device_tag(device)}",
+            iteration=iteration,
+            prechecks=_prechecks(),
+            stages=[
+                create_steps_stage(
+                    steps=[
+                        create_run_ssh_command_step(
+                            cmd=disable_cmd,
+                            device_regexes=[device["hostname"]],
+                            description=(
+                                f"Admin-disable {device['hostname']}:"
+                                f"{device['zr_port_channel']}"
+                            ),
+                        ),
+                        create_longevity_step(
+                            duration=10,
+                            description="Hold the ZR port-channel down",
+                        ),
+                        create_run_ssh_command_step(
+                            cmd=enable_cmd,
+                            device_regexes=[device["hostname"]],
+                            description=(
+                                f"Admin-enable {device['hostname']}:"
+                                f"{device['zr_port_channel']}"
+                            ),
+                        ),
+                        create_longevity_step(
+                            duration=recovery_wait_s,
+                            description=(
+                                "Wait for the 3-member ZR port-channel to recover"
+                            ),
+                        ),
+                    ]
+                ),
+                _routing_recovery_stage(),
+            ],
+            cleanup_steps=[
+                create_run_ssh_command_step(
+                    cmd=enable_cmd,
+                    device_regexes=[device["hostname"]],
+                    description=(
+                        f"Cleanup: admin-enable {device['hostname']}:"
+                        f"{device['zr_port_channel']}"
+                    ),
+                )
+            ],
+            postchecks=_postchecks(),
+            traffic_items_to_start=[traffic_item_name],
+        )
+
+    playbooks: t.List[Playbook] = []
+    for device in devices:
+        device_playbooks = [
+            _member_flap_playbook(
+                "test_rbb_zr_member_flap",
+                device,
+                taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
+            ),
+            _member_flap_playbook(
+                "test_rbb_zr_qsfp_low_power",
+                device,
+                taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_UTIL_POWER,
+            ),
+            _member_flap_playbook(
+                "test_rbb_zr_qsfp_util_disable",
+                device,
+                taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_UTIL_TX,
+            ),
+            _qsfp_reset_playbook(device),
+        ]
+        if (
+            qsfp_reset_error_monitoring_targets is not None
+            and device["hostname"] in qsfp_reset_error_monitoring_targets
+        ):
+            device_playbooks.append(
+                _qsfp_reset_error_monitoring_playbook(
+                    device,
+                    qsfp_reset_error_monitoring_targets[device["hostname"]],
+                )
+            )
+        device_playbooks.extend(
+            [
+                _service_playbook(
+                    "test_rbb_zr_agent_warmboot",
+                    device,
+                    Service.AGENT,
+                    ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+                    clear_traffic_stats=False,
+                ),
+                _service_playbook(
+                    "test_rbb_zr_agent_coldboot",
+                    device,
+                    Service.AGENT,
+                    ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+                    cold_boot=True,
+                ),
+                _service_playbook(
+                    "test_rbb_zr_agent_crash",
+                    device,
+                    Service.AGENT,
+                    ServiceInterruptionTrigger.CRASH,
+                ),
+                _service_playbook(
+                    "test_rbb_zr_qsfp_service_restart",
+                    device,
+                    Service.QSFP_SERVICE,
+                    ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+                    clear_traffic_stats=False,
+                ),
+                _service_playbook(
+                    "test_rbb_zr_qsfp_service_crash",
+                    device,
+                    Service.QSFP_SERVICE,
+                    ServiceInterruptionTrigger.CRASH,
+                ),
+                _port_channel_flap_playbook(device),
+            ]
+        )
+        playbooks.extend(device_playbooks)
+
+    playbooks.append(
+        Playbook(
+            name="test_rbb_zr_12hr_longevity",
+            prechecks=_prechecks(),
+            stages=[
+                create_steps_stage(
+                    steps=[
+                        create_longevity_step(
+                            duration=longevity_duration_s,
+                            collect_port_state=True,
+                            poll_interval=5,
+                            fail_on_flap=True,
+                            description="12-hour ZR traffic and link stability soak",
+                        )
+                    ]
+                )
+            ],
+            postchecks=_postchecks(),
+            traffic_items_to_start=[traffic_item_name],
+        )
+    )
+    return playbooks
+
+
 def gen_snake_playbooks(
     hostname: str,
     iteration: int,
@@ -16396,7 +17359,9 @@ def gen_snake_playbooks(
     include_link_flap_longevity: bool = False,
     link_flap_longevity_iterations: int = 33,
     link_flap_longevity_disable_delay_s: int = 30,
-    link_flap_longevity_enable_delay_s: int = 10,
+    # Links take up to ~15s to relink after an admin enable; 20s keeps the
+    # single-shot port-state and LLDP postchecks from racing the recovery.
+    link_flap_longevity_enable_delay_s: int = 20,
     link_flap_longevity_soak_s: int = 3600,
     link_flap_longevity_interface_slice: t.Optional[str] = None,
     include_rapid_a_end_flap_stress: bool = False,
@@ -16419,7 +17384,10 @@ def gen_snake_playbooks(
     rapid_a_end_flap_neighbor_hostnames: t.Optional[t.List[str]] = None,
     flap_recovery_check_retry_count: t.Optional[int] = None,
     flap_recovery_check_retry_delay_seconds: float = 10.0,
+    half_toggle_check_retry_count: t.Optional[int] = None,
+    half_toggle_check_retry_delay_seconds: float = 2.0,
     skip_lldp_check: bool = False,
+    include_split_agent_warmboot: bool = False,
 ) -> t.List[taac_types.Playbook]:
     def _create_flap_recovery_checks() -> t.List[
         taac_types.PointInTimeHealthCheck
@@ -16435,8 +17403,32 @@ def gen_snake_playbooks(
         )
         checks = [port_state_check]
         if not skip_lldp_check:
-            checks.append(create_lldp_check())
+            # LLDP neighbors can only reappear after the port is up, so give the
+            # LLDP check the same opt-in retries as the port-state check.
+            checks.append(
+                create_lldp_check()
+                if flap_recovery_check_retry_count is None
+                else create_lldp_check(
+                    retry_count=flap_recovery_check_retry_count,
+                    retry_delay_seconds=flap_recovery_check_retry_delay_seconds,
+                    retry_delay_multiplier=1.0,
+                )
+            )
         return checks
+
+    # Opt-in retries for the half-interface-toggle checks that run right after
+    # interfaces are re-enabled (ports and LLDP neighbors can take longer than
+    # the enable delay to come back). Empty when half_toggle_check_retry_count
+    # is None, so those checks stay single-shot for configs that don't set it.
+    half_toggle_retry_kwargs: t.Dict[str, t.Any] = (
+        {}
+        if half_toggle_check_retry_count is None
+        else {
+            "retry_count": half_toggle_check_retry_count,
+            "retry_delay_seconds": half_toggle_check_retry_delay_seconds,
+            "retry_delay_multiplier": 1.0,
+        }
+    )
 
     _prechecks = common_prechecks or []
     _postchecks = common_postchecks or []
@@ -16550,6 +17542,11 @@ def gen_snake_playbooks(
                 iteration=iteration,
                 prechecks=_prechecks,
                 postchecks=_postchecks
+                + (
+                    [create_lldp_check(**half_toggle_retry_kwargs)]
+                    if half_toggle_retry_kwargs and not skip_lldp_check
+                    else []
+                )
                 + [
                     create_ixia_packet_loss_check(clear_traffic_stats=True),
                 ]
@@ -16650,6 +17647,7 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
+                                        **half_toggle_retry_kwargs,
                                     ),
                                     create_port_state_check(
                                         disabled_interfaces_jq=f'."{hostname}".interfaces',
@@ -16664,6 +17662,7 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
+                                        **half_toggle_retry_kwargs,
                                     ),
                                 ],
                                 stage=taac_types.ValidationStage.MID_TEST,
@@ -16822,28 +17821,6 @@ def gen_snake_playbooks(
                 ],
             ),
             taac_types.Playbook(
-                name="test_snake_fsdb_restart",
-                iteration=iteration,
-                prechecks=_prechecks,
-                postchecks=_postchecks,
-                stages=[
-                    create_steps_stage(
-                        steps=[
-                            create_service_interruption_step(
-                                service=taac_types.Service.FSDB,
-                                trigger=taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
-                            ),
-                            create_service_convergence_step(
-                                services=[
-                                    taac_types.Service.AGENT,
-                                    taac_types.Service.FSDB,
-                                ],
-                            ),
-                        ]
-                    )
-                ],
-            ),
-            taac_types.Playbook(
                 name="test_snake_agent_coldboot",
                 iteration=iteration,
                 prechecks=_prechecks,
@@ -16936,30 +17913,6 @@ def gen_snake_playbooks(
                     create_ixia_packet_loss_check(clear_traffic_stats=True),
                 ]
                 + gen_ptp_health_checks(),
-            ),
-            taac_types.Playbook(
-                name="test_snake_fsdb_crash",
-                iteration=iteration,
-                prechecks=_prechecks,
-                postchecks=_postchecks,
-                stages=[
-                    create_steps_stage(
-                        steps=[
-                            create_service_interruption_step(
-                                service=taac_types.Service.FSDB,
-                                trigger=taac_types.ServiceInterruptionTrigger.CRASH,
-                            ),
-                            create_service_convergence_step(
-                                services=[
-                                    taac_types.Service.AGENT,
-                                    taac_types.Service.FSDB,
-                                ],
-                            ),
-                            # Wait some additional time since the convergence step can sometimes complete too quickly
-                            create_longevity_step(duration=300),
-                        ]
-                    )
-                ],
             ),
             taac_types.Playbook(
                 name="test_snake_system_reboot_bmc_full",
@@ -17174,6 +18127,44 @@ def gen_snake_playbooks(
                 postchecks=_postchecks + gen_ptp_health_checks(),
             ),
         )
+
+    if include_split_agent_warmboot:
+        # Same shape as test_snake_agent_warmboot, but restarts one half of a
+        # split agent. On native NetOS the hw agent unit is also what
+        # Service.AGENT resolves to, so the hw variant repeats the wedge_agent
+        # warmboot there.
+        for name, service in (
+            ("test_snake_sw_agent_warmboot", taac_types.Service.FBOSS_SW_AGENT),
+            ("test_snake_hw_agent_warmboot", taac_types.Service.FBOSS_HW_AGENT_0),
+        ):
+            playbooks.append(
+                taac_types.Playbook(
+                    name=name,
+                    iteration=iteration,
+                    prechecks=_prechecks,
+                    postchecks=_postchecks,
+                    stages=[
+                        create_steps_stage(
+                            steps=[
+                                create_service_interruption_step(
+                                    service=service,
+                                    trigger=taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+                                ),
+                                create_service_convergence_step(
+                                    services=[taac_types.Service.AGENT],
+                                    description="Wait for wedge_agent to converge",
+                                ),
+                                create_longevity_step(
+                                    duration=SNAKE_AGENT_LLDP_SETTLE_S,
+                                    description=(
+                                        "Let LLDP neighbors relearn before postchecks"
+                                    ),
+                                ),
+                            ]
+                        )
+                    ],
+                )
+            )
 
     if manual_test_interfaces:
         playbooks.extend(
@@ -21629,7 +22620,10 @@ OPENR_RESTART_SERVICE_CHECK = create_service_restart_health_check(
 # ---------------------------------------------------------------------------
 
 
-def create_agent_warmboot_playbook(iteration: int = 5) -> Playbook:
+def create_agent_warmboot_playbook(
+    iteration: int = 5,
+    post_restart_settle_seconds: int | None = None,
+) -> Playbook:
     """Build the `test_agent_warmboot` Playbook for FBOSS hardening conveyors.
 
     Repeats `iteration` cycles of FBOSS AGENT service restart (warmboot
@@ -21640,16 +22634,23 @@ def create_agent_warmboot_playbook(iteration: int = 5) -> Playbook:
 
     Args:
         iteration: Number of warmboot cycles. Default 5.
+        post_restart_settle_seconds: When set, each cycle ends with a longevity
+            step of this many seconds. On native NetOS, bgpd and openr restart
+            after the SW agent, which can be after the convergence step
+            returns.
 
     Returns:
         A `Playbook` named `test_agent_warmboot` with one repeated stage.
     """
+    steps = create_service_restart_steps(Service.AGENT)
+    if post_restart_settle_seconds:
+        steps.append(create_longevity_step(duration=post_restart_settle_seconds))
     return Playbook(
         name="test_agent_warmboot",
         stages=[
             create_steps_stage(
                 iteration=iteration,
-                steps=create_service_restart_steps(Service.AGENT),
+                steps=steps,
             ),
         ],
         postchecks=[
@@ -22013,6 +23014,7 @@ def create_qsfp_service_warmboot_and_reset_playbook(
     iteration: int = 5,
     post_warmboot_wait_seconds: int = 300,
     post_reset_settle_seconds: int = 300,
+    interfaces: t.Optional[t.List[str]] = None,
 ) -> Playbook:
     """Build the `test_qsfp_service_warmboot_and_reset` Playbook.
 
@@ -22034,10 +23036,23 @@ def create_qsfp_service_warmboot_and_reset_playbook(
         iteration: Number of warmboot + reset cycles. Default 5.
         post_warmboot_wait_seconds: Hold between the warmboot and the reset.
         post_reset_settle_seconds: Hold after the reset for optics to relink.
+        interfaces: Explicit interface list to reset. Default ``None`` resolves
+            the DUT's interfaces from the topology at runtime.
 
     Returns:
         A `Playbook` named `test_qsfp_service_warmboot_and_reset`.
     """
+    if interfaces is not None and not interfaces:
+        raise ValueError(
+            "create_qsfp_service_warmboot_and_reset_playbook: `interfaces` "
+            "was passed as an empty list; pass the interfaces to reset, or "
+            "omit the argument to resolve them from the topology."
+        )
+    reset_kwargs: t.Dict[str, t.Any] = (
+        {"interfaces": list(interfaces)}
+        if interfaces is not None
+        else {"jq_params": {"interfaces": '."{dut}".interfaces'}}
+    )
     return Playbook(
         name="test_qsfp_service_warmboot_and_reset",
         postchecks=[
@@ -22067,11 +23082,11 @@ def create_qsfp_service_warmboot_and_reset_playbook(
                         interface_flap_method=int(
                             taac_types.InterfaceFlapMethod.FBOSS_WEDGE_QSFP_RESET
                         ),
-                        jq_params={"interfaces": '."{dut}".interfaces'},
                         description=(
                             "Reset all transceivers in one "
                             "`wedge_qsfp_util --qsfp-reset` invocation"
                         ),
+                        **reset_kwargs,
                     ),
                     create_longevity_step(
                         duration=post_reset_settle_seconds,
@@ -22417,10 +23432,15 @@ def get_critical_services_single_box_playbooks(
     iteration: int = 5,
     ixia_rogue_ic_parent_network_v6: str = "",
     ixia_rogue_ic_parent_network_v4: str = "",
+    agent_post_restart_settle_seconds: int | None = None,
+    interfaces: t.Optional[t.List[str]] = None,
 ) -> list[Playbook]:
     """Build the critical-services playbooks that require only one DUT."""
     playbooks = [
-        create_agent_warmboot_playbook(iteration=iteration),
+        create_agent_warmboot_playbook(
+            iteration=iteration,
+            post_restart_settle_seconds=agent_post_restart_settle_seconds,
+        ),
         _repeat_single_stage_playbook(
             TEST_FBOSS_SW_AGENT_WARMBOOT_PLAYBOOK(attribute_filters={}),
             iteration,
@@ -22458,9 +23478,11 @@ def get_critical_services_single_box_playbooks(
         ),
         create_qsfp_service_warmboot_and_tx_flap_playbook(
             iteration=iteration,
+            interfaces=interfaces,
         ),
         create_qsfp_service_warmboot_and_reset_playbook(
             iteration=iteration,
+            interfaces=interfaces,
         ),
         create_bgpd_and_fsdb_restart_playbook(iteration=iteration),
         create_agent_and_fsdb_restart_playbook(iteration=iteration),
@@ -22498,13 +23520,24 @@ def _nbr_flap_non_circuit_checks(
     )
 
 
-def _warmboot_nbr_flap_non_circuit_checks() -> t.List[PointInTimeHealthCheck]:
+def _warmboot_nbr_flap_non_circuit_checks(
+    restart_service_check: PointInTimeHealthCheck = AGENT_WARMBOOT_SERVICE_CHECK,
+    systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
+) -> t.List[PointInTimeHealthCheck]:
     """Mid-test checks for the agent-warmboot + neighbour-flap window.
 
     Thin wrapper kept so the landed warmboot playbook's serialized output is
     unchanged by the generalization above.
     """
-    return _nbr_flap_non_circuit_checks(AGENT_WARMBOOT_SERVICE_CHECK)
+    checks = _nbr_flap_non_circuit_checks(restart_service_check)
+    if systemctl_active_check is not None:
+        checks = [
+            systemctl_active_check
+            if check.name == hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK
+            else check
+            for check in checks
+        ]
+    return checks
 
 
 def create_gtsw_warmboot_nbr_uplink_flap_playbook(
@@ -22515,6 +23548,8 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
     longevity_sec: int = 300,
     playbook_name: str = "test_warmboot_nbr_uplink_flap",
     traffic_items_to_configure: t.Optional[t.Mapping[str, TrafficItemSettings]] = None,
+    restart_service_check: PointInTimeHealthCheck = AGENT_WARMBOOT_SERVICE_CHECK,
+    systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
 ) -> Playbook:
     """Build a `test_warmboot_nbr_uplink_flap` Playbook.
 
@@ -22568,7 +23603,11 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
     Returns:
         A `Playbook` named `playbook_name`.
     """
-    non_circuit_checks = _warmboot_nbr_flap_non_circuit_checks()
+    active_check = systemctl_active_check or create_systemctl_active_state_check()
+    non_circuit_checks = _warmboot_nbr_flap_non_circuit_checks(
+        restart_service_check=restart_service_check,
+        systemctl_active_check=active_check,
+    )
 
     def _nbr_flap_step(duration_sec: int) -> Step:
         return create_fpf_rapid_flap_step_lldp(
@@ -22589,8 +23628,8 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
         iteration=iteration,
         traffic_items_to_configure=traffic_items_to_configure,
         postchecks=[
-            AGENT_WARMBOOT_SERVICE_CHECK,
-            create_systemctl_active_state_check(),
+            restart_service_check,
+            active_check,
             create_device_core_dumps_check(),
             create_unclean_exit_check(),
             create_lldp_check(),
@@ -22655,6 +23694,7 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
     post_restart_settle_sec: int = 0,
     extra_post_flap_checks: t.Optional[t.Sequence[PointInTimeHealthCheck]] = None,
     traffic_items_to_configure: t.Optional[t.Mapping[str, TrafficItemSettings]] = None,
+    systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
 ) -> Playbook:
     """Restart one service on the DUT, then flap the neighbour's uplinks.
 
@@ -22707,7 +23747,14 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
     Returns:
         A `Playbook` named `playbook_name`.
     """
+    active_check = systemctl_active_check or create_systemctl_active_state_check()
     non_circuit_checks = list(_nbr_flap_non_circuit_checks(restart_service_check))
+    non_circuit_checks = [
+        active_check
+        if check.name == hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK
+        else check
+        for check in non_circuit_checks
+    ]
     non_circuit_checks.extend(extra_post_flap_checks or [])
 
     restart_steps = [
@@ -22734,7 +23781,7 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
         traffic_items_to_configure=traffic_items_to_configure,
         postchecks=[
             restart_service_check,
-            create_systemctl_active_state_check(),
+            active_check,
             create_device_core_dumps_check(),
             create_unclean_exit_check(),
             create_lldp_check(),
@@ -23154,6 +24201,8 @@ def create_cpu_queue_playbooks(
     high_queue: int,
     ixia_downlink_interface: str,
     bgp_peer_count: int = 0,
+    static_route_device_group_index: int = 0,
+    ixia_interfaces: list[str] | None = None,
 ) -> t.List[Playbook]:
     """Create all CPU queue test playbooks.
 
@@ -23168,10 +24217,20 @@ def create_cpu_queue_playbooks(
             noise floor (no per-session scaling) — appropriate for callers that
             don't supply a peer count. Pass `downlink + uplink + rogue` from the
             TestConfig factory to enable scale-aware tuning.
+        static_route_device_group_index: IXIA device group on the downlink
+            port whose IPv6 address and network group 0 feed the CPU_037/038
+            static routes. It must carry both.
+        ixia_interfaces: Explicit DUT ports that must be UP after CPU_039 restores
+            MTU. Defaults to the downlink for callers that omit the port list.
 
     Returns:
         List of all CPU queue test Playbook objects
     """
+    if ixia_interfaces is None:
+        ixia_interfaces = [ixia_downlink_interface]
+    if not ixia_interfaces:
+        raise ValueError("CPU_039 requires a non-empty IXIA interface list")
+
     # Per-queue inactive-queue noise tolerances for the A2 leakage assertion.
     # These scale with `bgp_peer_count` because BGP control traffic dominates
     # CPU-queue background pps at multi-session test scale (each established
@@ -23471,9 +24530,11 @@ def create_cpu_queue_playbooks(
         description=(
             "CPU_009: DHCPv6 request with link-local source (fe80::) and "
             "link-local multicast destination (ff02::1:2) and DSCP=48 (UDP "
-            "src 546, dst 547) must be punted to the MID CPU queue. Matches "
-            "the real DHCPv6 client→server discovery flow with explicit DSCP "
-            "marking."
+            "src 546, dst 547) must be punted to the HIGH CPU queue. DSCP 48 "
+            "matches the CoPP ACL `cpuPolicing-high-NetworkControl-ff02::/16` "
+            "(dscp 48, dst ff02::/16), which precedes `cpuPolicing-mid-ff02::/16` "
+            "(see `genLinkLocalCoppAcls` in "
+            "fboss/lib/config/agent/CoppConfigUtils.cpp)."
         ),
         traffic_items_to_start=[
             "TEST_RAW_DHCP_V6_LL_DSCP48_TRAFFIC",
@@ -23485,14 +24546,13 @@ def create_cpu_queue_playbooks(
         ],
         snapshot_checks=[
             create_cpu_queue_snapshot_check(
-                active_queues=[mid_queue],
-                inactive_queues=[low_queue, high_queue],
+                active_queues=[high_queue],
+                inactive_queues=[low_queue, mid_queue],
                 inactive_max_pps_per_queue={
                     low_queue: low_q_noise,
-                    high_queue: high_q_noise,
+                    mid_queue: mid_q_noise,
                 },
                 no_discard_queues=[high_queue],
-                active_min_out_pps_per_queue={low_queue: 10},
             )
         ],
     )
@@ -23680,9 +24740,10 @@ def create_cpu_queue_playbooks(
         name=NPI_CPU_004_BGP_CP_V6_LINK_LOCAL_DSCP0_TO_HIGH_QUEUE.name,
         description=(
             "CPU_004: BGPv6 control-plane traffic with link-local source/destination "
-            "addresses and DSCP=0 (TCP/179) must be punted to the HIGH CPU queue. "
-            "Verifies BGP CP classification falls through to TCP/179 protocol match "
-            "even without DSCP marking on IPv6 link-local-scope sessions."
+            "addresses and DSCP=0 (TCP/179) is punted to the MID CPU queue. No CoPP "
+            "ACL matches TCP/179 on link-local, so without DSCP 48 the packet hits "
+            "`cpuPolicing-mid-linkLocal-v6` (`genLinkLocalCoppAcls` in "
+            "`fboss/lib/config/agent/CoppConfigUtils.cpp`)."
         ),
         traffic_items_to_start=[
             "TEST_RAW_BGP_CP_V6_LINK_LOCAL_DSCP0_TRAFFIC",
@@ -23694,14 +24755,14 @@ def create_cpu_queue_playbooks(
         ],
         snapshot_checks=[
             create_cpu_queue_snapshot_check(
-                active_queues=[high_queue],
-                inactive_queues=[low_queue, mid_queue],
+                active_queues=[mid_queue],
+                inactive_queues=[low_queue, high_queue],
                 inactive_max_pps_per_queue={
                     low_queue: low_q_noise,
-                    mid_queue: mid_q_noise,
+                    high_queue: high_q_noise,
                 },
                 no_discard_queues=[high_queue],
-                active_min_out_pps_per_queue={low_queue: 10},
+                active_min_out_pps_per_queue={mid_queue: 10},
             )
         ],
     )
@@ -23836,6 +24897,14 @@ def create_cpu_queue_playbooks(
     # require a LOW-queue punt; guard against leakage into MID and HIGH.
     npi_cpu_039_mtu_exceed_to_low_queue_playbook = Playbook(
         name="npi_cpu_039_mtu_exceed_to_low_queue",
+        # `traffic_items_to_start` runs before prechecks, so the common
+        # zero-loss precheck would otherwise see the intentional drop.
+        prechecks=[
+            create_ixia_packet_loss_check(
+                clear_traffic_stats=True,
+                skip_traffic_items=["TEST_MTU_EXCEED_IPV6_TRAFFIC"],
+            ),
+        ],
         postchecks=[
             # The oversized stream is intentionally dropped by newer ASICs.
             # Keep the generic packet-loss health check for every other item,
@@ -23927,6 +24996,19 @@ def create_cpu_queue_playbooks(
                         services=[Service.AGENT, Service.BGP],
                         step_id="restore_mtu_agent_convergence",
                     ),
+                    create_verify_port_operational_state_step(
+                        interfaces=ixia_interfaces,
+                        operational_state=True,
+                        start_traffic=False,
+                    ),
+                    create_custom_step(
+                        params_dict={
+                            "custom_step_name": "verify_interface_mtu",
+                            "interface": ixia_downlink_interface,
+                            "expected_mtu": 9000,
+                            "skip_start_traffic": True,
+                        },
+                    ),
                     # DUT warmboot interrupts its BGP adjacencies. IXIA does
                     # not reliably re-establish retained-session protocols on
                     # its own, so explicitly restart them before postchecks
@@ -23948,13 +25030,6 @@ def create_cpu_queue_playbooks(
                         args_dict={"wait_for_refresh": True},
                         description="Clear intentional MTU-drop traffic statistics",
                         start_traffic=False,
-                    ),
-                    create_custom_step(
-                        params_dict={
-                            "custom_step_name": "verify_interface_mtu",
-                            "interface": ixia_downlink_interface,
-                            "expected_mtu": 9000,
-                        },
                     ),
                 ],
             )
@@ -24021,8 +25096,11 @@ def create_cpu_queue_playbooks(
         ],
     )
 
-    # CPU_048: DSCP=48 to-switch link-local IPv6 → MID queue. Link-local
-    # variant of CPU_047 (SIP=Ixia LL, DIP=switch LL).
+    # CPU_048: DSCP=48 to-switch link-local IPv6 → HIGH queue. Link-local
+    # variant of CPU_047 (SIP=Ixia LL, DIP=switch LL). DSCP 48 matches the
+    # CoPP ACL `cpuPolicing-high-NetworkControl-linkLocal-v6` (dscp 48, dst
+    # fe80::/10), which precedes `cpuPolicing-mid-linkLocal-v6` (see
+    # `genLinkLocalCoppAcls` in fboss/lib/config/agent/CoppConfigUtils.cpp).
     npi_cpu_048_dscp_48_to_switch_ll_to_mid_queue_playbook = Playbook(
         name="npi_cpu_048_dscp_48_to_switch_ll_to_mid_queue",
         traffic_items_to_start=[
@@ -24035,14 +25113,13 @@ def create_cpu_queue_playbooks(
         ],
         snapshot_checks=[
             create_cpu_queue_snapshot_check(
-                active_queues=[mid_queue],
-                inactive_queues=[low_queue, high_queue],
+                active_queues=[high_queue],
+                inactive_queues=[low_queue, mid_queue],
                 inactive_max_pps_per_queue={
                     low_queue: low_q_noise,
-                    high_queue: high_q_noise,
+                    mid_queue: mid_q_noise,
                 },
                 no_discard_queues=[high_queue],
-                active_min_out_pps_per_queue={mid_queue: 10},
             )
         ],
     )
@@ -24649,6 +25726,7 @@ def create_cpu_queue_playbooks(
                     create_custom_step(
                         params_dict={
                             "custom_step_name": "register_cpu_queue_static_route_patcher",
+                            "device_group_index": static_route_device_group_index,
                             "static_route_mask": 64,
                             "next_hop_egress_port": ixia_downlink_interface,
                             "patcher_name": "cpu_queue_static_route_patcher",
@@ -24716,6 +25794,7 @@ def create_cpu_queue_playbooks(
                     create_custom_step(
                         params_dict={
                             "custom_step_name": "register_cpu_queue_static_route_patcher",
+                            "device_group_index": static_route_device_group_index,
                             "static_route_mask": 128,
                             "next_hop_egress_port": ixia_downlink_interface,
                             "patcher_name": "cpu_queue_static_route_patcher",
@@ -26367,6 +27446,11 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
     name: str,
     traffic_item_name: str,
     longevity_duration_seconds: int = 300,
+    bgp_session_check: t.Optional[PointInTimeHealthCheck] = None,
+    systemctl_active_check: t.Optional[PointInTimeHealthCheck] = None,
+    restart_service_check: t.Optional[PointInTimeHealthCheck] = None,
+    base_bandwidth_gbps: int = 200,
+    traffic_item_names: t.Optional[t.Sequence[str]] = None,
 ) -> Playbook:
     """Playbook factory for the IcePack GTSW agent-warmboot + RoCE
     troubleshooting Playbook.
@@ -26381,6 +27465,25 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
     Prechecks mirror the canonical IcePack GTSW panel
     (`add_common_checks_to_thft_playbooks`).
     """
+    bgp_check = bgp_session_check or create_bgp_session_establish_check(
+        min_established_pct=0.9
+    )
+    active_check = systemctl_active_check or create_systemctl_active_state_check()
+    service_check = restart_service_check or create_service_restart_check(
+        services=[
+            "wedge_agent",
+            "fboss_sw_agent",
+            "fboss_hw_agent@0",
+            "bgpd",
+        ],
+        expected_restarted_services=[
+            "wedge_agent",
+            "fboss_sw_agent",
+            "fboss_hw_agent@0",
+            "bgpd",
+        ],
+    )
+    checked_traffic_items = list(traffic_item_names or [traffic_item_name])
     return Playbook(
         name=name,
         prechecks=[
@@ -26389,8 +27492,8 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
             # not use the fabric, and the GTSW carries 2 structural always-IDLE
             # non-peer entries (an AS-0 aggregate + a self-ASN entry) that a
             # 100%-established gate flags. 48/50 real peers up = 0.96 > 0.9.
-            create_bgp_session_establish_check(min_established_pct=0.9),
-            create_systemctl_active_state_check(),
+            bgp_check,
+            active_check,
             create_memory_utilization_check(
                 threshold=5 * (1024**3),  # 5 GiB
                 start_time_jq_var="test_case_start_time",
@@ -26418,7 +27521,7 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
                 clear_traffic_stats=False,
                 thresholds=[
                     hc_types.PacketLossThreshold(
-                        names=[traffic_item_name],
+                        names=checked_traffic_items,
                         str_value="0",
                         metric=hc_types.PacketLossMetric.PERCENTAGE,
                     ),
@@ -26427,13 +27530,13 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
             create_ixia_traffic_rate_check(
                 thresholds=[
                     hc_types.TrafficRateThreshold(
-                        names=[traffic_item_name],
+                        names=checked_traffic_items,
                         value=45,
                         threshold_type=hc_types.ThresholdType.PERCENT,
                         metric=hc_types.TrafficRateMetric.TX_RATE,
                     ),
                 ],
-                base_bandwidth_gbps=200,  # IcePack GTSW IXIA links are 200G
+                base_bandwidth_gbps=base_bandwidth_gbps,
             ),
             create_port_counters_check(),
             # IcePack GTSW (TH6) runs the split sw/hw agent + wedge_agent + bgpd
@@ -26444,20 +27547,7 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
             # services that cycle on a Service.AGENT warmboot (verified live
             # 2026-07-28: wedge_agent/fboss_sw_agent/fboss_hw_agent@0/bgpd all
             # restart at the warmboot instant; fsdb/qsfp are preserved).
-            create_service_restart_check(
-                services=[
-                    "wedge_agent",
-                    "fboss_sw_agent",
-                    "fboss_hw_agent@0",
-                    "bgpd",
-                ],
-                expected_restarted_services=[
-                    "wedge_agent",
-                    "fboss_sw_agent",
-                    "fboss_hw_agent@0",
-                    "bgpd",
-                ],
-            ),
+            service_check,
             create_unclean_exit_check(),
             create_cpu_utilization_check(
                 threshold=400.0, start_time_jq_var="test_case_start_time"
@@ -26467,7 +27557,7 @@ def create_icepack_gtsw_warmboot_troubleshooting_playbook(
             create_core_dumps_snapshot_check(),
             create_bgp_peer_route_snapshot_check(),
         ],
-        traffic_items_to_start=[traffic_item_name],
+        traffic_items_to_start=checked_traffic_items,
         enabled=True,
     )
 
@@ -27978,7 +29068,9 @@ def create_fpf_hardening_playbook_v2(
     prod_prefix_recovery: bool = False,
     local_prod_prefixes: list[str] | None = None,
     prod_prefixes_by_host: dict[str, list[str]] | None = None,
+    affected_prod_prefixes_by_host: dict[str, list[str]] | None = None,
     impacted_planes_by_host: dict | None = None,
+    prod_impacted_planes_by_host: dict | None = None,
     impacted_lanes_drained: list[int] | None = None,
     impacted_spray_max_gbps: float = 10.0,
     spray_recovering_by_host: dict | None = None,
@@ -28230,6 +29322,9 @@ def create_fpf_hardening_playbook_v2(
         {resolved_prod_prefix_host: list(prod_prefixes)}
         if resolved_prod_prefix_host and prod_prefixes
         else None
+    )
+    resolved_affected_prod_prefixes_by_host = (
+        affected_prod_prefixes_by_host or resolved_prod_prefixes_by_host
     )
     recovered_device_planes_by_host: dict[str, dict[str, list[int]]] = {}
     recovered_prod_expectations_by_host: dict[
@@ -28650,8 +29745,10 @@ def create_fpf_hardening_playbook_v2(
                 mode="local_undrain",
                 local_prefixes=local_prod_prefixes,
                 prefixes_by_host=resolved_prod_prefixes_by_host,
-                affected_prefixes_by_host=resolved_prod_prefixes_by_host,
-                impacted_planes_by_host=impacted_planes_by_host or {},
+                affected_prefixes_by_host=resolved_affected_prod_prefixes_by_host,
+                impacted_planes_by_host=(
+                    prod_impacted_planes_by_host or impacted_planes_by_host or {}
+                ),
                 max_drain_sec=FPF_ACTIVE_THRESHOLDS.prod_prefix_recovery_sla_sec,
                 check_id="fpf_prod_hrt_prefix_recovery",
             )
@@ -28833,6 +29930,8 @@ def create_fpf_link_event_disrupt_playbook(
     impacted_planes_by_host: dict,
     prod_prefixes: list[str] | None = None,
     prod_prefixes_by_host: dict[str, list[str]] | None = None,
+    affected_prod_prefixes_by_host: dict[str, list[str]] | None = None,
+    prod_impacted_planes_by_host: dict[str, list[int]] | None = None,
     hrt_memory_hosts: list[str] | None = None,
     hrt_driver_hosts: list[str] | None = None,
     spray_hosts: list[str] | None = None,
@@ -28852,6 +29951,7 @@ def create_fpf_link_event_disrupt_playbook(
     gtsw_convergence_settle_sec: int = 0,
     gtsw_rib_unavailable_lanes: list[int] | None = None,
     prod_prefix_precheck_lookback_sec: int | None = None,
+    prod_switch_route_namespace: str | None = None,
     hrt_device_ids: list[int] | None = None,
     ib_traffic_config: t.Mapping[str, t.Any] | None = None,
     additional_postchecks: list | None = None,
@@ -28933,6 +30033,7 @@ def create_fpf_link_event_disrupt_playbook(
         create_fpf_hrt_system_memory_check,
         create_fpf_ods_counter_check,
         create_fpf_prod_hrt_prefix_stability_check,
+        create_fpf_remote_prefix_lifecycle_check,
     )
     from taac.libs.fpf.fpf_thresholds import (
         ACTIVE as FPF_ACTIVE_THRESHOLDS,
@@ -28959,6 +30060,9 @@ def create_fpf_link_event_disrupt_playbook(
         else list(resolved_hrt_device_ids)
     )
     resolved_prod_prefixes_by_host = prod_prefixes_by_host
+    resolved_affected_prod_prefixes_by_host = (
+        affected_prod_prefixes_by_host or resolved_prod_prefixes_by_host
+    )
 
     # ---- Prechecks: assert healthy/stable BEFORE the disruption ----
     prechecks = [
@@ -28984,6 +30088,23 @@ def create_fpf_link_event_disrupt_playbook(
                 check_id="fpf_prod_hrt_prefix_stability_precheck",
             )
         prechecks.append(prod_prefix_precheck)
+    if prod_switch_route_namespace:
+        prechecks.append(
+            create_fpf_remote_prefix_lifecycle_check(
+                mode="present",
+                runner_device=gtsws[0],
+                scalar_expectations=[
+                    [collector, gtsw, 1]
+                    for gtsw in gtsws
+                    for collector in (
+                        f"bgp_{prod_switch_route_namespace}",
+                        f"fsdb_{prod_switch_route_namespace}",
+                    )
+                ],
+                deadline_sec=transition_sla_sec,
+                check_id="fpf_prod_switch_route_present",
+            )
+        )
     if hrt_memory_hosts:
         prechecks.append(
             create_fpf_hrt_system_memory_check(
@@ -29322,9 +30443,29 @@ def create_fpf_link_event_disrupt_playbook(
             create_fpf_prod_hrt_prefix_stability_check(
                 mode="transition",
                 prefixes_by_host=resolved_prod_prefixes_by_host,
-                impacted_planes_by_host=impacted_planes_by_host,
+                affected_prefixes_by_host=resolved_affected_prod_prefixes_by_host,
+                impacted_planes_by_host=(
+                    prod_impacted_planes_by_host or impacted_planes_by_host
+                ),
                 max_transition_sec=float(transition_sla_sec),
                 check_id="fpf_prod_hrt_prefix_transition",
+            )
+        )
+    if prod_switch_route_namespace:
+        postchecks.append(
+            create_fpf_remote_prefix_lifecycle_check(
+                mode="disruption",
+                runner_device=gtsws[0],
+                scalar_expectations=[
+                    [collector, gtsw, 0]
+                    for gtsw in gtsws
+                    for collector in (
+                        f"bgp_{prod_switch_route_namespace}",
+                        f"fsdb_{prod_switch_route_namespace}",
+                    )
+                ],
+                deadline_sec=transition_sla_sec,
+                check_id="fpf_prod_switch_route_withdrawal",
             )
         )
 
@@ -30469,51 +31610,9 @@ _SC9_EBGP_PREFIX_POOLS: t.List[str] = [
 ]
 
 
-# Ceiling on REAL ECMP sets (>= _SC9_MIN_ECMP_WIDTH wide) at any sample.
-#
-# Two observations bound this, and neither is a guess. The first fully clean
-# single-drain run peaked at 12 multi-way groups (and zero width-1 groups) for a
-# 75.6s plateau, against a steady state of exactly 2 -- corroborated by the
-# device's own ECMP high watermark moving 7 -> 12 across the same window, an
-# independent max-over-time counter that cannot miss a sub-sample peak. The
-# worst peak ever recorded on this topology is 27, from the ten-cycle run whose
-# cycles re-withdrew mid-recovery; that is a pathological shape this playbook no
-# longer produces, but 32 clears even it.
-#
-# So: 2.7x the clean observation, above the worst contaminated one, 8x under the
-# topology's structural maximum of 128*2+2 = 258, and 256x under the device's
-# 8,192-entry EcmpLevel2 table. Stated plainly because an earlier version of
-# this comment claimed "~5x" against a peak of 6 that a later, cleaner run
-# superseded -- the margin is real but it is 2.7x, not 5x.
-#
-# ★ NOW DERIVED FROM A COMPLETE FIVE-CYCLE RUN, which is the first one there has
-# ever been. Five clean draws peaked at ELEVEN multi-way sets (plus a single
-# width-1), against twelve total nexthop groups; the one earlier clean draw, at
-# one cycle, peaked at 12. So the distribution is tight and -- the part that
-# matters -- the peak does NOT grow with cycle count.
-#
-# That falsified the reasoning behind an interim raise to 64. The argument was
-# that N cycles is N draws so the expected maximum climbs with N, anchored on a
-# reading of 20 from a two-and-a-bit-cycle run. But that 20 was not a clean
-# draw: it was taken while the drain was dying mid-transition with the restore
-# ALSO failing, so the device was in a non-recovered state when the maximum
-# landed. Discard it and the observations are 11 and 12.
-#
-# 32 is ~2.9x the five-cycle peak, still 8x under the topology's structural
-# maximum of 258 and 256x under the device's 8,192-entry table. 64 would need
-# fragmentation to go six-fold worse than anything observed before it said a
-# word, which is not a gate.
-#
-# Being honest about what this number is: it is FITTED to observation, not
-# derived from hardware, and it exists to catch an order-of-magnitude explosion.
-# The claim itself rests on the calibration-free assertions -- settled at exactly
-# 2 per AFI, no groups left unprogrammed, and RIB-level recovery to the
-# discovered baseline.
-_SC9_MAX_MULTIWAY_GROUPS = 32
-
 # The number of distinct ECMP sets this topology can structurally produce: one
-# per eBGP peer per AFI, plus the two converged sets. Used as the bound on how
-# far the device-maintained ECMP high watermark may climb ACROSS the drain.
+# per eBGP peer per AFI, plus the two converged sets. This bounds both sampled
+# multi-way groups and the device-maintained high-watermark delta.
 #
 # A structural bound, not a calibrated one, and labelled as such: the clean
 # single-drain run moved that watermark by 5, so 258 is ~50x that observation
@@ -30612,6 +31711,9 @@ _SC9_BASELINE_PREDICATE_TIMEOUT_SECONDS = 120.0
 # The poll does the waiting now. This is only enough for sessions to start
 # coming up so the first read is not certainly wasted; the stock default is 300.
 _SC9_SETUP_SETTLE_SECONDS = 60
+# Only the eBGP children carry the multipath width; the iBGP mimic peers are
+# expected to sit IDLE, so gating on them would fail every healthy run.
+_SC9_EBGP_IXIA_PEER_REGEX = r"BGP_PEER_IPV[46]_EBGP_SET\d+"
 
 
 def get_bgp_ebb_bounded_ecmp_sc9_playbook(
@@ -30721,16 +31823,13 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
       as Requirement Coverage (the catalog admits only precheck / workload /
       postcheck / snapshot phases), and the task's own baseline window would
       land during setup_steps, before convergence.
-    * Hardware headroom -- two things, which an earlier revision conflated. The
-      profile's pre/post hardware-capacity checks bound the device-maintained
-      ``ecmp_high_watermark`` in ABSOLUTE terms at both ends, so a peak the box
-      arrived carrying is attributed to the testbed rather than to this drain.
-      Separately, the capture/compare pair in Stages A and C is the only thing
-      that COMPARES those two readings: each hardware-capacity check is
-      independent and stateless, so before this the watermark was measured twice
-      and differenced never. That delta is the one gate here immune to sampling
-      -- a max-over-time counter maintained by the device cannot miss a peak
-      that falls between two 5s polls.
+    * Hardware headroom -- the profile's pre/post hardware-capacity checks gate
+      instantaneous usage and table limits. They deliberately ignore the
+      boot-lifetime ECMP high watermark because Conveyor runs SC9 after
+      full-scale workloads on the same boot. The capture/compare pair in Stages
+      A and C instead bounds watermark growth relative to SC9's converged
+      baseline. That delta records any new max-over-time peak above the captured
+      baseline, including one that falls between two 5s polls.
     * Instrument liveness -- the periodic task's ``min_observed_groups``, which
       fails a run that reported only zeroes. That is not hypothetical: the
       predecessor suite on bag012 read 0 for all 884 samples and passed eleven
@@ -30769,7 +31868,17 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
             # Trimmed from the stock 300s because Stage A now polls: the wait
             # that matters is the one with a predicate behind it.
             convergence_wait_seconds=_SC9_SETUP_SETTLE_SECONDS,
-        ),
+            start_device_groups_after_enable=True,
+        )
+        + [
+            # A peer that never establishes leaves Stage A one width short
+            # (125 vs 128) and fails as a baseline mismatch. Recovering or
+            # naming it here keeps that IXIA fault out of the SC9 verdict.
+            create_bgp_ixia_session_recovery_step(
+                device_name=device_name,
+                ixia_bgp_peer_regex=_SC9_EBGP_IXIA_PEER_REGEX,
+            ),
+        ],
         prechecks=profile_checks.prechecks,
         postchecks=profile_checks.postchecks,
         snapshot_checks=profile_checks.snapshot_checks,
@@ -30786,40 +31895,16 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
                 threshold=_SC9_ECMP_LEVEL2_CAPACITY,
                 # Blocking: a run that only ever reported zero measured nothing.
                 min_observed_groups=1,
-                # The device's own report that it could not program a group --
-                # the most direct hardware-exhaustion signal available, and the
-                # one number that does not need calibrating. Measured 0 on all
-                # 728 readings of the first bag013 run, against a peak of 27
-                # groups in an 8,192-entry table, so this is a real gate rather
-                # than a threshold picked to pass.
-                max_unprogrammed=0,
-                # Tolerate groups momentarily IN FLIGHT; gate on groups that
-                # stay unprogrammed. The first complete five-cycle run read 0
-                # in 390 of 391 samples and 4 in exactly one, caught mid-rebuild
-                # with widths climbing 1,2,3,12,...,26 and back to 0 five
-                # seconds later. `max_unprogrammed=0` alone asserted that
-                # creation and hardware programming are atomic, which they are
-                # not, so it failed a run whose every other gate passed.
-                #
-                # 3 samples is ~18s at the measured 5.8s cadence, against an
-                # unprogrammed condition that lasted ONE sample (~5s): the poll
-                # read 0 groups for five samples, then 3 groups at widths 1/2/3,
-                # then 12 groups with 4 unprogrammed, then 9 groups with 0. Note
-                # this is the duration of the UNPROGRAMMED state, not of the
-                # rebuild -- the rebuild itself runs ~70s to {128: 2} (76/71/68/
-                # 70s across the four sampled cycles), so a tolerance sized to
-                # the rebuild would be four times too wide and would blind the
-                # gate. Anything genuinely unprogrammed persists far longer than
-                # 18s -- rel-191 sat at 8 while the ECMP structure was
-                # collapsing. Caveat: n=1, one non-zero reading in five cycles.
-                unprogrammed_tolerance_samples=3,
+                # Intentional drain/readvertise phases can leave groups in
+                # flight for minutes. The post-soak window must be clean.
+                max_converged_unprogrammed=0,
                 # Report real ECMP sets separately from width-1 singletons. No
                 # ceiling yet -- the peak has never been measured on an
                 # uncontaminated run, and the coverage-bearing bound is the
                 # hardware-capacity postcheck.
                 min_ecmp_width=_SC9_MIN_ECMP_WIDTH,
-                # Bound the transient on REAL ECMP sets -- see the constant.
-                max_multiway_groups=_SC9_MAX_MULTIWAY_GROUPS,
+                # Use the topology-derived bound for real ECMP sets.
+                max_multiway_groups=_SC9_STRUCTURAL_MAX_ECMP_SETS,
                 # SC9's FIRST claim, and until now the only one untested: 5,000
                 # routes from 128 peers install as ONE ECMP set per AFI. Every
                 # other verdict on this task is a maximum over the run, so a
@@ -30874,7 +31959,7 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
                             "next-hops, then record it"
                         ),
                     ),
-                    # Capture the device's own FEC/ECMP peak counters, AFTER the
+                    # Capture the device's own FEC/ECMP counters, AFTER the
                     # baseline has converged so the reading is a steady state
                     # rather than a mid-convergence one.
                     #
@@ -30960,15 +32045,18 @@ def get_bgp_ebb_bounded_ecmp_sc9_playbook(
                     # recovery is already asserted twice over -- at RIB level by
                     # the multipath-width postcheck and on the sampled series by
                     # the converged verdict -- so it is corroboration here, not
-                    # the gate. The watermark INCREASE is the gate.
+                    # the gate. The ECMP watermark INCREASE is the gate. FEC
+                    # current recovery remains checked, but the topology-derived
+                    # ECMP group bound must not be applied to the FEC peak.
                     create_hardware_capacity_delta_step(
                         device_name,
                         "compare",
                         _sc9_capacity_state_key(device_name),
                         max_high_watermark_increase=_SC9_STRUCTURAL_MAX_ECMP_SETS,
+                        high_watermark_resources=("ecmp",),
                         description=(
-                            "SC9 Stage C: compare FEC/ECMP capacity against the "
-                            "pre-drain capture"
+                            "SC9 Stage C: compare current capacity and the ECMP "
+                            "high watermark against the pre-drain capture"
                         ),
                     ),
                 ],

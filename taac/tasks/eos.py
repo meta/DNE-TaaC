@@ -1,7 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-# pyre-unsafe
-
 """
 EOS-specific tasks for TAAC.
 
@@ -9,7 +7,9 @@ Tasks in this module operate on Arista EOS devices using the AristaSwitch driver
 directly (EOS CLI via FCR), rather than COOP patchers used by FBOSS tasks.
 """
 
+import asyncio
 import ipaddress
+import time
 import typing as t
 
 from taac.tasks.base_task import BaseTask
@@ -429,6 +429,104 @@ class ConfigureEosParallelBgpPeers(BaseTask):
             kwargs["graceful_restart_helper"] = True
 
         return kwargs
+
+
+class WaitForEosInterfacesTask(BaseTask):
+    """Wait for EOS interfaces created by a breakout change to materialize."""
+
+    NAME = "wait_for_eos_interfaces"
+
+    @staticmethod
+    def _normalize_interface(interface: str) -> str:
+        value = interface.strip().lower()
+        if value.startswith("ethernet"):
+            value = "et" + value[len("ethernet") :]
+        return value
+
+    async def run(self, params: t.Dict[str, t.Any]) -> None:
+        from taac.internal.driver.arista_switch import (
+            AristaSwitch,
+        )
+
+        hostname = params["hostname"]
+        interfaces = params.get("interfaces")
+        timeout_seconds = params.get("timeout_seconds", 120)
+        poll_interval_seconds = params.get("poll_interval_seconds", 5)
+        if (
+            not isinstance(interfaces, list)
+            or not interfaces
+            or any(
+                not isinstance(interface, str) or not interface
+                for interface in interfaces
+            )
+        ):
+            raise ValueError("interfaces must be a non-empty list of interface names")
+        for name, value in (
+            ("timeout_seconds", timeout_seconds),
+            ("poll_interval_seconds", poll_interval_seconds),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive number")
+
+        expected_by_normalized = {
+            self._normalize_interface(interface): interface for interface in interfaces
+        }
+        driver = AristaSwitch(hostname, logger=self.logger)
+        deadline = time.monotonic() + timeout_seconds
+        last_error: t.Optional[str] = None
+        missing = list(interfaces)
+        poll_count = 0
+        while True:
+            poll_count += 1
+            try:
+                response = await driver.async_execute_show_json_on_shell(
+                    "show interfaces status | json"
+                )
+                statuses = response.get("interfaceStatuses")
+                if not isinstance(statuses, dict):
+                    raise ValueError(
+                        "EOS interface-status response is missing interfaceStatuses"
+                    )
+                present = {
+                    self._normalize_interface(interface)
+                    for interface in statuses
+                    if isinstance(interface, str)
+                }
+                missing = [
+                    original
+                    for normalized, original in expected_by_normalized.items()
+                    if normalized not in present
+                ]
+                last_error = None
+                if not missing:
+                    self.logger.info(
+                        f"All expected EOS interfaces materialized on {hostname} "
+                        f"after {poll_count} poll(s): {interfaces}"
+                    )
+                    return
+                self.logger.info(
+                    f"Waiting for EOS interfaces to materialize on {hostname}; "
+                    f"missing={missing}"
+                )
+            except Exception as error:
+                last_error = f"{type(error).__name__}: {error}"
+                self.logger.warning(
+                    f"Failed to read EOS interface inventory on {hostname}; "
+                    f"retrying: {last_error}"
+                )
+
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(
+                    f"Timed out after {timeout_seconds}s waiting for EOS interfaces "
+                    f"to materialize on {hostname}; missing={missing}; "
+                    f"last_error={last_error}"
+                )
+            await asyncio.sleep(min(poll_interval_seconds, max(0.0, deadline - now)))
 
 
 class BackupRunningConfigTask(BaseTask):

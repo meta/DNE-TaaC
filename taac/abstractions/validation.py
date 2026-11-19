@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import typing as t
 from dataclasses import dataclass
 
@@ -37,9 +38,11 @@ from taac.abstractions.topology.prefix import (
 
 if t.TYPE_CHECKING:
     from taac.abstractions.topology.model import (
+        BoundTopology,
         DeviceGroupSpec,
         EndpointSpec,
         LogicalTopology,
+        OpenRInjectionPlan,
         PrefixAdvertisement,
         PrefixPool,
         PrefixSet,
@@ -49,6 +52,7 @@ if t.TYPE_CHECKING:
 
 
 VALID_AFIS = frozenset({"v4", "v6"})
+_DEVICE_STATE_GUARD_NAMESPACE = re.compile(r"[A-Za-z0-9_.-]+")
 VALID_ENDPOINT_REQUIRED_OS = frozenset({"eos", "fboss", "ixia"})
 VALID_ENDPOINT_SETUP_MODES = frozenset({"full", "preloaded", "skip", "verify_only"})
 VALID_ENDPOINT_KINDS = frozenset({"dut", "ixia", "traffic", "trafficgen"})
@@ -125,6 +129,34 @@ def validate_logical_topology(logical_topology: LogicalTopology) -> None:
     issues = collect_logical_topology_issues(logical_topology)
     if issues:
         raise TopologyValidationError(logical_topology.name or "<unnamed>", issues)
+
+
+def resolve_validated_openr_injection_plan(
+    bound: BoundTopology,
+) -> OpenRInjectionPlan | None:
+    """Resolve ``bound``'s Open/R injection, failing as a topology error.
+
+    The compiler and the playbook factories both read the plan, and either can
+    be first to resolve it, so both resolve through here and an unusable range
+    declaration fails the same way whichever layer reaches it.
+
+    Raises:
+        TopologyValidationError: The declared injection ranges cannot be
+            resolved; the issue message names the offending declaration.
+    """
+    try:
+        return bound.resolve_openr_injection_plan()
+    except ValueError as error:
+        raise TopologyValidationError(
+            bound.logical_topology.name,
+            [
+                ValidationIssue(
+                    path="device_config.openr_injection_scale",
+                    code="unresolvable_openr_injection",
+                    message=str(error),
+                )
+            ],
+        ) from error
 
 
 def collect_logical_topology_issues(
@@ -375,10 +407,13 @@ def _validate_prefix_set(
                 "prefix_step must be positive and in the prefix-set AFI",
             )
         )
+    parents = _validated_prefix_parents(
+        source, parsed_parent, prefix_set.afi, path, issues
+    )
     span = _validated_prefix_span(source, path, issues)
     if span is None:
         return
-    if parsed_start is None or parsed_parent is None or step is None:
+    if parsed_start is None or parents is None or step is None:
         return
     block_size = 1 << (parsed_start.max_prefixlen - source.prefix_length)
     if int(parsed_start) % block_size or step % block_size:
@@ -399,9 +434,9 @@ def _validate_prefix_set(
                 "formulaic prefix set overflows its AFI",
             )
         )
-    elif (
-        parsed_start not in parsed_parent
-        or ipaddress.ip_address(terminal) not in parsed_parent
+    elif not any(
+        int(first) <= int(parsed_start) and terminal <= int(last)
+        for first, last in parents
     ):
         issues.append(
             _issue(
@@ -410,6 +445,72 @@ def _validate_prefix_set(
                 "formulaic prefix set is not contained by parent_network",
             )
         )
+
+
+def _validated_prefix_parents(
+    source: t.Any,
+    parsed_parent: ipaddress.IPv4Network | ipaddress.IPv6Network | None,
+    afi: str,
+    path: str,
+    issues: list[ValidationIssue],
+) -> list[tuple[t.Any, t.Any]] | None:
+    """Merge the parent and its extensions into one contiguous address range."""
+    extensions = source.extension_parent_networks
+    if not isinstance(extensions, tuple) or not all(
+        isinstance(network, str) for network in extensions
+    ):
+        issues.append(
+            _issue(
+                f"{path}.source.extension_parent_networks",
+                "invalid_parent_network",
+                "extension_parent_networks must be a tuple of network strings",
+            )
+        )
+        return None
+    networks = [parsed_parent]
+    for index, network in enumerate(extensions):
+        parsed = _parse_network(network, afi)
+        if parsed is None:
+            issues.append(
+                _issue(
+                    f"{path}.source.extension_parent_networks[{index}]",
+                    "invalid_parent_network",
+                    "extension parent must be a network in the prefix-set AFI",
+                )
+            )
+        networks.append(parsed)
+    if any(network is None for network in networks):
+        return None
+    ordered = sorted(
+        t.cast(list[ipaddress.IPv4Network | ipaddress.IPv6Network], networks),
+        key=lambda network: int(network.network_address),
+    )
+    merged: list[tuple[t.Any, t.Any]] = []
+    for network in ordered:
+        if merged and int(network.network_address) <= int(merged[-1][1]):
+            issues.append(
+                _issue(
+                    f"{path}.source.extension_parent_networks",
+                    "overlapping_parent_networks",
+                    f"parent networks overlap at {network}",
+                )
+            )
+            return None
+        if merged and int(network.network_address) > int(merged[-1][1]) + 1:
+            issues.append(
+                _issue(
+                    f"{path}.source.extension_parent_networks",
+                    "non_contiguous_parent_networks",
+                    f"parent networks must form one contiguous range; {network} "
+                    f"starts after a gap following {merged[-1][1]}",
+                )
+            )
+            return None
+        if merged:
+            merged[-1] = (merged[-1][0], network.broadcast_address)
+        else:
+            merged.append((network.network_address, network.broadcast_address))
+    return merged
 
 
 def _validated_prefix_span(
@@ -2492,6 +2593,49 @@ def _validate_fibagent_bgp_nhg_watermarks(
         )
 
 
+def _validate_bgp_total_path_limit(
+    config: RoutingDeviceConfig,
+    path: str,
+    issues: list[ValidationIssue],
+) -> None:
+    limit = config.bgp_total_path_limit
+    if limit is None:
+        return
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        issues.append(
+            _issue(
+                f"{path}.bgp_total_path_limit",
+                "invalid_total_path_limit",
+                "bgp_total_path_limit must be None or a positive integer",
+            )
+        )
+
+
+def is_valid_device_state_guard_namespace(value: object) -> bool:
+    """Whether ``value`` can prefix ``:``-joined lifecycle operation ids."""
+    return isinstance(value, str) and (
+        _DEVICE_STATE_GUARD_NAMESPACE.fullmatch(value) is not None
+    )
+
+
+def _validate_device_state_guard_namespace(
+    config: RoutingDeviceConfig,
+    path: str,
+    issues: list[ValidationIssue],
+) -> None:
+    namespace = config.device_state_guard_namespace
+    if namespace is None or is_valid_device_state_guard_namespace(namespace):
+        return
+    issues.append(
+        _issue(
+            f"{path}.device_state_guard_namespace",
+            "invalid_device_state_guard_namespace",
+            "device_state_guard_namespace must be None or a nonempty string of "
+            "ASCII letters, digits, '_', '.' or '-'",
+        )
+    )
+
+
 def _validate_routing_device_config(
     config: RoutingDeviceConfig,
     path: str,
@@ -2535,6 +2679,8 @@ def _validate_routing_device_config(
             )
         )
     _validate_fibagent_bgp_nhg_watermarks(config, path, issues)
+    _validate_bgp_total_path_limit(config, path, issues)
+    _validate_device_state_guard_namespace(config, path, issues)
     for attr in ("route_limit", "prefix_limit", "per_peer_max_route_limit"):
         value = getattr(config, attr)
         if isinstance(value, bool):

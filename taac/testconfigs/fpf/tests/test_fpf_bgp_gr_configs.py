@@ -1,7 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-# pyre-unsafe
-
 """Structural tests for FPF graceful-restart collection contracts."""
 
 import importlib
@@ -21,9 +19,6 @@ from taac.testconfigs.fpf import (
     fpf_tc07_fsdb_gr_within_window,
     fpf_tc08_fsdb_gr_beyond_window,
     fpf_tc15_interface_disable,
-    fpf_tc23_bgp_restart,
-    fpf_tc25_wedge_agent_restart,
-    fpf_tc27_agent_coldboot,
     fpf_tc35_stsw_undrain_reinject,
     fpf_tc36_stsw_all_connections_down,
     fpf_tc54_stsw_device_drain,
@@ -70,6 +65,17 @@ def _all_steps(config):
             yield from stage.steps or []
 
 
+def _custom_step_names(config) -> set[str]:
+    names = set()
+    for step in _all_steps(config):
+        if step.step_params is None or step.step_params.json_params is None:
+            continue
+        params = json.loads(step.step_params.json_params)
+        if "custom_step_name" in params:
+            names.add(params["custom_step_name"])
+    return names
+
+
 def _reload_shared_suite_modules():
     """Reload environment-derived standalone factories before their umbrella."""
     importlib.reload(fpf_hardening_common)
@@ -81,10 +87,7 @@ def _reload_shared_suite_modules():
 
 class TestCampaignExecutionContracts(unittest.TestCase):
     def test_tc27_collects_fsdb_session_timeline_every_two_seconds(self) -> None:
-        for config in (
-            fpf_tc27_agent_coldboot.TEST_CONFIG,
-            fpf_shared_injection_suite.TEST_CONFIG,
-        ):
+        for config in (fpf_shared_injection_suite.TEST_CONFIG,):
             collector = next(
                 task
                 for task in config.setup_tasks or []
@@ -367,7 +370,10 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
                 _assert_restart_contract(self, _playbook(config, name))
 
     def test_tc23_restarts_only_the_targeted_dut_bgp_rib(self):
-        playbook = fpf_tc23_bgp_restart.create_fpf_tc23_test_config().playbooks[0]
+        playbook = _playbook(
+            fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config(),
+            "fpf_tc23_bgp_restart",
+        )
         bgp_checks = {
             check.check_id: _check_params(check)
             for check in playbook.postchecks or []
@@ -376,12 +382,14 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
 
         restarted = bgp_checks["fpf_bgp_restart_reconverge_lane0"]
         observer = bgp_checks["fpf_bgp_stable_lane1"]
-        self.assertEqual(restarted["lane_map"], {"0": fpf_tc23_bgp_restart.DUT_GTSW})
+        self.assertEqual(
+            restarted["lane_map"], {"0": fpf_shared_injection_suite.DUT_GTSW}
+        )
         self.assertEqual(restarted["mode"], "restart")
         self.assertEqual(restarted["reconverge_sla_sec"], 60.0)
         self.assertEqual(
             observer["lane_map"],
-            {"1": fpf_tc23_bgp_restart.OBSERVER_GTSWS[1]},
+            {"1": fpf_shared_injection_suite.OBSERVER_GTSWS[1]},
         )
         self.assertNotIn("mode", observer)
 
@@ -433,6 +441,18 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
             with self.subTest(playbook=name):
                 _assert_ods_policy(self, _playbook(shared, name), transient_allowed)
 
+    def test_shared_suite_runs_tc26_qsfp_restart_before_routing_restarts(self):
+        config = (
+            fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
+        )
+        names = [playbook.name for playbook in config.playbooks]
+
+        self.assertEqual(names.count("fpf_tc26_qsfp_service_restart"), 1)
+        self.assertLess(
+            names.index("fpf_tc26_qsfp_service_restart"),
+            names.index("fpf_tc23_bgp_restart"),
+        )
+
     def test_shared_suite_uses_tc04_as_the_single_wedge_warm_restart(self):
         config = (
             fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
@@ -441,12 +461,6 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
 
         self.assertEqual(names.count("fpf_tc04_wedge_agent_warmboot"), 1)
         self.assertNotIn("fpf_tc25_wedge_agent_restart", names)
-        self.assertEqual(
-            fpf_tc25_wedge_agent_restart.create_fpf_tc25_test_config()
-            .playbooks[0]
-            .name,
-            "fpf_tc25_wedge_agent_restart",
-        )
 
     def test_shared_suite_retains_default_ib_device(self):
         with (
@@ -586,107 +600,6 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
         finally:
             _reload_shared_suite_modules()
 
-    def test_standalone_tc25_honors_twshared_hosts_topology_and_no_ib_mode(self):
-        hosts = ["twshared1352.03.mwg2", "twshared1388.03.mwg2"]
-        device_ids = list(range(8))
-        local_planes = [0, 1, 2, 3]
-        try:
-            with patch.dict(
-                os.environ,
-                {
-                    "FPF_GPU_HOSTS": ",".join(hosts),
-                    "FPF_HRT_DEVICE_IDS": "0,1,2,3,4,5,6,7",
-                    "FPF_HRT_LANES": "0,1,2,3",
-                    "FPF_HRT_VF1_DEVICE_IDS": "0,2,4,6",
-                    "FPF_HRT_VF2_DEVICE_IDS": "1,3,5,7",
-                    "TAAC_FPF_SKIP_IB_TRAFFIC": "1",
-                },
-            ):
-                os.environ.pop("TAAC_FPF_SKIP_SSH_DEPS", None)
-                importlib.reload(fpf_hardening_common)
-                importlib.reload(fpf_tc25_wedge_agent_restart)
-                config = fpf_tc25_wedge_agent_restart.create_fpf_tc25_test_config()
-
-                self.assertEqual(fpf_tc25_wedge_agent_restart.GPU_HOSTS, hosts)
-                self.assertEqual(fpf_tc25_wedge_agent_restart.HRT_MEMORY_HOSTS, hosts)
-
-                task_names = {
-                    task.task_name
-                    for task in [*config.setup_tasks, *config.teardown_tasks]
-                }
-                self.assertNotIn("fpf_start_ib_traffic", task_names)
-                self.assertNotIn("fpf_stop_ib_traffic", task_names)
-
-                collector = next(
-                    task
-                    for task in config.setup_tasks
-                    if task.task_name == "fpf_start_collectors"
-                )
-                collector_params = json.loads(collector.params.json_params)
-                self.assertEqual(collector_params["hosts"], hosts)
-                self.assertEqual(collector_params["prod_prefix_host"], hosts[0])
-                self.assertEqual(collector_params["hrt_device_ids"], device_ids)
-                self.assertEqual(collector_params["hrt_plane_ids"], local_planes)
-                self.assertEqual(
-                    collector_params["rf_vf_groups"][0]["device_ids"],
-                    [0, 2, 4, 6],
-                )
-                self.assertEqual(
-                    collector_params["rf_vf_groups"][1]["device_ids"],
-                    [1, 3, 5, 7],
-                )
-                for group in collector_params["rf_vf_groups"]:
-                    self.assertEqual(group["lanes"], local_planes)
-
-                by_id = {
-                    check.check_id: _optional_check_params(check)
-                    for check in _all_checks(config)
-                    if check.check_id
-                }
-                self.assertEqual(by_id["fpf_hrt_bulk_stable"]["device_ids"], device_ids)
-                self.assertEqual(by_id["fpf_hrt_bulk_stable"]["lanes"], local_planes)
-                self.assertEqual(
-                    by_id["fpf_hrt_remote_failure_stable_vf1"]["device_ids"],
-                    [0, 2, 4, 6],
-                )
-                self.assertEqual(
-                    by_id["fpf_hrt_remote_failure_stable_vf2"]["device_ids"],
-                    [1, 3, 5, 7],
-                )
-                self.assertEqual(
-                    by_id["fpf_hrt_plane_status_all_up"]["device_ids"], device_ids
-                )
-                self.assertEqual(
-                    by_id["fpf_hrt_plane_status_all_up"]["expected_planes"],
-                    local_planes,
-                )
-
-                check_params_with_hosts = [
-                    _optional_check_params(check)
-                    for check in _all_checks(config)
-                    if "hosts" in _optional_check_params(check)
-                    and (check.check_id or "").startswith("fpf_hrt")
-                ]
-                self.assertTrue(check_params_with_hosts)
-                for params in check_params_with_hosts:
-                    self.assertEqual(params["hosts"], hosts)
-
-                check_ids = {
-                    check.check_id for check in _all_checks(config) if check.check_id
-                }
-                self.assertNotIn("fpf_host_spray", check_ids)
-                custom_step_names = {
-                    _step_params(step).get("custom_step_name")
-                    for step in _all_steps(config)
-                    if step.step_params is not None
-                }
-                self.assertNotIn("fpf_ensure_traffic", custom_step_names)
-        finally:
-            # Restore module-level environment-derived constants for subsequent
-            # tests after patch.dict has restored the process environment.
-            importlib.reload(fpf_hardening_common)
-            importlib.reload(fpf_tc25_wedge_agent_restart)
-
     def test_shared_suite_no_ib_mode_omits_tasks_checks_and_readiness(self):
         try:
             with patch.dict(os.environ, {"TAAC_FPF_SKIP_IB_TRAFFIC": "1"}):
@@ -715,96 +628,7 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
         finally:
             _reload_shared_suite_modules()
 
-    def test_standalone_tc25_retains_legacy_single_device_defaults(self):
-        topology_vars = (
-            "FPF_HRT_DEVICE_IDS",
-            "FPF_HRT_LANES",
-            "FPF_HRT_VF1_DEVICE_IDS",
-            "FPF_HRT_VF2_DEVICE_IDS",
-        )
-        try:
-            with patch.dict(os.environ):
-                for env_name in topology_vars:
-                    os.environ.pop(env_name, None)
-                importlib.reload(fpf_hardening_common)
-                importlib.reload(fpf_tc25_wedge_agent_restart)
-                config = fpf_tc25_wedge_agent_restart.create_fpf_tc25_test_config()
-
-                self.assertEqual(fpf_tc25_wedge_agent_restart.HRT_DEVICE_IDS, [0])
-                self.assertEqual(
-                    fpf_tc25_wedge_agent_restart.INJECTED_LANES, list(range(8))
-                )
-                self.assertEqual(
-                    fpf_tc25_wedge_agent_restart.HRT_VF_DEVICE_IDS, ([0], [0])
-                )
-
-                collector = next(
-                    task
-                    for task in config.setup_tasks
-                    if task.task_name == "fpf_start_collectors"
-                )
-                collector_params = json.loads(collector.params.json_params)
-                # Factory serialization omits legacy defaults; the task resolves
-                # absent values to dev0 and planes 0-7.
-                self.assertNotIn("hrt_device_ids", collector_params)
-                self.assertNotIn("hrt_plane_ids", collector_params)
-                self.assertNotIn("device_ids", collector_params["rf_vf_groups"][0])
-                self.assertNotIn("device_ids", collector_params["rf_vf_groups"][1])
-
-                by_id = {
-                    check.check_id: _optional_check_params(check)
-                    for check in _all_checks(config)
-                    if check.check_id
-                }
-                self.assertEqual(
-                    by_id["fpf_hrt_bulk_stable"].get("device_ids", [0]), [0]
-                )
-                self.assertEqual(
-                    by_id["fpf_hrt_plane_status_all_up"].get("device_ids", [0]),
-                    [0],
-                )
-                self.assertEqual(
-                    by_id["fpf_hrt_plane_status_all_up"].get(
-                        "expected_planes", list(range(8))
-                    ),
-                    list(range(8)),
-                )
-        finally:
-            importlib.reload(fpf_hardening_common)
-            importlib.reload(fpf_tc25_wedge_agent_restart)
-
-    def test_standalone_tc25_keeps_legacy_ib_device_by_default(self):
-        for configured_device in (None, ""):
-            with (
-                self.subTest(configured_device=configured_device),
-                patch.dict(os.environ),
-                patch.object(
-                    fpf_tc25_wedge_agent_restart,
-                    "skip_ssh_dependencies",
-                    return_value=False,
-                ),
-                patch.object(
-                    fpf_tc25_wedge_agent_restart,
-                    "skip_ib_traffic",
-                    return_value=False,
-                ),
-            ):
-                if configured_device is None:
-                    os.environ.pop("TAAC_FPF_IB_DEVICE", None)
-                else:
-                    os.environ["TAAC_FPF_IB_DEVICE"] = configured_device
-                config = fpf_tc25_wedge_agent_restart.create_fpf_tc25_test_config()
-
-            start = next(
-                task
-                for task in config.setup_tasks
-                if task.task_name == "fpf_start_ib_traffic"
-            )
-            params = json.loads(start.params.json_params)
-            self.assertEqual(params["device"], "mlx5_34")
-            self.assertEqual(params["gid_iface"], "bveth0")
-
-    def test_standalone_tc25_honors_twshared_ib_device_override(self):
+    def test_shared_suite_skip_twshared_ssh_preserves_non_ssh_coverage(self):
         hosts = ["twshared1352.03.mwg2", "twshared1388.03.mwg2"]
         try:
             with patch.dict(
@@ -815,84 +639,48 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
                     "FPF_HRT_LANES": "0,1,2,3",
                     "FPF_HRT_VF1_DEVICE_IDS": "0,2,4,6",
                     "FPF_HRT_VF2_DEVICE_IDS": "1,3,5,7",
-                    "FPF_VF_GROUP_PODS": "16",
-                    "FPF_VF_PREFIXES_PER_POD": "252",
-                    "TAAC_FPF_IB_DEVICE": "mlx5_bveth0",
+                    "TAAC_FPF_LINK_DRAIN_INTERFACE": "eth1/41/5",
+                    "TAAC_FPF_DEVICE_DRAIN_GTSW": "gtsw002.l1002.c087.mwg2",
+                    "TAAC_FPF_SKIP_TWSHARED_SSH": "1",
                 },
             ):
-                os.environ.pop("TAAC_FPF_SKIP_SSH_DEPS", None)
-                os.environ.pop("TAAC_FPF_SKIP_IB_TRAFFIC", None)
-                importlib.reload(fpf_hardening_common)
-                importlib.reload(fpf_tc25_wedge_agent_restart)
-                config = fpf_tc25_wedge_agent_restart.create_fpf_tc25_test_config()
+                _reload_shared_suite_modules()
+                config = fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
 
-                self.assertEqual(fpf_tc25_wedge_agent_restart.PREFIX_COUNT, 4032)
-                self.assertEqual(
-                    fpf_tc25_wedge_agent_restart.HRT_DEVICE_IDS,
-                    list(range(8)),
-                )
-                self.assertEqual(
-                    fpf_tc25_wedge_agent_restart.INJECTED_LANES,
-                    [0, 1, 2, 3],
-                )
-
-                start = next(
-                    task
-                    for task in config.setup_tasks
-                    if task.task_name == "fpf_start_ib_traffic"
-                )
-                params = json.loads(start.params.json_params)
-                self.assertEqual(params["server"], hosts[0])
-                self.assertEqual(params["clients"], [hosts[1]])
-                self.assertEqual(params["device"], "mlx5_bveth0")
-                self.assertEqual(params["gid_iface"], "bveth0")
-
-                ensure = next(
-                    _step_params(step)
-                    for step in _all_steps(config)
-                    if step.step_params is not None
-                    and _step_params(step).get("custom_step_name")
-                    == "fpf_ensure_traffic"
-                )
-                for key in (
-                    "server",
-                    "clients",
-                    "device",
-                    "gid_iface",
-                    "gid_prefix",
-                    "port",
-                    "msg_size",
-                    "qp",
-                    "tclass",
-                    "iters",
-                    "min_egress_gbps",
-                    "settle_sec",
-                    "ods_window_sec",
-                ):
-                    self.assertEqual(ensure[key], params[key])
-
-                stop = next(
-                    task
-                    for task in config.teardown_tasks
-                    if task.task_name == "fpf_stop_ib_traffic"
-                )
-                stop_params = json.loads(stop.params.json_params)
-                self.assertEqual(stop_params["server"], hosts[0])
-                self.assertEqual(stop_params["clients"], [hosts[1]])
-
-                check_ids = {
-                    check.check_id for check in _all_checks(config) if check.check_id
+                self.assertTrue(fpf_hardening_common.skip_twshared_ssh())
+                task_names = {
+                    task.task_name
+                    for task in [*config.setup_tasks, *config.teardown_tasks]
                 }
-                self.assertIn("fpf_host_spray", check_ids)
-                custom_step_names = {
-                    _step_params(step).get("custom_step_name")
-                    for step in _all_steps(config)
-                    if step.step_params is not None
-                }
-                self.assertIn("fpf_ensure_traffic", custom_step_names)
+                self.assertNotIn("fpf_start_ib_traffic", task_names)
+                self.assertNotIn("fpf_stop_ib_traffic", task_names)
+                self.assertIn("fpf_start_collectors", task_names)
+                self.assertNotIn("fpf_restart_hrt", _custom_step_names(config))
+                baseline = _playbook(config, "fpf_tc41_longevity_pristine")
+                self.assertIn(
+                    "fpf_host_spray",
+                    {check.check_id for check in baseline.postchecks or []},
+                )
         finally:
-            importlib.reload(fpf_hardening_common)
-            importlib.reload(fpf_tc25_wedge_agent_restart)
+            os.environ.pop("TAAC_FPF_SKIP_TWSHARED_SSH", None)
+            _reload_shared_suite_modules()
+
+    def test_shared_suite_prod_prefix_prechecks_use_recent_history(self):
+        config = (
+            fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
+        )
+        checks = [
+            (playbook.name, _optional_check_params(check))
+            for playbook in config.playbooks
+            for check in playbook.prechecks or []
+            if check.check_id == "fpf_prod_hrt_prefix_stability_precheck"
+        ]
+        self.assertTrue(checks)
+        for playbook_name, params in checks:
+            self.assertFalse(
+                params.get("use_test_case_start_time", True), playbook_name
+            )
+            self.assertEqual(params.get("lookback_sec"), 120, playbook_name)
 
     def test_shared_suite_wires_explicit_twshared_device_identity(self):
         device_ids = list(range(8))
@@ -1047,13 +835,21 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
 
     def test_tc15_and_tc16_use_validated_twshared_interface(self):
         hosts = ["twshared1352.03.mwg2", "twshared1375.03.mwg2"]
+        owner_prefixes = [
+            fpf_shared_injection_suite.get_prefix(
+                host,
+                fpf_shared_injection_suite.PROD_PREFIX_DEVICE_ID,
+            )
+            for host in hosts
+        ]
+        cross_host_observations = {host: owner_prefixes for host in hosts}
         with (
             patch.object(fpf_shared_injection_suite, "GPU_HOSTS", hosts),
             patch.object(fpf_shared_injection_suite, "PROD_PREFIX_HOST", hosts[0]),
             patch.object(
                 fpf_shared_injection_suite,
                 "PROD_PREFIXES_BY_HOST",
-                {hosts[0]: [fpf_shared_injection_suite.PROD_TARGET_PREFIX]},
+                cross_host_observations,
             ),
             patch.dict(
                 os.environ,
@@ -1167,8 +963,10 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
             if task.task_name == "fpf_start_collectors"
         )
         collector_params = json.loads(collector_task.params.json_params)
-        expected_observations = {
-            host: [fpf_shared_injection_suite.PROD_TARGET_PREFIX] for host in hosts
+        expected_observations = {host: owner_prefixes for host in hosts}
+        expected_affected_observations = {
+            hosts[0]: [owner_prefixes[1]],
+            hosts[1]: [owner_prefixes[0]],
         }
         self.assertEqual(
             collector_params["prod_prefixes_by_host"], expected_observations
@@ -1176,9 +974,9 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
         self.assertNotIn("prod_prefix_host", collector_params)
         self.assertNotIn("prod_prefixes", collector_params)
 
-        # The dual-host collector is shared suite-wide, but only TC15 opts into
-        # dual-host assertions. Unrelated playbooks preserve the legacy origin-
-        # host scope instead of silently gaining a second verdict surface.
+        # Every prod-prefix check consumes the full observer x owner matrix.
+        # Event-specific checks separately identify the one source-owned route
+        # that must transition; the peer-owned route must remain stable.
         baseline = _playbook(config, "fpf_tc41_longevity_pristine")
         baseline_prod_checks = [
             check
@@ -1192,8 +990,7 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
         self.assertEqual(len(baseline_prod_checks), 2)
         for check in baseline_prod_checks:
             self.assertEqual(
-                _check_params(check)["prefixes_by_host"],
-                {hosts[0]: [fpf_shared_injection_suite.PROD_TARGET_PREFIX]},
+                _check_params(check)["prefixes_by_host"], expected_observations
             )
 
         expected_conditional_route_impacts = {host: [0] for host in hosts}
@@ -1223,7 +1020,11 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
         )
         self.assertEqual(
             _check_params(recovery)["affected_prefixes_by_host"],
-            expected_observations,
+            expected_affected_observations,
+        )
+        self.assertEqual(
+            _check_params(transition)["affected_prefixes_by_host"],
+            expected_affected_observations,
         )
         self.assertEqual(
             fpf_shared_injection_suite._impacted_planes_by_host(circuits),
@@ -1285,6 +1086,25 @@ class TestFpfGracefulRestartConfigs(unittest.TestCase):
                 _check_params(check)["prefixes_by_host"],
                 {host: [target] for host in hosts},
             )
+
+    def test_every_shared_suite_prod_check_requires_cross_host_matrix(self):
+        config = (
+            fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
+        )
+        expected = fpf_shared_injection_suite.PROD_PREFIXES_BY_HOST
+        prod_checks = [
+            check
+            for check in _all_checks(config)
+            if (check.check_id or "").startswith("fpf_prod_hrt_prefix")
+        ]
+
+        self.assertGreater(len(prod_checks), 0)
+        for check in prod_checks:
+            with self.subTest(check_id=check.check_id):
+                self.assertEqual(
+                    _check_params(check).get("prefixes_by_host"),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

@@ -242,6 +242,20 @@ async def async_find_critical_core_dumps(
         return critical_core_dumps
 
 
+def is_fboss_core_dump_from_process(
+    core_file: str, process_names: t.Collection[str]
+) -> bool:
+    """Match an FBOSS packaged core path to an explicitly named process."""
+    parts = core_file.strip("/").split("/")
+    if len(parts) < 2 or parts[-1] not in ("core", "metadata"):
+        return False
+    return any(
+        re.fullmatch(rf"{re.escape(process)}_\d+_{re.escape(process)}_\d+", parts[-2])
+        is not None
+        for process in process_names
+    )
+
+
 async def async_is_critical_core_dump(
     core_dump_filename: str,
     critical_core_dump_keywords: t.Optional[t.List[str]] = None,

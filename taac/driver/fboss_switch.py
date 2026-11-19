@@ -78,6 +78,35 @@ if not TAAC_OSS:
     from fboss.fb_thrift_clients import FbossAgentClient
 
 
+try:
+    from neteng.fboss.bgp.client.canonical_rib_py3 import (
+        get_rib_entries,
+        get_rib_subprefixes,
+    )
+except ModuleNotFoundError as exc:
+    _canonical_rib_module = "neteng.fboss.bgp.client.canonical_rib_py3"
+    if not TAAC_OSS or not (
+        exc.name == _canonical_rib_module
+        or _canonical_rib_module.startswith(f"{exc.name}.")
+    ):
+        raise
+    # The neteng.fboss.bgp subpackage (canonical_rib_py3) is generated only
+    # in Meta-internal builds; the OSS thrift build does not produce it. Keep
+    # the driver module importable in OSS by deferring the failure to call
+    # time — only the RIB-dump helpers below actually need it.
+    async def get_rib_entries(*_args, **_kwargs):
+        raise NotImplementedError(
+            "neteng.fboss.bgp.client.canonical_rib_py3 is unavailable in this "
+            "build; get_rib_entries is not supported."
+        )
+
+    async def get_rib_subprefixes(*_args, **_kwargs):
+        raise NotImplementedError(
+            "neteng.fboss.bgp.client.canonical_rib_py3 is unavailable in this "
+            "build; get_rib_subprefixes is not supported."
+        )
+
+
 from neteng.fboss.bgp_attr.types import TBgpAfi, TIpPrefix
 from neteng.fboss.bgp_route_types.types import TBgpPath, TRibEntry
 from neteng.fboss.bgp_thrift.clients import TBgpService
@@ -88,6 +117,22 @@ from neteng.fboss.bgp_thrift.types import (
     TGetUpdateGroupInfoResponse,
     TOriginatedRoute,
 )
+
+# This response type is absent from the OSS fboss thrift-defs build (drift vs
+# Meta-internal). It is used only as a local-variable annotation below, so an
+# inert placeholder keeps the driver importable without masking unrelated
+# import failures from this generated module.
+if not TAAC_OSS:
+    TGetUpdateGroupSummariesResponse = (
+        fboss_bgp_thrift_types.TGetUpdateGroupSummariesResponse
+    )
+else:
+    TGetUpdateGroupSummariesResponse = getattr(
+        fboss_bgp_thrift_types,
+        "TGetUpdateGroupSummariesResponse",
+        type("TGetUpdateGroupSummariesResponse", (), {}),
+    )
+
 from neteng.fboss.ctrl.clients import FbossCtrl
 from neteng.fboss.ctrl.types import (
     AggregatePortThrift,
@@ -2870,7 +2915,23 @@ class FbossSwitch(AbstractSwitch):
             HwObjectType.NEXT_HOP_GROUP,
             HwObjectType.ROUTE_ENTRY,
         ]
-        if await self.async_is_mnpu():
+        # sw_agent serves listHwObjects only when monolithic; split agents
+        # reject it and the hw agent answers instead. A thrift stress burst
+        # calls this 10k times concurrently, so they share one run-mode probe;
+        # a failed probe fails them all once and the next call probes again.
+        loop = asyncio.get_running_loop()
+        probe = self.__dict__.get("_hw_objects_probe")
+        if probe is None or probe.get_loop() is not loop:
+            probe = self._hw_objects_probe = loop.create_task(
+                self.async_is_multi_switch()
+            )
+        try:
+            multi_switch = await asyncio.shield(probe)
+        except Exception:
+            if self.__dict__.get("_hw_objects_probe") is probe:
+                self._hw_objects_probe = None
+            raise
+        if multi_switch:
             async with await self.get_hw_agent_client(switch_index=0) as client:
                 hw_objects = await client.listHwObjects(
                     hw_object_type_list, cached=False
@@ -3607,7 +3668,9 @@ class FbossSwitch(AbstractSwitch):
         if create_parent_dir:
             parent = os.path.dirname(remote_path)
             if parent:
-                await self.async_run_cmd_on_shell(f"mkdir -p {shlex.quote(parent)}")
+                await self.async_run_cmd_on_shell(
+                    f"mkdir -p -- {shlex.quote(parent)}"
+                )
 
         self.logger.info(
             f"Writing {len(contents)} bytes to {self.hostname}:{remote_path}"
@@ -3626,7 +3689,9 @@ class FbossSwitch(AbstractSwitch):
         if create_parent_dir:
             parent = os.path.dirname(remote_path)
             if parent:
-                await self.async_run_cmd_on_shell(f"mkdir -p {shlex.quote(parent)}")
+                await self.async_run_cmd_on_shell(
+                    f"mkdir -p -- {shlex.quote(parent)}"
+                )
 
         self.logger.info(
             f"Copying {local_path} to {self.hostname}:{remote_path}"
@@ -4346,8 +4411,15 @@ class FbossSwitch(AbstractSwitch):
         end_time: Optional[int] = None,
         grep_pattern: Optional[str] = None,
         tail_lines: Optional[int] = None,
+        utc_offset_seconds: Optional[int] = None,
     ) -> str:
-        """Read a Classic/NSPAWN FBOSS log with optional remote filtering."""
+        """Read a Classic/NSPAWN FBOSS log with optional remote filtering.
+
+        The time window is matched against the device's wall-clock stamps.
+        Pass the device's UTC offset (seconds east of UTC) as
+        utc_offset_seconds; without it the host's local zone is assumed,
+        which only works when the host and device share a zone.
+        """
         if start_time is None and grep_pattern is None and tail_lines is None:
             return await self.async_read_file(log_file_path)
 
@@ -4358,7 +4430,11 @@ class FbossSwitch(AbstractSwitch):
             first_minute = start_time - (start_time % 60)
             last_minute = stop_time - (stop_time % 60)
             for timestamp in range(first_minute, last_minute + 1, 60):
-                local_time = time.localtime(timestamp)
+                local_time = (
+                    time.localtime(timestamp)
+                    if utc_offset_seconds is None
+                    else time.gmtime(timestamp + utc_offset_seconds)
+                )
                 # FBOSS files contain both syslog-style timestamps
                 # ("Sep 23 19:03") and glog prefixes ("I0923 19:03").
                 formatted_times.extend(
@@ -4379,7 +4455,8 @@ class FbossSwitch(AbstractSwitch):
         self, log_file_path: str, start_time: Optional[str] = None
     ) -> str:
         """Return a shell command that streams an FBOSS log to stdout."""
-        return f"zcat -f {shlex.quote(log_file_path)}"
+        decompressor = "zstdcat" if log_file_path.endswith(".zst") else "zcat -f"
+        return f"{decompressor} {shlex.quote(log_file_path)}"
 
     async def async_delete_file(self, file_location: str) -> None:
         """
@@ -5749,13 +5826,18 @@ class FbossSwitch(AbstractSwitch):
         self.logger.info(
             f"Waiting for agent to reach configured state on {self.hostname}"
         )
-        end_time = time.time() + timeout
-        while time.time() < end_time:
+        deadline = time.monotonic() + timeout
+        while True:
             if await self.async_is_agent_configured():
+                self.logger.info(
+                    f"Agent has reached configured state on {self.hostname}"
+                )
                 return
-            await asyncio.sleep(interval)
-        self.logger.info(f"Agent has reached configured state on {self.hostname}")
-        raise Exception(
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(interval, remaining))
+        raise TimeoutError(
             f"Agent did not reach configured state within {timeout} seconds on {self.hostname}"
         )
 

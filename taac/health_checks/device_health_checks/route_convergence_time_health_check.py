@@ -630,6 +630,11 @@ class RouteConvergenceTimeHealthCheck(
             f'-v next_day="{next_date:%m%d}"'
         )
 
+    @staticmethod
+    def _default_log_source_command(log_file: str) -> str:
+        decompressor = "zstdcat" if log_file.endswith(".zst") else "zcat -f"
+        return f"{decompressor} {shlex.quote(log_file)}"
+
     def _build_add_awk_command(
         self,
         log_file: str,
@@ -647,7 +652,9 @@ class RouteConvergenceTimeHealthCheck(
         start_time = start_time_str or "00:00:00"
         date_args = self._awk_date_args(start_stamp)
 
-        source_command = log_source_command or f"zcat -f {shlex.quote(log_file)}"
+        source_command = log_source_command or self._default_log_source_command(
+            log_file
+        )
         return f"""{source_command} | awk -v start="{start_time}" -v threshold="{time_threshold}" {date_args} '
 function time_to_sec(t) {{
     split(t, a, ":");
@@ -728,7 +735,9 @@ END {{
         start_time = start_time_str or "00:00:00"
         date_args = self._awk_date_args(start_stamp)
 
-        source_command = log_source_command or f"zcat -f {shlex.quote(log_file)}"
+        source_command = log_source_command or self._default_log_source_command(
+            log_file
+        )
         return f"""{source_command} | awk -v start="{start_time}" -v threshold="{time_threshold}" {date_args} '
 function time_to_sec(t) {{
     split(t, a, ":");
@@ -863,12 +872,12 @@ END {{
         """
         archives: t.List[t.Tuple[str, str]] = []
         basename = PurePosixPath(log_file).name
-        archive_pattern = re.compile(rf"{re.escape(basename)}-(\d{{12}})\.gz$")
+        archive_pattern = re.compile(rf"{re.escape(basename)}-(\d{{12}})\.(?:gz|zst)$")
         if start_stamp:
             try:
                 # pyrefly: ignore [missing-attribute]
                 out = await self.driver.async_run_cmd_on_shell(
-                    f"ls -1 {shlex.quote(archive_dir)}/{shlex.quote(basename)}-*.gz 2>/dev/null"
+                    f"ls -1 {shlex.quote(archive_dir)}/{shlex.quote(basename)}-* 2>/dev/null"
                 )
             except Exception as e:
                 self.logger.warning(f"Failed to list archive logs: {e}")

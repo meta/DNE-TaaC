@@ -5,7 +5,7 @@ import unittest
 from taac.abstractions.eos_bgpcpp_setup_tasks import (
     create_bgpcpp_logging_setup_task,
 )
-from taac.abstractions.physical_inventory import BAG010_ASH6
+from taac.abstractions.physical_inventory import NRQEB006_ASH6
 from taac.testconfigs.routing.factories.bgp_ebb_characteristic import (
     _validate_sc6_startup_order,
     create_bgp_ebb_characteristic_route_churn_processing_test_config,
@@ -22,7 +22,7 @@ from taac.testconfigs.routing.util.bgp_ebb_constants import (
 from taac.test_as_a_config import types as taac_types
 
 _SC6 = create_bgp_ebb_characteristic_route_churn_processing_test_config(
-    BAG010_ASH6,
+    NRQEB006_ASH6,
     enable_update_group=True,
 )
 _NEXTHOP_IFACE_STATE_FLAG = "bgp_resolve_nexthops_from_interface_state"
@@ -97,10 +97,10 @@ class Sc6TestbedDrivenNameTest(unittest.TestCase):
 
     def test_name_derives_from_device_with_ug(self) -> None:
         config = create_bgp_ebb_characteristic_route_churn_processing_test_config(
-            BAG010_ASH6, enable_update_group=True
+            NRQEB006_ASH6, enable_update_group=True
         )
         self.assertEqual(
-            config.name, "BAG010_ASH6_SC6_CHURN_PROCESSING_TEST_UPDATE_GROUP"
+            config.name, "NRQEB006_ASH6_SC6_CHURN_PROCESSING_TEST_UPDATE_GROUP"
         )
 
 
@@ -193,19 +193,19 @@ class Sc6ChurnSweepTest(unittest.TestCase):
         params = _custom_step_params(_SC6)
         self.assertEqual(
             params.get("ibgp_receiver_source_pairs"),
-            {"2401:db00:e50d:11:9::10": "2401:db00:e50d:11:9::11"},
+            {"2401:db00:e50d:33:9::10": "2401:db00:e50d:33:9::11"},
         )
         egress_pairs = params.get("ebgp_receiver_source_pairs")
         self.assertIsInstance(egress_pairs, dict)
         assert isinstance(egress_pairs, dict)
         self.assertEqual(len(egress_pairs), 100)
         self.assertEqual(
-            egress_pairs.get("2401:db00:e50d:11:8::11"),
-            "2401:db00:e50d:11:8::10",
+            egress_pairs.get("2401:db00:e50d:33:8::11"),
+            "2401:db00:e50d:33:8::10",
         )
         self.assertEqual(
-            egress_pairs.get("2401:db00:e50d:11:8::d7"),
-            "2401:db00:e50d:11:8::d6",
+            egress_pairs.get("2401:db00:e50d:33:8::d7"),
+            "2401:db00:e50d:33:8::d6",
         )
 
     def test_capture_window_bounded_but_above_fail_ceiling(self) -> None:
@@ -224,7 +224,7 @@ class Sc6ChurnSweepTest(unittest.TestCase):
     def test_every_sweep_scale_must_leave_an_unchurned_control_slice(self) -> None:
         with self.assertRaisesRegex(ValueError, "larger than churn_count"):
             create_bgp_ebb_scaling_route_churn_prefix_test_config(
-                BAG010_ASH6,
+                NRQEB006_ASH6,
                 name="INVALID_SC6_GEOMETRY",
                 ebgp_peer_count=2,
                 ibgp_peer_count=2,
@@ -324,7 +324,7 @@ class Sc6ThriftTimeoutTest(unittest.TestCase):
             index
             for index, (task, task_params) in enumerate(zip(tasks, params))
             if task.task_name == "arista_daemon_control"
-            and task_params.get("daemon_name") == "Bgp"
+            and task_params.get("daemon_name") == "Bgpcpp"
             and task_params.get("action") == "enable"
         ]
         self.assertEqual(len(flag_indices), 1)
@@ -346,7 +346,8 @@ class Sc6ThriftTimeoutTest(unittest.TestCase):
             task
             for task in tasks
             if task.task_name == "arista_daemon_control"
-            and json.loads(task.params.json_params or "{}").get("daemon_name") == "Bgp"
+            and json.loads(task.params.json_params or "{}").get("daemon_name")
+            == "Bgpcpp"
             and json.loads(task.params.json_params or "{}").get("action") == "enable"
         )
         with self.assertRaisesRegex(ValueError, "must precede"):
@@ -367,7 +368,8 @@ class Sc6ThriftTimeoutTest(unittest.TestCase):
             task
             for task in tasks
             if task.task_name == "arista_daemon_control"
-            and json.loads(task.params.json_params or "{}").get("daemon_name") == "Bgp"
+            and json.loads(task.params.json_params or "{}").get("daemon_name")
+            == "Bgpcpp"
             and json.loads(task.params.json_params or "{}").get("action") == "enable"
         )
         unrelated_tasks = [
@@ -402,7 +404,8 @@ class Sc6ThriftTimeoutTest(unittest.TestCase):
             task
             for task in tasks
             if task.task_name == "arista_daemon_control"
-            and json.loads(task.params.json_params or "{}").get("daemon_name") == "Bgp"
+            and json.loads(task.params.json_params or "{}").get("daemon_name")
+            == "Bgpcpp"
             and json.loads(task.params.json_params or "{}").get("action") == "enable"
         )
         unrelated_task = taac_types.Task(
@@ -436,7 +439,7 @@ class Sc6ThriftTimeoutTest(unittest.TestCase):
 
 
 class Sc6DaemonRestartBudgetTest(unittest.TestCase):
-    """Pin how many times setup cycles the Bgp daemon.
+    """Pin how many times setup cycles the Bgpcpp daemon.
 
     Every restart is minutes of wall clock and a chance to land in the
     out-of-order-init state (bgpd restarted independently of FibAgentBgp) that
@@ -455,7 +458,7 @@ class Sc6DaemonRestartBudgetTest(unittest.TestCase):
         bgp_actions = [
             p.get("action")
             for p in _params_for(_SC6, "arista_daemon_control")
-            if p.get("daemon_name") == "Bgp"
+            if p.get("daemon_name") == "Bgpcpp"
         ]
         self.assertEqual(bgp_actions.count("enable"), 2, f"actions={bgp_actions}")
 
@@ -513,9 +516,9 @@ class Sc6UpdateGroupEnablementTest(unittest.TestCase):
 
     def test_bgp_restarts_after_config_deployment(self) -> None:
         daemon_tasks = _params_for(_SC6, "arista_daemon_control")
-        bgp_tasks = [p for p in daemon_tasks if p.get("daemon_name") == "Bgp"]
+        bgp_tasks = [p for p in daemon_tasks if p.get("daemon_name") == "Bgpcpp"]
         self.assertGreaterEqual(
-            len(bgp_tasks), 2, "Expected disable + enable Bgp daemon tasks"
+            len(bgp_tasks), 2, "Expected disable + enable Bgpcpp daemon tasks"
         )
 
     def test_postcheck_drain_preserves_sessions_at_bounded_scale(self) -> None:

@@ -39,6 +39,10 @@ class PhysicalInventory:
     # stable and interpreted by the logical topology consumer.
     ixia_ports: list[tuple[str, str]] = field(default_factory=list)
     secondary_ixia_chassis_ip: str | None = None
+    # Basset pool that owns this physical device. ``dne.test`` preserves the
+    # legacy routing-factory behavior; inventories in another pool override it
+    # at their declaration site.
+    basset_pool: str = "dne.test"
 
     # ─── Which catalog surfaces may bind this physical inventory ──────────
     # Members of ``VALID_USAGES``. A cicd_*.py catalog file may only bind
@@ -143,6 +147,10 @@ class PhysicalInventory:
         return profiles
 
     def __post_init__(self) -> None:
+        if not self.basset_pool:
+            raise ValueError(
+                f"PhysicalInventory {self.device_name}: basset_pool must be nonempty"
+            )
         _validate_physical_interface_profiles(self)
         if self.network_role is not None and not isinstance(
             self.network_role, NetworkRole

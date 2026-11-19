@@ -221,6 +221,9 @@ def create_fpf_tc15_test_config() -> TestConfig:
         spray_hosts=spray,
         flip_fsdb_session=True,
         flip_discards=True,
+        remote_failure_sla_sec=10,
+        transition_sla_sec=10,
+        prod_switch_route_namespace="prod_route",
         fsdb_expected_total=EXPECTED_FSDB_SESSION_COUNT,
         include_ssh_checks=not skip_ssh,
         # Prefixes injected once by the setup task (8-STSW split-per-VF).
@@ -329,6 +332,15 @@ def create_fpf_tc15_test_config() -> TestConfig:
             fsdb_mode=FSDB_COLLECTOR_MODE,
             allow_baseline_failures=ALLOW_BASELINE_FAILURES,
             rf_vf_groups=RF_VF_GROUPS,
+            additional_namespaces=[
+                {
+                    "name": "prod_route",
+                    "subnet_prefix": PROD_TARGET_PREFIX,
+                    "bgp_gtsws": OBSERVER_GTSWS,
+                    "fsdb_gtsws": OBSERVER_GTSWS,
+                    "poll_interval_sec": 1.0,
+                }
+            ],
         )
     )
     # Inject the two VF prefix groups on all 8 STSWs once (after collectors

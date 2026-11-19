@@ -70,12 +70,12 @@ class TestSystemctlActiveStateHealthCheck(unittest.IsolatedAsyncioTestCase):
             return_value="LoadState=loaded\nActiveState=active\n"
         )
 
-        is_active = await self.health_check.async_is_systemctl_service_active(
+        reason = await self.health_check.async_get_inactive_reason(
             self.device.name,
             "bgpd",
         )
 
-        self.assertTrue(is_active)
+        self.assertIsNone(reason)
         self.health_check.driver.async_run_cmd_on_shell.assert_awaited_once_with(
             "systemctl show netos.service.fboss_bgp --no-page"
         )
@@ -119,6 +119,106 @@ class TestSystemctlActiveStateHealthCheck(unittest.IsolatedAsyncioTestCase):
         result = await self.health_check._run(self.device, input_data, {})
         self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
         self.assertIn(self.device.name, result.message)
+        self.assertIn("bgpd: inactive", result.message)
+        self.assertNotIn("wedge_agent", result.message)
+
+    def _mock_unit_and_uptime(self, unit_output: str, uptime: str) -> None:
+        async def mock_cmd(cmd):
+            if cmd == "cat /proc/uptime":
+                return uptime
+            return unit_output
+
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            side_effect=mock_cmd
+        )
+
+    async def test_min_active_seconds_stable_unit_passes(self):
+        # Active since 100s after boot, uptime 200s: active for 100s.
+        self._mock_unit_and_uptime(
+            "LoadState=loaded\nActiveState=active\n"
+            "ActiveEnterTimestampMonotonic=100000000\n",
+            "200.50 1000.00\n",
+        )
+        result = await self.health_check._run(
+            self.device,
+            hc_types.SystemctlActiveStateHealthCheckIn(
+                services=[hc_types.Service.QSFP_SERVICE],
+            ),
+            {"min_active_seconds": 30},
+        )
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
+
+    async def test_min_active_seconds_recently_restarted_unit_fails(self):
+        # Active since 196s after boot, uptime 200s: active for 4s.
+        self._mock_unit_and_uptime(
+            "LoadState=loaded\nActiveState=active\n"
+            "ActiveEnterTimestampMonotonic=196000000\n",
+            "200.50 1000.00\n",
+        )
+        result = await self.health_check._run(
+            self.device,
+            hc_types.SystemctlActiveStateHealthCheckIn(
+                services=[hc_types.Service.QSFP_SERVICE],
+            ),
+            {"min_active_seconds": 30},
+        )
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("qsfp_service: active for 4s (< 30s)", result.message)
+
+    async def test_min_active_seconds_requires_a_valid_enter_timestamp(self):
+        for timestamp_line in (
+            "",
+            "ActiveEnterTimestampMonotonic=0\n",
+            "ActiveEnterTimestampMonotonic=\n",
+            "ActiveEnterTimestampMonotonic=invalid\n",
+            "ActiveEnterTimestampMonotonic=-1\n",
+        ):
+            with self.subTest(timestamp=timestamp_line):
+                self._mock_unit_and_uptime(
+                    "LoadState=loaded\nActiveState=active\n" + timestamp_line,
+                    "200.50 1000.00\n",
+                )
+                result = await self.health_check._run(
+                    self.device,
+                    hc_types.SystemctlActiveStateHealthCheckIn(
+                        services=[hc_types.Service.QSFP_SERVICE],
+                    ),
+                    {"min_active_seconds": 30},
+                )
+                self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+                self.assertIn("qsfp_service", result.message)
+                self.assertIn("ActiveEnterTimestampMonotonic", result.message)
+
+    async def test_min_active_seconds_activating_unit_fails(self):
+        self._mock_unit_and_uptime(
+            "LoadState=loaded\nActiveState=activating\n"
+            "ActiveEnterTimestampMonotonic=0\n",
+            "200.50 1000.00\n",
+        )
+        result = await self.health_check._run(
+            self.device,
+            hc_types.SystemctlActiveStateHealthCheckIn(
+                services=[hc_types.Service.QSFP_SERVICE],
+            ),
+            {"min_active_seconds": 30},
+        )
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("qsfp_service: activating", result.message)
+
+    async def test_uptime_not_read_without_min_active_seconds(self):
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            return_value="LoadState=loaded\nActiveState=active\n"
+        )
+        await self.health_check._run(
+            self.device,
+            hc_types.SystemctlActiveStateHealthCheckIn(
+                services=[hc_types.Service.QSFP_SERVICE],
+            ),
+            {},
+        )
+        self.health_check.driver.async_run_cmd_on_shell.assert_awaited_once_with(
+            "systemctl show qsfp_service --no-page"
+        )
 
 
 if __name__ == "__main__":

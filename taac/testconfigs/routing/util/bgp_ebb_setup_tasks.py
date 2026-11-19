@@ -40,6 +40,7 @@ from taac.task_definitions import (
     create_eos_compiler_lifecycle_task,
     create_interface_ip_cleanup_task,
     create_interface_ip_configuration_task,
+    create_invoke_ixia_api_task,
     create_run_commands_on_shell_task,
     create_set_bgp_setting_config_task,
     create_validate_bgpcpp_update_group_state_task,
@@ -92,7 +93,7 @@ BGPCPP_CONFIG_PATH = "/mnt/flash/bgpcpp_config"
 BGPCPP_STARTUP_PATH = "/usr/sbin/run_bgpcpp.sh"
 # patternlint-disable-next-line no-dev-shm-usage
 BGP_RP_STATE_PATH = "/dev/shm/bgp_rp_state.txt"
-_STATE_GUARD_DAEMONS = (*BGPCPP_DAEMONS, "BgpTcpdump")
+_STATE_GUARD_DAEMONS = (*BGPCPP_DAEMONS, "bgpcpp", "BgpTcpdump")
 _STATE_GUARD_DIRECTORIES = (
     "/usr/facebook/thrift_acls",
     "/mnt/fb/agent_configs",
@@ -961,7 +962,7 @@ def build_rescale_bgpcpp_config_steps(
     return [
         create_daemon_control_step(
             device_name=device_name,
-            daemon_name="Bgp",
+            daemon_name="Bgpcpp",
             action="disable",
             description=(
                 f"Disable Bgp daemon before rewriting {config_path}"
@@ -980,7 +981,7 @@ def build_rescale_bgpcpp_config_steps(
         ),
         create_daemon_control_step(
             device_name=device_name,
-            daemon_name="Bgp",
+            daemon_name="Bgpcpp",
             action="enable",
             description=f"Re-enable Bgp daemon with {len(peers)} peers configured",
         ),
@@ -990,6 +991,13 @@ def build_rescale_bgpcpp_config_steps(
 # Upper bound used when stopping IXIA IBGP peers between iterations. Matches
 # the long-standing lab convention.
 PER_ITERATION_MAX_IBGP_SESSIONS_TO_STOP: int = 500
+# Stopping hundreds of IXIA sessions completes asynchronously; a Start issued
+# while it is still settling left 65 of 100 IPv6 sessions resetting every DUT
+# OPEN on NRQEB008 SC1 (2026-11-06).
+PER_ITERATION_IXIA_STOP_SETTLE_SECONDS: int = 30
+# The DUT already has this iteration's peers configured, so a started session
+# that is not up within a minute is stuck and gets restarted.
+PER_ITERATION_IXIA_UP_TIMEOUT_SECONDS: int = 60
 _REGEX_IBGP_V6: str = "BGP_PEER_IPV6_IBGP"
 _REGEX_IBGP_V4: str = "BGP_PEER_IPV4_IBGP"
 
@@ -1049,16 +1057,22 @@ def build_ixia_ibgp_subset_activation_steps(n_v6: int, n_v4: int) -> list:
 
     Skips the start step for an AF whose count is 0.
     """
-    from taac.steps.step_definitions import create_ixia_api_step
+    from taac.steps.step_definitions import (
+        create_ixia_api_step,
+        create_longevity_step,
+    )
 
     def _args(start: bool, regex: str, end_idx: int) -> t.Dict[str, t.Any]:
-        return {
+        args: t.Dict[str, t.Any] = {
             "start": start,
             "regex": regex,
             "session_start_idx": 1,
             "session_end_idx": end_idx,
             "verify_started": start,
         }
+        if start:
+            args["verify_up_timeout_seconds"] = PER_ITERATION_IXIA_UP_TIMEOUT_SECONDS
+        return args
 
     steps = [
         create_ixia_api_step(
@@ -1071,6 +1085,13 @@ def build_ixia_ibgp_subset_activation_steps(n_v6: int, n_v4: int) -> list:
             (_REGEX_IBGP_V4, "IPv4"),
         )
     ]
+    steps.append(
+        create_longevity_step(
+            duration=PER_ITERATION_IXIA_STOP_SETTLE_SECONDS,
+            description="Let IXIA finish stopping IBGP peers before restarting them",
+            start_traffic=False,
+        )
+    )
     for regex, label, n in (
         (_REGEX_IBGP_V6, "IPv6", n_v6),
         (_REGEX_IBGP_V4, "IPv4", n_v4),
@@ -1176,16 +1197,22 @@ def build_ixia_ebgp_subset_activation_steps(n_v6: int, n_v4: int) -> list:
     ``build_ixia_ibgp_subset_activation_steps``. Skips the start step for an AF
     whose count is 0.
     """
-    from taac.steps.step_definitions import create_ixia_api_step
+    from taac.steps.step_definitions import (
+        create_ixia_api_step,
+        create_longevity_step,
+    )
 
     def _args(start: bool, regex: str, end_idx: int) -> t.Dict[str, t.Any]:
-        return {
+        args: t.Dict[str, t.Any] = {
             "start": start,
             "regex": regex,
             "session_start_idx": 1,
             "session_end_idx": end_idx,
             "verify_started": start,
         }
+        if start:
+            args["verify_up_timeout_seconds"] = PER_ITERATION_IXIA_UP_TIMEOUT_SECONDS
+        return args
 
     steps = [
         create_ixia_api_step(
@@ -1198,6 +1225,13 @@ def build_ixia_ebgp_subset_activation_steps(n_v6: int, n_v4: int) -> list:
             (_REGEX_EBGP_V4, "IPv4"),
         )
     ]
+    steps.append(
+        create_longevity_step(
+            duration=PER_ITERATION_IXIA_STOP_SETTLE_SECONDS,
+            description="Let IXIA finish stopping EBGP peers before restarting them",
+            start_traffic=False,
+        )
+    )
     for regex, label, n in (
         (_REGEX_EBGP_V6, "IPv6", n_v6),
         (_REGEX_EBGP_V4, "IPv4", n_v4),
@@ -1462,6 +1496,9 @@ def get_common_setup_tasks(
 
 def build_expected_peer_identity(
     parent_networks: t.Optional[t.Dict[str, str]] = None,
+    *,
+    ibgp_peers_per_plane: int = IBGP_PEER_SCALE_PER_PLANE,
+    include_bgp_mon: bool = True,
 ) -> t.Dict[str, str]:
     """
     Build expected {peer_addr: local_addr} mapping for full-scale EBB tests.
@@ -1481,6 +1518,9 @@ def build_expected_peer_identity(
             the peers really do come up on that chassis' subnets, so leaving
             this at the default marks every session as unexpected and fails
             the snapshot check on an otherwise healthy run.
+        ibgp_peers_per_plane: Peers in each HE and MP iBGP device group, from
+            the scale profile the topology was built at.
+        include_bgp_mon: Whether the BGP-monitor peers are expected at all.
 
     Returns:
         Mapping of peer address to the DUT-local address facing it.
@@ -1496,7 +1536,7 @@ def build_expected_peer_identity(
     for base, count in [
         (_net("ebgp_v6", IXIA_EBGP_IC_PARENT_NETWORK_V6), EBGP_PEER_COUNT_V6),
         *(
-            (_net(f"ibgp_{tier}_p{plane}_v6", default), IBGP_PEER_SCALE_PER_PLANE)
+            (_net(f"ibgp_{tier}_p{plane}_v6", default), ibgp_peers_per_plane)
             for tier, defaults in (
                 (
                     "dc",
@@ -1519,7 +1559,11 @@ def build_expected_peer_identity(
             )
             for plane, default in enumerate(defaults, start=1)
         ),
-        (_net("bgpmon_v6", IXIA_BGP_MON_IC_PARENT_NETWORK), BGP_MON_PEER_COUNT),
+        *(
+            ((_net("bgpmon_v6", IXIA_BGP_MON_IC_PARENT_NETWORK), BGP_MON_PEER_COUNT),)
+            if include_bgp_mon
+            else ()
+        ),
     ]:
         for entry in _generate_ixia_v6_peer_entries_for_bgpcpp(
             remote_as=0,
@@ -1533,7 +1577,7 @@ def build_expected_peer_identity(
     for base, count in [
         (_net("ebgp_v4", IXIA_EBGP_IC_PARENT_NETWORK_V4), EBGP_PEER_COUNT_V4),
         *(
-            (_net(f"ibgp_{tier}_p{plane}_v4", default), IBGP_PEER_SCALE_PER_PLANE)
+            (_net(f"ibgp_{tier}_p{plane}_v4", default), ibgp_peers_per_plane)
             for tier, defaults in (
                 (
                     "dc",
@@ -1620,7 +1664,7 @@ def get_ebb_device_state_guard_tasks(
             operation_id=component_operation_id,
             startup_path=BGPCPP_STARTUP_PATH,
             file_restores=file_restores,
-            force_restart_daemons=["Bgp"],
+            force_restart_daemons=["Bgpcpp"],
         )
     ]
     return setup_tasks, teardown_tasks
@@ -1957,7 +2001,7 @@ def get_update_packing_setup_tasks(  # noqa: C901
     setup_tasks.append(
         create_arista_daemon_control_task(
             hostname=device_name,
-            daemon_name="Bgp",
+            daemon_name="Bgpcpp",
             action="disable",
             ixia_needed=True,
         )
@@ -1965,7 +2009,7 @@ def get_update_packing_setup_tasks(  # noqa: C901
     setup_tasks.append(
         create_arista_daemon_control_task(
             hostname=device_name,
-            daemon_name="Bgp",
+            daemon_name="Bgpcpp",
             action="enable",
             ixia_needed=True,
         )
@@ -2061,6 +2105,74 @@ def get_teardown_tasks(
         )
         for interface in reversed(interfaces)
     ]
+
+
+def _is_bgpcpp_enable_task(task: Task) -> bool:
+    if task.task_name != "arista_daemon_control":
+        return False
+    try:
+        params = json.loads(task.params.json_params or "{}")
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(params, dict)
+        and params.get("daemon_name") == "Bgpcpp"
+        and params.get("action") == "enable"
+    )
+
+
+def insert_gateway_resolution_gate(
+    setup_tasks: t.Sequence[Task],
+    device_group_names: t.Sequence[str],
+) -> t.List[Task]:
+    """Gate the first post-IXIA Bgpcpp enable on every named IXIA gateway MAC.
+
+    StartAllProtocols sends its only ARP/NS before the DUT interface IP
+    configuration tasks give the DUT its gateway addresses. The gate re-sends
+    ARP/NS after the last of those tasks and fails setup while any gateway MAC
+    of the named device groups stays unresolved. Raises `ValueError` when no
+    device group is named or either anchor task is missing, so the gate cannot
+    be dropped silently.
+    """
+    if not device_group_names:
+        raise ValueError("Gateway gate requires at least one IXIA device group")
+    tasks = list(setup_tasks)
+    interface_ip_indices = [
+        index
+        for index, task in enumerate(tasks)
+        if task.task_name == "interface_ip_configuration"
+    ]
+    if not interface_ip_indices:
+        raise ValueError(
+            "Gateway gate requires an interface_ip_configuration setup task"
+        )
+    # Pre-IXIA tasks all run before post-IXIA tasks, so only post-IXIA interface
+    # configuration constrains the gate position.
+    last_post_ixia_interface_ip = max(
+        (index for index in interface_ip_indices if tasks[index].ixia_needed),
+        default=-1,
+    )
+    bgpcpp_enable_index = next(
+        (
+            index
+            for index in range(last_post_ixia_interface_ip + 1, len(tasks))
+            if tasks[index].ixia_needed and _is_bgpcpp_enable_task(tasks[index])
+        ),
+        None,
+    )
+    if bgpcpp_enable_index is None:
+        raise ValueError(
+            "Gateway gate requires a post-IXIA Bgpcpp enable after the DUT "
+            "interface IP configuration"
+        )
+    tasks.insert(
+        bgpcpp_enable_index,
+        create_invoke_ixia_api_task(
+            api_name="refresh_and_verify_gateway_resolution",
+            args_dict={"device_group_names": list(device_group_names)},
+        ),
+    )
+    return tasks
 
 
 # CPU stress constants and task factories are in task_definitions.py.

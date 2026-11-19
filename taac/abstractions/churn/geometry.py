@@ -51,8 +51,10 @@ def sample_prefix_range(
     sample_count: int,
     concrete_last: str | None = None,
 ) -> tuple[str, ...]:
-    if route_count != 750 or sample_count != 2:
-        raise ValueError("CICD-EBB-10 geometry requires 750 routes and 2 samples")
+    if route_count <= 0:
+        raise ValueError("route_count must be positive")
+    if sample_count != 2:
+        raise ValueError("CICD-EBB-10 geometry requires 2 samples per route block")
     address = ipaddress.ip_address(start)
     stride = 1 << (address.max_prefixlen - prefix_length)
     last = (

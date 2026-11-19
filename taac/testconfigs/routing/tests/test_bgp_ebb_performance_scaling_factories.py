@@ -1,13 +1,24 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 # pyre-unsafe
+import base64
 import json
+import re
+import shlex
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
+from taac.abstractions.compatibility.eos_bgpcpp_compatibility import (
+    build_cleanup_materialized_policy_evaluation_files_cmd,
+    build_materialize_missing_bgpcpp_startup_cmd,
+    build_materialize_missing_lab_thrift_acl_files_cmd,
+    POLICY_EVALUATION_BGPCPP_STARTUP_FLAGS,
+)
+from taac.abstractions.eos_bgpcpp_setup_tasks import (
+    create_bgpcpp_logging_setup_task,
+    POLICY_EVALUATION_SOURCE_CONFIG_PATH,
+)
 from taac.abstractions.physical_inventory import (
-    BAG010_ASH6,
-    BAG012_ASH6,
     NRQEB006_ASH6,
     NRQEB007_ASH6,
     NRQEB008_ASH6,
@@ -24,15 +35,22 @@ from taac.abstractions.topologies.egress_peer_scale import (
 from taac.abstractions.topologies.ipv6_update_packing import (
     IPV6_UPDATE_PACKING_PARENT_NETWORKS_IXIA03,
 )
+from taac.abstractions.topologies.separable_policy_evaluation import (
+    SEPARABLE_POLICY_EVALUATION,
+)
+from taac.abstractions.topology import BgpPeerGroup
 from taac.constants import BgpPlusPlusProfile
+from taac.testconfigs.routing import cicd_ebb_int_tc
 from taac.testconfigs.routing.factories import (
     bgp_ebb_characteristic as characteristic_factory,
 )
 from taac.testconfigs.routing.factories.bgp_ebb_characteristic import (
     create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config,
+    create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config,
     create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config,
     create_bgp_ebb_characteristic_performance_scaling_test_config,
     create_bgp_ebb_characteristic_transient_memory_route_scale_test_config,
+    create_bgp_ebb_separable_policy_evaluation_test_config,
     create_bgp_ebb_update_packing_test_config,
 )
 from taac.testconfigs.routing.factories.bgp_ebb_scaling import (
@@ -49,10 +67,42 @@ from taac.test_as_a_config.types import Params, Playbook, Task
 _ROUTER_ID_ASSIGN = "c['router_id']="
 
 
+class ConstantAttributeStoragePortOverrideTest(unittest.TestCase):
+    def _config(self, basic_port_configs):
+        return characteristic_factory.test_config_constant_attribute_storage_varying_combinations_on_eos(
+            test_config_name="SC2_PORT_OVERRIDE_TEST",
+            device_name="nrqeb006.ash6",
+            ixia_interface_mimic_ebgp="Ethernet1",
+            ebgp_remote_as=65334,
+            ixia_ebgp_ic_parent_network_v6="2001:db8:1",
+            ixia_ebgp_ic_parent_network_v4="192.0.2",
+            unique_combination_counts=[1],
+            test_address_families=["ipv6"],
+            basic_port_configs=basic_port_configs,
+        )
+
+    def test_empty_override_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "basic_port_configs override.*at least one"
+        ):
+            self._config([])
+
+    def test_none_uses_legacy_defaults(self) -> None:
+        config = self._config(None)
+        self.assertEqual(len(config.basic_port_configs or []), 1)
+        self.assertEqual(
+            config.basic_port_configs[0].endpoint, "nrqeb006.ash6:Ethernet1"
+        )
+        self.assertEqual(
+            config.basic_port_configs[0].device_group_configs[0].device_group_name,
+            "DEVICE_GROUP_IPV6_EBGP",
+        )
+
+
 class IngressPeerScaleIxiaGeometryTest(unittest.TestCase):
     def test_disjoint_compact_geometry_is_forwarded_to_ixia_builder(self) -> None:
         config = create_bgp_ebb_scaling_ingress_peer_scale_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             name="SC4_GEOMETRY_TEST",
             ingress_peer_counts=[1, 2, 4, 8, 16],
             ibgp_peer_count=500,
@@ -85,6 +135,24 @@ def _task_json_params(task) -> dict:
     return value
 
 
+def _run_task_input(step) -> dict:
+    if step.input_json is None:
+        raise AssertionError("RUN_TASK step must have input_json")
+    value = json.loads(step.input_json)
+    if not isinstance(value, dict):
+        raise AssertionError("RUN_TASK input must be an object")
+    return value
+
+
+def _decode_base64_python_command(command: str) -> str:
+    tokens = shlex.split(command)
+    try:
+        encoded = tokens[tokens.index("%s") + 1]
+    except (ValueError, IndexError) as error:
+        raise AssertionError(f"not a base64 Python command: {command}") from error
+    return base64.b64decode(encoded).decode()
+
+
 def _custom_step_params(config) -> list:
     """Params of every CUSTOM_STEP across the config's playbooks."""
     found = []
@@ -103,32 +171,31 @@ def _custom_step_params(config) -> list:
 class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
     """The perf-scaling factory is physical-inventory-driven: the TestConfig name derives
     from ``physical_inventory.device_name`` and ``router_id`` is optional so physical inventories that
-    rely on the device-default router-id (bag010) work without pinning one."""
+    rely on the device-default router-id work without pinning one."""
 
     def test_name_derives_from_device(self) -> None:
         # The name is device-derived: {DEVICE}_SC1_EGRESS_PEER_SCALE_TEST. A
-        # non-bag010 device (bag012) exercises the derivation independently of
-        # the bag010 default.
+        # second NRQ inventory exercises the derivation independently.
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG012_ASH6
+            NRQEB008_ASH6
         )
-        self.assertEqual(config.name, "BAG012_ASH6_SC1_EGRESS_PEER_SCALE_TEST")
+        self.assertEqual(config.name, "NRQEB008_ASH6_SC1_EGRESS_PEER_SCALE_TEST")
 
-    def test_bag010_builds_without_router_id(self) -> None:
-        # bag010 has no router_id — the factory must not require one, and the
+    def test_nrqeb006_builds_without_router_id(self) -> None:
+        # NRQEB006 has no router_id — the factory must not require one, and the
         # name must derive from the physical_inventory device_name.
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6
+            NRQEB006_ASH6
         )
-        self.assertEqual(config.name, "BAG010_ASH6_SC1_EGRESS_PEER_SCALE_TEST")
+        self.assertEqual(config.name, "NRQEB006_ASH6_SC1_EGRESS_PEER_SCALE_TEST")
 
     def test_update_group_appends_suffix(self) -> None:
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6, enable_update_group=True
+            NRQEB006_ASH6, enable_update_group=True
         )
         self.assertEqual(
             config.name,
-            "BAG010_ASH6_SC1_EGRESS_PEER_SCALE_TEST_UPDATE_GROUP",
+            "NRQEB006_ASH6_SC1_EGRESS_PEER_SCALE_TEST_UPDATE_GROUP",
         )
 
     def test_nrqeb006_sc2_uses_primary_ixia03_addresses_and_port(self) -> None:
@@ -231,13 +298,13 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
     def test_sc2_empty_parent_networks_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing required keys"):
             create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-                BAG010_ASH6,
+                NRQEB006_ASH6,
                 parent_networks={},
             )
 
     def test_sc2_explicit_parent_networks_support_unknown_ixia_chassis(self) -> None:
         unknown_chassis = replace(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             primary_ixia_chassis_ip="2401:db00:2066:3036::ffff",
         )
 
@@ -255,7 +322,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
 
     def test_sc2_required_keys_are_derived_from_canonical_maps(self) -> None:
         unknown_chassis = replace(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             primary_ixia_chassis_ip="2401:db00:2066:3036::ffff",
         )
         first_canonical_map = {
@@ -298,7 +365,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
             )
 
     def test_sc2_known_chassis_uses_only_its_canonical_keys(self) -> None:
-        legacy_chassis = BAG010_ASH6.primary_ixia_chassis_ip
+        legacy_chassis = NRQEB006_ASH6.primary_ixia_chassis_ip
         extended_other_chassis_map = {
             **EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
             "future_required": "2001:db8:ffff::",
@@ -362,13 +429,13 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
                     ixia_chassis_ip=unknown_chassis_ip,
                 )
 
-    def test_sc2_explicit_legacy_parent_networks_do_not_imply_direct_binding(
+    def test_sc2_explicit_parent_networks_do_not_imply_direct_binding(
         self,
     ) -> None:
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             parent_networks={
-                **EGRESS_PEER_SCALE_PARENT_NETWORKS,
+                **EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
                 "metadata": "ignored",
             },
         )
@@ -377,7 +444,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
         self.assertEqual(1, len(dut_endpoints))
         self.assertFalse(dut_endpoints[0].direct_ixia_connections)
         self.assertIn(
-            EGRESS_PEER_SCALE_PARENT_NETWORKS["ebgp_v6"],
+            EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03["ebgp_v6"],
             "\n".join(
                 task.params.json_params or "" for task in config.setup_tasks or []
             ),
@@ -674,8 +741,8 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
     def test_sc3_rejects_parent_networks_for_different_ixia_chassis(self) -> None:
         with self.assertRaisesRegex(ValueError, "do not match IXIA chassis"):
             create_bgp_ebb_characteristic_transient_memory_route_scale_test_config(
-                BAG010_ASH6,
-                parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03,
+                NRQEB006_ASH6,
+                parent_networks=EGRESS_PEER_SCALE_PARENT_NETWORKS,
             )
 
     def test_nrqeb008_sc1_uses_primary_ixia03_addresses_and_ports(self) -> None:
@@ -722,7 +789,7 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
 
     def test_sc1_requires_complete_dual_stack_parent_network_map(self) -> None:
         cases = (
-            (BAG012_ASH6, EGRESS_PEER_SCALE_PARENT_NETWORKS),
+            (NRQEB008_ASH6, EGRESS_PEER_SCALE_PARENT_NETWORKS),
             (NRQEB008_ASH6, EGRESS_PEER_SCALE_PARENT_NETWORKS_IXIA03),
         )
         required_keys = ("ebgp_v4", "ebgp_v6", "ibgp_v4", "ibgp_v6")
@@ -740,6 +807,22 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
                             inventory,
                             parent_networks=incomplete_networks,
                         )
+
+    def test_nrqeb009_sc9_runs_bgpcpp_at_dbg1(self) -> None:
+        commands = [
+            command
+            for task in cicd_ebb_int_tc.NRQEB009_SC9_BOUNDED_ECMP_SETS_TEST_CONFIG_UG.setup_tasks
+            or []
+            if task.task_name == "run_commands_on_shell"
+            for command in json.loads(task.params.json_params or "{}").get("cmds", [])
+        ]
+
+        def logging_command(logging_config: str) -> str:
+            task = create_bgpcpp_logging_setup_task("nrqeb009.ash6", logging_config)
+            return json.loads(task.params.json_params or "{}")["cmds"][0]
+
+        self.assertIn(logging_command("DBG1;default:async=true"), commands)
+        self.assertNotIn(logging_command("DBG5;default:async=true"), commands)
 
     def test_nrqeb009_sc9_uses_primary_ixia03_addresses_and_ports(self) -> None:
         config = create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config(
@@ -790,6 +873,56 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
             },
             address_starts,
         )
+
+    def test_sc9_initializes_every_ixia_device_group_disabled(self) -> None:
+        config = create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config(
+            NRQEB009_ASH6,
+            parent_networks=BOUNDED_ECMP_PARENT_NETWORKS_IXIA03,
+        )
+        device_groups = [
+            group
+            for port in config.basic_port_configs or []
+            for group in port.device_group_configs or []
+        ]
+
+        self.assertEqual(8, len(device_groups))
+        self.assertTrue(all(not group.enable for group in device_groups))
+
+    def test_sc9_uses_bgpcpp_bgp_timers(self) -> None:
+        config = create_bgp_ebb_characteristic_bounded_ecmp_sc9_test_config(
+            NRQEB009_ASH6,
+            parent_networks=BOUNDED_ECMP_PARENT_NETWORKS_IXIA03,
+        )
+        bgp_configs = [
+            bgp_config
+            for port in config.basic_port_configs or []
+            for group in port.device_group_configs or []
+            for bgp_config in (group.v4_bgp_config, group.v6_bgp_config)
+            if bgp_config is not None
+        ]
+
+        self.assertEqual(8, len(bgp_configs))
+        self.assertEqual(
+            {(15, 5)},
+            {
+                (bgp_config.hold_timer, bgp_config.keepalive_timer)
+                for bgp_config in bgp_configs
+            },
+        )
+
+    def test_retained_bounded_ecmp_keeps_default_ixia_bgp_timers(self) -> None:
+        config = create_bgp_ebb_characteristic_bounded_ecmp_sets_test_config(
+            NRQEB009_ASH6
+        )
+        timers = {
+            (bgp_config.hold_timer, bgp_config.keepalive_timer)
+            for port in config.basic_port_configs or []
+            for group in port.device_group_configs or []
+            for bgp_config in (group.v4_bgp_config, group.v6_bgp_config)
+            if bgp_config is not None
+        }
+
+        self.assertEqual({(30, 10)}, timers)
 
     def test_update_packing_conveyor_config_is_ug_and_non_vacuous(self) -> None:
         config = create_bgp_ebb_update_packing_test_config(
@@ -878,9 +1011,452 @@ class PerformanceScalingPhysicalInventoryDrivenTest(unittest.TestCase):
         self.assertEqual(1, len(packing_steps))
         self.assertEqual(50000, packing_steps[0].get("min_advertised_nlri"))
 
+    def test_ebb23_nrqeb008_is_ug_paired_and_non_vacuous(self) -> None:
+        config = create_bgp_ebb_separable_policy_evaluation_test_config(
+            NRQEB008_ASH6,
+            enable_update_group=True,
+            name_override="NRQEB008_ASH6_EBB23_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
+        )
+
+        self.assertEqual(
+            "NRQEB008_ASH6_EBB23_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
+            config.name,
+        )
+        self.assertEqual(
+            ["bgp_ebb_separable_policy_evaluation_playbook"],
+            [playbook.name for playbook in config.playbooks or []],
+        )
+        self.assertEqual(
+            [("Ethernet3/35/1", "2401:db00:2066:3036::3003", "1/89")],
+            [
+                (
+                    connection.interface,
+                    connection.ixia_chassis_ip,
+                    connection.ixia_port,
+                )
+                for connection in config.endpoints[0].direct_ixia_connections or []
+            ],
+        )
+        update_group_validators = [
+            _task_json_params(task)
+            for task in config.setup_tasks or []
+            if task.task_name == "validate_bgpcpp_update_group_state"
+        ]
+        self.assertEqual(
+            [{"hostname": "nrqeb008.ash6", "expect_enabled": True}],
+            update_group_validators,
+        )
+        self.assertEqual(
+            1,
+            sum(
+                build_materialize_missing_bgpcpp_startup_cmd(
+                    startup_flags=POLICY_EVALUATION_BGPCPP_STARTUP_FLAGS
+                )
+                in (_task_json_params(task).get("cmds") or [])
+                for task in config.setup_tasks or []
+                if task.params.json_params is not None
+            ),
+        )
+        self.assertEqual(
+            1,
+            sum(
+                build_materialize_missing_lab_thrift_acl_files_cmd()
+                in (_task_json_params(task).get("cmds") or [])
+                for task in config.setup_tasks or []
+                if task.params.json_params is not None
+            ),
+        )
+        self.assertEqual(
+            1,
+            sum(
+                build_cleanup_materialized_policy_evaluation_files_cmd()
+                in (_task_json_params(task).get("cmds") or [])
+                for task in config.teardown_tasks or []
+                if task.params.json_params is not None
+            ),
+        )
+        custom_steps = [
+            params
+            for params in _custom_step_params(config)
+            if params.get("custom_step_name") == "policy_evaluation_sweep"
+        ]
+        self.assertEqual(12, len(custom_steps))
+        self.assertEqual(
+            1, sum(step["action"] == "initialize" for step in custom_steps)
+        )
+        self.assertEqual(10, sum(step["action"] == "collect" for step in custom_steps))
+        self.assertEqual(1, sum(step["action"] == "evaluate" for step in custom_steps))
+        collected = [step for step in custom_steps if step["action"] == "collect"]
+        self.assertEqual(
+            [
+                ("baseline", 10_000),
+                ("candidate", 10_000),
+                ("candidate", 20_000),
+                ("baseline", 20_000),
+                ("baseline", 30_000),
+                ("candidate", 30_000),
+                ("candidate", 40_000),
+                ("baseline", 40_000),
+                ("baseline", 50_000),
+                ("candidate", 50_000),
+            ],
+            [(step["arm"], step["prefix_count"]) for step in collected],
+        )
+        self.assertEqual(
+            {"baseline": 5, "candidate": 5},
+            {
+                arm: sum(step["arm"] == arm for step in collected)
+                for arm in ("baseline", "candidate")
+            },
+        )
+        self.assertEqual(
+            {10_000, 20_000, 30_000, 40_000, 50_000},
+            {step["prefix_count"] for step in collected},
+        )
+        run_tasks = [
+            _run_task_input(step)
+            for playbook in config.playbooks or []
+            for stage in playbook.stages or []
+            for step in stage.steps or []
+            if step.input_json is not None and '"task"' in step.input_json
+        ]
+        compact_resize_steps = [
+            json.loads(params["task"]["params"]["json_params"])
+            for params in run_tasks
+            if params["task"]["task_name"] == "ixia_enable_disable_bgp_prefixes"
+            and json.loads(params["task"]["params"]["json_params"]).get(
+                "target_number_of_addresses"
+            )
+            is not None
+        ]
+        self.assertEqual(20, len(compact_resize_steps))
+        self.assertEqual(
+            {10_000, 20_000, 30_000, 40_000, 50_000},
+            {step["target_number_of_addresses"] for step in compact_resize_steps},
+        )
+        self.assertTrue(all(not step["enable"] for step in compact_resize_steps))
+        self.assertTrue(
+            all(
+                step["safe_number_of_addresses"] == 50_000
+                and step["allowed_current_number_of_addresses"]
+                == [10_000, 20_000, 30_000, 40_000, 50_000]
+                for step in compact_resize_steps
+            )
+        )
+        route_gates = [
+            params
+            for params in run_tasks
+            if params["task"]["task_name"] == "bgp_verify_received_routes"
+        ]
+        self.assertEqual(10, len(route_gates))
+        self.assertTrue(
+            all(params["task"]["params"]["json_params"] for params in route_gates)
+        )
+        self.assertTrue(
+            any(
+                task.task_name == "interface_ip_cleanup"
+                and _task_json_params(task)["interfaces"] == ["Ethernet3/35/1"]
+                for task in config.teardown_tasks or []
+            )
+        )
+
+    def test_ebb23_nrqeb009_preserves_bound_ixia03_config_across_policy_arms(
+        self,
+    ) -> None:
+        self.assertIsNone(SEPARABLE_POLICY_EVALUATION.task_compatibility_profile)
+        config = create_bgp_ebb_separable_policy_evaluation_test_config(
+            NRQEB009_ASH6,
+            enable_update_group=True,
+            name_override="NRQEB009_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
+        )
+
+        self.assertEqual(
+            "NRQEB009_SC8_POLICY_EVALUATION_TEST_CONFIG_UG",
+            config.name,
+        )
+        self.assertEqual(
+            [("Ethernet3/35/1", "2401:db00:2066:3036::3003", "1/93")],
+            [
+                (
+                    connection.interface,
+                    connection.ixia_chassis_ip,
+                    connection.ixia_port,
+                )
+                for connection in config.endpoints[0].direct_ixia_connections or []
+            ],
+        )
+        self.assertEqual(
+            {"10.180.28.11", "2401:db00:e50d:33:8::11"},
+            {
+                address.starting_ip
+                for port in config.basic_port_configs or []
+                for group in port.device_group_configs or []
+                for address in (
+                    group.v4_addresses_config,
+                    group.v6_addresses_config,
+                )
+                if address is not None
+            },
+        )
+        setup_shell_commands = [
+            command
+            for task in config.setup_tasks or []
+            if task.task_name == "run_commands_on_shell"
+            for command in (_task_json_params(task).get("cmds") or [])
+        ]
+        self.assertTrue(
+            any(
+                "c['local_as_4_byte']=65009" in command
+                for command in setup_shell_commands
+            )
+        )
+        peer_chunks = [
+            shlex.split(command)[2]
+            for command in setup_shell_commands
+            if command.startswith("bash echo '") and command.endswith("/tmp/peers.b64")
+        ]
+        self.assertTrue(peer_chunks)
+        compiled_peers = json.loads(base64.b64decode("".join(peer_chunks)))
+        self.assertEqual(
+            {
+                (
+                    "10.180.28.11",
+                    "10.180.28.10",
+                    65334,
+                    "EB-FA-V4",
+                ),
+                (
+                    "2401:db00:e50d:33:8::11",
+                    "2401:db00:e50d:33:8::10",
+                    65334,
+                    "EB-FA-V6",
+                ),
+            },
+            {
+                (
+                    peer["peer_addr"],
+                    peer["local_addr"],
+                    peer["remote_as_4_byte"],
+                    peer["peer_group_name"],
+                )
+                for peer in compiled_peers
+            },
+        )
+        self.assertEqual(
+            {
+                ("10.180.28.11", "10.180.28.10", 65334),
+                (
+                    "2401:db00:e50d:33:8::11",
+                    "2401:db00:e50d:33:8::10",
+                    65334,
+                ),
+            },
+            {
+                (
+                    addresses.starting_ip,
+                    addresses.gateway_starting_ip,
+                    bgp.local_as_4_bytes,
+                )
+                for port in config.basic_port_configs or []
+                for group in port.device_group_configs or []
+                for addresses, bgp in (
+                    (group.v4_addresses_config, group.v4_bgp_config),
+                    (group.v6_addresses_config, group.v6_bgp_config),
+                )
+                if addresses is not None and bgp is not None
+            },
+        )
+
+        serialized_tasks = []
+        for playbook in config.playbooks or []:
+            for stage in playbook.stages or []:
+                for step in stage.steps or []:
+                    if step.input_json is None or '"task"' not in step.input_json:
+                        continue
+                    task = _run_task_input(step)["task"]
+                    params = json.loads(task["params"]["json_params"])
+                    serialized_tasks.append((task["task_name"], params))
+
+        staged_sources = [
+            params
+            for task_name, params in serialized_tasks
+            if task_name == "arista_create_file_from_config"
+        ]
+        self.assertEqual(10, len(staged_sources))
+        self.assertTrue(
+            all(
+                params["file_path"] == POLICY_EVALUATION_SOURCE_CONFIG_PATH
+                for params in staged_sources
+            )
+        )
+        self.assertTrue(
+            all(
+                params["file_path"] != "/mnt/flash/bgpcpp_config"
+                for params in staged_sources
+            )
+        )
+
+        overlay_scripts = []
+        transition_sequence = []
+        for task_name, params in serialized_tasks:
+            if task_name == "run_commands_on_shell":
+                scripts = [
+                    _decode_base64_python_command(command)
+                    for command in params.get("cmds", [])
+                    if "base64 -d | sudo python3 -" in command
+                ]
+                if scripts:
+                    self.assertTrue(params["validate_output"])
+                    overlay_scripts.extend(scripts)
+                    transition_sequence.append("overlay")
+            elif task_name == "arista_create_file_from_config":
+                transition_sequence.append("stage")
+            elif task_name == "validate_bgpcpp_config_on_device":
+                transition_sequence.append("validate_config")
+            elif task_name == "arista_daemon_control" and params["action"] == "enable":
+                transition_sequence.append("enable_bgp")
+            elif task_name == "validate_bgpcpp_update_group_state":
+                transition_sequence.append("validate_update_group")
+
+        self.assertEqual(10, len(overlay_scripts))
+        self.assertTrue(
+            all(
+                "expected_local_as = 65009" in script
+                and "10.180.28.11" in script
+                and "10.180.28.10" in script
+                and "2401:db00:e50d:33:8::11" in script
+                and "2401:db00:e50d:33:8::10" in script
+                and "remote_as_4_byte" in script
+                and "65334" in script
+                for script in overlay_scripts
+            )
+        )
+        self.assertEqual(
+            [
+                label
+                for _ in range(10)
+                for label in (
+                    "stage",
+                    "overlay",
+                    "validate_config",
+                    "enable_bgp",
+                    "validate_update_group",
+                )
+            ],
+            transition_sequence,
+        )
+
+    def test_ebb23_uses_bound_handles_for_triggers_and_validation(self) -> None:
+        pool_names = {
+            "v4": "POOL.v4[bound]+",
+            "v6": "POOL(v6)?^",
+        }
+        peer_group_names = {
+            "v4": "PG.v4+",
+            "v6": "PG[v6]",
+        }
+        groups = []
+        peer_groups: list[BgpPeerGroup] = []
+        for group in SEPARABLE_POLICY_EVALUATION.device_groups:
+            if not isinstance(group.peer_group, BgpPeerGroup):
+                self.fail(f"expected a typed peer group for {group.name}")
+            peer_group = replace(
+                group.peer_group,
+                name=peer_group_names[group.afi],
+            )
+            advertisement = replace(
+                group.prefix_advertisements[0],
+                legacy_ixia_name=pool_names[group.afi],
+            )
+            groups.append(
+                replace(
+                    group,
+                    peer_group=peer_group,
+                    prefix_advertisements=(advertisement,),
+                )
+            )
+            peer_groups.append(peer_group)
+        topology = replace(
+            SEPARABLE_POLICY_EVALUATION,
+            device_groups=tuple(groups),
+            peer_groups=tuple(peer_groups),
+        )
+        peer_group_map = {peer_group.name: peer_group for peer_group in peer_groups}
+
+        with (
+            patch.object(
+                characteristic_factory,
+                "SEPARABLE_POLICY_EVALUATION",
+                topology,
+            ),
+            patch.object(
+                characteristic_factory,
+                "SEPARABLE_POLICY_EVALUATION_PEER_GROUPS",
+                peer_group_map,
+            ),
+        ):
+            config = create_bgp_ebb_separable_policy_evaluation_test_config(
+                NRQEB009_ASH6,
+                enable_update_group=True,
+            )
+
+        task_params = []
+        for playbook in config.playbooks or []:
+            for stage in playbook.stages or []:
+                for step in stage.steps or []:
+                    if step.input_json is None or '"task"' not in step.input_json:
+                        continue
+                    task = _run_task_input(step)["task"]
+                    task_params.append(
+                        (
+                            task["task_name"],
+                            json.loads(task["params"]["json_params"]),
+                        )
+                    )
+
+        prefix_steps = [
+            params
+            for task_name, params in task_params
+            if task_name == "ixia_enable_disable_bgp_prefixes"
+        ]
+        expected_pool_names = set(pool_names.values())
+        expected_pool_regexes = {
+            rf"^{re.escape(pool_name)}$" for pool_name in expected_pool_names
+        }
+        self.assertEqual(40, len(prefix_steps))
+        self.assertEqual(
+            expected_pool_regexes,
+            {params["prefix_pool_regex"] for params in prefix_steps},
+        )
+        self.assertTrue(
+            all(
+                set(params.get("expected_prefix_pool_names", [])) <= expected_pool_names
+                for params in prefix_steps
+            )
+        )
+        route_gates = [
+            params
+            for task_name, params in task_params
+            if task_name == "bgp_verify_received_routes"
+        ]
+        self.assertEqual(10, len(route_gates))
+        self.assertTrue(
+            all(
+                params["exact_peer_group_names"]
+                == [peer_group_names["v4"], peer_group_names["v6"]]
+                for params in route_gates
+            )
+        )
+        self.assertTrue(
+            all(
+                set(params["expected_count_histogram_by_afi"]) == {"ipv4", "ipv6"}
+                for params in route_gates
+            )
+        )
+
     def test_explicit_empty_ixia_overrides_are_preserved(self) -> None:
         config = create_bgp_ebb_scaling_performance_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             name="EMPTY_IXIA_OVERRIDES",
             egress_peer_counts=[1],
             endpoints=[],
@@ -916,7 +1492,7 @@ class PerformanceScalingInterfaceIpCoverageTest(unittest.TestCase):
     """
 
     def _ibgp_interface_ip_peer_counts(self, config) -> list:
-        ibgp_iface = BAG010_ASH6.ixia_ports[1][0]
+        ibgp_iface = NRQEB006_ASH6.ixia_ports[1][0]
         counts = []
         for task in config.setup_tasks or []:
             if task.task_name != "interface_ip_configuration":
@@ -928,7 +1504,7 @@ class PerformanceScalingInterfaceIpCoverageTest(unittest.TestCase):
 
     def test_ibgp_interface_covers_full_sweep(self) -> None:
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6
+            NRQEB006_ASH6
         )
         counts = self._ibgp_interface_ip_peer_counts(config)
         self.assertEqual(
@@ -957,7 +1533,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
 
     def test_nexthop_resolution_gflag_enabled_via_managed_shell(self) -> None:
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6
+            NRQEB006_ASH6
         )
         matching = [
             p
@@ -979,7 +1555,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
 
     def test_no_openr_ingress_only_config_uses_same_mode_invariant(self) -> None:
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         matching = [
@@ -1004,7 +1580,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
             index
             for index, task in enumerate(config.setup_tasks or [])
             if task.task_name == "arista_daemon_control"
-            and _task_json_params(task).get("daemon_name") == "Bgp"
+            and _task_json_params(task).get("daemon_name") == "Bgpcpp"
             and _task_json_params(task).get("action") == "enable"
         ]
         self.assertEqual(1, len(flag_indices))
@@ -1026,7 +1602,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
         test below pins.
         """
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         enabling = [
@@ -1044,7 +1620,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
 
     def test_update_group_state_uses_thrift_after_final_bgp_restart(self) -> None:
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         tasks = config.setup_tasks or []
@@ -1057,7 +1633,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
             index
             for index, task in enumerate(tasks)
             if task.task_name == "arista_daemon_control"
-            and _task_json_params(task).get("daemon_name") == "Bgp"
+            and _task_json_params(task).get("daemon_name") == "Bgpcpp"
             and _task_json_params(task).get("action") == "enable"
         ]
         shell_commands = [
@@ -1070,7 +1646,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
         self.assertEqual(1, len(validators))
         self.assertEqual(
             {
-                "hostname": BAG010_ASH6.device_name,
+                "hostname": NRQEB006_ASH6.device_name,
                 "expect_enabled": True,
             },
             validators[0][1],
@@ -1090,7 +1666,7 @@ class PerformanceScalingNexthopResolutionGflagTest(unittest.TestCase):
         iBGP peer count reaching zero is what keeps the DUT silent.
         """
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         sweep_steps = [
@@ -1128,7 +1704,7 @@ class ConstantAttributeStorageIngressAttributeDumpTest(unittest.TestCase):
 
     def test_attribute_dump_disabled(self) -> None:
         config = create_bgp_ebb_characteristic_constant_attribute_storage_ingress_test_config(
-            BAG010_ASH6,
+            NRQEB006_ASH6,
             enable_update_group=True,
         )
         sweep_steps = [
@@ -1158,7 +1734,7 @@ class PerformanceScalingRouteFilterClearTest(unittest.TestCase):
 
     def test_route_filter_cleared(self) -> None:
         config = create_bgp_ebb_characteristic_performance_scaling_test_config(
-            BAG010_ASH6
+            NRQEB006_ASH6
         )
         clear_tasks = [
             task
@@ -1171,3 +1747,130 @@ class PerformanceScalingRouteFilterClearTest(unittest.TestCase):
             "exactly one bgp_clear_route_filter task must be wired so injected "
             "prefixes are not blocked by the route registry",
         )
+
+
+def _is_bgpcpp_enable(task) -> bool:
+    return (
+        task.task_name == "arista_daemon_control"
+        and _task_json_params(task).get("daemon_name") == "Bgpcpp"
+        and _task_json_params(task).get("action") == "enable"
+    )
+
+
+def _gateway_gate_indices(tasks) -> list:
+    return [
+        index
+        for index, task in enumerate(tasks)
+        if task.task_name == "invoke_ixia_api"
+        and _task_json_params(task).get("api_name")
+        == "refresh_and_verify_gateway_resolution"
+    ]
+
+
+def _daemon_task(action: str, ixia_needed: bool = True) -> Task:
+    return Task(
+        task_name="arista_daemon_control",
+        ixia_needed=ixia_needed,
+        params=Params(
+            json_params=json.dumps(
+                {"hostname": "dut", "daemon_name": "Bgpcpp", "action": action}
+            )
+        ),
+    )
+
+
+def _interface_ip_task(ixia_needed: bool = True) -> Task:
+    return Task(
+        task_name="interface_ip_configuration",
+        ixia_needed=ixia_needed,
+        params=Params(json_params="{}"),
+    )
+
+
+class PerformanceScalingGatewayResolutionGateTest(unittest.TestCase):
+    """IXIA sends its only ARP/NS before the DUT owns its gateway addresses,
+    so SC1 must re-resolve every IXIA BGP gateway between the DUT interface IP
+    configuration and the first Bgpcpp enable."""
+
+    def test_nrqeb008_sc1_gates_first_bgpcpp_enable_on_bgp_gateways(self) -> None:
+        tasks = (
+            cicd_ebb_int_tc.NRQEB008_SC1_EGRESS_PEER_SCALE_TEST_CONFIG_UG.setup_tasks
+            or []
+        )
+        gates = _gateway_gate_indices(tasks)
+        last_interface_ip = max(
+            index
+            for index, task in enumerate(tasks)
+            if task.task_name == "interface_ip_configuration"
+        )
+        first_enable_after_ips = next(
+            index
+            for index in range(last_interface_ip + 1, len(tasks))
+            if _is_bgpcpp_enable(tasks[index])
+        )
+
+        self.assertEqual(1, len(gates))
+        self.assertTrue(tasks[gates[0]].ixia_needed)
+        self.assertTrue(tasks[last_interface_ip].ixia_needed)
+        self.assertEqual(first_enable_after_ips - 1, gates[0])
+        self.assertEqual(
+            {
+                "device_group_names": [
+                    "DEVICE_GROUP_IPV6_EBGP",
+                    "DEVICE_GROUP_IPV4_EBGP",
+                    "DEVICE_GROUP_IPV6_IBGP",
+                    "DEVICE_GROUP_IPV4_IBGP",
+                ]
+            },
+            json.loads(_task_json_params(tasks[gates[0]])["args_json"]),
+        )
+
+    def test_gate_skips_bgpcpp_enable_before_interface_ips(self) -> None:
+        tasks = characteristic_factory._insert_gateway_resolution_gate(
+            [
+                _daemon_task("enable"),
+                _interface_ip_task(),
+                _daemon_task("disable"),
+                _daemon_task("enable"),
+                _daemon_task("enable"),
+            ]
+        )
+
+        self.assertEqual([3], _gateway_gate_indices(tasks))
+        self.assertEqual(6, len(tasks))
+
+    def test_pre_ixia_interface_ips_gate_first_post_ixia_enable(self) -> None:
+        tasks = characteristic_factory._insert_gateway_resolution_gate(
+            [
+                _interface_ip_task(ixia_needed=False),
+                _daemon_task("enable", ixia_needed=False),
+                _daemon_task("enable"),
+            ]
+        )
+
+        self.assertEqual([2], _gateway_gate_indices(tasks))
+
+    def test_unreadable_daemon_task_params_do_not_anchor_the_gate(self) -> None:
+        unreadable = Task(
+            task_name="arista_daemon_control",
+            ixia_needed=True,
+            params=Params(json_params="{not json"),
+        )
+
+        tasks = characteristic_factory._insert_gateway_resolution_gate(
+            [_interface_ip_task(), unreadable, _daemon_task("enable")]
+        )
+
+        self.assertEqual([2], _gateway_gate_indices(tasks))
+
+    def test_gate_requires_interface_ip_configuration(self) -> None:
+        with self.assertRaisesRegex(ValueError, "interface_ip_configuration"):
+            characteristic_factory._insert_gateway_resolution_gate(
+                [_daemon_task("enable")]
+            )
+
+    def test_gate_requires_bgpcpp_enable_after_interface_ips(self) -> None:
+        with self.assertRaisesRegex(ValueError, "post-IXIA Bgpcpp enable"):
+            characteristic_factory._insert_gateway_resolution_gate(
+                [_daemon_task("enable"), _interface_ip_task(), _daemon_task("disable")]
+            )

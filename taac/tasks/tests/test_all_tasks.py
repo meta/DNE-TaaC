@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
+import asyncio
 import base64
 import contextlib
 import json
@@ -10,7 +11,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, MagicMock, patch
 
 import later.unittest
-from taac.task_definitions import create_coop_apply_patchers_task
+from coop_thrift.coop.types import CoopConfigPatcher
+from taac.task_definitions import (
+    create_coop_apply_patchers_task,
+    create_coop_unregister_patchers_task,
+    create_enable_ixia_ports_patcher_task,
+)
 from neteng.test_infra.dne.taac.tasks import all as tasks_all
 from taac.tasks.all import (
     AristaCreateFileFromConfig,
@@ -34,6 +40,117 @@ RETRY_UTILS_PATH = "neteng.test_infra.dne.taac.utils.oss_taac_lib_utils"
 
 
 class AristaDaemonControlTaskTest(later.unittest.TestCase):
+    async def test_enable_does_not_treat_shutdown_pid_as_running(self) -> None:
+        driver = MagicMock()
+        driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
+            side_effect=[
+                "daemon Bgpcpp\n   exec /usr/sbin/run_bgpcpp.sh\n   no shutdown",
+                "Process: Bgpcpp (shutdown with PID 3139)",
+                "",
+                "daemon Bgpcpp\n   exec /usr/sbin/run_bgpcpp.sh\n   no shutdown",
+                "Process: Bgpcpp (running)",
+            ]
+        )
+        task = AristaDaemonControlTask(logger=MagicMock())
+        task._remove_renamed_daemons = AsyncMock()
+
+        with patch(
+            f"{ALL_PATH}.async_get_device_driver",
+            new_callable=AsyncMock,
+            return_value=driver,
+        ):
+            await task.run(
+                {
+                    "hostname": "nrqeb009.ash6",
+                    "daemon_name": "Bgpcpp",
+                    "action": "enable",
+                }
+            )
+
+        driver.async_execute_show_or_configure_cmd_on_shell.assert_has_awaits(
+            [
+                call("show running-config section daemon"),
+                call("show daemon Bgpcpp"),
+                call(
+                    "daemon Bgpcpp\nexec /usr/sbin/run_bgpcpp.sh\nno shutdown",
+                    configure=True,
+                ),
+                call("show running-config section daemon"),
+                call("show daemon Bgpcpp"),
+            ]
+        )
+
+    async def test_enable_accepts_running_agent_status(self) -> None:
+        driver = MagicMock()
+        driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
+            side_effect=[
+                "daemon FibGrpc\n   exec /usr/bin/EosSdkRpc\n   no shutdown",
+                "Agent: FibGrpc (shutdown)",
+                "",
+                "daemon FibGrpc\n   exec /usr/bin/EosSdkRpc\n   no shutdown",
+                "Agent: FibGrpc (running with PID 8132) uptime 3d CPU 0.1%",
+            ]
+        )
+        task = AristaDaemonControlTask(logger=MagicMock())
+        task._remove_renamed_daemons = AsyncMock()
+
+        with patch(
+            f"{ALL_PATH}.async_get_device_driver",
+            new_callable=AsyncMock,
+            return_value=driver,
+        ):
+            await task.run(
+                {
+                    "hostname": "nrqeb009.ash6",
+                    "daemon_name": "FibGrpc",
+                    "action": "enable",
+                    "exec_script": "/usr/bin/EosSdkRpc",
+                }
+            )
+
+        self.assertEqual(
+            call(
+                "daemon FibGrpc\nexec /usr/bin/EosSdkRpc\nno shutdown",
+                configure=True,
+            ),
+            driver.async_execute_show_or_configure_cmd_on_shell.await_args_list[2],
+        )
+
+    async def test_enable_removes_stanzas_left_under_renamed_daemons(self) -> None:
+        driver = MagicMock()
+        driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock()
+        task = AristaDaemonControlTask(logger=MagicMock())
+        task._check_daemon_exists = AsyncMock(return_value=True)
+
+        await task._remove_renamed_daemons(driver, "Bgpcpp")
+
+        self.assertEqual(
+            [call(driver, "Bgp"), call(driver, "bgpcpp")],
+            task._check_daemon_exists.await_args_list,
+        )
+        self.assertEqual(
+            [
+                call("no daemon Bgp", configure=True),
+                call("no daemon bgpcpp", configure=True),
+            ],
+            driver.async_execute_show_or_configure_cmd_on_shell.await_args_list,
+        )
+
+    async def test_enable_skips_removal_when_old_stanza_is_absent(self) -> None:
+        driver = MagicMock()
+        driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock()
+        task = AristaDaemonControlTask(logger=MagicMock())
+        task._check_daemon_exists = AsyncMock(return_value=False)
+
+        await task._remove_renamed_daemons(driver, "Bgpcpp")
+        await task._remove_renamed_daemons(driver, "FibAgent")
+
+        self.assertEqual(
+            [call(driver, "Bgp"), call(driver, "bgpcpp")],
+            task._check_daemon_exists.await_args_list,
+        )
+        driver.async_execute_show_or_configure_cmd_on_shell.assert_not_awaited()
+
     async def test_enable_is_noop_when_daemon_is_already_healthy(self) -> None:
         driver = MagicMock()
         driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock()
@@ -43,14 +160,14 @@ class AristaDaemonControlTaskTest(later.unittest.TestCase):
                 "daemon_exists": True,
                 "is_running": True,
                 "daemon_config": (
-                    "daemon Bgp",
+                    "daemon Bgpcpp",
                     "exec /usr/sbin/run_bgpcpp.sh",
                     "no shutdown",
                 ),
             }
         )
 
-        await task._enable_daemon(driver, "Bgp", "/usr/sbin/run_bgpcpp.sh")
+        await task._enable_daemon(driver, "Bgpcpp", "/usr/sbin/run_bgpcpp.sh")
 
         driver.async_execute_show_or_configure_cmd_on_shell.assert_not_awaited()
 
@@ -64,7 +181,7 @@ class AristaDaemonControlTaskTest(later.unittest.TestCase):
                     "daemon_exists": True,
                     "is_running": True,
                     "daemon_config": (
-                        "daemon Bgp",
+                        "daemon Bgpcpp",
                         "exec /usr/sbin/old_bgpcpp.sh",
                         "no shutdown",
                     ),
@@ -73,7 +190,7 @@ class AristaDaemonControlTaskTest(later.unittest.TestCase):
                     "daemon_exists": True,
                     "is_running": True,
                     "daemon_config": (
-                        "daemon Bgp",
+                        "daemon Bgpcpp",
                         "exec /usr/sbin/run_bgpcpp.sh",
                         "no shutdown",
                     ),
@@ -82,11 +199,53 @@ class AristaDaemonControlTaskTest(later.unittest.TestCase):
         )
 
         with patch(f"{ALL_PATH}.asyncio.sleep", new_callable=AsyncMock):
-            await task._enable_daemon(driver, "Bgp", "/usr/sbin/run_bgpcpp.sh")
+            await task._enable_daemon(driver, "Bgpcpp", "/usr/sbin/run_bgpcpp.sh")
 
         driver.async_execute_show_or_configure_cmd_on_shell.assert_awaited_once_with(
-            "daemon Bgp\nexec /usr/sbin/run_bgpcpp.sh\nno shutdown",
+            "daemon Bgpcpp\nexec /usr/sbin/run_bgpcpp.sh\nno shutdown",
             configure=True,
+        )
+
+    async def test_enable_fails_when_daemon_never_starts(self) -> None:
+        driver = MagicMock()
+
+        async def execute(command: str, configure: bool = False) -> str:
+            if configure:
+                return ""
+            if command == "show running-config section daemon":
+                return "daemon Bgpcpp\n   exec /usr/sbin/run_bgpcpp.sh"
+            if command == "show daemon Bgpcpp":
+                return "Process: Bgpcpp (shutdown)"
+            raise AssertionError(f"Unexpected command: {command}")
+
+        driver.async_execute_show_or_configure_cmd_on_shell = AsyncMock(
+            side_effect=execute
+        )
+        task = AristaDaemonControlTask(logger=MagicMock())
+
+        with (
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+            patch(f"{ALL_PATH}.asyncio.sleep", new_callable=AsyncMock),
+            self.assertRaisesRegex(RuntimeError, "did not reach running state"),
+        ):
+            await task.run(
+                {
+                    "hostname": "nrqeb009.ash6",
+                    "daemon_name": "Bgpcpp",
+                    "action": "enable",
+                }
+            )
+
+        self.assertEqual(
+            1,
+            sum(
+                await_call.kwargs.get("configure", False)
+                for await_call in driver.async_execute_show_or_configure_cmd_on_shell.await_args_list
+            ),
         )
 
 
@@ -149,6 +308,145 @@ class ScpFileTest(later.unittest.TestCase):
 
 
 class CoopApplyPatchersTaskTest(later.unittest.TestCase):
+    async def test_strict_agent_reload_failure_propagates(self) -> None:
+        for config_name in ("agent", "bgpcpp"):
+            with self.subTest(config_name=config_name):
+                driver = MagicMock()
+                driver.async_agent_config_reload = AsyncMock(
+                    side_effect=RuntimeError("agent reload failed")
+                )
+                driver.async_restart_service = AsyncMock()
+                task = create_coop_apply_patchers_task(
+                    ["fsw.example"],
+                    config_name=config_name,
+                    fail_on_agent_reload_error=True,
+                )
+                assert task.params is not None
+                with (
+                    _taac_env(taac_oss=False, meta_internal=False),
+                    patch(
+                        f"{ALL_PATH}.async_get_device_driver",
+                        new_callable=AsyncMock,
+                        return_value=driver,
+                    ),
+                    self.assertRaises(ExceptionGroup) as failure,
+                ):
+                    await CoopApplyPatchersTask(logger=MagicMock()).run(
+                        json.loads(task.params.json_params or "{}")
+                    )
+                self.assertEqual(1, len(failure.exception.exceptions))
+                self.assertIsInstance(failure.exception.exceptions[0], RuntimeError)
+                driver.async_agent_config_reload.assert_awaited_once_with()
+                driver.async_restart_service.assert_not_called()
+
+    async def test_failure_waits_for_other_agent_reloads(self) -> None:
+        finished = asyncio.Event()
+
+        async def slow_reload() -> None:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            finished.set()
+
+        failing_driver = MagicMock()
+        failing_driver.async_agent_config_reload = AsyncMock(
+            side_effect=RuntimeError("agent reload failed")
+        )
+        other_driver = MagicMock()
+        other_driver.async_agent_config_reload = AsyncMock(side_effect=slow_reload)
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                side_effect=[failing_driver, other_driver],
+            ),
+            self.assertRaises(ExceptionGroup),
+        ):
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                {
+                    "hostnames": ["first.example", "second.example"],
+                    "config_name": "agent",
+                    "fail_on_agent_reload_error": True,
+                }
+            )
+        self.assertTrue(finished.is_set())
+        other_driver.async_agent_config_reload.assert_awaited_once_with()
+
+    async def test_strict_apply_preserves_reload_cancellation(self) -> None:
+        driver = MagicMock()
+        driver.async_agent_config_reload = AsyncMock(side_effect=asyncio.CancelledError)
+        driver.async_restart_service = AsyncMock()
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                {
+                    "hostnames": ["fsw.example"],
+                    "config_name": "bgpcpp",
+                    "fail_on_agent_reload_error": True,
+                }
+            )
+        driver.async_agent_config_reload.assert_awaited_once_with()
+        driver.async_restart_service.assert_not_called()
+
+    async def test_strict_apply_reports_both_reload_errors(self) -> None:
+        errors = [
+            RuntimeError("first reload failed"),
+            ValueError("second reload failed"),
+        ]
+        drivers = [MagicMock(), MagicMock()]
+        for driver, error in zip(drivers, errors):
+            driver.async_agent_config_reload = AsyncMock(side_effect=error)
+            driver.async_restart_service = AsyncMock()
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                side_effect=drivers,
+            ),
+            self.assertRaises(ExceptionGroup) as failure,
+        ):
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                {
+                    "hostnames": ["first.example", "second.example"],
+                    "config_name": "bgpcpp",
+                    "fail_on_agent_reload_error": True,
+                }
+            )
+        self.assertEqual(tuple(errors), failure.exception.exceptions)
+        for driver in drivers:
+            driver.async_agent_config_reload.assert_awaited_once_with()
+            driver.async_restart_service.assert_not_called()
+
+    async def test_legacy_default_still_restarts_bgp_on_reload_error(self) -> None:
+        driver = MagicMock()
+        driver.async_agent_config_reload = AsyncMock(
+            side_effect=RuntimeError("agent reload failed")
+        )
+        driver.async_restart_service = AsyncMock()
+        task = create_coop_apply_patchers_task(["fsw.example"])
+        assert task.params is not None
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+        ):
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                json.loads(task.params.json_params or "{}")
+            )
+        driver.async_agent_config_reload.assert_awaited_once_with()
+        driver.async_restart_service.assert_awaited_once()
+
     async def test_singular_agent_config_does_not_restart_bgpd(self) -> None:
         driver = MagicMock()
         driver.async_agent_config_reload = AsyncMock()
@@ -274,6 +572,101 @@ class CoopUnregisterPatchersTaskTest(later.unittest.TestCase):
         driver, registered = await self._run_teardown(taac_oss=True, owner=None)
         self._assert_every_config_cleaned(driver, registered)
         driver.async_restore_patched_configs.assert_awaited_once_with()
+
+
+class EnableIxiaPortsPatcherTaskTest(later.unittest.TestCase):
+    async def test_registration_enables_only_configured_ports(self) -> None:
+        driver = MagicMock()
+        driver.async_register_python_patcher = AsyncMock()
+        cases = [
+            (
+                ["eth1/1/1", "eth1/2/1", "eth1/1/1"],
+                {"eth1/1/1": "enable", "eth1/2/1": "enable"},
+            ),
+            (
+                iter(["eth1/3/1", "eth1/4/1", "eth1/5/1"]),
+                {"eth1/3/1": "enable", "eth1/4/1": "enable", "eth1/5/1": "enable"},
+            ),
+        ]
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+        ):
+            for interfaces, expected in cases:
+                with self.subTest(ports=expected):
+                    driver.async_register_python_patcher.reset_mock()
+                    task = create_enable_ixia_ports_patcher_task(
+                        "fsw.example", interfaces
+                    )
+                    assert task.params is not None
+                    await CoopRegisterPatcherTask(logger=MagicMock()).run(
+                        json.loads(task.params.json_params or "{}")
+                    )
+                    driver.async_register_python_patcher.assert_awaited_once_with(
+                        config_name="agent",
+                        patcher_name="a_enable_ixia_ports",
+                        py_func_name="change_port_admin_state",
+                        patcher_args=expected,
+                        patcher_desc="",
+                    )
+
+    def test_empty_or_invalid_scope_is_rejected(self) -> None:
+        for interfaces in ([], [""], [" "], [" eth1/1/1 "], "eth1/1/1"):
+            with self.subTest(interfaces=interfaces):
+                with self.assertRaisesRegex(ValueError, "IXIA interfaces"):
+                    create_enable_ixia_ports_patcher_task(
+                        "fsw.example", t.cast(list[str], interfaces)
+                    )
+
+    async def test_teardown_unregisters_before_agent_reload(self) -> None:
+        registered = [
+            CoopConfigPatcher(
+                name="a_enable_ixia_ports", owner=tasks_all.DNE_TEST_REGRESSION_NAME
+            ),
+            CoopConfigPatcher(name="foreign_patcher", owner="another-owner"),
+        ]
+
+        async def list_patchers(config_name: str) -> list[CoopConfigPatcher]:
+            return list(registered) if config_name == "agent" else []
+
+        async def unregister(name: str, config_name: str, **kwargs: t.Any) -> None:
+            registered[:] = [patcher for patcher in registered if patcher.name != name]
+
+        driver = MagicMock()
+        driver.async_coop_list_patchers = AsyncMock(side_effect=list_patchers)
+        driver.async_coop_unregister_patchers = AsyncMock(side_effect=unregister)
+        driver.async_agent_config_reload = AsyncMock()
+        driver.async_restart_service = AsyncMock()
+        cleanup = create_coop_unregister_patchers_task("fsw.example")
+        apply = create_coop_apply_patchers_task(
+            ["fsw.example"], config_name="agent", fail_on_agent_reload_error=True
+        )
+        assert cleanup.params is not None and apply.params is not None
+        with (
+            _taac_env(taac_oss=False, meta_internal=False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+        ):
+            await CoopUnregisterPatchersTask(logger=MagicMock()).run(
+                json.loads(cleanup.params.json_params or "{}")
+            )
+            driver.async_agent_config_reload.assert_not_awaited()
+            await CoopApplyPatchersTask(logger=MagicMock()).run(
+                json.loads(apply.params.json_params or "{}")
+            )
+        self.assertEqual(["foreign_patcher"], [patcher.name for patcher in registered])
+        driver.async_coop_unregister_patchers.assert_awaited_once_with(
+            "a_enable_ixia_ports", "agent", auto_remediate_failure=True
+        )
+        driver.async_agent_config_reload.assert_awaited_once_with()
+        driver.async_restart_service.assert_not_awaited()
 
 
 class CoopPatcherTaskGateTest(later.unittest.TestCase):
@@ -402,6 +795,40 @@ class CoopPatcherTaskGateTest(later.unittest.TestCase):
         driver.async_coop_list_patchers.assert_awaited()
         driver.async_restore_patched_configs.assert_not_awaited()
         driver.async_apply_patchers.assert_not_awaited()
+
+
+class CoopRegisterPatcherTaskTest(later.unittest.TestCase):
+    async def test_internal_registers_generic_jq_patcher_to_current(self) -> None:
+        driver = MagicMock()
+        register_jq = AsyncMock()
+        coop_utils = SimpleNamespace(async_register_jq_patcher=register_jq)
+        with (
+            patch.object(tasks_all, "TAAC_OSS", False),
+            patch(
+                f"{ALL_PATH}.async_get_device_driver",
+                new_callable=AsyncMock,
+                return_value=driver,
+            ),
+            patch(f"{ALL_PATH}.importlib.import_module", return_value=coop_utils),
+        ):
+            await CoopRegisterPatcherTask(logger=MagicMock()).run(
+                {
+                    "hostname": "rdsw.example",
+                    "config_name": "bgpcpp",
+                    "patcher_name": "path_limit_10m",
+                    "jq_program": ".switch_limit_config.total_path_limit = 10000000",
+                }
+            )
+
+        register_jq.assert_awaited_once_with(
+            hostname="rdsw.example",
+            config_name="bgpcpp",
+            patcher_name="path_limit_10m",
+            jq_program=".switch_limit_config.total_path_limit = 10000000",
+            description="",
+            persistent=True,
+        )
+        driver.async_register_python_patcher.assert_not_called()
 
 
 class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
@@ -719,9 +1146,14 @@ class IxiaSyncRawSourceMacsTaskTest(later.unittest.TestCase):
         }
         task = IxiaSyncRawSourceMacsTask(ixia=ixia, logger=MagicMock())
 
-        await task.run({"traffic_item_regex": "^CPU_RAW$"})
+        await task.run(
+            {
+                "traffic_item_regex": "^CPU_RAW$",
+                "sync_destination_macs": True,
+            }
+        )
 
-        ixia.sync_raw_traffic_source_macs.assert_called_once_with("^CPU_RAW$")
+        ixia.sync_raw_traffic_source_macs.assert_called_once_with("^CPU_RAW$", True)
 
     async def test_fails_when_nothing_was_synced(self) -> None:
         ixia = MagicMock()
@@ -1027,3 +1459,58 @@ class ValidateBgpcppUpdateGroupStateTest(later.unittest.TestCase):
                 }
             )
         self.assertEqual(3, self.logger.exception.call_count)
+
+
+_BGPCPP_ENABLED = (
+    "daemon Bgpcpp\n   exec /usr/sbin/run_bgpcpp.sh\n   no shutdown\n"
+    "daemon FibAgent\n   exec /usr/sbin/run_fibagent.sh\n   no shutdown\n"
+)
+_ROUTER_BGP_SHUT = (
+    "router bgp 65006\n   router-id 10.0.0.1\n   shutdown\n"
+    "   neighbor 10.0.0.2 shutdown\n"
+)
+
+
+class VerifyBgpcppStackTaskTest(unittest.TestCase):
+    def test_bgpcpp_only_stack_passes(self) -> None:
+        self.assertEqual(
+            [],
+            tasks_all.VerifyBgpcppStackTask.stack_problems(
+                _BGPCPP_ENABLED, _ROUTER_BGP_SHUT
+            ),
+        )
+
+    def test_absent_router_bgp_passes(self) -> None:
+        self.assertEqual(
+            [], tasks_all.VerifyBgpcppStackTask.stack_problems(_BGPCPP_ENABLED, "")
+        )
+
+    def test_native_router_bgp_running_fails(self) -> None:
+        """A neighbor-level shutdown does not disable the native BGP instance."""
+        problems = tasks_all.VerifyBgpcppStackTask.stack_problems(
+            _BGPCPP_ENABLED,
+            "router bgp 65006\n   router-id 10.0.0.1\n   neighbor 10.0.0.2 shutdown\n",
+        )
+        self.assertEqual(["native router bgp 65006 is not shut down"], problems)
+
+    def test_missing_or_shut_bgpcpp_fails(self) -> None:
+        self.assertEqual(
+            ["daemon Bgpcpp is not configured"],
+            tasks_all.VerifyBgpcppStackTask.stack_problems("", _ROUTER_BGP_SHUT),
+        )
+        self.assertEqual(
+            ["daemon Bgpcpp is shut down"],
+            tasks_all.VerifyBgpcppStackTask.stack_problems(
+                "daemon Bgpcpp\n   exec /usr/sbin/run_bgpcpp.sh\n   shutdown\n",
+                _ROUTER_BGP_SHUT,
+            ),
+        )
+
+    def test_pre_rename_daemon_bgp_fails(self) -> None:
+        self.assertEqual(
+            ["pre-rename daemon Bgp is still configured"],
+            tasks_all.VerifyBgpcppStackTask.stack_problems(
+                _BGPCPP_ENABLED + "daemon Bgp\n   exec /usr/sbin/run_bgpcpp.sh\n",
+                _ROUTER_BGP_SHUT,
+            ),
+        )

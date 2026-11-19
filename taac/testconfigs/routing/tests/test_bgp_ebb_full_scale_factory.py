@@ -1793,7 +1793,7 @@ class EbbDaemonRestartDualScaleFactoryTest(unittest.TestCase):
         )
 
     @staticmethod
-    def _reactivation_steps(
+    def _restart_toggle_steps(
         config: taac_types.TestConfig,
     ) -> list[taac_types.Step]:
         return [
@@ -1802,14 +1802,42 @@ class EbbDaemonRestartDualScaleFactoryTest(unittest.TestCase):
             for stage in playbook.stages or []
             for step in stage.steps or []
             if step.name == taac_types.StepName.INVOKE_IXIA_API_STEP
-            and step.description == "Toggle all device groups back to active"
+            and step.description
+            in {
+                "Toggle all device groups to inactive",
+                "Toggle all device groups back to active",
+            }
         ]
 
-    def test_fy27_reactivates_ixia_peers_before_bgpcpp_restart(self) -> None:
-        self.assertEqual(1, len(self._reactivation_steps(self._config(EBB_FY27_SCALE))))
+    def test_fy27_cycles_ixia_peers_before_bgpcpp_restart(self) -> None:
+        steps = self._restart_toggle_steps(self._config(EBB_FY27_SCALE))
 
-    def test_fy26_preserves_restart_without_ixia_reactivation(self) -> None:
-        self.assertEqual([], self._reactivation_steps(self._config(EBB_FY26_SCALE)))
+        self.assertEqual(
+            [
+                "Toggle all device groups to inactive",
+                "Toggle all device groups back to active",
+            ],
+            [step.description for step in steps],
+        )
+        self.assertEqual(
+            [False, True],
+            [
+                json.loads(json.loads(step.step_params.json_params)["args_json"])[
+                    "enable"
+                ]
+                for step in steps
+                if step.step_params is not None and step.step_params.json_params
+            ],
+        )
+        for step in steps:
+            assert step.step_params is not None
+            payload = json.loads(step.step_params.json_params or "{}")
+            args = json.loads(payload["args_json"])
+            self.assertTrue(args["require_match"])
+            self.assertTrue(args["verify_readback"])
+
+    def test_fy26_preserves_restart_without_ixia_toggle(self) -> None:
+        self.assertEqual([], self._restart_toggle_steps(self._config(EBB_FY26_SCALE)))
 
 
 class EbbFauuDualScaleFactoryTest(unittest.TestCase):

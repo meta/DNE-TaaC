@@ -318,6 +318,7 @@ def get_bgp_ebb_daemon_restart_playbook(
     parent_prefixes_to_ignore: t.Optional[t.List[str]] = None,
     exclude_bgp_mon: bool = True,
     reactivate_device_groups: bool = False,
+    cycle_device_groups_before_restart: bool = False,
     characterization: CharacterizationConfig = DISABLED,
     bgp_mon_parent_network: str | None = None,
     ibgp_pnh_start_ipv4s: t.Optional[t.Sequence[str]] = None,
@@ -353,6 +354,9 @@ def get_bgp_ebb_daemon_restart_playbook(
         enable_socket_monitoring: Enable socket statistics monitoring
         reactivate_device_groups: Re-apply enabled IXIA device groups while
             BGP++ is down so emulated peers are listening before restart.
+        cycle_device_groups_before_restart: Disable and verify every matched
+            IXIA device group before re-enabling it, forcing a peer FSM
+            transition even when the groups were already active.
         precheck_thresholds: Custom precheck thresholds (uses defaults if None)
         postcheck_thresholds: Custom postcheck thresholds (uses defaults if None)
 
@@ -431,6 +435,7 @@ def get_bgp_ebb_daemon_restart_playbook(
                     enable_bgp_events=enable_bgp_events,
                     enable_socket_monitoring=enable_socket_monitoring,
                     reactivate_device_groups=reactivate_device_groups,
+                    cycle_device_groups_before_restart=cycle_device_groups_before_restart,
                     adaptive_convergence=True,
                     expected_established_sessions=expected_established_sessions,
                     parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,

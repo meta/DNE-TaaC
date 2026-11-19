@@ -168,6 +168,10 @@ class EbbScaleProfile:
         restart_reactivate_device_groups: Whether the daemon-restart playbook
             re-applies enabled IXIA device groups while BGP++ is down, so the
             emulated peers start from a listening FSM before BGP++ restarts.
+        restart_cycle_device_groups: Whether the daemon-restart playbook first
+            disables and verifies every IXIA device group before re-enabling it.
+            Use this when re-applying an already-active group would not force an
+            IXIA peer FSM transition.
         openr_injection_headroom: Injected rows per range beyond the advertised
             population. Explicit so that zero headroom is an enforced
             equality, not two numbers that happen to match.
@@ -212,6 +216,7 @@ class EbbScaleProfile:
     attribute_churn_ixia_apply_timeout_seconds: int = 60
     route_oscillation_advertise_threshold_seconds: int | None = None
     restart_reactivate_device_groups: bool = False
+    restart_cycle_device_groups: bool = False
     next_hop_step: int = 2
     bgp_total_path_limit: int | None = None
     device_state_guard_namespace: str | None = None
@@ -257,6 +262,7 @@ class EbbScaleProfile:
             "allows_dense_unvetted_route_tail",
             "fa_diverse_nhg_memberships",
             "restart_reactivate_device_groups",
+            "restart_cycle_device_groups",
         ):
             value = getattr(self, field_name)
             if not isinstance(value, bool):
@@ -357,6 +363,7 @@ EBB_FY27_SCALE = EbbScaleProfile(
     attribute_churn_ixia_apply_timeout_seconds=150,
     route_oscillation_advertise_threshold_seconds=120,
     restart_reactivate_device_groups=True,
+    restart_cycle_device_groups=True,
 )
 
 

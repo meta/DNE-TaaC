@@ -170,6 +170,7 @@ def create_bgp_restart_test_stage(
     enable_offcpu_profiling: bool = False,
     enable_socket_monitoring: bool = False,
     reactivate_device_groups: bool = True,
+    cycle_device_groups_before_restart: bool = False,
     adaptive_convergence: bool = False,
     expected_established_sessions: int | None = None,
     parent_prefixes_to_ignore: list[str] | None = None,
@@ -183,7 +184,7 @@ def create_bgp_restart_test_stage(
     This stage performs the following sequence:
     1. Disable BGP daemon
     2. Sleep for specified duration
-    3. Toggle all device groups back to active
+    3. Optionally cycle or re-apply IXIA device groups
     4. Enable BGP daemon
     5. Monitor thread CPU during convergence (optional, starts immediately after BGP enable)
 
@@ -210,6 +211,10 @@ def create_bgp_restart_test_stage(
                                 Captures blocking/waiting time in addition to on-CPU time
                                 Generates latency reports and time histograms
                                 Thread-level profiling has 5-10% overhead
+        reactivate_device_groups: Re-apply matching IXIA device groups before
+            restarting the daemon.
+        cycle_device_groups_before_restart: Force matching IXIA device groups
+            inactive and verify readback before re-enabling them.
 
     Returns:
         Stage object for BGP restart test
@@ -247,13 +252,32 @@ def create_bgp_restart_test_stage(
             *(
                 [
                     create_ixia_device_group_toggle_step(
+                        enable=False,
+                        device_group_name_regex=device_group_regex,
+                        description="Toggle all device groups to inactive",
+                        require_match=True,
+                        verify_readback=True,
+                    ),
+                    create_ixia_device_group_toggle_step(
                         enable=True,
                         device_group_name_regex=device_group_regex,
                         description="Toggle all device groups back to active",
-                    )
+                        require_match=True,
+                        verify_readback=True,
+                    ),
                 ]
-                if reactivate_device_groups
-                else []
+                if cycle_device_groups_before_restart
+                else (
+                    [
+                        create_ixia_device_group_toggle_step(
+                            enable=True,
+                            device_group_name_regex=device_group_regex,
+                            description="Toggle all device groups back to active",
+                        )
+                    ]
+                    if reactivate_device_groups
+                    else []
+                )
             ),
             # Step 4: Enable BGP daemon
             create_daemon_control_step(

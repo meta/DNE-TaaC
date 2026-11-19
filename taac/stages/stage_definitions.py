@@ -4850,6 +4850,7 @@ def create_periodic_service_restart_stage(
     iteration_index: int = 0,
     total_iterations: int = 1,
     trigger: ServiceInterruptionTrigger = ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+    clear_thrift_drain_exit: bool = False,
 ) -> Stage:
     """Single iteration of a periodic service-restart cycle.
 
@@ -4873,6 +4874,7 @@ def create_periodic_service_restart_stage(
             in the stage id for human-readable progress.
         trigger: How to interrupt the service. Default
             `SYSTEMCTL_RESTART` (graceful systemctl restart).
+        clear_thrift_drain_exit: See `create_service_interruption_step`.
     """
     return Stage(
         id=(
@@ -4886,6 +4888,7 @@ def create_periodic_service_restart_stage(
                     f"systemctl restart {service_label} "
                     f"(iter {iteration_index + 1}/{total_iterations})"
                 ),
+                clear_thrift_drain_exit=clear_thrift_drain_exit,
             ),
             create_longevity_step(duration=period_s),
         ],

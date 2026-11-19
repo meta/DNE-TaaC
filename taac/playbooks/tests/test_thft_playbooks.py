@@ -8,6 +8,7 @@ from taac.playbooks.playbook_definitions import (
     create_thft_playbooks,
 )
 from taac.health_check.health_check import types as hc_types
+from taac.test_as_a_config.types import StepName
 
 
 class ThftPlaybooksTest(unittest.TestCase):
@@ -127,6 +128,30 @@ class ThftPlaybooksTest(unittest.TestCase):
                 hc_types.CheckName.CORE_DUMPS_CHECK,
                 [check.name for check in (playbook.snapshot_checks or [])],
             )
+
+    def test_only_the_wedge_agent_restart_clears_the_bgpd_drain_exit(self) -> None:
+        playbooks = create_thft_playbooks(
+            "dut", restart_test_duration_s=600, restart_period_s=300
+        )
+        for playbook in playbooks:
+            if "_with_restart_" not in playbook.name:
+                continue
+            interruptions = [
+                step
+                for stage in playbook.stages or []
+                for step in stage.steps or []
+                if step.name == StepName.SERVICE_INTERRUPTION_STEP
+            ]
+            self.assertEqual(len(interruptions), 2, playbook.name)
+            for step in interruptions:
+                params = json.loads(
+                    step.step_params.json_params if step.step_params else "{}"
+                )
+                self.assertEqual(
+                    params.get("clear_thrift_drain_exit", False),
+                    playbook.name.endswith("_wedge_agent"),
+                    playbook.name,
+                )
 
 
 if __name__ == "__main__":

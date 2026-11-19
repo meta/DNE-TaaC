@@ -16512,6 +16512,19 @@ SNAKE_BENCHMARK_MAX_LOSS_PCT = 80
 SNAKE_AGENT_LLDP_SETTLE_S = 120
 
 
+def ixia_traffic_item_identifiers(name: str, instances: int = 1) -> t.List[str]:
+    """Every identifier of the ``instances`` per-snake items built from one name.
+
+    A snake config builds one traffic item per snake, named with a " #N" suffix
+    after the first (which keeps the bare name), because the IXIA layer skips a
+    traffic item whose name already exists. The packet-loss check matches
+    identifiers by exact string, so a threshold naming only the bare form
+    silently misses every sibling -- which lands them in the catch-all
+    zero-loss default instead.
+    """
+    return [name] + [f"{name} #{idx}" for idx in range(1, max(instances, 1))]
+
+
 def gen_snake_benchmark_playbooks(
     traffic_item_name_by_packet_size: t.Dict[int, str],
     duration_s: int = SNAKE_BENCHMARK_DURATION_S,
@@ -16519,11 +16532,13 @@ def gen_snake_benchmark_playbooks(
     postchecks: t.Optional[t.List[taac_types.PointInTimeHealthCheck]] = None,
     min_rate_gbps_by_packet_size: t.Optional[t.Dict[int, int]] = None,
     allowed_loss_packet_sizes: t.Optional[t.Set[int]] = None,
+    traffic_item_instances: int = 1,
 ) -> t.List[taac_types.Playbook]:
     """One throughput-benchmark playbook per packet size.
 
-    Each playbook starts only its own fixed-frame-size traffic item, clears the
-    IXIA counters, soaks for ``duration_s``, then measures loss and rate. Sizes
+    Each playbook starts only its own size's fixed-frame-size traffic items (one
+    per snake), clears the IXIA counters, soaks for ``duration_s``, then
+    measures loss and rate. Sizes
     run as separate playbooks rather than stages of one playbook because IXIA
     frame size is fixed on the traffic item at config-build time — there is no
     runtime "change frame size" step — so the sweep is expressed as one traffic
@@ -16538,14 +16553,16 @@ def gen_snake_benchmark_playbooks(
         prechecks: Playbook prechecks, typically ``gen_common_hcs`` output.
         postchecks: Playbook postchecks; the loss + rate checks are appended.
         min_rate_gbps_by_packet_size: Frame size (bytes) -> minimum Tx and Rx
-            rate (Gbps) for that size's traffic item. When ``None`` the rate
-            check carries no thresholds and always passes.
+            rate (Gbps) for each of that size's per-snake traffic items. When
+            ``None`` the rate check carries no thresholds and always passes.
         allowed_loss_packet_sizes: Frame sizes whose playbook may lose its own
             item's packets without failing (sizes below the ASIC's line-rate
             minimum, where loss at 100%% offered rate is physics, e.g.
             ``{64, 192}`` on TH5). The measured throughput is still recorded
             by the benchmark report step; loss on any other traffic item, or
             at any other size, still fails.
+        traffic_item_instances: Per-snake traffic items built from each name
+            (see ``ixia_traffic_item_identifiers``).
 
     Returns:
         One Playbook per entry, ordered by ascending packet size.
@@ -16556,9 +16573,13 @@ def gen_snake_benchmark_playbooks(
         # An explicit threshold excludes the named item from the loss check's
         # catch-all zero-loss default; every other item stays guarded. Bounded
         # at SNAKE_BENCHMARK_MAX_LOSS_PCT rather than unlimited, so expected
-        # PPS-ceiling loss passes but a blackholed item still fails.
+        # PPS-ceiling loss passes but a blackholed item still fails. Must name
+        # every per-snake item: on a multi-snake config the " #N" items are
+        # separate identifiers and would otherwise fall to the zero-loss default.
         return hc_types.PacketLossThreshold(
-            names=[traffic_item_name],
+            names=ixia_traffic_item_identifiers(
+                traffic_item_name, traffic_item_instances
+            ),
             metric=hc_types.PacketLossMetric.PERCENTAGE,
             comparison=hc_types.ComparisonType.LESS_THAN_EQUAL_TO,
             str_value=str(SNAKE_BENCHMARK_MAX_LOSS_PCT),
@@ -16612,13 +16633,17 @@ def gen_snake_benchmark_playbooks(
     playbooks: t.List[taac_types.Playbook] = []
     for packet_size in sorted(traffic_item_name_by_packet_size):
         traffic_item_name = traffic_item_name_by_packet_size[packet_size]
+        # One item per snake; every one of them is held to the rate and reported.
+        per_snake_names = ixia_traffic_item_identifiers(
+            traffic_item_name, traffic_item_instances
+        )
         rate_check = create_ixia_traffic_rate_check()
         if min_rate_gbps_by_packet_size:
-            # Scoped to this size's item so the disabled items (0 Gbps) are ignored.
+            # Scoped to this size's items so the disabled items (0 Gbps) are ignored.
             rate_check = create_ixia_traffic_rate_check(
                 thresholds=[
                     hc_types.TrafficRateThreshold(
-                        names=[traffic_item_name],
+                        names=per_snake_names,
                         value=min_rate_gbps_by_packet_size[packet_size],
                         threshold_type=hc_types.ThresholdType.ABSOLUTE,
                     )
@@ -16628,8 +16653,8 @@ def gen_snake_benchmark_playbooks(
             taac_types.Playbook(
                 name=f"test_snake_benchmark_{packet_size}b",
                 description=(
-                    f"Benchmark test: {packet_size} byte frames at 100% line rate "
-                    f"for {duration_s // 60} mins."
+                    f"Benchmark test: {packet_size} byte frames at the "
+                    f"configured benchmark line rate for {duration_s // 60} mins."
                 ),
                 prechecks=_prechecks_allowing_benchmark_loss(traffic_item_name),
                 postchecks=(postchecks or [])
@@ -16667,21 +16692,24 @@ def gen_snake_benchmark_playbooks(
                                     f"{duration_s}s at line rate"
                                 ),
                             ),
-                            # End-of-soak, traffic still running: record the
-                            # normalized max-forwarding-rate report. This is
-                            # the benchmark's deliverable and emits even when
-                            # the loss postcheck fails the playbook.
+                        ]
+                        # End-of-soak, traffic still running: record the
+                        # normalized max-forwarding-rate report. This is
+                        # the benchmark's deliverable and emits even when
+                        # the loss postcheck fails the playbook.
+                        + [
                             create_ixia_api_step(
                                 api_name="log_benchmark_rate_report",
                                 args_dict={
-                                    "traffic_item_name": traffic_item_name,
+                                    "traffic_item_name": per_snake_name,
                                     "frame_size_bytes": packet_size,
                                 },
                                 description=(
                                     f"Report measured throughput for "
-                                    f"{packet_size}B frames"
+                                    f"{packet_size}B frames ({per_snake_name})"
                                 ),
-                            ),
+                            )
+                            for per_snake_name in per_snake_names
                         ]
                     )
                 ],
@@ -17388,32 +17416,38 @@ def gen_snake_playbooks(
     half_toggle_check_retry_delay_seconds: float = 2.0,
     skip_lldp_check: bool = False,
     include_split_agent_warmboot: bool = False,
+    # Post-flap wait for the playbooks that reinitialise the transceiver
+    # (qsfp_util --clear_low_power, --qsfp-reset). INTERFACE_FLAP_STEP's
+    # ``delay`` is a single sleep after the whole batch, so this is the only
+    # time links get to relock before postchecks; modules need minutes.
+    optics_recovery_wait_s: int = 300,
+    benchmark_traffic_item_instances: int = 1,
+    include_48hr_longevity: bool = False,
 ) -> t.List[taac_types.Playbook]:
+    # Retry knobs for every PORT_STATE_CHECK and LLDP_CHECK that runs right
+    # after an interface re-enable (link-flap recovery, rapid A-end flap,
+    # half-toggle MID_TEST). Those checks fire 0-2 s after the enable step,
+    # before slow-training optics have linked up; without retries a single
+    # read fails the playbook (PORT_STATE as FAIL, LLDP as ERROR since it has
+    # only a ~16 s internal retry before raising).
+    _flap_recovery_retry_kwargs: t.Dict[str, t.Any] = (
+        {}
+        if flap_recovery_check_retry_count is None
+        else {
+            "retry_count": flap_recovery_check_retry_count,
+            "retry_delay_seconds": flap_recovery_check_retry_delay_seconds,
+            "retry_delay_multiplier": 1.0,
+        }
+    )
+
     def _create_flap_recovery_checks() -> t.List[
         taac_types.PointInTimeHealthCheck
     ]:
-        port_state_check = (
-            create_port_state_check()
-            if flap_recovery_check_retry_count is None
-            else create_port_state_check(
-                retry_count=flap_recovery_check_retry_count,
-                retry_delay_seconds=flap_recovery_check_retry_delay_seconds,
-                retry_delay_multiplier=1.0,
-            )
-        )
-        checks = [port_state_check]
+        checks = [create_port_state_check(**_flap_recovery_retry_kwargs)]
         if not skip_lldp_check:
             # LLDP neighbors can only reappear after the port is up, so give the
             # LLDP check the same opt-in retries as the port-state check.
-            checks.append(
-                create_lldp_check()
-                if flap_recovery_check_retry_count is None
-                else create_lldp_check(
-                    retry_count=flap_recovery_check_retry_count,
-                    retry_delay_seconds=flap_recovery_check_retry_delay_seconds,
-                    retry_delay_multiplier=1.0,
-                )
-            )
+            checks.append(create_lldp_check(**_flap_recovery_retry_kwargs))
         return checks
 
     # Opt-in retries for the half-interface-toggle checks that run right after
@@ -17461,6 +17495,21 @@ def gen_snake_playbooks(
                 prechecks=_prechecks,
                 postchecks=_postchecks,
             ),
+        ]
+    )
+
+    if include_48hr_longevity:
+        playbooks.append(
+            gen_snake_longevity_playbook(
+                "test_48hr_longevity",
+                3600 * 24 * 2,
+                prechecks=_prechecks,
+                postchecks=_postchecks,
+            )
+        )
+
+    playbooks.extend(
+        [
             taac_types.Playbook(
                 name="test_snake_interface_toggle_with_thrift_api",
                 prechecks=_prechecks,
@@ -17584,6 +17633,7 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
+                                        **_flap_recovery_retry_kwargs,
                                     ),
                                     create_port_state_check(
                                         disabled_interfaces_jq=f'."{hostname}".interfaces',
@@ -17598,6 +17648,7 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
+                                        **_flap_recovery_retry_kwargs,
                                     ),
                                 ],
                                 stage=taac_types.ValidationStage.MID_TEST,
@@ -17647,7 +17698,10 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
-                                        **half_toggle_retry_kwargs,
+                                        **(
+                                            half_toggle_retry_kwargs
+                                            or _flap_recovery_retry_kwargs
+                                        ),
                                     ),
                                     create_port_state_check(
                                         disabled_interfaces_jq=f'."{hostname}".interfaces',
@@ -17662,7 +17716,10 @@ def gen_snake_playbooks(
                                                 ),
                                             )
                                         ],
-                                        **half_toggle_retry_kwargs,
+                                        **(
+                                            half_toggle_retry_kwargs
+                                            or _flap_recovery_retry_kwargs
+                                        ),
                                     ),
                                 ],
                                 stage=taac_types.ValidationStage.MID_TEST,
@@ -17738,7 +17795,7 @@ def gen_snake_playbooks(
                             create_interface_flap_step(
                                 enable=True,
                                 interface_flap_method=3,
-                                delay=link_flap_longevity_enable_delay_s,
+                                delay=optics_recovery_wait_s,
                                 jq_params={"interfaces": f'."{hostname}".interfaces'},
                                 description="Sequentially enable all interfaces",
                             ),
@@ -17762,7 +17819,7 @@ def gen_snake_playbooks(
                             create_interface_flap_step(
                                 enable=False,
                                 interface_flap_method=5,
-                                delay=link_flap_longevity_enable_delay_s,
+                                delay=optics_recovery_wait_s,
                                 jq_params={"interfaces": f'."{hostname}".interfaces'},
                                 description="Sequentially reset all interfaces",
                             ),
@@ -17812,10 +17869,21 @@ def gen_snake_playbooks(
                                 service=taac_types.Service.QSFP_SERVICE,
                                 trigger=taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
                             ),
+                            # QSFP_SERVICE, not just AGENT: the agent is not
+                            # touched, so waiting only on it returns at once and
+                            # the postchecks would run while qsfp_service is still
+                            # coming up. Matches test_snake_qsfp_service_crash.
                             create_service_convergence_step(
-                                services=[taac_types.Service.AGENT],
-                                description="Wait for wedge_agent to converge",
+                                services=[
+                                    taac_types.Service.AGENT,
+                                    taac_types.Service.QSFP_SERVICE,
+                                ],
+                                description="Wait for agent + qsfp_service to converge",
                             ),
+                            # Convergence can report active before the
+                            # transceiver re-poll settles. Same settle as the
+                            # crash variant.
+                            create_longevity_step(duration=300),
                         ]
                     )
                 ],
@@ -18192,6 +18260,7 @@ def gen_snake_playbooks(
                 allowed_loss_packet_sizes=benchmark_allowed_loss_packet_sizes,
                 prechecks=_prechecks,
                 postchecks=_postchecks,
+                traffic_item_instances=benchmark_traffic_item_instances,
                 min_rate_gbps_by_packet_size=benchmark_min_rate_gbps_by_packet_size,
             )
         )

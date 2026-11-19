@@ -123,6 +123,47 @@ class BgpSessionOscillationPlaybookTest(unittest.TestCase):
         )
         self.assertEqual(_step_payload(legacy.steps[0]), payload)
 
+    def test_ibgp_playbook_preserves_fy26_serialized_geometry(self) -> None:
+        playbook = get_bgp_ebb_ibgp_plane_session_oscillation_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="IBGP_V6",
+            peergroup_ibgp_v4="IBGP_V4",
+            ipv4_sessions_per_plane=62,
+            ipv6_sessions_per_plane=62,
+            expected_established_sessions=1272,
+        )
+        payload = _step_payload(playbook.stages[0].steps[0])
+        expected_group_names = [
+            f"plane_{plane}_{role}_ipv{afi}"
+            for plane in range(1, 5)
+            for role in ("eb", "mp")
+            for afi in (4, 6)
+        ]
+
+        self.assertEqual(
+            expected_group_names,
+            [group["name"] for group in payload["session_groups"]],
+        )
+        self.assertEqual(
+            [
+                [f"plane_{plane}_{role}_ipv4", f"plane_{plane}_{role}_ipv6"]
+                for plane in range(1, 5)
+                for role in ("eb", "mp")
+            ],
+            payload["cycle_schedule"],
+        )
+        self.assertEqual(
+            {62}, {group["session_count"] for group in payload["session_groups"]}
+        )
+        self.assertEqual(
+            {8}, {group["sessions_per_cycle"] for group in payload["session_groups"]}
+        )
+        self.assertEqual(1272, payload["expected_established_sessions"])
+        self.assertEqual(1800, payload["test_duration_seconds"])
+        self.assertEqual(30, payload["uptime_seconds"])
+        self.assertEqual(30, payload["downtime_seconds"])
+        self.assertEqual(600, payload["ixia_restore_timeout_floor_seconds"])
+
     def test_ibgp_playbook_rejects_width_that_cannot_cover_both_families(
         self,
     ) -> None:

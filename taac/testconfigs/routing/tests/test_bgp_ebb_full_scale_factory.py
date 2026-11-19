@@ -2080,6 +2080,7 @@ class EbbFy27RouteRegistryFactoryTest(unittest.TestCase):
 _SUPPORTED_NON_UG_FY27_PLAYBOOKS = [
     "bgp_ebb_daemon_restart_playbook",
     "bgp_ebb_ebgp_session_oscillation_playbook",
+    "bgp_ebb_ibgp_plane_session_oscillation_playbook",
     "bgp_ebb_cold_start_playbook",
     "bgp_ebb_ebgp_route_oscillation_playbook",
     "bgp_ebb_igp_unresolvable_pnh_playbook",
@@ -2147,6 +2148,7 @@ class EbbFy27SupportedNonUgFactoryTest(unittest.TestCase):
             [
                 "bgp_ebb_daemon_restart_playbook",
                 "bgp_ebb_ebgp_session_oscillation_playbook",
+                "bgp_ebb_ibgp_plane_session_oscillation_playbook",
                 "bgp_ebb_cold_start_playbook",
                 "bgp_ebb_ebgp_route_oscillation_playbook",
                 "bgp_ebb_igp_unresolvable_pnh_playbook",
@@ -2194,6 +2196,62 @@ class EbbFy27SupportedNonUgFactoryTest(unittest.TestCase):
             }
         }
         self.assertEqual({1_880}, session_totals)
+
+    def test_ibgp_plane_session_oscillation_targets_fy27_groups(self) -> None:
+        (playbook,) = [
+            playbook
+            for playbook in self.config.playbooks or []
+            if playbook.name == "bgp_ebb_ibgp_plane_session_oscillation_playbook"
+        ]
+        payloads = [
+            json.loads(step.step_params.json_params)
+            for stage in playbook.stages or []
+            for step in stage.steps or []
+            if step.step_params is not None
+            and step.step_params.json_params is not None
+            and json.loads(step.step_params.json_params).get("custom_step_name")
+            == "bgp_session_oscillation"
+        ]
+        self.assertEqual(1, len(payloads))
+        payload = payloads[0]
+        expected_group_names = [
+            f"plane_{plane}_{role}_ipv{afi}"
+            for plane in range(1, 5)
+            for role in ("eb", "mp")
+            for afi in (4, 6)
+        ]
+
+        self.assertEqual(
+            expected_group_names,
+            [group["name"] for group in payload["session_groups"]],
+        )
+        groups_by_name = {group["name"]: group for group in payload["session_groups"]}
+        for plane in range(1, 5):
+            for role in ("eb", "mp"):
+                for afi in (4, 6):
+                    with self.subTest(plane=plane, role=role, afi=afi):
+                        self.assertEqual(
+                            f".*IPV{afi}_IBGP_PLANE_{plane}_REMOTE_{role.upper()}$",
+                            groups_by_name[f"plane_{plane}_{role}_ipv{afi}"][
+                                "peer_regex"
+                            ],
+                        )
+        self.assertEqual(
+            [
+                [f"plane_{plane}_{role}_ipv4", f"plane_{plane}_{role}_ipv6"]
+                for plane in range(1, 5)
+                for role in ("eb", "mp")
+            ],
+            payload["cycle_schedule"],
+        )
+        self.assertEqual(
+            {100}, {group["session_count"] for group in payload["session_groups"]}
+        )
+        self.assertEqual(
+            {8}, {group["sessions_per_cycle"] for group in payload["session_groups"]}
+        )
+        self.assertEqual(1880, payload["expected_established_sessions"])
+        self.assertEqual(600, payload["ixia_restore_timeout_floor_seconds"])
 
     def test_monitor_free_three_port_binding(self) -> None:
         (endpoint,) = self.config.endpoints or []

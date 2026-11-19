@@ -228,7 +228,20 @@ async def async_register(
         config = _read_working_copy(state, spec)
 
     try:
-        if any(p.name == patcher.name for p in state.patchers):
+        existing = next((p for p in state.patchers if p.name == patcher.name), None)
+        if existing is not None and existing.args != patcher.args:
+            # Legal, but nearly always a test-config bug: make the loss visible.
+            changed = sorted(
+                str(k)
+                for k in existing.args.keys() | patcher.args.keys()
+                if existing.args.get(k) != patcher.args.get(k)
+            )
+            switch.logger.warning(
+                f"[oss-patcher] {patcher.name} on {host}:{config_name} re-registered "
+                f"with different args; the earlier registration is discarded. "
+                f"Changed keys: {changed}"
+            )
+        if existing is not None:
             patchers = [
                 patcher if p.name == patcher.name else p for p in state.patchers
             ]
@@ -408,14 +421,72 @@ async def _async_snapshot_baseline(
         source = await _async_device_path(switch, spec)
         await _async_run_checked(switch, f"cp -a {source} {baseline}")
         created = True
-    return await _async_read_baseline(switch, spec), created
+    try:
+        return await _async_read_baseline(switch, spec), created
+    except Exception:
+        # Nothing got registered, so teardown has nothing to restore.
+        if created:
+            await _async_run_checked(switch, f"rm -f {baseline}")
+        raise
 
 
 async def _async_read_baseline(switch: t.Any, spec: ConfigSpec) -> t.Any:
+    source = f"{switch.hostname}:{spec.baseline_path}"
     raw = await switch.async_read_file(spec.baseline_path)
-    return config_modifiers.deserialize_config(
-        spec.config_type, raw, f"{switch.hostname}:{spec.baseline_path}"
+    config = config_modifiers.deserialize_config(spec.config_type, raw, source)
+    # Deserializing skips fields the TAAC thrift bindings do not know, so every
+    # config patched from this baseline would silently lose them.
+    deprecated: t.List[str] = []
+    dropped = _dropped_fields(
+        json.loads(raw),
+        json.loads(config_modifiers.serialize_config(config)),
+        deprecated=deprecated,
     )
+    if deprecated:
+        switch.logger.warning(
+            f"[oss-patcher] {source}: dropping {deprecated}, which FBOSS renamed "
+            "to <name>_DEPRECATED. The agent already ignores the old name."
+        )
+    if dropped:
+        raise RuntimeError(
+            f"oss-patcher: {source} has {len(dropped)} field(s) the TAAC thrift "
+            f"bindings do not know, which patching would drop: {dropped[:10]}. "
+            "Bump the fboss-thrift-defs pin to the device's FBOSS version."
+        )
+    return config
+
+
+def _dropped_fields(
+    raw: t.Any,
+    kept: t.Any,
+    path: str = "",
+    deprecated: t.Optional[t.List[str]] = None,
+) -> t.List[str]:
+    """Key paths in ``raw`` that ``kept`` lacks. Keys only ``kept`` has (defaults
+    the serializer fills in) and explicit nulls (it omits them) are fine. A key
+    whose ``<key>_DEPRECATED`` twin ``kept`` has goes to ``deprecated`` instead."""
+    if isinstance(raw, dict) and isinstance(kept, dict):
+        dropped = []
+        for key, value in raw.items():
+            key_path = f"{path}.{key}" if path else str(key)
+            if key in kept:
+                dropped += _dropped_fields(value, kept[key], key_path, deprecated)
+            elif value is None:
+                continue
+            elif f"{key}_DEPRECATED" in kept and deprecated is not None:
+                deprecated.append(key_path)
+            else:
+                dropped.append(key_path)
+        return dropped
+    if isinstance(raw, list) and isinstance(kept, list) and len(raw) == len(kept):
+        return [
+            dropped_path
+            for i, (item, kept_item) in enumerate(zip(raw, kept))
+            for dropped_path in _dropped_fields(
+                item, kept_item, f"{path}[{i}]", deprecated
+            )
+        ]
+    return []
 
 
 async def _async_rebuild(

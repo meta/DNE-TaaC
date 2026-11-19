@@ -23414,6 +23414,22 @@ def create_fboss_hw_agent_0_coldboot_playbook(
     )
 
 
+def create_restart_allowlisted_systemctl_check(
+    expected_restarted_services: t.Sequence[str],
+) -> PointInTimeHealthCheck:
+    """SYSTEMCTL_ACTIVE_STATE_CHECK for a playbook that restarts on purpose.
+
+    The window closes at evaluation time, so a sub-second restart can be caught
+    mid-transition; retries re-evaluate with a later window end.
+    """
+    return create_systemctl_active_state_check(
+        expected_restarted_services=list(expected_restarted_services),
+        retry_count=3,
+        retry_delay_seconds=10,
+        retry_delay_multiplier=1.0,
+    )
+
+
 def _repeat_single_stage_playbook(
     playbook: Playbook,
     iteration: int,
@@ -23493,6 +23509,7 @@ def get_critical_services_single_box_playbooks(
 
 def _nbr_flap_non_circuit_checks(
     restart_service_check: PointInTimeHealthCheck,
+    expected_restarted_services: t.Sequence[str],
 ) -> t.List[PointInTimeHealthCheck]:
     """Mid-test health checks for a disruption + neighbour-flap window.
 
@@ -23500,6 +23517,8 @@ def _nbr_flap_non_circuit_checks(
     intentionally down for most of the window. IXIA packet loss is excluded for
     the same reason: traffic runs DUT -> STSW -> NBR, so flapping the NBR's
     uplinks breaks the path by design.
+    `expected_restarted_services` are the units the disruption restarts on
+    purpose; the systemctl check tolerates them going inactive.
 
     `restart_service_check` must match the service actually being disrupted.
     A check built for one service false-fails another: the agent-warmboot
@@ -23509,7 +23528,7 @@ def _nbr_flap_non_circuit_checks(
     """
     return filter_out_circuit_health_checks(
         [
-            create_systemctl_active_state_check(),
+            create_restart_allowlisted_systemctl_check(expected_restarted_services),
             create_unclean_exit_check(),
             create_device_core_dumps_check(),
             create_memory_utilization_check(threshold=5 * (1024**3)),
@@ -23529,7 +23548,10 @@ def _warmboot_nbr_flap_non_circuit_checks(
     Thin wrapper kept so the landed warmboot playbook's serialized output is
     unchanged by the generalization above.
     """
-    checks = _nbr_flap_non_circuit_checks(restart_service_check)
+    checks = _nbr_flap_non_circuit_checks(
+        restart_service_check,
+        expected_restarted_services=SERVICES_EXPECTED_TO_RESTART_DURING_AGENT_WARMBOOT,
+    )
     if systemctl_active_check is not None:
         checks = [
             systemctl_active_check
@@ -23603,7 +23625,9 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
     Returns:
         A `Playbook` named `playbook_name`.
     """
-    active_check = systemctl_active_check or create_systemctl_active_state_check()
+    active_check = systemctl_active_check or create_restart_allowlisted_systemctl_check(
+        SERVICES_EXPECTED_TO_RESTART_DURING_AGENT_WARMBOOT
+    )
     non_circuit_checks = _warmboot_nbr_flap_non_circuit_checks(
         restart_service_check=restart_service_check,
         systemctl_active_check=active_check,
@@ -23667,6 +23691,7 @@ def create_gtsw_warmboot_nbr_uplink_flap_playbook(
             create_steps_stage(
                 stage_id="longevity",
                 steps=[
+                    create_clear_traffic_stats_step(),
                     create_longevity_step(
                         duration=longevity_sec,
                         description=(
@@ -23747,13 +23772,21 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
     Returns:
         A `Playbook` named `playbook_name`.
     """
-    active_check = systemctl_active_check or create_systemctl_active_state_check()
-    non_circuit_checks = list(_nbr_flap_non_circuit_checks(restart_service_check))
+    # The restarted unit is the whole allowlist: every service wired in today
+    # restarts alone. A wedge_agent variant takes WEDGE_AGENT_BINDS_TO_CASCADE
+    # down with it and must allowlist that instead.
+    restarted_units = [service_label]
+    active_check = systemctl_active_check or create_restart_allowlisted_systemctl_check(
+        restarted_units
+    )
     non_circuit_checks = [
         active_check
         if check.name == hc_types.CheckName.SYSTEMCTL_ACTIVE_STATE_CHECK
         else check
-        for check in non_circuit_checks
+        for check in _nbr_flap_non_circuit_checks(
+            restart_service_check,
+            expected_restarted_services=restarted_units,
+        )
     ]
     non_circuit_checks.extend(extra_post_flap_checks or [])
 
@@ -23830,6 +23863,7 @@ def create_gtsw_service_restart_nbr_uplink_flap_playbook(
             create_steps_stage(
                 stage_id="longevity",
                 steps=[
+                    create_clear_traffic_stats_step(),
                     create_longevity_step(
                         duration=longevity_sec,
                         description=(

@@ -41,6 +41,7 @@ from taac.health_checks.constants import (
     EOS_CRITICAL_CORE_DUMPS,
     FBOSS_CORE_DUMP_PATH,
     FBOSS_CRITICAL_CORE_DUMPS,
+    FBOSS_SYSTEMD_CORE_DUMP_PATH,
 )
 from taac.libs.collectors.registry import get_test_case_start_time
 from taac.utils.driver_factory import async_get_device_driver
@@ -183,20 +184,38 @@ async def async_find_critical_core_dumps(
     core_dump_path, critical_processes = await async_get_core_dump_config(hostname)
 
     if TAAC_OSS:
-        # OSS mode: always FBOSS, use find command approach
-        core_dump_find_cmd = f"find {core_dump_path} -type f -printf '%T@ %p\n'"
+        # OSS mode: always FBOSS, use find command approach. Both core
+        # directories are listed; "dir:" marks each one that exists, so a
+        # device with neither is an error rather than "no core dumps".
+        core_dump_dirs = (core_dump_path, FBOSS_SYSTEMD_CORE_DUMP_PATH)
+        core_dump_find_cmd = (
+            f"for d in {' '.join(core_dump_dirs)}; do [ -d \"$d\" ] && "
+            "echo \"dir:$d\" && find \"$d\" -type f -printf '%T@ %p\\n'; "
+            "done 2>/dev/null; true"
+        )
         core_dump_output = none_throws(
             await driver.async_run_cmd_on_shell(cmd=core_dump_find_cmd)
         )
         critical_core_dumps = {}
+        listed_dir = None
         for line in core_dump_output.splitlines() or []:
+            if line.startswith("dir:"):
+                listed_dir = line[len("dir:") :]
+                continue
+            if not line.strip() or listed_dir is None:
+                continue
             timestamp, core_file_full_path = line.split(" ")
             timestamp = int(float(timestamp))
-            core_filename = core_file_full_path[len(core_dump_path) :]
+            core_filename = core_file_full_path[len(listed_dir) :]
             if await async_is_critical_core_dump(
                 core_file_full_path, critical_processes
             ):
                 critical_core_dumps[core_filename] = int(timestamp)
+        if listed_dir is None:
+            raise RuntimeError(
+                f"No core dump directory on {hostname}: none of "
+                f"{', '.join(core_dump_dirs)} exists"
+            )
         return critical_core_dumps
     else:
         from taac.internal.netwhoami_utils import fetch_whoami

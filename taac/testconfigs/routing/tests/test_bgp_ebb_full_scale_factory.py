@@ -2285,3 +2285,90 @@ class EbbFy27SupportedNonUgFactoryTest(unittest.TestCase):
                 ]
                 self.assertTrue(identities)
                 self.assertTrue(all(len(identity) == 1_880 for identity in identities))
+
+
+class EbbIgpPnhMetricOscillationDualScaleFactoryTest(unittest.TestCase):
+    """CICD-EBB-07 oscillates whatever the bound scale injected, nothing else.
+
+    The workload mutates one metric per plane across every injected row, and
+    the fallback cleanup re-injects the same inventory, so both payloads have
+    to carry the resolved site count: 63 per range at FY26, 100 at FY27.
+    """
+
+    _PLAYBOOK = "bgp_ebb_igp_pnh_metric_oscillation_playbook"
+
+    @classmethod
+    def _config(cls, scale: EbbScaleProfile) -> taac_types.TestConfig:
+        return factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB008_ASH6,
+            name=f"IGP_PNH_METRIC_{scale.name}",
+            playbooks_selected=[cls._PLAYBOOK],
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            enable_update_group=False,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            scale=scale,
+        )
+
+    @staticmethod
+    def _oscillation_payload(playbook: taac_types.Playbook) -> dict:
+        payloads = [
+            _json_params(step.step_params)
+            for stage in playbook.stages or []
+            for step in stage.steps or []
+            if _json_params(step.step_params).get("custom_step_name")
+            == "bgp_igp_pnh_metric_oscillation"
+        ]
+        if len(payloads) != 1:
+            raise AssertionError(f"expected one oscillation step, got {len(payloads)}")
+        return payloads[0]
+
+    @staticmethod
+    def _cleanup_payload(playbook: taac_types.Playbook) -> dict:
+        payloads = [
+            _json_params(step.step_params)
+            for step in playbook.cleanup_steps or []
+            if _json_params(step.step_params).get("action") == "inject"
+        ]
+        if len(payloads) != 1:
+            raise AssertionError(f"expected one cleanup inject, got {len(payloads)}")
+        return payloads[0]
+
+    def _assert_scale_reaches_the_workload(self, scale: EbbScaleProfile) -> None:
+        config = self._config(scale)
+        injected = EbbInjectionScaleReachesEveryPnhCheckTest._injection_task_params(
+            config
+        )
+        (playbook,) = config.playbooks or []
+        self.assertEqual(self._PLAYBOOK, playbook.name)
+        workload = self._oscillation_payload(playbook)
+        cleanup = self._cleanup_payload(playbook)
+
+        self.assertEqual(scale.he_sites_per_range, injected["count"])
+        for label, payload in (("workload", workload), ("cleanup", cleanup)):
+            with self.subTest(scale=scale.name, payload=label):
+                self.assertEqual(scale.he_sites_per_range, payload["count"])
+                self.assertEqual(scale.next_hop_step, payload["step"])
+                self.assertEqual(injected["start_ipv4s"], payload["start_ipv4s"])
+                self.assertEqual(injected["start_ipv6s"], payload["start_ipv6s"])
+                self.assertEqual(4, len(payload["start_ipv4s"]))
+                self.assertEqual(4, len(payload["start_ipv6s"]))
+
+    def test_fy26_still_oscillates_sixty_three_sites_per_range(self) -> None:
+        self._assert_scale_reaches_the_workload(EBB_FY26_SCALE)
+        self.assertEqual(63, EBB_FY26_SCALE.he_sites_per_range)
+
+    def test_fy27_oscillates_one_hundred_sites_in_every_resolved_plane(self) -> None:
+        self._assert_scale_reaches_the_workload(EBB_FY27_SCALE)
+        self.assertEqual(100, EBB_FY27_SCALE.he_sites_per_range)
+
+    def test_fy27_case_carries_no_stale_fy26_counts(self) -> None:
+        (playbook,) = self._config(EBB_FY27_SCALE).playbooks or []
+        serialized = json.loads(thrift_to_json(playbook))
+
+        stale = [
+            (path, value)
+            for path, value in _integer_leaves(serialized)
+            if value in _STALE_FY26_COUNTS
+        ]
+        self.assertEqual([], stale)

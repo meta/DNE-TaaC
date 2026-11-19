@@ -1605,6 +1605,32 @@ class IxiaLldpDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         optical_discovery.assert_awaited_once_with("dut1")
 
 
+class IxiaAssetOrderTest(unittest.IsolatedAsyncioTestCase):
+    """Discovered assets keep their order, which decides device group creation
+    order and so the Ixia MACs. A set orders by string hash, which changes with
+    every process, so enough ports are used that it cannot match by chance.
+    """
+
+    async def test_discovered_assets_keep_discovery_order(self) -> None:
+        discovered = [
+            _discovered_ixia_asset(f"eth1/{n}/1", str(n)) for n in range(40, 0, -1)
+        ]
+        endpoint = taac_types.Endpoint(name="dut1", dut=True)
+        generator = TrafficGenerator(endpoints=[endpoint], logger=MagicMock())
+
+        with (
+            patch(f"{_TRAFFIC_GENERATOR_MODULE}.TAAC_OSS", False),
+            patch.object(
+                generator,
+                "_async_get_complete_lldp_ixia_assets",
+                new=AsyncMock(return_value=discovered + [discovered[3]]),
+            ),
+        ):
+            assets = await generator.async_get_endpoint_desired_ixia_assets(endpoint)
+
+        self.assertEqual(assets, discovered)
+
+
 class IxiaFallbackTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.config = _config(_endpoint("eth1/1/1", "2/2"))

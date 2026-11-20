@@ -942,6 +942,88 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
         self.assertEqual(850, topology_builder.call_args.kwargs["ebgp_prefix_count"])
 
 
+class EbbMultipathOscillationDualScaleFactoryTest(unittest.TestCase):
+    _PLAYBOOK = "bgp_ebb_multipath_group_oscillation_playbook"
+
+    @classmethod
+    def _config(cls, scale: EbbScaleProfile) -> taac_types.TestConfig:
+        return factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB008_ASH6,
+            name=f"MULTIPATH_{scale.name}",
+            playbooks_selected=[cls._PLAYBOOK],
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            enable_update_group=False,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            scale=scale,
+        )
+
+    @staticmethod
+    def _workload_params(config: taac_types.TestConfig) -> dict[str, t.Any]:
+        payloads = []
+        for playbook in config.playbooks or []:
+            for stage in playbook.stages or []:
+                for step in stage.steps or []:
+                    payload = _json_params(step.step_params)
+                    if payload.get("custom_step_name") == "bgp_multipath_oscillation":
+                        payloads.append(payload)
+        if len(payloads) != 1:
+            raise AssertionError(f"expected one multipath workload, got {payloads}")
+        return payloads[0]
+
+    def test_fy26_output_matches_legacy_monitor_defaults(self) -> None:
+        builder = factory.get_bgp_ebb_multipath_group_oscillation_playbook
+        with mock.patch.object(factory, builder.__name__, wraps=builder) as wrapped:
+            config = self._config(EBB_FY26_SCALE)
+
+        kwargs = wrapped.call_args.kwargs
+        legacy_kwargs = dict(kwargs)
+        legacy_kwargs.pop("exclude_bgp_mon")
+        self.assertEqual(builder(**legacy_kwargs), builder(**kwargs))
+        self.assertTrue(kwargs["exclude_bgp_mon"])
+        self.assertEqual(
+            EBB_PARENT_NETWORKS_IXIA03["bgpmon_v6"],
+            kwargs["bgp_mon_parent_network"],
+        )
+        self.assertEqual(1272, kwargs["expected_established_sessions"])
+        self.assertEqual(63, kwargs["ibgp_pnh_count"])
+        self.assertIn("DEVICE_GROUP_BGP_MON", _enabled_device_group_names(config))
+
+    def test_fy27_derives_140_peer_monitor_free_dynamic_cohorts(self) -> None:
+        builder = factory.get_bgp_ebb_multipath_group_oscillation_playbook
+        with mock.patch.object(factory, builder.__name__, wraps=builder) as wrapped:
+            config = self._config(EBB_FY27_SCALE)
+
+        kwargs = wrapped.call_args.kwargs
+        self.assertFalse(kwargs["exclude_bgp_mon"])
+        self.assertIsNone(kwargs["bgp_mon_parent_network"])
+        self.assertEqual(1880, kwargs["expected_established_sessions"])
+        self.assertEqual(100, kwargs["ibgp_pnh_count"])
+        self.assertNotIn("DEVICE_GROUP_BGP_MON", _enabled_device_group_names(config))
+        workload = self._workload_params(config)
+        self.assertEqual(
+            {
+                "ipv4_peer_regex": "^BGP_PEER_IPV4_EBGP$",
+                "ipv6_peer_regex": "^BGP_PEER_IPV6_EBGP$",
+                "ipv4_session_count": 140,
+                "ipv6_session_count": 140,
+                "prefix_subnets": [],
+                "probe_prefixes_per_afi": 2,
+            },
+            {
+                key: workload[key]
+                for key in (
+                    "ipv4_peer_regex",
+                    "ipv6_peer_regex",
+                    "ipv4_session_count",
+                    "ipv6_session_count",
+                    "prefix_subnets",
+                    "probe_prefixes_per_afi",
+                )
+            },
+        )
+
+
 class StuckIxiaSessionRecoveryTest(unittest.TestCase):
     @staticmethod
     def _last_custom_step_name(playbook: taac_types.Playbook) -> str | None:

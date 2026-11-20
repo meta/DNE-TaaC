@@ -1503,7 +1503,10 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ipv6_session_count=automation.ebgp_peer_counts_by_afi["ipv6"],
             profile=profile,
             precheck_thresholds=full_scale_precheck_thresholds,
-            bgp_mon_parent_network=bound_bgp_mon_network,
+            exclude_bgp_mon=automation.has_bgp_monitor,
+            bgp_mon_parent_network=(
+                bound_bgp_mon_network if automation.has_bgp_monitor else None
+            ),
             ibgp_pnh_start_ipv4s=ibgp_pnh_start_ipv4s,
             ibgp_pnh_start_ipv6s=ibgp_pnh_start_ipv6s,
             ibgp_pnh_count=openr_pnh_count,

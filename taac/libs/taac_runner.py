@@ -13,6 +13,7 @@ import time
 import traceback
 import typing as t
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -108,6 +109,7 @@ from taac.libs.ixia_config_baseline import (
 )
 from taac.libs.parameter_evaluator import ParameterEvaluator
 from taac.libs.periodic_task_executor import PeriodicTaskExecutor
+from neteng.test_infra.dne.taac.libs.run_monitor import NullRunMonitor, RunMonitor
 from taac.libs.run_result import worst_check_status
 from taac.libs.test_setup_orchestrator import (
     TestSetupOrchestrator,
@@ -615,6 +617,7 @@ class TaacRunner:
         force_take_ixia_port_ownership: bool = True,
         ixia_use_tx_rx_sync: bool = True,
         campaign_control: CampaignControl | NoopCampaignControl | None = None,
+        run_monitor: RunMonitor | None = None,
     ) -> None:
         if isinstance(test_config, str):
             # Registry discovery imports hardware-specific configs and can do
@@ -626,6 +629,7 @@ class TaacRunner:
             self.test_config = test_config
         self._validate_no_test_config_level_checks()
         self.campaign_control = campaign_control or CampaignControl.from_environment()
+        self.run_monitor: RunMonitor = run_monitor or NullRunMonitor()
         if (
             self.campaign_control.is_enabled
             and self.campaign_control.manifest is not None
@@ -1411,21 +1415,28 @@ class TaacRunner:
                 ]
             }
 
+    @asynccontextmanager
+    async def _monitored_section(self, name: str) -> t.AsyncIterator[SectionResult]:
+        async with self.run_monitor.step(name):
+            with self.test_summary.tracked_section(name) as section:
+                yield section
+
     async def async_test_setUp(self) -> None:
         setup_start_time = int(time.time())
         try:
-            self._skip_test_config_teardown_tasks = True
-            endpoint_bindings = (
-                await self.test_setup_orchestrator.async_resolve_basset_endpoints()
-            )
-            if endpoint_bindings:
-                self.test_config = self.test_setup_orchestrator.test_config
-                self.ixia_candidates = self.test_setup_orchestrator.ixia_candidates
-                self.duts[:] = self.test_setup_orchestrator.devices_under_test
-                self._basset_endpoint_bindings = endpoint_bindings
-                self.dynamic_vars.update(endpoint_bindings)
-            self._skip_test_config_teardown_tasks = False
-            await self._async_run_test_setup()
+            async with self.run_monitor.step("Test config setup"):
+                self._skip_test_config_teardown_tasks = True
+                endpoint_bindings = (
+                    await self.test_setup_orchestrator.async_resolve_basset_endpoints()
+                )
+                if endpoint_bindings:
+                    self.test_config = self.test_setup_orchestrator.test_config
+                    self.ixia_candidates = self.test_setup_orchestrator.ixia_candidates
+                    self.duts[:] = self.test_setup_orchestrator.devices_under_test
+                    self._basset_endpoint_bindings = endpoint_bindings
+                    self.dynamic_vars.update(endpoint_bindings)
+                self._skip_test_config_teardown_tasks = False
+                await self._async_run_test_setup()
         except BaseException as error:
             # The setup slice is the only record of what the chassis was
             # asked to do before it refused, and a setup that raises may
@@ -1452,17 +1463,17 @@ class TaacRunner:
         self._add_host_driver_args_data()
 
         log_section("OSS SETUP TASKS", logger=self.logger)
-        with self.test_summary.tracked_section("OSS setup tasks"):
+        async with self._monitored_section("OSS setup tasks"):
             with suppress_console_logs(self.logger):
                 await self._async_run_oss_setup_tasks()
 
         log_section("PRE-IXIA SETUP TASKS", logger=self.logger)
-        with self.test_summary.tracked_section("Pre-IXIA setup tasks"):
+        async with self._monitored_section("Pre-IXIA setup tasks"):
             with suppress_console_logs(self.logger):
                 await self._async_prepare_ixia_candidate(first_candidate)
 
         log_section("IXIA & TOPOLOGY SETUP", logger=self.logger)
-        with self.test_summary.tracked_section("Test orchestrator setup"):
+        async with self._monitored_section("Test orchestrator setup"):
             with suppress_console_logs(self.logger):
                 await self.test_setup_orchestrator.async_setUp()
                 self.ixia = self.test_setup_orchestrator.ixia
@@ -1475,7 +1486,7 @@ class TaacRunner:
                 self.populate_jq_vars()
 
         log_section("POST-IXIA SETUP TASKS", logger=self.logger)
-        with self.test_summary.tracked_section("Post-IXIA setup tasks"):
+        async with self._monitored_section("Post-IXIA setup tasks"):
             with suppress_console_logs(self.logger):
                 await self.run_tasks(
                     [
@@ -1522,7 +1533,8 @@ class TaacRunner:
             # Deprecated - periodic_tasks should be defined at playbook level
             # TestConfig-level periodic tasks are no longer started here
 
-        await self.run_startup_checks()
+        async with self.run_monitor.step("Startup health checks"):
+            await self.run_startup_checks()
         log_phase_end(
             "TEST CONFIG SETUP",
             duration_secs=time.time() - setup_start,
@@ -1898,7 +1910,8 @@ class TaacRunner:
                 _start_test_case_time_window(self.jq_vars, int(time.time()))
                 await self._capture_topology_baseline(playbook)
                 with suppress_console_logs(self.logger):
-                    await self.async_test_case_setUp(playbook, test_device)
+                    async with self.run_monitor.step("Test case setup"):
+                        await self.async_test_case_setUp(playbook, test_device)
                 test_case_start_time = int(time.time())
                 set_test_case_start_time(float(test_case_start_time))
                 log_playbook_header(
@@ -1916,13 +1929,14 @@ class TaacRunner:
                 # Execute playbook setup_steps first, before snapshot checks
                 with suppress_console_logs(self.logger):
                     if playbook.setup_steps:
-                        await self.initialize_and_run_steps(
-                            playbook.setup_steps,
-                            test_device=test_device,
-                            test_case_name=test_case_name,
-                            test_case_start_time=test_case_start_time,
-                            test_case_results=test_case_results,
-                        )
+                        async with self.run_monitor.step("Playbook setup steps"):
+                            await self.initialize_and_run_steps(
+                                playbook.setup_steps,
+                                test_device=test_device,
+                                test_case_name=test_case_name,
+                                test_case_start_time=test_case_start_time,
+                                test_case_results=test_case_results,
+                            )
                     snapshot_check_objs = (
                         await self.initialize_and_setup_snapshot_checks(
                             snapshot_checks,
@@ -1931,13 +1945,14 @@ class TaacRunner:
                     )
                     self._current_snapshot_checks = snapshot_check_objs
                     stages = self.inject_validation_stages(playbook)
-                    await self.async_run_snapshot_checks(
-                        snapshot_check_objs,
-                        DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID,
-                        int(time.time()),
-                        test_case_results,
-                        playbook.name,
-                    )
+                    async with self.run_monitor.step("Pre-snapshot checks"):
+                        await self.async_run_snapshot_checks(
+                            snapshot_check_objs,
+                            DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID,
+                            int(time.time()),
+                            test_case_results,
+                            playbook.name,
+                        )
                 _stage_exc: t.Optional[BaseException] = None
                 try:
                     for stage in stages:
@@ -2029,13 +2044,14 @@ class TaacRunner:
                     # always run post-snapshot checks for observability, regardless of stage failures
                     with suppress_console_logs(self.logger):
                         try:
-                            await self.async_run_snapshot_checks(
-                                snapshot_check_objs,
-                                DEFAULT_POST_SNAPSHOT_CHECKPOINT_ID,
-                                int(time.time()),
-                                test_case_results,
-                                test_case_name,
-                            )
+                            async with self.run_monitor.step("Post-snapshot checks"):
+                                await self.async_run_snapshot_checks(
+                                    snapshot_check_objs,
+                                    DEFAULT_POST_SNAPSHOT_CHECKPOINT_ID,
+                                    int(time.time()),
+                                    test_case_results,
+                                    test_case_name,
+                                )
                             self.logger.info(
                                 f"Post-snapshot checks completed for {test_case_name}"
                             )
@@ -2053,13 +2069,14 @@ class TaacRunner:
                                 logger=self.logger,
                             )
                             _cleanup_start = time.time()
-                            await self.initialize_and_run_steps(
-                                playbook.cleanup_steps,
-                                test_device=test_device,
-                                test_case_name=test_case_name,
-                                test_case_start_time=test_case_start_time,
-                                test_case_results=test_case_results,
-                            )
+                            async with self.run_monitor.step("Playbook cleanup steps"):
+                                await self.initialize_and_run_steps(
+                                    playbook.cleanup_steps,
+                                    test_device=test_device,
+                                    test_case_name=test_case_name,
+                                    test_case_start_time=test_case_start_time,
+                                    test_case_results=test_case_results,
+                                )
                             log_phase_end(
                                 f"Cleanup Steps ({len(playbook.cleanup_steps)} step(s))",
                                 duration_secs=time.time() - _cleanup_start,
@@ -2102,12 +2119,13 @@ class TaacRunner:
                     _teardown_exc: BaseException | None = None
                     with suppress_console_logs(self.logger):
                         try:
-                            await self.async_test_case_tearDown(
-                                playbook,
-                                test_device,
-                                test_case_results,
-                                test_case_start_time,
-                            )
+                            async with self.run_monitor.step("Test case teardown"):
+                                await self.async_test_case_tearDown(
+                                    playbook,
+                                    test_device,
+                                    test_case_results,
+                                    test_case_start_time,
+                                )
                         except asyncio.CancelledError as e:
                             if _stage_exc is not None:
                                 e.add_note(
@@ -2759,36 +2777,38 @@ class TaacRunner:
         )
         _stage_error = None
         try:
-            for _stage_iter in range(stage.iteration):
-                if stage.iteration > 1:
-                    self.logger.info(
-                        f"\033[1m\033[33m  ── Iteration {_stage_iter + 1}/"
-                        f"{stage.iteration} ──\033[0m"
-                    )
-                if stage.concurrent:
-                    concurrent_steps = stage.concurrent_steps
-                    if not concurrent_steps and stage.steps:
-                        # Wrap each step as its own ConcurrentStep so they
-                        # run in parallel when only steps= + concurrent=True
-                        # is set (no explicit concurrent_steps).
-                        concurrent_steps = [
-                            taac_types.ConcurrentStep(steps=[s]) for s in stage.steps
-                        ]
-                    await self.initialize_and_run_concurrent_steps(
-                        none_throws(concurrent_steps),
-                        test_device,
-                        test_case_name,
-                        test_case_start_time,
-                        test_case_results,
-                    )
-                else:
-                    await self.initialize_and_run_steps(
-                        stage.steps,
-                        test_device,
-                        test_case_name,
-                        test_case_start_time,
-                        test_case_results,
-                    )
+            async with self.run_monitor.step(f"{stage_name} | {test_device.name}"):
+                for _stage_iter in range(stage.iteration):
+                    if stage.iteration > 1:
+                        self.logger.info(
+                            f"\033[1m\033[33m  ── Iteration {_stage_iter + 1}/"
+                            f"{stage.iteration} ──\033[0m"
+                        )
+                    if stage.concurrent:
+                        concurrent_steps = stage.concurrent_steps
+                        if not concurrent_steps and stage.steps:
+                            # Wrap each step as its own ConcurrentStep so they
+                            # run in parallel when only steps= + concurrent=True
+                            # is set (no explicit concurrent_steps).
+                            concurrent_steps = [
+                                taac_types.ConcurrentStep(steps=[s])
+                                for s in stage.steps
+                            ]
+                        await self.initialize_and_run_concurrent_steps(
+                            none_throws(concurrent_steps),
+                            test_device,
+                            test_case_name,
+                            test_case_start_time,
+                            test_case_results,
+                        )
+                    else:
+                        await self.initialize_and_run_steps(
+                            stage.steps,
+                            test_device,
+                            test_case_name,
+                            test_case_start_time,
+                            test_case_results,
+                        )
         except Exception as e:
             _stage_error = e
             raise
@@ -3045,7 +3065,10 @@ class TaacRunner:
                             ),
                             testconfig_name=self.test_config.name,
                         )
-                    await self.run_test_case(playbook, test_device)
+                    async with self.run_monitor.step(
+                        f"Playbook: {playbook.name} | {dut}"
+                    ):
+                        await self.run_test_case(playbook, test_device)
                 except Exception as e:
                     failed_playbooks.append((playbook.name, dut, e))
                     self.logger.error(
@@ -3221,7 +3244,8 @@ class TaacRunner:
                 sleep_time=step.step.retryable_delay,
                 exceptions=(Exception,),
             )(step._run)
-            await retryable_run(step._input, step._step_params)
+            async with self.run_monitor.step(f"{step_label} | {device_name}"):
+                await retryable_run(step._input, step._step_params)
         _step_elapsed = time.time() - _step_start
         self.logger.info(
             f"\033[32m    ✓ {step_label}\033[0m \033[2m({_step_elapsed:.0f}s)\033[0m"
@@ -4898,10 +4922,11 @@ class TaacRunner:
                     "TEST CONFIG TEARDOWN"
                 )
                 implementation_started = True
-                await self._async_test_tearDown_impl(
-                    teardown_start,
-                    teardown_section,
-                )
+                async with self.run_monitor.step("Test config teardown"):
+                    await self._async_test_tearDown_impl(
+                        teardown_start,
+                        teardown_section,
+                    )
             except BaseException as error:  # noqa: B036
                 teardown_failure = error
         finally:

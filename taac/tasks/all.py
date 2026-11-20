@@ -425,6 +425,15 @@ class ConfigureParallelBgpPeers(BaseTask):
                 interface_to_port_info,
                 shared_vlan_id,
             )
+        configured_vlan_addresses: t.Dict[int, t.List[str]] = {}
+        if any(
+            config.get("retain_existing_vlan_addresses", True)
+            for configs in config_json.values()
+            for config in configs
+        ):
+            configured_vlan_addresses = (
+                await driver.async_get_all_vlan_configured_addresses()
+            )
         for interface, configs in config_json.items():
             for config in configs:
                 config_only_interface_ip = config.get("config_only_interface_ip", False)
@@ -483,11 +492,11 @@ class ConfigureParallelBgpPeers(BaseTask):
                                 description,
                             )
                         )
-                existing_vlan_addresses = []
-                if retain_existing_vlan_addresses:
-                    existing_vlan_addresses = (
-                        await driver.async_get_vlan_configured_addresses(vlan_id)
-                    )
+                existing_vlan_addresses = (
+                    configured_vlan_addresses.get(vlan_id, [])
+                    if retain_existing_vlan_addresses
+                    else []
+                )
                 vlan_ip_addresses = list(
                     set(
                         existing_vlan_addresses

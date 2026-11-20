@@ -89,7 +89,9 @@ class FbossSwitchTest(TestCase):
 
         self.assertEqual(["first", "second"], result)
 
-    async def test_get_vlan_configured_addresses_reads_running_config(self) -> None:
+    async def test_get_all_vlan_configured_addresses_reads_running_config_once(
+        self,
+    ) -> None:
         client = AsyncMock()
         client.__aenter__.return_value = client
         client.getRunningConfig.return_value = json.dumps(
@@ -118,12 +120,50 @@ class FbossSwitchTest(TestCase):
             new_callable=PropertyMock,
             return_value=client,
         ):
-            addresses = await self.switch.async_get_vlan_configured_addresses(2000)
+            addresses = await self.switch.async_get_all_vlan_configured_addresses()
 
-        self.assertEqual(["2401:db00:abcd::a/64", "fe80::face:b00c/64"], addresses)
+        self.assertEqual(
+            {
+                2000: ["2401:db00:abcd::a/64", "fe80::face:b00c/64"],
+                3000: ["2401:db00:dcba::a/64"],
+            },
+            addresses,
+        )
         client.getRunningConfig.assert_awaited_once_with()
 
-    async def test_get_vlan_configured_addresses_accepts_empty_addresses(self) -> None:
+    async def test_get_all_vlan_configured_addresses_retries_rate_limit(
+        self,
+    ) -> None:
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.getRunningConfig.side_effect = [
+            ApplicationOverloadError(
+                "reject thrift methd due to rate limit: 2 for method: getRunningConfig"
+            ),
+            json.dumps({"sw": {"interfaces": [{"vlanID": 2000}]}}),
+        ]
+
+        with (
+            patch.object(
+                FbossSwitch,
+                "async_agent_client",
+                new_callable=PropertyMock,
+                return_value=client,
+            ),
+            patch(
+                "neteng.test_infra.dne.taac.driver.fboss_switch.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as sleep,
+        ):
+            addresses = await self.switch.async_get_all_vlan_configured_addresses()
+
+        self.assertEqual({2000: []}, addresses)
+        self.assertEqual(2, client.getRunningConfig.await_count)
+        sleep.assert_awaited_once()
+
+    async def test_get_all_vlan_configured_addresses_accepts_empty_addresses(
+        self,
+    ) -> None:
         client = AsyncMock()
         client.__aenter__.return_value = client
         client.getRunningConfig.return_value = json.dumps(
@@ -136,11 +176,11 @@ class FbossSwitchTest(TestCase):
             new_callable=PropertyMock,
             return_value=client,
         ):
-            addresses = await self.switch.async_get_vlan_configured_addresses(2000)
+            addresses = await self.switch.async_get_all_vlan_configured_addresses()
 
-        self.assertEqual([], addresses)
+        self.assertEqual({2000: []}, addresses)
 
-    async def test_get_vlan_configured_addresses_accepts_omitted_addresses(
+    async def test_get_all_vlan_configured_addresses_accepts_omitted_addresses(
         self,
     ) -> None:
         client = AsyncMock()
@@ -155,11 +195,11 @@ class FbossSwitchTest(TestCase):
             new_callable=PropertyMock,
             return_value=client,
         ):
-            addresses = await self.switch.async_get_vlan_configured_addresses(2000)
+            addresses = await self.switch.async_get_all_vlan_configured_addresses()
 
-        self.assertEqual([], addresses)
+        self.assertEqual({2000: []}, addresses)
 
-    async def test_get_vlan_configured_addresses_accepts_missing_interface(
+    async def test_get_all_vlan_configured_addresses_skips_interfaces_without_vlan(
         self,
     ) -> None:
         client = AsyncMock()
@@ -168,10 +208,11 @@ class FbossSwitchTest(TestCase):
             {
                 "sw": {
                     "interfaces": [
+                        {"ipAddresses": ["2401:db00:abcd::a/64"]},
                         {
                             "vlanID": 3000,
                             "ipAddresses": ["2401:db00:dcba::a/64"],
-                        }
+                        },
                     ]
                 }
             }
@@ -183,9 +224,9 @@ class FbossSwitchTest(TestCase):
             new_callable=PropertyMock,
             return_value=client,
         ):
-            addresses = await self.switch.async_get_vlan_configured_addresses(2000)
+            addresses = await self.switch.async_get_all_vlan_configured_addresses()
 
-        self.assertEqual([], addresses)
+        self.assertEqual({3000: ["2401:db00:dcba::a/64"]}, addresses)
 
     async def test_start_all_bgp_sessions_uses_async_sleep(self) -> None:
         client = AsyncMock()

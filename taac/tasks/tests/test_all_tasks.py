@@ -837,7 +837,7 @@ class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
         driver.async_get_all_port_info = AsyncMock(
             return_value={10: SimpleNamespace(name="eth2/1/1", portId=10, vlans=[3000])}
         )
-        driver.async_get_vlan_configured_addresses = AsyncMock(return_value=[])
+        driver.async_get_all_vlan_configured_addresses = AsyncMock(return_value={})
         driver.async_register_python_patcher = AsyncMock()
         task = ConfigureParallelBgpPeers(logger=MagicMock())
 
@@ -887,8 +887,8 @@ class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
         driver.async_get_all_port_info = AsyncMock(
             return_value={10: SimpleNamespace(name="eth2/1/1", portId=10, vlans=[3000])}
         )
-        driver.async_get_vlan_configured_addresses = AsyncMock(
-            return_value=["2401:db00:abcd::a/64", "fe80::face:b00c/64"]
+        driver.async_get_all_vlan_configured_addresses = AsyncMock(
+            return_value={3000: ["2401:db00:abcd::a/64", "fe80::face:b00c/64"]}
         )
         driver.async_register_python_patcher = AsyncMock()
         task = ConfigureParallelBgpPeers(logger=MagicMock())
@@ -921,7 +921,7 @@ class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
                 }
             )
 
-        driver.async_get_vlan_configured_addresses.assert_awaited_once_with(3000)
+        driver.async_get_all_vlan_configured_addresses.assert_awaited_once_with()
         vlan_call = next(
             call
             for call in driver.async_register_python_patcher.await_args_list
@@ -938,6 +938,65 @@ class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
             ],
         )
 
+    async def test_running_config_is_read_once_for_all_retained_vlans(self) -> None:
+        driver = MagicMock()
+        driver.async_get_all_port_info = AsyncMock(
+            return_value={
+                10: SimpleNamespace(name="eth2/1/1", portId=10, vlans=[3000]),
+                11: SimpleNamespace(name="eth2/2/1", portId=11, vlans=[4000]),
+            }
+        )
+        driver.async_get_all_vlan_configured_addresses = AsyncMock(
+            return_value={3000: ["fe80::face:b00c/64"]}
+        )
+        driver.async_register_python_patcher = AsyncMock()
+        config = {
+            interface: [
+                {
+                    "starting_ip": f"2401:db00:abcd::{host}",
+                    "increment_ip": "::2",
+                    "prefix_length": 127,
+                    "description": "retained",
+                    "peer_group_name": "TEST",
+                    "num_sessions": 1,
+                    "remote_as_4_byte": 65000,
+                    "gateway_starting_ip": f"2401:db00:abcd::{host + 1}",
+                    "gateway_increment_ip": "::2",
+                }
+                for host in hosts
+            ]
+            for interface, hosts in (("eth2/1/1", (10, 20)), ("eth2/2/1", (30,)))
+        }
+
+        with patch(
+            f"{ALL_PATH}.async_get_device_driver",
+            new_callable=AsyncMock,
+            return_value=driver,
+        ):
+            await ConfigureParallelBgpPeers(logger=MagicMock()).run(
+                {"hostname": "fsw.example", "config_json": json.dumps(config)}
+            )
+
+        driver.async_get_all_vlan_configured_addresses.assert_awaited_once_with()
+        vlan_call = next(
+            call
+            for call in driver.async_register_python_patcher.await_args_list
+            if call.kwargs["config_name"] == "agent"
+        )
+        vlan_args = vlan_call.kwargs["patcher_args"]
+        self.assertCountEqual(
+            json.loads(vlan_args["vlan3000"])["ip_addresses"],
+            [
+                "fe80::face:b00c/64",
+                "2401:db00:abcd::10/127",
+                "2401:db00:abcd::20/127",
+            ],
+        )
+        self.assertEqual(
+            json.loads(vlan_args["vlan4000"])["ip_addresses"],
+            ["2401:db00:abcd::30/127"],
+        )
+
     async def test_explicit_vlan_split_replaces_existing_vlan_addresses(self) -> None:
         driver = MagicMock()
         driver.async_get_all_port_info = AsyncMock(
@@ -946,8 +1005,8 @@ class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
                 137: SimpleNamespace(name="eth1/18/1", portId=137, vlans=[2000]),
             }
         )
-        driver.async_get_vlan_configured_addresses = AsyncMock(
-            return_value=["2401:db00:501c::a/64"]
+        driver.async_get_all_vlan_configured_addresses = AsyncMock(
+            return_value={2000: ["2401:db00:501c::a/64"]}
         )
         driver.async_register_python_patcher = AsyncMock()
         task = ConfigureParallelBgpPeers(logger=MagicMock())
@@ -1017,7 +1076,7 @@ class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
             secondary["ip_addresses"],
             ["2401:db00:e50d:11:18::10/127"],
         )
-        driver.async_get_vlan_configured_addresses.assert_not_awaited()
+        driver.async_get_all_vlan_configured_addresses.assert_not_awaited()
 
         bgp_call = next(
             call

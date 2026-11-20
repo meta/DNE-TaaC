@@ -23,6 +23,8 @@ from typing import (
     Any,
     AsyncContextManager,
     AsyncGenerator,
+    Awaitable,
+    Callable,
     ContextManager,
     DefaultDict,
     Dict,
@@ -32,6 +34,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    TypeVar,
     Union,
 )
 
@@ -302,6 +305,9 @@ def _is_fboss_method_rate_limit(error: BaseException) -> bool:
             "reject thrift methd due to rate limit:",
         )
     )
+
+
+_T = TypeVar("_T")
 
 
 def fb_gethostbyname(hostname: str) -> str:
@@ -3489,6 +3495,29 @@ class FbossSwitch(AbstractSwitch):
         async with self.async_agent_client as client:
             return await client.getLldpNeighbors()
 
+    async def _async_retry_agent_rate_limit(
+        self, method: str, call_agent: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        """
+        Run an agent Thrift call, retrying explicit Thrift method rate limits.
+        """
+
+        def log_retry(state: RetryCallState) -> None:
+            assert state.outcome is not None and state.next_action is not None
+            self.logger.warning(
+                f"{method} on {self.hostname} rate limited on "
+                f"attempt {state.attempt_number}/4; retrying in "
+                f"{state.next_action.sleep:.2f}s: {state.outcome.exception()}"
+            )
+
+        return await AsyncRetrying(
+            retry=retry_if_exception(_is_fboss_method_rate_limit),
+            stop=stop_after_attempt(4),
+            wait=wait_exponential_jitter(initial=1, max=4.1, jitter=0.1),
+            before_sleep=log_retry,
+            reraise=True,
+        )(call_agent)
+
     async def async_get_switch_run_state(self) -> SwitchRunState:
         """
         Request fresh agent run state, retrying explicit Thrift rate limits.
@@ -3501,21 +3530,9 @@ class FbossSwitch(AbstractSwitch):
             async with self.async_agent_client as client:
                 return await client.getSwitchRunState()
 
-        def log_retry(state: RetryCallState) -> None:
-            assert state.outcome is not None and state.next_action is not None
-            self.logger.warning(
-                f"getSwitchRunState on {self.hostname} rate limited on "
-                f"attempt {state.attempt_number}/4; retrying in "
-                f"{state.next_action.sleep:.2f}s: {state.outcome.exception()}"
-            )
-
-        return await AsyncRetrying(
-            retry=retry_if_exception(_is_fboss_method_rate_limit),
-            stop=stop_after_attempt(4),
-            wait=wait_exponential_jitter(initial=1, max=4.1, jitter=0.1),
-            before_sleep=log_retry,
-            reraise=True,
-        )(read_state)
+        return await self._async_retry_agent_rate_limit(
+            "getSwitchRunState", read_state
+        )
 
     @async_retryable(retries=3, sleep_time=5, exceptions=(Exception,))
     async def async_get_all_port_info(self) -> Dict[int, PortInfoThrift]:
@@ -5620,14 +5637,28 @@ class FbossSwitch(AbstractSwitch):
                 ip_addresses_str.append(f"{ip_address_obj}/{address.prefixLength}")
         return ip_addresses_str
 
-    async def async_get_vlan_configured_addresses(self, vlan_id: int) -> List[str]:
-        async with self.async_agent_client as client:
-            running_config = json.loads(await client.getRunningConfig())
+    async def async_get_all_vlan_configured_addresses(self) -> Dict[int, List[str]]:
+        """
+        Configured addresses of each VLAN interface in the agent running config.
+        """
 
+        async def read_running_config() -> str:
+            async with self.async_agent_client as client:
+                return await client.getRunningConfig()
+
+        running_config = json.loads(
+            await self._async_retry_agent_rate_limit(
+                "getRunningConfig", read_running_config
+            )
+        )
+        vlan_addresses: Dict[int, List[str]] = {}
         for interface_config in running_config.get("sw", {}).get("interfaces", []):
-            if interface_config.get("vlanID") == vlan_id:
-                return interface_config.get("ipAddresses", [])
-        return []
+            vlan_id = interface_config.get("vlanID")
+            if vlan_id is not None:
+                vlan_addresses.setdefault(
+                    vlan_id, interface_config.get("ipAddresses", [])
+                )
+        return vlan_addresses
 
     async def async_get_bgp_local_asn(self) -> int:
         async with await self._get_bgp_client() as bgp_client:

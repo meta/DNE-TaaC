@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # pyre-unsafe
+import asyncio
 import logging
 import time
 import typing as t
@@ -44,6 +45,17 @@ class SectionResult:
     error_message: str = ""
     indent_level: int = 0
     start_time: float = 0.0
+
+
+def section_error_message(error: BaseException) -> str:
+    """The REASON text for a failed section.
+
+    ``str(asyncio.CancelledError())`` is empty, so a run cut short by the
+    runner's ``--timeout`` would otherwise report a FAIL with no reason.
+    """
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled (run timeout)"
+    return str(error) or type(error).__name__
 
 
 def _to_thrift(section: SectionResult) -> trr_types.SectionResult:
@@ -205,10 +217,15 @@ class TaacTestSummary:
         log_phase_start(name, logger=self._logger)
         try:
             yield section
-        except Exception as e:
+        except BaseException as e:
+            # BaseException, not Exception: a run cut short by the runner's
+            # --timeout raises asyncio.CancelledError into whatever section is
+            # open, and an unhandled one would leave the section at PASS.
             elapsed = time.time() - section.start_time
             log_phase_end(name, duration_secs=elapsed, logger=self._logger)
-            self.end_section(section, SectionStatus.FAIL, error_message=str(e))
+            self.end_section(
+                section, SectionStatus.FAIL, error_message=section_error_message(e)
+            )
             raise
         else:
             elapsed = time.time() - section.start_time

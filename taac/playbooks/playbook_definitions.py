@@ -15102,17 +15102,16 @@ def create_spillover_testing_playbooks(
 # the first hardware run on a given platform (W400/IcePack derived theirs
 # empirically).
 # =============================================================================
-def _ecmp_post_churn_recovery_stage(
-    main_traffic: str, rouge_traffic: str, settle_seconds: int
-) -> Stage:
-    """Strict recovery check for the overcommit churn playbooks.
+def _ecmp_post_churn_recovery_loss_check(
+    main_traffic: str, rouge_traffic: str
+) -> PointInTimeHealthCheck:
+    """Strict post-churn loss check: Main 0% loss and Rouge fully rejected.
 
-    Their postcheck loss thresholds are record-only. This stage runs after
-    flapping is disarmed, waits ``settle_seconds``, snapshots the hardware ECMP
-    table, and requires the steady state the plain overcommit playbook asserts
-    on freshly cleared counters: Main 0% loss and Rouge fully rejected.
+    Used as the overcommit churn playbooks' postcheck in place of their
+    record-only thresholds, so a failure is reported together with the other
+    postchecks instead of stopping the playbook before they run.
     """
-    recovery_loss_check = create_ixia_packet_loss_check(
+    return create_ixia_packet_loss_check(
         clear_traffic_stats=True,
         sleep_time=30,
         thresholds=[
@@ -15129,6 +15128,14 @@ def _ecmp_post_churn_recovery_stage(
             ),
         ],
     )
+
+
+def _ecmp_post_churn_recovery_stage(settle_seconds: int) -> Stage:
+    """Settle after churn and snapshot the hardware ECMP table.
+
+    Runs after flapping is disarmed so the playbook postchecks, including
+    `_ecmp_post_churn_recovery_loss_check`, measure the recovered steady state.
+    """
     return create_steps_stage(
         stage_id="post_churn_recovery",
         steps=[
@@ -15144,17 +15151,6 @@ def _ecmp_post_churn_recovery_stage(
                 ),
                 description="Snapshot hardware ECMP table after churn",
                 log_output=True,
-            ),
-            create_validation_step(
-                point_in_time_checks=[recovery_loss_check],
-                description="Post-churn recovery: Main 0% loss, Rouge fully rejected",
-                fail_on_failure=True,
-            ),
-            # The loss check stops traffic; the playbook postchecks need it.
-            create_ixia_api_step(
-                api_name="start_traffic",
-                args_dict={},
-                description="Restart traffic for postchecks",
             ),
         ],
     )
@@ -15223,7 +15219,7 @@ def create_ecmp_only_groups_playbooks(
             allow_parent_child_mismatch=churning,
         )
 
-    def _common_postchecks(churning: bool = False):
+    def _common_postchecks(churning: bool = False, recovery: bool = False):
         return [
             create_systemctl_active_state_check(
                 services=[
@@ -15264,7 +15260,11 @@ def create_ecmp_only_groups_playbooks(
             # question, but it is not one this playbook can assert on, and
             # failing here would only mask the checks that still mean something.
             # The observed percentages are still logged for analysis.
-            _packet_loss(
+            # `recovery` measures after the post-churn settle, where the steady
+            # state is expected again, so it uses the strict thresholds.
+            _ecmp_post_churn_recovery_loss_check(main_traffic, rouge_traffic)
+            if recovery
+            else _packet_loss(
                 main_loss="100" if churning else "0",
                 rouge_loss="100",
             ),
@@ -15465,6 +15465,7 @@ def create_ecmp_only_groups_playbooks(
         )
 
     def _make_disruptive(name, overcommit, service, cold_boot):
+        recovery = overcommit and post_churn_recovery_seconds is not None
         # Overcommit still validates ResourceAccountant engaged — as a stage,
         # after setup_steps establish the over-budget config.
         ra_stages = (
@@ -15485,19 +15486,15 @@ def create_ecmp_only_groups_playbooks(
             + ra_stages
             + _disruptive_stages(service, cold_boot)
             + (
-                [
-                    _ecmp_post_churn_recovery_stage(
-                        main_traffic, rouge_traffic, post_churn_recovery_seconds
-                    )
-                ]
-                if overcommit and post_churn_recovery_seconds is not None
+                [_ecmp_post_churn_recovery_stage(post_churn_recovery_seconds)]
+                if recovery and post_churn_recovery_seconds is not None
                 else []
             ),
             skip_test_config_snapshot_checks=True,
             # Only overcommit churns: Full_Utilization flaps too, but with Rouge
             # disabled there is no second pool to contend for the freed
             # next-hops, so Main is still expected to hold 0% loss there.
-            postchecks=_common_postchecks(churning=overcommit),
+            postchecks=_common_postchecks(churning=overcommit, recovery=recovery),
         )
 
     return [
@@ -15583,7 +15580,7 @@ def create_ecmp_only_members_playbooks(
             allow_parent_child_mismatch=churning,
         )
 
-    def _common_postchecks(churning: bool = False):
+    def _common_postchecks(churning: bool = False, recovery: bool = False):
         return [
             create_systemctl_active_state_check(
                 services=[
@@ -15616,7 +15613,10 @@ def create_ecmp_only_members_playbooks(
             # flapping) relaxes Main to 100% i.e. record-only, because Main and
             # Rouge contend for one shared next-hop pool on every flap and Main
             # genuinely cannot hold its budget. Percentages are still logged.
-            _packet_loss(
+            # `recovery` uses the strict post-settle thresholds instead.
+            _ecmp_post_churn_recovery_loss_check(main_traffic, rouge_traffic)
+            if recovery
+            else _packet_loss(
                 main_loss="100" if churning else "0",
                 rouge_loss="100",
             ),
@@ -15827,6 +15827,7 @@ def create_ecmp_only_members_playbooks(
         )
 
     def _make_disruptive(name, overcommit, service, cold_boot):
+        recovery = overcommit and post_churn_recovery_seconds is not None
         # Overcommit still validates ResourceAccountant engaged — as a stage,
         # after setup_steps establish the over-budget config.
         ra_stages = (
@@ -15847,19 +15848,15 @@ def create_ecmp_only_members_playbooks(
             + ra_stages
             + _disruptive_stages(service, cold_boot)
             + (
-                [
-                    _ecmp_post_churn_recovery_stage(
-                        main_traffic, rouge_traffic, post_churn_recovery_seconds
-                    )
-                ]
-                if overcommit and post_churn_recovery_seconds is not None
+                [_ecmp_post_churn_recovery_stage(post_churn_recovery_seconds)]
+                if recovery and post_churn_recovery_seconds is not None
                 else []
             ),
             skip_test_config_snapshot_checks=True,
             # Only overcommit churns: Full_Utilization flaps too, but with Rouge
             # disabled there is no second pool to contend for the freed
             # next-hops, so Main is still expected to hold 0% loss there.
-            postchecks=_common_postchecks(churning=overcommit),
+            postchecks=_common_postchecks(churning=overcommit, recovery=recovery),
         )
 
     return [

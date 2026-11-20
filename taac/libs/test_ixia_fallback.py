@@ -55,7 +55,10 @@ from taac.utils.oss_taac_constants import (
     IxiaFallbackExhaustedError,
     IxiaPortUnavailableError,
 )
-from taac.utils.taac_test_summary import SectionStatus
+from taac.utils.taac_test_summary import (
+    SectionResult,
+    SectionStatus,
+)
 from taac.test_as_a_config import types as taac_types
 
 
@@ -154,6 +157,9 @@ class TaacRunnerFailurePrecedenceTest(unittest.IsolatedAsyncioTestCase):
         teardown = ValueError("strict teardown")
 
         runner.test_summary = MagicMock()
+        runner.test_summary.start_section.side_effect = (
+            lambda name, indent_level=0: SectionResult(name, indent_level=indent_level)
+        )
         runner.async_test_case_setUp = AsyncMock()
         runner.initialize_and_setup_snapshot_checks = AsyncMock(return_value=[])
         runner.inject_validation_stages = MagicMock(return_value=[stage])

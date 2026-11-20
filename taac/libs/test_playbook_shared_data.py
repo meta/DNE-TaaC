@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 from taac.constants import TestDevice
 from taac.libs.taac_runner import TaacRunner
 from taac.utils.oss_taac_lib_utils import ConsoleFileLogger
+from taac.utils.taac_test_summary import SectionResult
 from taac.test_as_a_config import types as taac_types
 
 
@@ -44,6 +45,9 @@ class TaacRunnerPlaybookSharedDataTest(unittest.IsolatedAsyncioTestCase):
             _config(), logger=ConsoleFileLogger("playbook-shared-data-test")
         )
         runner.test_summary = MagicMock()
+        runner.test_summary.start_section.side_effect = (
+            lambda name, indent_level=0: SectionResult(name, indent_level=indent_level)
+        )
         runner._capture_topology_baseline = AsyncMock()
         runner.initialize_and_setup_snapshot_checks = AsyncMock(return_value=[])
         runner.inject_validation_stages = MagicMock(return_value=[])

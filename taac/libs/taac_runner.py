@@ -1861,7 +1861,7 @@ class TaacRunner:
                 )
         return selected
 
-    async def run_test_case(
+    async def run_test_case(  # noqa: C901
         self,
         playbook: taac_types.Playbook,
         test_device: TestDevice,
@@ -1879,6 +1879,8 @@ class TaacRunner:
         recorded_iterations = 0
         test_case_results: t.List[trr_types.CheckResult] = []
         test_case_start_time = int(time.time())
+        playbook_section: SectionResult | None = None
+        last_recorded_result_index: int | None = None
         iteration_count = self._get_test_case_iteration_count(playbook)
         self._playbook_shared_task_data = {}
 
@@ -1888,9 +1890,11 @@ class TaacRunner:
                 self._test_case_investigation_attempted = False
                 test_case_results = []
                 test_case_start_time = int(time.time())
+                playbook_section = None
                 self._current_playbook_section = self.test_summary.start_section(
                     f"Playbook: {playbook.name} | {test_device.name}"
                 )
+                playbook_section = self._current_playbook_section
                 _start_test_case_time_window(self.jq_vars, int(time.time()))
                 await self._capture_topology_baseline(playbook)
                 with suppress_console_logs(self.logger):
@@ -2019,6 +2023,7 @@ class TaacRunner:
                             )
                 except BaseException as error:
                     _stage_exc = error
+                    self._record_playbook_section_error(playbook_section, error)
                     raise
                 finally:
                     # always run post-snapshot checks for observability, regardless of stage failures
@@ -2126,7 +2131,9 @@ class TaacRunner:
                     empty_status=hc_types.HealthCheckStatus.PASS,
                 )
                 recorded_iterations = _npi_iteration_count
+                last_recorded_result_index = len(self.playbook_results) - 1
         except Exception as e:
+            self._record_playbook_section_error(playbook_section, e)
             await self._async_run_failed_test_case_investigation_if_enabled(
                 playbook=playbook,
                 test_device=test_device,
@@ -2142,21 +2149,36 @@ class TaacRunner:
                 e,
             )
         finally:
-            _run_exc = await self._run_test_case_fallback_cleanup(
-                test_case_name,
-                test_case_results,
-                test_device,
-                test_case_start_time,
-                _run_exc,
-                sys.exception(),
-            )
-            # The iteration that was in flight when the run broke off, recorded
-            # only here so it carries the checks the fallback cleanup above
-            # just appended to test_case_results.
-            if _npi_iteration_count > recorded_iterations:
-                self._record_playbook_result(
-                    playbook, test_device, _npi_iteration_count, test_case_results
+            try:
+                _run_exc = await self._run_test_case_fallback_cleanup(
+                    test_case_name,
+                    test_case_results,
+                    test_device,
+                    test_case_start_time,
+                    _run_exc,
+                    sys.exception(),
                 )
+            finally:
+                self._record_playbook_section_error(playbook_section, _run_exc)
+                self._record_playbook_section_error(playbook_section, sys.exception())
+                self._finalize_playbook_section([], [])
+                execution_error = sys.exception() or _run_exc
+                if (
+                    execution_error is not None
+                    or _npi_iteration_count > recorded_iterations
+                ):
+                    self._record_playbook_result(
+                        playbook,
+                        test_device,
+                        _npi_iteration_count,
+                        test_case_results,
+                        execution_error=execution_error,
+                        replace_index=(
+                            last_recorded_result_index
+                            if _npi_iteration_count == recorded_iterations
+                            else None
+                        ),
+                    )
             # Publish NPI result immediately after all iterations complete,
             # before returning to run_tests for the next playbook.
             # This ensures the result reflects the full aggregated outcome
@@ -2175,16 +2197,28 @@ class TaacRunner:
         results: t.Sequence[trr_types.CheckResult],
         *,
         empty_status: hc_types.HealthCheckStatus = hc_types.HealthCheckStatus.UNKNOWN,
+        execution_error: BaseException | None = None,
+        replace_index: int | None = None,
     ) -> None:
-        self.playbook_results.append(
-            trr_types.PlaybookResult(
-                playbook_name=playbook.name,
-                dut=test_device.name,
-                iteration=iteration,
-                status=worst_check_status(results) if results else empty_status,
-                results=list(results),
+        status = worst_check_status(results) if results else empty_status
+        if execution_error is not None:
+            status = (
+                hc_types.HealthCheckStatus.FAIL
+                if isinstance(execution_error, TestCaseFailure)
+                and status != hc_types.HealthCheckStatus.ERROR
+                else hc_types.HealthCheckStatus.ERROR
             )
+        result = trr_types.PlaybookResult(
+            playbook_name=playbook.name,
+            dut=test_device.name,
+            iteration=iteration,
+            status=status,
+            results=list(results),
         )
+        if replace_index is not None:
+            self.playbook_results[replace_index] = result
+        else:
+            self.playbook_results.append(result)
 
     def _record_npi_iteration_error(
         self,
@@ -3444,6 +3478,23 @@ class TaacRunner:
                 errors.append(error)
         return errors
 
+    @staticmethod
+    def _record_playbook_section_error(
+        section: SectionResult | None, error: BaseException | None
+    ) -> None:
+        """Retain a failure without ending the Playbook's log capture."""
+        if section is None or error is None:
+            return
+        if isinstance(error, TestbedError):
+            section.status = SectionStatus.INFRA_ERROR
+        elif section.status != SectionStatus.INFRA_ERROR:
+            section.status = SectionStatus.FAIL
+        detail = "".join(traceback.format_exception(error)).rstrip()
+        if detail not in section.error_message:
+            section.error_message = "\n".join(
+                part for part in (section.error_message, detail) if part
+            )
+
     def _finalize_playbook_section(
         self,
         exceptions: t.Sequence[BaseException],
@@ -3452,20 +3503,18 @@ class TaacRunner:
         section = self._current_playbook_section
         if section is None:
             return
-        if exceptions:
-            status = (
-                SectionStatus.INFRA_ERROR
-                if topology_restore_errors
-                or any(isinstance(error, TestbedError) for error in exceptions)
-                else SectionStatus.FAIL
-            )
-            self.test_summary.end_section(
-                section,
-                status,
-                "; ".join(str(error) for error in exceptions),
-            )
-        else:
-            self.test_summary.end_section(section, SectionStatus.PASS)
+        for error in exceptions:
+            self._record_playbook_section_error(section, error)
+        for error in topology_restore_errors:
+            self._record_playbook_section_error(section, error)
+        if topology_restore_errors:
+            section.status = SectionStatus.INFRA_ERROR
+        status = (
+            section.status
+            if section.status in (SectionStatus.FAIL, SectionStatus.INFRA_ERROR)
+            else SectionStatus.PASS
+        )
+        self.test_summary.end_section(section, status, section.error_message)
         self._last_completed_playbook_section = section
         self._current_playbook_section = None
 

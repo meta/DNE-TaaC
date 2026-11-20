@@ -115,6 +115,9 @@ class AbstractSwitch(ABC):
         **kwargs,
     ) -> str: ...
 
+    async def async_get_vlan_configured_addresses(self, vlan_id: int) -> List[str]:
+        raise NotImplementedError
+
     @abstractmethod
     async def async_get_interfaces_status(
         self, interface_names: List[str], skip_logging: bool = False

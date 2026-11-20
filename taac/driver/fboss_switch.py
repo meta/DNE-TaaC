@@ -5620,6 +5620,15 @@ class FbossSwitch(AbstractSwitch):
                 ip_addresses_str.append(f"{ip_address_obj}/{address.prefixLength}")
         return ip_addresses_str
 
+    async def async_get_vlan_configured_addresses(self, vlan_id: int) -> List[str]:
+        async with self.async_agent_client as client:
+            running_config = json.loads(await client.getRunningConfig())
+
+        for interface_config in running_config.get("sw", {}).get("interfaces", []):
+            if interface_config.get("vlanID") == vlan_id:
+                return interface_config.get("ipAddresses", [])
+        return []
+
     async def async_get_bgp_local_asn(self) -> int:
         async with await self._get_bgp_client() as bgp_client:
             bgp_local_config = await bgp_client.getBgpLocalConfig()

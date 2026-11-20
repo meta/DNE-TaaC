@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, MagicMock, patch, PropertyMock
@@ -87,6 +88,104 @@ class FbossSwitchTest(TestCase):
         result = await self.switch.async_get_dump_transceiver_i2c_log()
 
         self.assertEqual(["first", "second"], result)
+
+    async def test_get_vlan_configured_addresses_reads_running_config(self) -> None:
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.getRunningConfig.return_value = json.dumps(
+            {
+                "sw": {
+                    "interfaces": [
+                        {
+                            "vlanID": 2000,
+                            "ipAddresses": [
+                                "2401:db00:abcd::a/64",
+                                "fe80::face:b00c/64",
+                            ],
+                        },
+                        {
+                            "vlanID": 3000,
+                            "ipAddresses": ["2401:db00:dcba::a/64"],
+                        },
+                    ]
+                }
+            }
+        )
+
+        with patch.object(
+            FbossSwitch,
+            "async_agent_client",
+            new_callable=PropertyMock,
+            return_value=client,
+        ):
+            addresses = await self.switch.async_get_vlan_configured_addresses(2000)
+
+        self.assertEqual(["2401:db00:abcd::a/64", "fe80::face:b00c/64"], addresses)
+        client.getRunningConfig.assert_awaited_once_with()
+
+    async def test_get_vlan_configured_addresses_accepts_empty_addresses(self) -> None:
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.getRunningConfig.return_value = json.dumps(
+            {"sw": {"interfaces": [{"vlanID": 2000, "ipAddresses": []}]}}
+        )
+
+        with patch.object(
+            FbossSwitch,
+            "async_agent_client",
+            new_callable=PropertyMock,
+            return_value=client,
+        ):
+            addresses = await self.switch.async_get_vlan_configured_addresses(2000)
+
+        self.assertEqual([], addresses)
+
+    async def test_get_vlan_configured_addresses_accepts_omitted_addresses(
+        self,
+    ) -> None:
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.getRunningConfig.return_value = json.dumps(
+            {"sw": {"interfaces": [{"vlanID": 2000}]}}
+        )
+
+        with patch.object(
+            FbossSwitch,
+            "async_agent_client",
+            new_callable=PropertyMock,
+            return_value=client,
+        ):
+            addresses = await self.switch.async_get_vlan_configured_addresses(2000)
+
+        self.assertEqual([], addresses)
+
+    async def test_get_vlan_configured_addresses_accepts_missing_interface(
+        self,
+    ) -> None:
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.getRunningConfig.return_value = json.dumps(
+            {
+                "sw": {
+                    "interfaces": [
+                        {
+                            "vlanID": 3000,
+                            "ipAddresses": ["2401:db00:dcba::a/64"],
+                        }
+                    ]
+                }
+            }
+        )
+
+        with patch.object(
+            FbossSwitch,
+            "async_agent_client",
+            new_callable=PropertyMock,
+            return_value=client,
+        ):
+            addresses = await self.switch.async_get_vlan_configured_addresses(2000)
+
+        self.assertEqual([], addresses)
 
     async def test_start_all_bgp_sessions_uses_async_sleep(self) -> None:
         client = AsyncMock()

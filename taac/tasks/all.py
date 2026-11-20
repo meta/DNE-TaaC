@@ -485,10 +485,8 @@ class ConfigureParallelBgpPeers(BaseTask):
                         )
                 existing_vlan_addresses = []
                 if retain_existing_vlan_addresses:
-                    # pyre-fixme[16]: `AbstractSwitch` has no attribute
-                    #  `async_get_vlan_addresses`.
-                    existing_vlan_addresses = await driver.async_get_vlan_addresses(
-                        vlan_id, global_only=True
+                    existing_vlan_addresses = (
+                        await driver.async_get_vlan_configured_addresses(vlan_id)
                     )
                 vlan_ip_addresses = list(
                     set(

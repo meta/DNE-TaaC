@@ -229,6 +229,41 @@ class CheckProfileRegistryTest(unittest.TestCase):
             ),
         )
 
+    def test_daemon_restart_restart_matrix_overrides(self):
+        """The restart matrix narrows the restart-aware service check, the log
+        window, and the snapshot end checkpoint through the context."""
+        ctx = ProfileContext(
+            peergroup_ibgp_v6="PG_IBGP_V6",
+            peergroup_ibgp_v4="PG_IBGP_V4",
+            expected_established_sessions=42,
+            expected_restarted_services=("Bgpcpp", "FibAgentBgp"),
+            log_window_start_jq_var="s3_start_time",
+            log_window_end_jq_var=None,
+            snapshot_post_checkpoint_id="stage.s3.end",
+        )
+        checks = get_profile_checks(CheckProfile.DAEMON_RESTART, ctx)
+
+        self.assertEqual(
+            checks.postchecks,
+            create_standard_postchecks(
+                postcheck_thresholds=None,
+                convergence_hard_timeout_seconds=1200,
+                expected_established_session_count=42,
+                expected_restarted_services=["Bgpcpp", "FibAgentBgp"],
+                restart_start_time_jq_var="daemon_restart_time",
+                log_window_start_jq_var="s3_start_time",
+                log_window_end_jq_var=None,
+            ),
+        )
+        self.assertEqual(
+            ["stage.s3.end", "stage.s3.end"],
+            [check.post_snapshot_checkpoint_id for check in checks.snapshot_checks],
+        )
+        self.assertEqual(
+            [None, None],
+            [check.pre_snapshot_checkpoint_id for check in checks.snapshot_checks],
+        )
+
     def test_cold_start_matches_factory(self):
         """COLD_START reproduces the exact create_standard_* calls the
         bgp_cold_start playbook used before migration (EOR tolerated, full

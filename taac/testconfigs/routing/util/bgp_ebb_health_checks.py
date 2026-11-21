@@ -425,6 +425,8 @@ def create_standard_postchecks(
     rib_fib_record_heal_latency: bool = True,
     rib_fib_heal_latency_max_sec: int = _RIB_FIB_HEAL_LATENCY_MAX_SEC,
     rib_fib_heal_latency_poll_sec: int = _RIB_FIB_HEAL_LATENCY_POLL_SEC,
+    log_window_start_jq_var: str = "test_case_start_time",
+    log_window_end_jq_var: str | None = "test_case_end_time",
 ) -> list[PointInTimeHealthCheck]:
     """
     Create standard postchecks for BGP tests.
@@ -489,6 +491,11 @@ def create_standard_postchecks(
         rib_fib_heal_latency_max_sec: Probe cap for the postcheck
             (default 480s, covers observed ~430s cold-boot heal).
         rib_fib_heal_latency_poll_sec: Probe poll interval (default 10s).
+        log_window_start_jq_var: jq variable holding the start of the window the
+            two log checks scan (default: playbook start).
+        log_window_end_jq_var: jq variable holding the end of that window
+            (default: playbook end). ``None`` ends the window when the check
+            runs, for checks that run before the playbook ends.
 
     Returns:
         List of standard postcheck health checks
@@ -550,15 +557,15 @@ def create_standard_postchecks(
                     "agent_name": "Bgpcpp",
                     "exclude_regex": "Memory Limit Reached",
                 },
-                start_time_jq_var="test_case_start_time",
-                end_time_jq_var="test_case_end_time",
+                start_time_jq_var=log_window_start_jq_var,
+                end_time_jq_var=log_window_end_jq_var,
                 check_id="system_level_log_check",
             ),
             # BGP time-bound log check
             create_log_parsing_check(
                 json_params={"check_system_logs": True},
-                start_time_jq_var="test_case_start_time",
-                end_time_jq_var="test_case_end_time",
+                start_time_jq_var=log_window_start_jq_var,
+                end_time_jq_var=log_window_end_jq_var,
                 check_id="bgp_time_bound_check",
             ),
             # RIB-FIB consistency check
@@ -629,7 +636,10 @@ def create_standard_snapshot_checks(
     all_prefixes_to_ignore.extend(bgp_mon.ignore_prefixes() or [])
 
     return [
-        create_core_dumps_snapshot_check(),
+        create_core_dumps_snapshot_check(
+            pre_snapshot_checkpoint_id=pre_snapshot_checkpoint_id,
+            post_snapshot_checkpoint_id=post_snapshot_checkpoint_id,
+        ),
         create_bgp_session_snapshot_check(
             parent_prefixes_to_ignore=all_prefixes_to_ignore or None,
             skip_flap_check=skip_flap_check,

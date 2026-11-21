@@ -10,6 +10,7 @@ The ordered ``__all__`` keeps the original CI/CD exports stable and appends
 durable characteristic factories.
 """
 
+import dataclasses
 import typing as t
 
 from taac.abstractions.churn.attribute import (
@@ -109,6 +110,7 @@ from taac.steps.step_definitions import (
     create_openr_route_action_step,
     create_policy_evaluation_point_steps,
     create_policy_evaluation_sweep_control_step,
+    create_record_jq_timestamp_step,
     create_route_registry_cleanup_step,
     create_route_registry_prefix_list_setup_steps,
     create_validation_step,
@@ -296,6 +298,94 @@ def _optional_pnh_route_starts(
     return tuple(starts) if starts is not None else None
 
 
+# CICD-EBB-01 restart matrix. Stage ids are fixed because each stage's
+# snapshot checks close at ``stage.<id>.end``.
+_RESTART_MATRIX_STAGES: tuple[tuple[str, str, str], ...] = (
+    (
+        "s1_fibagent_bgp_restart",
+        "FibAgentBgp",
+        "S1: restart FibAgentBgp once and verify recovery",
+    ),
+    ("s3_bgpcpp_restart", "Bgpcpp", "S3: restart BGP++ once and verify recovery"),
+)
+# The playbook setup restarts BGP++ after test_case_start_time, so every check
+# in the matrix must accept both daemons, not only those restarted so far.
+_RESTART_MATRIX_EXPECTED_RESTARTS: tuple[str, ...] = ("Bgpcpp", "FibAgentBgp")
+
+
+def _restart_matrix_stages(
+    *,
+    device_name: str,
+    context: ProfileContext,
+    expected_established_sessions: int,
+    parent_prefixes_to_ignore: t.List[str],
+) -> t.Tuple[t.List[Stage], t.List[SnapshotHealthCheck]]:
+    """Build one stage per restart scenario and its snapshot checks.
+
+    Each stage restarts its daemon, waits for it to recover, then runs the
+    EBB-01 postchecks. Its log checks scan only that stage (the first also
+    covers setup and prechecks), and its snapshot checks compare the stage end
+    with the playbook start.
+    """
+    stages: t.List[Stage] = []
+    snapshot_checks: t.List[SnapshotHealthCheck] = []
+    for index, (stage_id, daemon_name, description) in enumerate(
+        _RESTART_MATRIX_STAGES
+    ):
+        log_window_start_jq_var = (
+            "test_case_start_time" if index == 0 else f"{stage_id}_start_time"
+        )
+        stage_checks = get_profile_checks(
+            CheckProfile.DAEMON_RESTART,
+            dataclasses.replace(
+                context,
+                log_window_start_jq_var=log_window_start_jq_var,
+                log_window_end_jq_var=None,
+                snapshot_post_checkpoint_id=f"stage.{stage_id}.end",
+                cpu_characterization=None,
+                rss_delta=None,
+            ),
+        )
+        restart = create_bgp_restart_test_stage(
+            device_name=device_name,
+            daemon_name=daemon_name,
+            reactivate_device_groups=False,
+            adaptive_convergence=True,
+            expected_established_sessions=expected_established_sessions,
+            parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+        )
+        stages.append(
+            create_steps_stage(
+                steps=[
+                    *(
+                        []
+                        if index == 0
+                        else [create_record_jq_timestamp_step(log_window_start_jq_var)]
+                    ),
+                    *restart.steps,
+                    create_validation_step(
+                        point_in_time_checks=[
+                            check(
+                                check_id=(
+                                    f"{stage_id}_"
+                                    f"{check.check_id or check.name.name.lower()}"
+                                )
+                            )
+                            for check in stage_checks.postchecks
+                        ],
+                        description=f"{stage_id}: post-restart checks",
+                        start_traffic=False,
+                        fail_on_failure=True,
+                    ),
+                ],
+                description=description,
+                stage_id=stage_id,
+            )
+        )
+        snapshot_checks.extend(stage_checks.snapshot_checks)
+    return stages, snapshot_checks
+
+
 def get_bgp_ebb_daemon_restart_playbook(
     device_name: str,
     peergroup_ibgp_v6: str,
@@ -325,6 +415,7 @@ def get_bgp_ebb_daemon_restart_playbook(
     ibgp_pnh_start_ipv6s: t.Optional[t.Sequence[str]] = None,
     ibgp_pnh_count: t.Optional[int] = None,
     ibgp_pnh_step: t.Optional[int] = None,
+    enable_restart_matrix: bool = False,
 ) -> Playbook:
     """
     Build CICD-EBB-01: BGP daemon restart.
@@ -359,6 +450,10 @@ def get_bgp_ebb_daemon_restart_playbook(
             transition even when the groups were already active.
         precheck_thresholds: Custom precheck thresholds (uses defaults if None)
         postcheck_thresholds: Custom postcheck thresholds (uses defaults if None)
+        enable_restart_matrix: Replace the single BGP++ restart with the
+            FibAgentBgp/BGP++ restart matrix, one stage per scenario, each
+            ending with the EBB-01 postchecks. Default False keeps the
+            scheduled single restart.
 
     Returns:
         Playbook configured for BGP daemon restart testing
@@ -386,27 +481,54 @@ def get_bgp_ebb_daemon_restart_playbook(
     cpu_characterization, rss_delta = _characterization_profile_configs(
         PHASE_CONVERGENCE, characterization
     )
-    restart_checks = get_profile_checks(
-        CheckProfile.DAEMON_RESTART,
-        ProfileContext(
-            peergroup_ibgp_v6=peergroup_ibgp_v6,
-            peergroup_ibgp_v4=peergroup_ibgp_v4,
-            precheck_thresholds=precheck_thresholds,
-            postcheck_thresholds=postcheck_thresholds,
-            cpu_baseline=cpu_baseline,
-            check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
-            ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
-            ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
-            ibgp_pnh_count=ibgp_pnh_count,
-            ibgp_pnh_step=ibgp_pnh_step,
-            expected_peer_identity=expected_peer_identity,
-            parent_prefixes_to_ignore=parent_prefixes_to_ignore,
-            expected_established_sessions=expected_established_sessions,
-            bgp_mon=bgp_mon_scope,
-            cpu_characterization=cpu_characterization,
-            rss_delta=rss_delta,
-        ),
+    restart_context = ProfileContext(
+        peergroup_ibgp_v6=peergroup_ibgp_v6,
+        peergroup_ibgp_v4=peergroup_ibgp_v4,
+        precheck_thresholds=precheck_thresholds,
+        postcheck_thresholds=postcheck_thresholds,
+        cpu_baseline=cpu_baseline,
+        check_ibgp_pnh=(profile == BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R),
+        ibgp_pnh_start_ipv4s=_optional_pnh_route_starts(ibgp_pnh_start_ipv4s),
+        ibgp_pnh_start_ipv6s=_optional_pnh_route_starts(ibgp_pnh_start_ipv6s),
+        ibgp_pnh_count=ibgp_pnh_count,
+        ibgp_pnh_step=ibgp_pnh_step,
+        expected_peer_identity=expected_peer_identity,
+        parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+        expected_established_sessions=expected_established_sessions,
+        bgp_mon=bgp_mon_scope,
+        cpu_characterization=cpu_characterization,
+        rss_delta=rss_delta,
     )
+    if enable_restart_matrix:
+        restart_context = dataclasses.replace(
+            restart_context,
+            expected_restarted_services=_RESTART_MATRIX_EXPECTED_RESTARTS,
+        )
+        restart_stages, stage_snapshot_checks = _restart_matrix_stages(
+            device_name=device_name,
+            context=restart_context,
+            expected_established_sessions=expected_established_sessions,
+            parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
+        )
+    else:
+        restart_stages = [
+            create_bgp_restart_test_stage(
+                device_name=device_name,
+                enable_thread_cpu_monitoring=enable_thread_cpu_monitoring,
+                thread_name_filter=thread_name_filter,
+                enable_offcpu_profiling=enable_offcpu_profiling,
+                enable_perf_profiling=enable_perf_profiling,
+                enable_bgp_events=enable_bgp_events,
+                enable_socket_monitoring=enable_socket_monitoring,
+                reactivate_device_groups=reactivate_device_groups,
+                cycle_device_groups_before_restart=cycle_device_groups_before_restart,
+                adaptive_convergence=True,
+                expected_established_sessions=expected_established_sessions,
+                parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
+            ),
+        ]
+        stage_snapshot_checks = []
+    restart_checks = get_profile_checks(CheckProfile.DAEMON_RESTART, restart_context)
     return Playbook(
         name="bgp_ebb_daemon_restart_playbook",
         setup_steps=create_bgp_restart_setup_steps(
@@ -417,7 +539,7 @@ def get_bgp_ebb_daemon_restart_playbook(
         ),
         prechecks=restart_checks.prechecks,
         postchecks=restart_checks.postchecks,
-        snapshot_checks=restart_checks.snapshot_checks,
+        snapshot_checks=[*restart_checks.snapshot_checks, *stage_snapshot_checks],
         periodic_tasks=create_standard_periodic_tasks(
             device_name=device_name,
             memory_threshold=memory_threshold,
@@ -425,22 +547,7 @@ def get_bgp_ebb_daemon_restart_playbook(
             memory_terminate_on_error=memory_terminate_on_error,
         ),
         stages=_characterized(
-            [
-                create_bgp_restart_test_stage(
-                    device_name=device_name,
-                    enable_thread_cpu_monitoring=enable_thread_cpu_monitoring,
-                    thread_name_filter=thread_name_filter,
-                    enable_offcpu_profiling=enable_offcpu_profiling,
-                    enable_perf_profiling=enable_perf_profiling,
-                    enable_bgp_events=enable_bgp_events,
-                    enable_socket_monitoring=enable_socket_monitoring,
-                    reactivate_device_groups=reactivate_device_groups,
-                    cycle_device_groups_before_restart=cycle_device_groups_before_restart,
-                    adaptive_convergence=True,
-                    expected_established_sessions=expected_established_sessions,
-                    parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
-                ),
-            ],
+            restart_stages,
             playbook_name="bgp_ebb_daemon_restart_playbook",
             phase=PHASE_CONVERGENCE,
             device_name=device_name,

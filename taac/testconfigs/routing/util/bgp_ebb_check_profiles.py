@@ -298,6 +298,14 @@ class ProfileContext:
     # RSS is self-soaking (postcheck only). None => not added.
     cpu_characterization: t.Optional[CpuCharacterizationConfig] = None
     rss_delta: t.Optional[RssDeltaConfig] = None
+    # Daemon restart: the daemons the restart-aware service check accepts as
+    # intentionally restarted, the window the log checks scan, and the
+    # checkpoint that closes the snapshot comparison. The CICD-EBB-01 restart
+    # matrix narrows these per stage; the defaults are the single BGP++ restart.
+    expected_restarted_services: tuple[str, ...] = ("Bgpcpp",)
+    log_window_start_jq_var: str = "test_case_start_time"
+    log_window_end_jq_var: str | None = "test_case_end_time"
+    snapshot_post_checkpoint_id: str | None = None
 
 
 class ProfileChecks(t.NamedTuple):
@@ -356,9 +364,11 @@ def _daemon_restart(ctx: ProfileContext) -> ProfileChecks:
             expected_established_session_count=(
                 ctx.expected_established_sessions or None
             ),
-            expected_restarted_services=["Bgpcpp"],
+            expected_restarted_services=list(ctx.expected_restarted_services),
             restart_start_time_jq_var="daemon_restart_time",
             bgp_mon=ctx.bgp_mon,
+            log_window_start_jq_var=ctx.log_window_start_jq_var,
+            log_window_end_jq_var=ctx.log_window_end_jq_var,
         ),
         snapshot_checks=create_standard_snapshot_checks(
             skip_flap_check=True,
@@ -366,6 +376,7 @@ def _daemon_restart(ctx: ProfileContext) -> ProfileChecks:
             expected_peer_identity=ctx.expected_peer_identity,
             parent_prefixes_to_ignore=ctx.parent_prefixes_to_ignore,
             bgp_mon=ctx.bgp_mon,
+            post_snapshot_checkpoint_id=ctx.snapshot_post_checkpoint_id,
         ),
     )
 

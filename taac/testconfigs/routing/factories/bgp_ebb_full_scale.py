@@ -1244,6 +1244,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
     nhg_storm_control_plane_sample_interval_seconds: int = 5,
     nhg_storm_control_plane_read_timeout_seconds: int = 180,
     gateway_device_group_names: t.Sequence[str] = (),
+    enable_daemon_restart_matrix: bool = False,
 ) -> list[Playbook]:
     device_config = bound.device_config
     if device_config is None:
@@ -1616,6 +1617,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ibgp_pnh_step=openr_pnh_step,
             reactivate_device_groups=scale.restart_reactivate_device_groups,
             cycle_device_groups_before_restart=scale.restart_cycle_device_groups,
+            enable_restart_matrix=enable_daemon_restart_matrix,
             # Deliberately unmeasured. Restarting bgpcpp replaces the PID
             # mid-bracket, and both collectors resolve the PID once at START:
             # CPU then reads a dead /proc entry and silently drops every
@@ -1931,6 +1933,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
     setup_only: bool = False,
     topology_override: LogicalTopology | None = None,
     scale: EbbScaleProfile = EBB_FY26_SCALE,
+    enable_daemon_restart_matrix: bool = False,
 ) -> TestConfig:
     """Build one selectable test suite on the canonical EBB full-scale topology.
 
@@ -1969,6 +1972,8 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
             binding uses ``EBB_FY26_SCALE``. Any other scale must use the
             Open/R profile and name its playbooks, none of which may be one
             still pinned to FY26 geometry.
+        enable_daemon_restart_matrix: Run CICD-EBB-01 as the FibAgentBgp/BGP++
+            restart matrix instead of the scheduled single BGP++ restart.
     """
     if setup_only and playbooks_selected is not None:
         raise ValueError("setup_only requires playbooks_selected=None")
@@ -2156,6 +2161,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
                 nhg_storm_control_plane_read_timeout_seconds
             ),
             gateway_device_group_names=testcase_gateway_device_group_names,
+            enable_daemon_restart_matrix=enable_daemon_restart_matrix,
         )
     if playbooks_selected:
         playbooks_by_name = {playbook.name: playbook for playbook in playbooks}

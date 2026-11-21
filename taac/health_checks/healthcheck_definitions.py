@@ -705,6 +705,8 @@ def create_ixia_packet_loss_check(
 def create_core_dumps_snapshot_check(
     core_dumps_to_ignore: t.Optional[t.List[str]] = None,
     core_dump_processes_to_ignore: t.Optional[t.List[str]] = None,
+    pre_snapshot_checkpoint_id: t.Optional[str] = None,
+    post_snapshot_checkpoint_id: t.Optional[str] = None,
 ) -> SnapshotHealthCheck:
     """Create a snapshot check that no new core dumps appeared during the playbook.
 
@@ -717,6 +719,10 @@ def create_core_dumps_snapshot_check(
         core_dumps_to_ignore: Exact filenames (or EOS process names) to ignore.
         core_dump_processes_to_ignore: Opt-in process names matched against
             FBOSS packaged core/metadata paths. Other new cores remain blocking.
+        pre_snapshot_checkpoint_id: Checkpoint for the pre-snapshot (default:
+            playbook start).
+        post_snapshot_checkpoint_id: Checkpoint for the post-snapshot (default:
+            playbook end).
     """
     params = {}
     if core_dumps_to_ignore is not None:
@@ -726,6 +732,8 @@ def create_core_dumps_snapshot_check(
     return SnapshotHealthCheck(
         name=hc_types.CheckName.CORE_DUMPS_CHECK,
         check_params=Params(json_params=json.dumps(params)) if params else None,
+        pre_snapshot_checkpoint_id=pre_snapshot_checkpoint_id,
+        post_snapshot_checkpoint_id=post_snapshot_checkpoint_id,
     )
 
 

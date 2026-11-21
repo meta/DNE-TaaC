@@ -339,6 +339,10 @@ class FBOSSConsoleError(Exception):
     pass
 
 
+class CrashServiceNoMatchError(RuntimeError):
+    """A crash command found no process to kill; retrying cannot fix that."""
+
+
 class MnpuNotEnabled(Exception):
     pass
 
@@ -1531,7 +1535,6 @@ class FbossSwitch(AbstractSwitch):
             ) from ex
 
     @is_dne_test_device
-    @async_retryable(retries=2, sleep_time=10, exceptions=(Exception,))
     async def async_crash_service(
         self,
         service: Service,
@@ -1551,19 +1554,49 @@ class FbossSwitch(AbstractSwitch):
             is_multi_switch = False
 
         if is_multi_switch:
+            # The hw agent binary may carry an SAI suffix
+            # (fboss_hw_agent-sai_impl), so match on the path, anchored so the
+            # pattern cannot match the shell running it.
+            hw_agent = r"^/opt/fboss/bin/fboss_hw_agent[^ ]*"
             match service_name:
                 case FbossSystemctlServiceName.AGENT.value:
                     # The units run with KillMode=process and their main
                     # process is agent_executor_runner, so --kill-who=main
                     # orphans the agent binaries; kill the binaries instead.
-                    command = "pkill -9 -x fboss_sw_agent; pkill -9 -x fboss_hw_agent"
+                    patterns = [r"^/opt/fboss/bin/fboss_sw_agent( |$)", f"{hw_agent}( |$)"]
+                    command = self._kill_matching_command(patterns)
                 case FbossSystemctlServiceName.FBOSS_HW_AGENT_0.value:
-                    command = 'pkill -9 -f "fboss_hw_agent .* --switchIndex 0"'
+                    command = self._kill_matching_command(
+                        [f"{hw_agent} .*--switchIndex 0( |$)"]
+                    )
                 case FbossSystemctlServiceName.FBOSS_HW_AGENT_1.value:
-                    command = 'pkill -9 -f "fboss_hw_agent .* --switchIndex 1"'
+                    command = self._kill_matching_command(
+                        [f"{hw_agent} .*--switchIndex 1( |$)"]
+                    )
 
         self.logger.info(f"Running {command} on {self.hostname}")
-        await self.async_run_cmd_on_shell(command)
+        output = await self._async_run_crash_command(command)
+        if output and "TAAC_CRASH_NO_MATCH" in output:
+            raise CrashServiceNoMatchError(
+                f"Crash of {service_name} on {self.hostname} killed nothing: "
+                f"{output.strip()[-300:]}"
+            )
+
+    @async_retryable(retries=2, sleep_time=10, exceptions=(Exception,))
+    async def _async_run_crash_command(self, command: str) -> str:
+        return await self.async_run_cmd_on_shell(command)
+
+    @staticmethod
+    def _kill_matching_command(patterns: List[str]) -> str:
+        """SIGKILL every process matching each pattern; report a pattern that matched none."""
+        parts = []
+        for pattern in patterns:
+            parts.append(
+                f"p=$(pgrep -f '{pattern}'); "
+                f"if [ -n \"$p\" ]; then kill -9 $p; "
+                f"else echo 'TAAC_CRASH_NO_MATCH {pattern}'; fi"
+            )
+        return "; ".join(parts)
 
     async def _async_get_qsfp_transceiver_id(self, interface_name: str) -> int:
         """

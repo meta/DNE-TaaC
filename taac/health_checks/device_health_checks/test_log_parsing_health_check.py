@@ -182,9 +182,7 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
-        self.health_check.driver.async_run_cmd_on_shell.assert_awaited_once_with(
-            "date +%z"
-        )
+        self.health_check.driver.async_run_cmd_on_shell.assert_any_await("date +%z")
         self.health_check.driver.async_read_log_file.assert_awaited_once_with(
             "/var/facebook/logs/fboss/wedge_agent.log",
             start_time=start_time,

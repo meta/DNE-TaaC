@@ -12397,6 +12397,19 @@ class RegisterPatcherStep(StepBase[taac_types.RegisterPatcherInput]):
 class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
     STEP_NAME = taac_types.StepName.ALLOCATE_CGROUP_SLICE_MEMORY_STEP
 
+    async def _async_oss_slice_memory_current(self, slice_name: str) -> float:
+        path = f"/sys/fs/cgroup/{slice_name}.slice/memory.current"
+        # pyre-ignore
+        raw = await self.driver.async_run_cmd_on_shell(f"cat {path}")
+        stripped = (raw or "").strip()
+        if not stripped.isdigit():
+            raise Exception(
+                f"could not read {path} on {self.hostname} (got {raw!r}); "
+                "the DUT may not use cgroup v2, or the slice may not have "
+                "the memory controller"
+            )
+        return float(stripped)
+
     async def run(
         self,
         input: taac_types.BaseInput,
@@ -12419,12 +12432,17 @@ class AllocateCgroupSliceMemory(StepBase[taac_types.BaseInput]):
 
         end_time = int(time.time())
         start_time = end_time - ods_query_duration
-        p90_memory_current = await async_get_memory_current_pct(
-            self.hostname,
-            slice_name,
-            start_time,
-            end_time,
-        )
+        if TAAC_OSS:
+            p90_memory_current = await self._async_oss_slice_memory_current(
+                slice_name
+            )
+        else:
+            p90_memory_current = await async_get_memory_current_pct(
+                self.hostname,
+                slice_name,
+                start_time,
+                end_time,
+            )
 
         if params.get("total_memory_pct_decimal") is not None:
             total_memory_pct = float(params["total_memory_pct_decimal"])

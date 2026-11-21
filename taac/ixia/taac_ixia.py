@@ -3,6 +3,7 @@
 import ipaddress
 import logging
 import os
+import re
 import threading
 import time
 import typing as t
@@ -76,6 +77,152 @@ VIEW_TO_IDENTIFIER: t.Dict[str, str] = {
 TRAFFIC_ITEM_VIEW = "Traffic Item Statistics"
 FLOW_STATISTICS_VIEW = "Flow Statistics"
 
+PORT_STATISTICS_VIEW = "Port Statistics"
+# Test-stream frames only: control frames are excluded from the scheduled Tx
+# count, and only frames carrying the IXIA signature count as data-integrity Rx,
+# so protocol traffic and frames the DUT floods back do not skew the loss.
+_PORT_TX_FRAMES = "Scheduled Frames Tx."
+_PORT_RX_FRAMES = "Data Integrity Frames Rx."
+# Port byte rates count every frame on the port, control frames and anything
+# the DUT floods back included; at line rate those are a negligible share.
+_PORT_TX_RATE_MBPS = "Tx. Rate (Mbps)"
+_PORT_RX_RATE_MBPS = "Rx. Rate (Mbps)"
+
+# Where traffic statistics (packet loss and rates) come from. "port" derives
+# them from Port Statistics for chassis whose traffic-item statistics views
+# never become ready. Port mode bypasses the background sampler, so it records
+# no Scuba packet-loss telemetry.
+TRAFFIC_STATS_SOURCE_ENV = "TAAC_IXIA_TRAFFIC_STATS_SOURCE"
+_TRAFFIC_STATS_SOURCES = ("traffic_item", "port")
+
+
+def _traffic_stats_source() -> str:
+    source = os.environ.get(TRAFFIC_STATS_SOURCE_ENV, "traffic_item")
+    if source not in _TRAFFIC_STATS_SOURCES:
+        raise IxiaSetupError(
+            f"{TRAFFIC_STATS_SOURCE_ENV}={source!r} is not one of "
+            f"{_TRAFFIC_STATS_SOURCES}"
+        )
+    return source
+
+
+class TrafficItemPorts(t.NamedTuple):
+    """Vports a traffic item transmits from and receives on, by vport name."""
+
+    name: str
+    tx_vports: t.FrozenSet[str]
+    rx_vports: t.FrozenSet[str]
+
+
+def _port_counters(
+    items: t.Sequence[TrafficItemPorts],
+    rows: IxnStatRow,
+    columns: t.Sequence[str],
+) -> t.Dict[str, t.Dict[str, float]]:
+    """``{vport: {column: value}}`` for the vports the items use.
+
+    Port counters attribute traffic to an item only when no vport carries more
+    than one item, so a shared vport is an error rather than a guess.
+    """
+    missing_columns = [column for column in columns if column not in rows.Columns]
+    if missing_columns:
+        raise IxiaSetupError(
+            f"{PORT_STATISTICS_VIEW} has no {missing_columns} column(s); cannot "
+            "derive traffic statistics from port counters"
+        )
+    owners: t.Dict[str, t.List[str]] = defaultdict(list)
+    for item in items:
+        for vport in item.tx_vports | item.rx_vports:
+            owners[vport].append(item.name)
+    shared = {vport: names for vport, names in owners.items() if len(names) > 1}
+    if shared:
+        raise IxiaSetupError(
+            f"Vport(s) carry more than one enabled traffic item, so port counters "
+            f"cannot attribute traffic per item: {dict(sorted(shared.items()))}"
+        )
+    # Parse only the vports in use, so a blank cell on an unrelated port cannot
+    # fail the check; IXIA leaves a counter blank when it has nothing to report.
+    counters = {
+        row["Port Name"]: {
+            column: float(row[column]) if row[column] != "" else 0.0
+            for column in columns
+        }
+        for row in rows
+        if row["Port Name"] in owners
+    }
+    missing_vports = sorted(set(owners) - set(counters))
+    if missing_vports:
+        raise IxiaSetupError(
+            f"Vport(s) {missing_vports} are missing from {PORT_STATISTICS_VIEW}"
+        )
+    return counters
+
+
+def compute_port_rate_stats(
+    items: t.Sequence[TrafficItemPorts],
+    rows: IxnStatRow,
+) -> t.List[t.Dict[str, t.Any]]:
+    """Per-traffic-item rates from Port Statistics.
+
+    Returns the same keys the Traffic Item Statistics rate reader produces,
+    with a bidirectional item's rates summed over both directions as that
+    view does.
+    """
+    counters = _port_counters(
+        items,
+        rows,
+        (_PORT_TX_RATE_MBPS, _PORT_RX_RATE_MBPS),
+    )
+
+    def _sum(column: str, vports: t.FrozenSet[str]) -> float:
+        return sum(counters[vport][column] for vport in vports)
+
+    return [
+        {
+            "identifier": item.name,
+            "view": PORT_STATISTICS_VIEW,
+            "Tx Rate": _sum(_PORT_TX_RATE_MBPS, item.tx_vports),
+            "Rx Rate": _sum(_PORT_RX_RATE_MBPS, item.rx_vports),
+        }
+        for item in items
+    ]
+
+
+def compute_port_loss_stats(
+    items: t.Sequence[TrafficItemPorts],
+    rows: IxnStatRow,
+    window_seconds: float,
+) -> t.List[t.Dict[str, t.Any]]:
+    """Per-traffic-item loss from Port Statistics counters.
+
+    Returns the same keys the Traffic Item Statistics loss reader produces.
+    """
+    counters = _port_counters(items, rows, (_PORT_TX_FRAMES, _PORT_RX_FRAMES))
+    stats = []
+    for item in items:
+        tx = sum(counters[vport][_PORT_TX_FRAMES] for vport in item.tx_vports)
+        rx = sum(counters[vport][_PORT_RX_FRAMES] for vport in item.rx_vports)
+        delta = tx - rx
+        stats.append(
+            {
+                "identifier": item.name,
+                "view": PORT_STATISTICS_VIEW,
+                "tx_frames": tx,
+                "rx_frames": rx,
+                "frame_delta": delta,
+                "packet_loss_percentage": delta * 100 / tx if tx else 0.0,
+                # Same derivation as IXIA's loss duration: the lost share of
+                # the frames sent, as a share of the time they were sent over.
+                # Assumes the item transmitted continuously over the window, as
+                # the snake items do; bursts or fixed-count items would skew it.
+                "packet_loss_duration": (
+                    delta * window_seconds * 1000 / tx if tx else 0.0
+                ),
+            }
+        )
+    return stats
+
+
 PTP_DRILL_DOWN_VIEW = "PTP Drill Down"
 
 
@@ -98,6 +245,10 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
     _traffic_start_pending: bool = False
     _traffic_view_readiness_pending: bool = False
     _pending_traffic_regexes: t.Optional[t.List[str]] = None
+    # Bound the port-counter loss window: counters run from the later of the
+    # last clear and the last start, until the last stop.
+    _stats_cleared_at: float = 0.0
+    _traffic_stop_time: float = 0.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -214,7 +365,13 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 self._stat_view_cache.pop(view_name, None)
 
     def clear_traffic_stats(self, wait_for_refresh: bool = True) -> None:
+        if _traffic_stats_source() == "port":
+            # The refresh being waited for is the traffic-item statistics one,
+            # which the port source exists to avoid: on chassis where those
+            # views never become ready, every wait runs into the gateway timeout.
+            wait_for_refresh = False
         super().clear_traffic_stats(wait_for_refresh)
+        self._stats_cleared_at = time.time()
         # The parent skips the clear when there are no traffic items.
         if self.has_traffic_items():
             # The clear zeroes the port fault counters too, so zero is now the
@@ -530,6 +687,8 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             max_timeout_sec (int, optional): Maximum timeout in seconds. Defaults to 120.
             since_time (float, optional): If provided, only return stats with a timestamp >= since_time.
         """
+        if _traffic_stats_source() == "port":
+            return self._get_port_loss_statistics()
         test_case_uuid = none_throws(self.test_case_uuid)
         timeout_time = time.time() + max_timeout_sec
         packet_loss_stats = self.captured_stats[test_case_uuid]
@@ -595,7 +754,7 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 default bidirectional item, 1 for unidirectional).
         """
         try:
-            if self.capturing:
+            if self.capturing or _traffic_stats_source() == "port":
                 stats = self.get_latest_stats_traffic()
             else:
                 # Sampler disabled (TAAC_IXIA_SAMPLE_INTERVAL_S=0): the stats
@@ -650,6 +809,8 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             max_timeout_sec (int, optional): Maximum timeout in seconds. Defaults to 120.
             since_time (float, optional): If provided, only return stats with a timestamp >= since_time.
         """
+        if _traffic_stats_source() == "port":
+            return self._get_port_rate_statistics()
         test_case_uuid = none_throws(self.test_case_uuid)
         timeout_time = time.time() + max_timeout_sec
         traffic_rate_stats = self.captured_stats_traffic[test_case_uuid]
@@ -690,6 +851,106 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             return self._get_traffic_rate_statistics_unlocked(
                 traffic_item_view_assistant
             )
+
+    def _get_port_loss_statistics(self) -> t.List[t.Dict[str, t.Any]]:
+        window_start = max(self._stats_cleared_at, self._traffic_start_time)
+        # Traffic still running (no stop since the window opened) is measured
+        # up to now; in-flight frames then count as loss, as they would in the
+        # traffic-item view.
+        window_end = (
+            self._traffic_stop_time
+            if self._traffic_stop_time > window_start
+            else time.time()
+        )
+        # Without a recorded clear or start (traffic started outside TAAC, e.g.
+        # on a retained session) the counters' window is unknown, and a loss
+        # duration derived from it would be meaningless.
+        if window_start <= 0 or window_end <= window_start:
+            raise IxiaSetupError(
+                "Cannot derive packet-loss duration from port counters: no "
+                "stats clear or traffic start recorded to bound the window "
+                f"(clear={self._stats_cleared_at}, start={self._traffic_start_time}, "
+                f"end={window_end})"
+            )
+        view = self.get_or_create_stat_view(PORT_STATISTICS_VIEW)
+        with self.stat_view_snapshot():
+            rows = self._get_stat_view_rows(view)
+        return compute_port_loss_stats(
+            self._enabled_traffic_item_ports(), rows, window_end - window_start
+        )
+
+    def _get_port_rate_statistics(self) -> t.List[t.Dict[str, t.Any]]:
+        view = self.get_or_create_stat_view(PORT_STATISTICS_VIEW)
+        with self.stat_view_snapshot():
+            rows = self._get_stat_view_rows(view)
+        return compute_port_rate_stats(self._enabled_traffic_item_ports(), rows)
+
+    def _enabled_traffic_item_ports(self) -> t.List[TrafficItemPorts]:
+        """Resolve each enabled traffic item's endpoints to vport names.
+
+        Protocol endpoints live under a topology, whose vports carry the
+        traffic; raw endpoints name the vport directly.
+        """
+        vport_names = {
+            vport.href: vport.Name for vport in self.ixnetwork.Vport.find()
+        }
+        topology_vports = {
+            topology.href: topology.Vports
+            for topology in self.ixnetwork.Topology.find()
+        }
+
+        def resolve(endpoint: str) -> t.Set[str]:
+            topology = re.match(r"(.*/topology/\d+)", endpoint)
+            vport_hrefs = (
+                topology_vports.get(topology.group(1), [])
+                if topology
+                else [endpoint.rsplit("/protocols", 1)[0]]
+            )
+            names = {
+                vport_names[href] for href in vport_hrefs if href in vport_names
+            }
+            if not names:
+                raise IxiaSetupError(
+                    f"Cannot resolve traffic endpoint {endpoint} to a vport"
+                )
+            return names
+
+        items = []
+        for traffic_item in self.ixnetwork.Traffic.TrafficItem.find():
+            if not traffic_item.Enabled:
+                continue
+            tx: t.Set[str] = set()
+            rx: t.Set[str] = set()
+            for endpoint_set in traffic_item.EndpointSet.find():
+                for source in endpoint_set.Sources or []:
+                    tx |= resolve(source)
+                for destination in endpoint_set.Destinations or []:
+                    rx |= resolve(destination)
+            # An item with no ports on one side would measure as 0% loss.
+            if not tx or not rx:
+                raise IxiaSetupError(
+                    f"Traffic item {traffic_item.Name} has no "
+                    f"{'transmitting' if not tx else 'receiving'} vports"
+                )
+            if traffic_item.BiDirectional:
+                tx = rx = tx | rx
+            items.append(
+                TrafficItemPorts(traffic_item.Name, frozenset(tx), frozenset(rx))
+            )
+        return items
+
+    def stop_traffic(self) -> None:
+        # A failed read must not skip the stop; assume it was running.
+        try:
+            was_running = self.is_traffic_running()
+        except Exception as error:
+            self.logger.warning(f"Could not read traffic state before stop: {error}")
+            was_running = True
+        super().stop_traffic()
+        # Only a running -> stopped transition ends the loss window; a redundant
+        # stop would otherwise stretch it over idle time.
+        if was_running:
+            self._traffic_stop_time = time.time()
 
     def run(self):
         # sample_time=0 disables the background periodic sampler entirely.
@@ -899,7 +1160,14 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             self.stop_protocols()
 
     def wait_for_view_assistants_ready(self):
-        self.traffic_item_view_assistant = self._get_traffic_item_view()
+        # The port source exists for chassis where this view never becomes
+        # ready; building it would wait out its timeout and fail the setup.
+        # With no view the background sampler skips traffic statistics.
+        self.traffic_item_view_assistant = (
+            None
+            if _traffic_stats_source() == "port"
+            else self._get_traffic_item_view()
+        )
         if self.ixia_config is not None and self.ixia_config.ptp_configs:
             self.ptp_drill_down_view_assistant = self._get_ptp_drill_down_view()
         else:

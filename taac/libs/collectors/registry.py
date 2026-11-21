@@ -43,6 +43,22 @@ def get_collector(name: str) -> t.Optional[t.Any]:
     return _collectors.get(name)
 
 
+def host_key(name: str, host: str) -> str:
+    """Registry key for ``name``'s collector on ``host``."""
+    return f"{name}@{host}"
+
+
+def get_collector_for_host(name: str, host: str) -> t.Optional[t.Any]:
+    """Get the ``name`` collector on ``host``; the bare slot must be bound to it."""
+    collector = _collectors.get(host_key(name, host))
+    if collector is not None:
+        return collector
+    collector = _collectors.get(name)
+    if collector is not None and getattr(collector, "host", None) == host:
+        return collector
+    return None
+
+
 def unregister_collector(name: str) -> None:
     """Drop the entry under ``name``, if any. A no-op when absent.
 

@@ -5,11 +5,20 @@
 
 """Continuous memory-utilization collector for OSS FBOSS DUTs.
 
-Polls each monitored service's ``MemoryCurrent`` (systemd's cgroup memory
-counter, in bytes) every ``interval_sec`` seconds and stores per-poll
-memory-usage rows. Health checks query ``max_per_service_in_window`` to
-get the peak memory each service reached across a time window — closer
-parity with ODS MAX-over-window semantics than a single-sample check.
+Polls each monitored service's anonymous memory (the ``anon`` counter of
+its cgroup's ``memory.stat``, in bytes) every ``interval_sec`` seconds and
+stores per-poll memory-usage rows. Health checks query
+``max_per_service_in_window`` to get the peak memory each service reached
+across a time window — closer parity with ODS MAX-over-window semantics
+than a single-sample check.
+
+Why ``anon`` and not systemd's ``MemoryCurrent``: ``MemoryCurrent`` is the
+whole cgroup, page cache included. Services that log via
+``StandardOutput=append:`` without rotation have every byte they write
+charged to their cgroup as cached file pages, so the counter grows with log
+volume rather than with process memory. ``anon`` is what the per-service
+ceilings describe. ``MemoryCurrent`` is still fetched as a fallback for
+cgroups that expose no ``anon`` (cgroup v1).
 
 Usage (registered by a setup task, consumed by a postcheck):
 
@@ -46,9 +55,10 @@ logger = logging.getLogger(__name__)
 class MemoryUtilizationSample:
     """One collector row — memory usage (bytes) per service at a point in time.
 
-    ``per_service`` maps each monitored service name to its ``MemoryCurrent``
-    value in bytes, or ``None`` if the service wasn't measurable at this poll
-    (not loaded, inactive, no cgroup yet, or SSH error).
+    ``per_service`` maps each monitored service name to its anonymous memory
+    (cgroup ``memory.stat`` ``anon``; ``MemoryCurrent`` if that is
+    unavailable) in bytes, or ``None`` if the service wasn't measurable at
+    this poll (not loaded, inactive, no cgroup yet, or SSH error).
     """
 
     timestamp: str
@@ -58,12 +68,16 @@ class MemoryUtilizationSample:
 
 
 class MemoryUtilizationCollector(ServicePollingCollector):
-    """Polls each service's ``MemoryCurrent`` via SSH.
+    """Polls each service's anonymous memory via SSH.
 
     Inherits SSH gather, file I/O, window queries, and the full
     ``_poll_once`` loop from ``ServicePollingCollector``. Simpler than
-    ``CpuUtilizationCollector`` — ``MemoryCurrent`` is an instantaneous
-    value (not a cumulative counter), so no delta computation is needed.
+    ``CpuUtilizationCollector`` — memory is an instantaneous value (not a
+    cumulative counter), so no delta computation is needed.
+
+    The batched ``systemctl show`` is extended, in the same SSH call, with
+    an ``Id=<unit>`` / ``MemoryAnon=<bytes>`` block per unit read from its
+    cgroup's ``memory.stat``; the base parser merges it into the unit's dict.
     """
 
     def __init__(
@@ -88,9 +102,34 @@ class MemoryUtilizationCollector(ServicePollingCollector):
     def _systemd_properties(self) -> t.List[str]:
         return ["LoadState", "ActiveState", "MemoryCurrent"]
 
+    def _shell_command(self, units: str, props: str) -> str:
+        # One extra ``systemctl show`` (Id + ControlGroup for all units) and
+        # one awk per cgroup. ``Id`` is taken from systemd so it matches the
+        # suffixed form in the show blocks. A missing or unreadable
+        # memory.stat leaves MemoryAnon empty and _extract_value falls back
+        # to MemoryCurrent. The ``-n "$cg"`` guard keeps an empty
+        # ControlGroup from resolving to the root cgroup.
+        emit = (
+            "a=$([ -n \"$cg\" ] && awk '/^anon /{print $2}' /sys/fs/cgroup$cg/memory.stat 2>/dev/null); "
+            "printf '\\nId=%s\\nMemoryAnon=%s\\n' \"$id\" \"$a\""
+        )
+        # Blocks are blank-line separated and ControlGroup precedes Id, so
+        # emit on the separator (and after the last block) and reset then.
+        anon_loop = (
+            f"systemctl show {units} -p Id,ControlGroup --no-page "
+            "| { id=; cg=; while IFS== read -r k v; do "
+            'case "$k" in Id) id=$v;; ControlGroup) cg=$v;; '
+            f'"") [ -n "$id" ] && {{ {emit}; }}; id=; cg=;; esac; '
+            f'done; [ -n "$id" ] && {{ {emit}; }}; }}'
+        )
+        return f"{super()._shell_command(units, props)}; {anon_loop}"
+
     def _extract_value(
         self, unit_data: t.Dict[str, str], service: str
     ) -> t.Optional[int]:
+        anon = self._parse_counter(unit_data.get("MemoryAnon", ""))
+        if anon is not None:
+            return anon
         return self._parse_counter(unit_data.get("MemoryCurrent", ""))
 
     def _make_sample(

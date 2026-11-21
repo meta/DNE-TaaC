@@ -351,6 +351,90 @@ class TestSystemdStateCollector(unittest.IsolatedAsyncioTestCase):
             {"openr": "inactive"},
         )
 
+    def test_condition_unmet_unit_is_not_an_outage(self) -> None:
+        """Open/R ships enabled but gated on a file the box lacks: loaded and
+        inactive with ConditionResult=no is skipped by both window queries; a
+        unit that stopped after its condition passed is still flagged."""
+        collector = SystemdStateCollector(
+            driver=MagicMock(),
+            services=["openr", "bgpd"],
+            host="dut1",
+            tmp_path="/dev/null",
+        )
+        gated = SystemdUnitState(
+            load_state="loaded",
+            unit_file_state="enabled",
+            active_state="inactive",
+            condition_result="no",
+        )
+        stopped = SystemdUnitState(
+            load_state="loaded",
+            unit_file_state="enabled",
+            active_state="inactive",
+            condition_result="yes",
+        )
+        collector.rows = [self._fake_row(1, {"openr": gated, "bgpd": stopped})]
+        self.assertEqual(
+            collector.services_ever_inactive_in_window(0, 100), {"bgpd": "inactive"}
+        )
+        self.assertEqual(
+            collector.services_not_active_at_end(0, 100), {"bgpd": "inactive"}
+        )
+        self.assertEqual(
+            collector.services_ever_inactive_in_window(
+                0, 100, skip_condition_unmet=False
+            ),
+            {"bgpd": "inactive", "openr": "inactive"},
+        )
+
+    def test_should_skip_flags(self) -> None:
+        """Each skip reason fires on its own and can be turned off alone; a
+        stopped unit whose condition passed is never skipped."""
+        disabled = SystemdUnitState(
+            load_state="loaded", unit_file_state="disabled", active_state="inactive"
+        )
+        not_loaded = SystemdUnitState(load_state="not-found", active_state="inactive")
+        gated = SystemdUnitState(
+            load_state="loaded",
+            unit_file_state="enabled",
+            active_state="inactive",
+            condition_result="no",
+        )
+        stopped = SystemdUnitState(
+            load_state="loaded",
+            unit_file_state="enabled",
+            active_state="inactive",
+            condition_result="yes",
+        )
+        for state, flag in (
+            (disabled, "skip_disabled"),
+            (not_loaded, "skip_not_loaded"),
+            (gated, "skip_condition_unmet"),
+        ):
+            self.assertTrue(state.should_skip())
+            self.assertFalse(state.should_skip(**{flag: False}))
+        self.assertFalse(stopped.should_skip())
+
+    async def test_poll_records_condition_result(self) -> None:
+        driver = _make_driver(
+            {
+                "openr": {
+                    "LoadState": "loaded",
+                    "ActiveState": "inactive",
+                    "UnitFileState": "enabled",
+                    "ConditionResult": "no",
+                }
+            }
+        )
+        collector = SystemdStateCollector(
+            driver=driver, services=["openr"], host="dut1", tmp_path="/dev/null"
+        )
+        await collector._poll_once()
+        state = collector.rows[-1].per_service["openr"]
+        self.assertEqual(state.condition_result, "no")
+        self.assertTrue(state.should_skip())
+        self.assertEqual(collector.services_ever_inactive_in_window(0, 1e12), {})
+
     async def test_services_ever_inactive_end_to_end(self) -> None:
         """Regression: exercise the whole ``_poll_once → services_ever_inactive``
         path. Guards against a future base-class change silently re-enabling

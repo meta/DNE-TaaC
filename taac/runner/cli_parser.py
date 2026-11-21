@@ -184,6 +184,25 @@ def create_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable debug logging (shortcut for --log-level DEBUG)",
     )
+    parser.add_argument(
+        "--dump-artifacts",
+        nargs="?",
+        const="text",
+        default=None,
+        metavar="SELECTOR",
+        help=(
+            "Dump run artifacts — files written outside the log stream, "
+            "such as collector poll logs — inline after the result "
+            "summary. Only artifacts a producer has declared with "
+            "taac.utils.run_artifacts.declare_artifact() are dumped; a "
+            "selector that matches none logs the available labels. Bare --dump-artifacts dumps every text artifact; pass "
+            "a comma-separated selector of labels and/or kinds to narrow, "
+            "e.g. --dump-artifacts cpu_utilization,memory_utilization or "
+            "--dump-artifacts 'hrt_*'. 'all' additionally reports binary "
+            "artifacts as path-only references, 'none' disables. Falls back "
+            "to TAAC_DUMP_ARTIFACTS when unset. Default: no dump."
+        ),
+    )
 
     # Output options
     parser.add_argument(

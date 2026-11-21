@@ -65,12 +65,6 @@ first TAAC import, as in the existing OSS workflow.
 Thrift JSON, with one config per line. It is not a new general `conf build`
 implementation for arbitrary Python source directories.
 
-The current registered OSS OTG factory cannot be exported successfully: it
-passes `port_location` to `DirectIxiaConnection`, but the schema does not define
-that field. This packaging change preserves the Python implementation and the
-schema, so that existing issue remains. The engine and JSON serialization
-utilities work with configs that use supported schema fields.
-
 ## Package builds at Meta
 
 The internal packaging target builds the native runtime with shared Buck

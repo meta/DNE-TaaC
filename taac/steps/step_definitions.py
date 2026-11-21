@@ -5329,6 +5329,27 @@ def create_bgp_lifecycle_convergence_step(
     return create_custom_step(params_dict=params, description=description)
 
 
+def create_fibagent_bgp_ready_step(
+    device_name: str,
+    convergence_hard_timeout_seconds: float,
+    convergence_poll_interval_seconds: float,
+    *,
+    convergence_soft_threshold_seconds: float | None = None,
+    description: str = "Wait for FibAgentBgp to serve its route table",
+) -> Step:
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "wait_for_fibagent_bgp_ready",
+        "hostname": device_name,
+        "convergence_hard_timeout_seconds": convergence_hard_timeout_seconds,
+        "convergence_poll_interval_seconds": convergence_poll_interval_seconds,
+    }
+    if convergence_soft_threshold_seconds is not None:
+        params["convergence_soft_threshold_seconds"] = (
+            convergence_soft_threshold_seconds
+        )
+    return create_custom_step(params_dict=params, description=description)
+
+
 def create_thread_cpu_monitoring_step(
     device_name: str,
     duration_minutes: int,

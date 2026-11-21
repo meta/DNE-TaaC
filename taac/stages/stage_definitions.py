@@ -83,6 +83,7 @@ from taac.steps.step_definitions import (
     create_cpu_percentile_stop_step,
     create_daemon_control_step,
     create_drain_convergence_verification_step,
+    create_fibagent_bgp_ready_step,
     create_igp_unresolvable_churn_step,
     create_interface_flap_step,
     create_interface_permanent_flap_step,
@@ -187,6 +188,8 @@ def create_bgp_restart_test_stage(
     3. Optionally cycle or re-apply IXIA device groups
     4. Enable BGP daemon
     5. Monitor thread CPU during convergence (optional, starts immediately after BGP enable)
+    6. For FibAgentBgp with adaptive convergence, wait until FibAgentBgp serves
+       its route table, since BGP++ lifecycle convergence does not cover it
 
     Args:
         device_name: Name of the device
@@ -371,6 +374,24 @@ def create_bgp_restart_test_stage(
                         )
                     ]
                 )
+            ),
+            *(
+                [
+                    create_fibagent_bgp_ready_step(
+                        device_name=device_name,
+                        convergence_soft_threshold_seconds=(
+                            convergence_soft_threshold_seconds
+                        ),
+                        convergence_hard_timeout_seconds=(
+                            convergence_hard_timeout_seconds
+                        ),
+                        convergence_poll_interval_seconds=(
+                            convergence_poll_interval_seconds
+                        ),
+                    )
+                ]
+                if daemon_name == "FibAgentBgp" and adaptive_convergence
+                else []
             ),
         ],
     )

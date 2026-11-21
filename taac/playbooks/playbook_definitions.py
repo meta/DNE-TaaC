@@ -15311,6 +15311,10 @@ def create_ecmp_only_groups_playbooks(
             description=(
                 f"Gate: Main holds {expected} ECMP groups with {nh} resolved next-hops"
             ),
+            # The step cannot see `exit 1`; it fails unless the marker is printed.
+            expect_in_output="Main programmed:",
+            # 30 x (dump + 10 s sleep) can run past the 300 s ssh default.
+            timeout=600,
         )
 
     def _admit_rouge_steps():
@@ -15682,6 +15686,10 @@ def create_ecmp_only_members_playbooks(
             description=(
                 f"Gate: Main holds {expected} ECMP members with {nh} resolved next-hops"
             ),
+            # The step cannot see `exit 1`; it fails unless the marker is printed.
+            expect_in_output="Main programmed:",
+            # 30 x (dump + 10 s sleep) can run past the 300 s ssh default.
+            timeout=600,
         )
 
     def _admit_rouge_steps():

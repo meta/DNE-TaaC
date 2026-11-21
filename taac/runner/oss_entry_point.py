@@ -282,6 +282,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=handlers,
     )
+    # asyncssh / paramiko emit an INFO line per SSH connect + command; with
+    # the many short-lived sessions a run opens this drowns out the actual
+    # test output. Keep them quiet unless we're genuinely at DEBUG.
+    if log_level > logging.DEBUG:
+        for _noisy in ("asyncssh", "paramiko", "paramiko.transport"):
+            logging.getLogger(_noisy).setLevel(logging.WARNING)
     logger = logging.getLogger("taac.oss")
 
     logger.info("=" * 60)

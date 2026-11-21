@@ -4,6 +4,9 @@ import json
 import typing as t
 import unittest
 
+from taac.playbooks.routing.bgp_ebb_playbooks import (
+    get_bgp_ebb_daemon_restart_playbook,
+)
 from taac.testconfigs.routing import cicd_ebb_int_tc
 from taac.testconfigs.routing.adhoc_agent_restart_matrix import (
     NRQEB006_EBB01_RESTART_MATRIX_UG_ADHOC,
@@ -22,7 +25,23 @@ from taac.test_as_a_config.types import (
 )
 
 _PLAYBOOK = "bgp_ebb_daemon_restart_playbook"
-_STAGE_IDS = ["s1_fibagent_bgp_restart", "s3_bgpcpp_restart"]
+_STAGE_IDS = [
+    "s1_fibagent_bgp_restart",
+    "s2_fibagent_bgp_repeated_restart",
+    "s3_bgpcpp_restart",
+    "s4_bgpcpp_repeated_restart",
+]
+_FIBAGENT_BGP_RESTART = [
+    "FibAgentBgp:disable",
+    "FibAgentBgp:enable",
+    "test_bgp_lifecycle_convergence",
+    "wait_for_fibagent_bgp_ready",
+]
+_BGPCPP_RESTART = [
+    "Bgpcpp:disable",
+    "Bgpcpp:enable",
+    "test_bgp_lifecycle_convergence",
+]
 
 
 def _playbook(config: TestConfig) -> Playbook:
@@ -48,12 +67,18 @@ def _daemon_actions(stage: Stage) -> list[tuple[str, str]]:
     return actions
 
 
-def _custom_step_names(stage: Stage) -> list[str]:
-    return [
-        _json_params(step)["custom_step_name"]
-        for step in stage.steps
-        if "custom_step_name" in _json_params(step)
-    ]
+def _restart_events(stage: Stage) -> list[str]:
+    """Daemon actions and recovery waits in step order."""
+    events = []
+    for step in stage.steps:
+        actions = _daemon_actions(Stage(steps=[step]))
+        if actions:
+            events.extend(f"{daemon}:{action}" for daemon, action in actions)
+            continue
+        name = _json_params(step).get("custom_step_name")
+        if name in ("test_bgp_lifecycle_convergence", "wait_for_fibagent_bgp_ready"):
+            events.append(name)
+    return events
 
 
 def _stage_checks(stage: Stage) -> list[PointInTimeHealthCheck]:
@@ -99,15 +124,48 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
     def test_one_stage_per_scenario_in_order(self) -> None:
         self.assertEqual(_STAGE_IDS, [stage.id for stage in self.playbook.stages])
 
-    def test_each_stage_restarts_its_daemon_without_ixia_toggle(self) -> None:
+    def test_each_restart_waits_for_recovery_before_the_next(self) -> None:
         self.assertEqual(
-            [("FibAgentBgp", "disable"), ("FibAgentBgp", "enable")],
-            _daemon_actions(self.stages["s1_fibagent_bgp_restart"]),
+            {
+                "s1_fibagent_bgp_restart": _FIBAGENT_BGP_RESTART,
+                "s2_fibagent_bgp_repeated_restart": _FIBAGENT_BGP_RESTART * 3,
+                "s3_bgpcpp_restart": _BGPCPP_RESTART,
+                "s4_bgpcpp_repeated_restart": _BGPCPP_RESTART * 3,
+            },
+            {
+                stage_id: _restart_events(self.stages[stage_id])
+                for stage_id in _STAGE_IDS
+            },
+        )
+
+    def test_repeat_count_sets_restarts_in_repeated_stages(self) -> None:
+        playbook = get_bgp_ebb_daemon_restart_playbook(
+            device_name="dut.example.com",
+            peergroup_ibgp_v6="PG_IBGP_V6",
+            peergroup_ibgp_v4="PG_IBGP_V4",
+            expected_established_sessions=4,
+            enable_restart_matrix=True,
+            restart_matrix_repeat_count=2,
+        )
+        stages = {stage.id: stage for stage in playbook.stages}
+        self.assertEqual(
+            _FIBAGENT_BGP_RESTART * 2,
+            _restart_events(stages["s2_fibagent_bgp_repeated_restart"]),
         )
         self.assertEqual(
-            [("Bgpcpp", "disable"), ("Bgpcpp", "enable")],
-            _daemon_actions(self.stages["s3_bgpcpp_restart"]),
+            _BGPCPP_RESTART * 2, _restart_events(stages["s4_bgpcpp_repeated_restart"])
         )
+        with self.assertRaises(ValueError):
+            get_bgp_ebb_daemon_restart_playbook(
+                device_name="dut.example.com",
+                peergroup_ibgp_v6="PG_IBGP_V6",
+                peergroup_ibgp_v4="PG_IBGP_V4",
+                expected_established_sessions=4,
+                enable_restart_matrix=True,
+                restart_matrix_repeat_count=0,
+            )
+
+    def test_no_stage_retoggles_ixia(self) -> None:
         for stage in self.playbook.stages:
             self.assertFalse(
                 any(
@@ -116,20 +174,6 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
                 ),
                 stage.id,
             )
-
-    def test_fibagent_bgp_stage_waits_for_fibagent_before_checks(self) -> None:
-        self.assertIn(
-            "wait_for_fibagent_bgp_ready",
-            _custom_step_names(self.stages["s1_fibagent_bgp_restart"]),
-        )
-        self.assertNotIn(
-            "wait_for_fibagent_bgp_ready",
-            _custom_step_names(self.stages["s3_bgpcpp_restart"]),
-        )
-        self.assertIn(
-            "test_bgp_lifecycle_convergence",
-            _custom_step_names(self.stages["s3_bgpcpp_restart"]),
-        )
 
     def test_each_stage_ends_with_ebb01_postchecks(self) -> None:
         playbook_check_names = sorted(
@@ -152,22 +196,24 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
             )
 
     def test_log_checks_scan_only_their_stage(self) -> None:
-        s1_checks = _stage_checks(self.stages["s1_fibagent_bgp_restart"])
-        s3_checks = _stage_checks(self.stages["s3_bgpcpp_restart"])
-        for suffix in ("system_level_log_check", "bgp_time_bound_check"):
-            self.assertEqual(
-                {"start_time": ".test_case_start_time"},
-                dict(
-                    _jq_params(_check(s1_checks, f"s1_fibagent_bgp_restart_{suffix}"))
-                ),
+        for index, stage_id in enumerate(_STAGE_IDS):
+            start_var = (
+                "test_case_start_time" if index == 0 else f"{stage_id}_start_time"
             )
-            self.assertEqual(
-                {"start_time": ".s3_bgpcpp_restart_start_time"},
-                dict(_jq_params(_check(s3_checks, f"s3_bgpcpp_restart_{suffix}"))),
-            )
-        first_step = _json_params(self.stages["s3_bgpcpp_restart"].steps[0])
-        self.assertEqual("record_jq_timestamp", first_step["custom_step_name"])
-        self.assertEqual("s3_bgpcpp_restart_start_time", first_step["var_name"])
+            checks = _stage_checks(self.stages[stage_id])
+            for suffix in ("system_level_log_check", "bgp_time_bound_check"):
+                self.assertEqual(
+                    {"start_time": f".{start_var}"},
+                    dict(_jq_params(_check(checks, f"{stage_id}_{suffix}"))),
+                )
+            first_step = _json_params(self.stages[stage_id].steps[0])
+            if index == 0:
+                self.assertNotEqual(
+                    "record_jq_timestamp", first_step.get("custom_step_name")
+                )
+            else:
+                self.assertEqual("record_jq_timestamp", first_step["custom_step_name"])
+                self.assertEqual(start_var, first_step["var_name"])
 
     def test_playbook_log_checks_keep_the_full_window(self) -> None:
         for check_id in ("system_level_log_check", "bgp_time_bound_check"):
@@ -211,7 +257,7 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
             for check in checks
             if check.name == hc_types.CheckName.SERVICE_RESTART_CHECK
         ]
-        self.assertEqual(3, len(restart_checks))
+        self.assertEqual(1 + len(_STAGE_IDS), len(restart_checks))
         for check in restart_checks:
             self.assertEqual(["Bgpcpp", "FibAgentBgp"], _expected_restarts(check))
 

@@ -298,19 +298,58 @@ def _optional_pnh_route_starts(
     return tuple(starts) if starts is not None else None
 
 
-# CICD-EBB-01 restart matrix. Stage ids are fixed because each stage's
-# snapshot checks close at ``stage.<id>.end``.
-_RESTART_MATRIX_STAGES: tuple[tuple[str, str, str], ...] = (
-    (
-        "s1_fibagent_bgp_restart",
-        "FibAgentBgp",
-        "S1: restart FibAgentBgp once and verify recovery",
-    ),
-    ("s3_bgpcpp_restart", "Bgpcpp", "S3: restart BGP++ once and verify recovery"),
-)
 # The playbook setup restarts BGP++ after test_case_start_time, so every check
 # in the matrix must accept both daemons, not only those restarted so far.
 _RESTART_MATRIX_EXPECTED_RESTARTS: tuple[str, ...] = ("Bgpcpp", "FibAgentBgp")
+
+
+@dataclasses.dataclass(frozen=True)
+class _RestartScenario:
+    """One CICD-EBB-01 restart-matrix stage.
+
+    ``stage_id`` is fixed because the stage's snapshot checks close at
+    ``stage.<id>.end``. Each daemon in ``daemons`` is restarted in order, and
+    the next restart starts only after the previous daemon has recovered.
+    """
+
+    stage_id: str
+    description: str
+    daemons: tuple[str, ...]
+
+
+def _restart_matrix_scenarios(repeat_count: int) -> tuple[_RestartScenario, ...]:
+    if repeat_count < 1:
+        raise ValueError(
+            f"restart_matrix_repeat_count must be positive, got {repeat_count}"
+        )
+    return (
+        _RestartScenario(
+            stage_id="s1_fibagent_bgp_restart",
+            description="S1: restart FibAgentBgp once and verify recovery",
+            daemons=("FibAgentBgp",),
+        ),
+        _RestartScenario(
+            stage_id="s2_fibagent_bgp_repeated_restart",
+            description=(
+                f"S2: restart FibAgentBgp {repeat_count} times, each after the "
+                "previous recovery, and verify recovery"
+            ),
+            daemons=("FibAgentBgp",) * repeat_count,
+        ),
+        _RestartScenario(
+            stage_id="s3_bgpcpp_restart",
+            description="S3: restart BGP++ once and verify recovery",
+            daemons=("Bgpcpp",),
+        ),
+        _RestartScenario(
+            stage_id="s4_bgpcpp_repeated_restart",
+            description=(
+                f"S4: restart BGP++ {repeat_count} times, each after the previous "
+                "recovery, and verify recovery"
+            ),
+            daemons=("Bgpcpp",) * repeat_count,
+        ),
+    )
 
 
 def _restart_matrix_stages(
@@ -319,19 +358,19 @@ def _restart_matrix_stages(
     context: ProfileContext,
     expected_established_sessions: int,
     parent_prefixes_to_ignore: t.List[str],
+    repeat_count: int,
 ) -> t.Tuple[t.List[Stage], t.List[SnapshotHealthCheck]]:
     """Build one stage per restart scenario and its snapshot checks.
 
-    Each stage restarts its daemon, waits for it to recover, then runs the
+    Each stage restarts its daemons, waiting for each to recover, then runs the
     EBB-01 postchecks. Its log checks scan only that stage (the first also
     covers setup and prechecks), and its snapshot checks compare the stage end
     with the playbook start.
     """
     stages: t.List[Stage] = []
     snapshot_checks: t.List[SnapshotHealthCheck] = []
-    for index, (stage_id, daemon_name, description) in enumerate(
-        _RESTART_MATRIX_STAGES
-    ):
+    for index, scenario in enumerate(_restart_matrix_scenarios(repeat_count)):
+        stage_id = scenario.stage_id
         log_window_start_jq_var = (
             "test_case_start_time" if index == 0 else f"{stage_id}_start_time"
         )
@@ -346,14 +385,18 @@ def _restart_matrix_stages(
                 rss_delta=None,
             ),
         )
-        restart = create_bgp_restart_test_stage(
-            device_name=device_name,
-            daemon_name=daemon_name,
-            reactivate_device_groups=False,
-            adaptive_convergence=True,
-            expected_established_sessions=expected_established_sessions,
-            parent_prefixes_to_ignore=parent_prefixes_to_ignore,
-        )
+        restart_steps = [
+            step
+            for daemon_name in scenario.daemons
+            for step in create_bgp_restart_test_stage(
+                device_name=device_name,
+                daemon_name=daemon_name,
+                reactivate_device_groups=False,
+                adaptive_convergence=True,
+                expected_established_sessions=expected_established_sessions,
+                parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+            ).steps
+        ]
         stages.append(
             create_steps_stage(
                 steps=[
@@ -362,7 +405,7 @@ def _restart_matrix_stages(
                         if index == 0
                         else [create_record_jq_timestamp_step(log_window_start_jq_var)]
                     ),
-                    *restart.steps,
+                    *restart_steps,
                     create_validation_step(
                         point_in_time_checks=[
                             check(
@@ -378,7 +421,7 @@ def _restart_matrix_stages(
                         fail_on_failure=True,
                     ),
                 ],
-                description=description,
+                description=scenario.description,
                 stage_id=stage_id,
             )
         )
@@ -416,6 +459,7 @@ def get_bgp_ebb_daemon_restart_playbook(
     ibgp_pnh_count: t.Optional[int] = None,
     ibgp_pnh_step: t.Optional[int] = None,
     enable_restart_matrix: bool = False,
+    restart_matrix_repeat_count: int = 3,
 ) -> Playbook:
     """
     Build CICD-EBB-01: BGP daemon restart.
@@ -454,6 +498,8 @@ def get_bgp_ebb_daemon_restart_playbook(
             FibAgentBgp/BGP++ restart matrix, one stage per scenario, each
             ending with the EBB-01 postchecks. Default False keeps the
             scheduled single restart.
+        restart_matrix_repeat_count: Restarts in each repeated-restart stage
+            of the matrix (S2 FibAgentBgp, S4 BGP++).
 
     Returns:
         Playbook configured for BGP daemon restart testing
@@ -509,6 +555,7 @@ def get_bgp_ebb_daemon_restart_playbook(
             context=restart_context,
             expected_established_sessions=expected_established_sessions,
             parent_prefixes_to_ignore=all_parent_prefixes_to_ignore,
+            repeat_count=restart_matrix_repeat_count,
         )
     else:
         restart_stages = [

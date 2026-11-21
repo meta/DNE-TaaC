@@ -163,7 +163,7 @@ from neteng.fboss.fsdb.clients import FsdbService
 from neteng.fboss.hardware_stats.types import CpuPortStats
 from neteng.fboss.hw_ctrl.clients import FbossHwCtrl
 from neteng.fboss.phy.phy.types import PortComponent
-from neteng.fboss.switch_config.thrift_types import SwitchDrainState
+from neteng.fboss.switch_config.thrift_types import PortState, SwitchDrainState
 from neteng.fboss.switch_config.types import DsfNode
 from neteng.fboss.transceiver import thrift_types as transceiver_types
 from neteng.fboss.transceiver.thrift_types import ReadRequest, TransceiverIOParameters
@@ -5659,6 +5659,30 @@ class FbossSwitch(AbstractSwitch):
                     vlan_id, interface_config.get("ipAddresses", [])
                 )
         return vlan_addresses
+
+    async def async_get_ports_disabled_in_running_config(
+        self, interfaces: List[str]
+    ) -> Set[str]:
+        """
+        The given ports whose admin state is DISABLED in the agent running config.
+        """
+
+        async def read_running_config() -> str:
+            async with self.async_agent_client as client:
+                return await client.getRunningConfig()
+
+        running_config = json.loads(
+            await self._async_retry_agent_rate_limit(
+                "getRunningConfig", read_running_config
+            )
+        )
+        wanted = set(interfaces)
+        return {
+            port["name"]
+            for port in running_config.get("sw", {}).get("ports", [])
+            if port.get("name") in wanted
+            and port.get("state") == PortState.DISABLED.value
+        }
 
     async def async_get_bgp_local_asn(self) -> int:
         async with await self._get_bgp_client() as bgp_client:

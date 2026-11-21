@@ -13,7 +13,7 @@ import unittest
 from abc import ABC, abstractmethod
 from dataclasses import asdict
 from ipaddress import IPv4Address, IPv4Interface, IPv6Address, IPv6Interface
-from typing import DefaultDict, Dict, List, Optional, Tuple, Union
+from typing import DefaultDict, Dict, List, Optional, Set, Tuple, Union
 
 from taac.driver.driver_constants import (
     BgpPeerAction,
@@ -253,6 +253,15 @@ class AbstractSwitch(ABC):
         it is DISABLED.
         """
         ...
+
+    async def async_get_ports_disabled_in_running_config(
+        self, interfaces: List[str]
+    ) -> Set[str]:
+        """
+        The given interfaces that the device's running config keeps
+        admin-disabled. Drivers that cannot read it report none.
+        """
+        return set()
 
     @async_retryable(
         retries=1000,

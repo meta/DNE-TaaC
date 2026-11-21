@@ -89,6 +89,35 @@ class FbossSwitchTest(TestCase):
 
         self.assertEqual(["first", "second"], result)
 
+    async def test_get_ports_disabled_in_running_config(self) -> None:
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.getRunningConfig.return_value = json.dumps(
+            {
+                "sw": {
+                    "ports": [
+                        {"name": "eth1/1/1", "state": 2},
+                        {"name": "eth1/60/5", "state": 1},
+                        {"name": "eth1/61/1", "state": 1},
+                        {"state": 1},
+                    ]
+                }
+            }
+        )
+
+        with patch.object(
+            FbossSwitch,
+            "async_agent_client",
+            new_callable=PropertyMock,
+            return_value=client,
+        ):
+            disabled = await self.switch.async_get_ports_disabled_in_running_config(
+                ["eth1/1/1", "eth1/60/5", "eth1/62/1"]
+            )
+
+        self.assertEqual({"eth1/60/5"}, disabled)
+        client.getRunningConfig.assert_awaited_once_with()
+
     async def test_get_all_vlan_configured_addresses_reads_running_config_once(
         self,
     ) -> None:

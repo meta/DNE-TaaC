@@ -23,8 +23,7 @@ class OomdKillHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn])
         input: hc_types.BaseHealthCheckIn,
         check_params: t.Dict[str, t.Any],
     ) -> hc_types.HealthCheckResult:
-        start_time = check_params["start_time"]
-        start_time = int(time.time() - 3600 * 24)
+        start_time = int(check_params["start_time"])
         end_time = int(check_params.get("end_time", time.time()))
         expected_oom_kills = check_params.get(
             "expected_oom_kills", {}

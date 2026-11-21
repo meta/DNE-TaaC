@@ -78,6 +78,7 @@ _NON_OSS_TEST_FILES = [
 # ---------------------------------------------------------------------------
 _OSS_READY_TEST_FILES = [
     "taac/health_checks/device_health_checks/test_bgp_rib_fib_consistency_health_check.py",
+    "taac/health_checks/device_health_checks/test_oomd_kill_health_check.py",
     "taac/health_checks/tests/test_common_utils.py",
     "taac/health_checks/tests/test_convergence_observer.py",
     "taac/tasks/tests/test_oss_gating.py",

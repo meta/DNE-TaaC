@@ -210,6 +210,7 @@ from taac.utils.client_factory_interface import (
 )
 from taac.driver.driver_constants import (
     _ONE_MBPS,
+    wedge_qsfp_util_cmd,
     ALLOWED_FBOSS_AGENTS,
     AristaCriticalAgents,
     BGP_SUMMARY_HEADER,
@@ -2996,7 +2997,7 @@ class FbossSwitch(AbstractSwitch):
 
         action_cmd = FLAP_COMMAND[flap_method][enable]
 
-        qsfp_command = f"wedge_qsfp_util {action_cmd} {interface_name}"
+        qsfp_command = f"{wedge_qsfp_util_cmd()} {action_cmd} {interface_name}"
 
         result = asyncio.run(self.async_run_cmd_on_shell(qsfp_command))
 
@@ -3035,20 +3036,24 @@ class FbossSwitch(AbstractSwitch):
         if up_time_sec is not None:
             for _ in range(total_flaps):
                 flap_command = (
-                    f"wedge_qsfp_util -tx_enable {interface_names_str} "
+                    f"{wedge_qsfp_util_cmd()} -tx_enable {interface_names_str} "
                     f"&& sleep {up_time_sec} "
-                    f"&& wedge_qsfp_util -tx_disable {interface_names_str} "
+                    f"&& {wedge_qsfp_util_cmd()} -tx_disable {interface_names_str} "
                     f"&& sleep {down_time_sec}"
                 )
                 await self.async_run_cmd_on_shell(flap_command)
                 self.logger.info("Symmetric flap cycle executed")
             # Leave the link UP — the cycle above ends tx_disabled.
             await self.async_run_cmd_on_shell(
-                f"wedge_qsfp_util -tx_enable {interface_names_str}"
+                f"{wedge_qsfp_util_cmd()} -tx_enable {interface_names_str}"
             )
             return
         for _ in range(total_flaps):
-            flap_command = f"wedge_qsfp_util -tx_disable {interface_names_str} && sleep {down_time_sec} && wedge_qsfp_util -tx_enable {interface_names_str}"
+            flap_command = (
+                f"{wedge_qsfp_util_cmd()} -tx_disable {interface_names_str} "
+                f"&& sleep {down_time_sec} "
+                f"&& {wedge_qsfp_util_cmd()} -tx_enable {interface_names_str}"
+            )
             await self.async_run_cmd_on_shell(flap_command)
             await asyncio.sleep(interval_to_link_up)
             self.logger.info("Flap command executed")
@@ -5278,7 +5283,10 @@ class FbossSwitch(AbstractSwitch):
             "Will be implemented for OSS in a future update."
         )
 
-    async def async_wedge_qsfp_util_pause_remediation(self, duration: int) -> None:
+    async def async_wedge_qsfp_util_pause_remediation(
+        self, duration: int, ports: t.Sequence[str] = ()
+    ) -> None:
+        """Pause remediation on the modules of `ports` (all if empty). Zero resumes."""
         if duration == 0:
             self.logger.info(
                 f"Attempting to resume qsfp remediations on {self.hostname}."
@@ -5287,8 +5295,21 @@ class FbossSwitch(AbstractSwitch):
             self.logger.info(
                 f"Attempting to pause qsfp remediations duration on {self.hostname} for {duration} seconds."
             )
-        cmd = f"wedge_qsfp_util --pause_remediation {duration}"
-        await self.async_run_cmd_on_shell(cmd)
+        # --pause_remediation 0 sends no RPC, so resume with 1 second.
+        sent = max(duration, 1)
+        cmd = " ".join(
+            [wedge_qsfp_util_cmd(), *ports, "--pause_remediation", str(sent)]
+        )
+        out = await self.async_run_cmd_on_shell(cmd) or ""
+        confirmed = {line.strip() for line in out.splitlines()}
+        missing = [
+            p for p in ports if f"PauseRemediation set for port {p}" not in confirmed
+        ]
+        if missing:
+            raise RuntimeError(
+                f"wedge_qsfp_util --pause_remediation {sent} not confirmed on "
+                f"{self.hostname} for {missing}: {out!r}"
+            )
 
     async def async_get_global_system_port_offset(self) -> int:
         async with self.async_agent_client as client:

@@ -9,6 +9,7 @@ from taac.constants import (  # oss-rewrite (force ShipIt re-export to taac.* ro
     TestDevice,
     TestTopology,
 )
+from taac.driver.driver_constants import wedge_qsfp_util_cmd
 from taac.libs.parameter_evaluator import ParameterEvaluator
 from taac.steps.step_definitions import InterfaceFlapStep
 from taac.test_as_a_config.thrift_types import (
@@ -430,7 +431,7 @@ class InterfaceFlapStepTest(unittest.IsolatedAsyncioTestCase):
             sequential=False,
         )
         self.driver_mock.async_run_cmd_on_shell.assert_awaited_once_with(
-            "wedge_qsfp_util --tx_disable eth1/1/1 eth1/2/1 eth1/3/1"
+            f"{wedge_qsfp_util_cmd()} --tx_disable eth1/1/1 eth1/2/1 eth1/3/1"
         )
 
     async def test_shell_cmd_sequential_individual_commands(self):
@@ -441,15 +442,10 @@ class InterfaceFlapStepTest(unittest.IsolatedAsyncioTestCase):
             sequential=True,
         )
         self.assertEqual(self.driver_mock.async_run_cmd_on_shell.await_count, 3)
-        self.driver_mock.async_run_cmd_on_shell.assert_any_await(
-            "wedge_qsfp_util --tx_enable eth1/1/1"
-        )
-        self.driver_mock.async_run_cmd_on_shell.assert_any_await(
-            "wedge_qsfp_util --tx_enable eth1/2/1"
-        )
-        self.driver_mock.async_run_cmd_on_shell.assert_any_await(
-            "wedge_qsfp_util --tx_enable eth1/3/1"
-        )
+        for interface in ("eth1/1/1", "eth1/2/1", "eth1/3/1"):
+            self.driver_mock.async_run_cmd_on_shell.assert_any_await(
+                f"{wedge_qsfp_util_cmd()} --tx_enable {interface}"
+            )
 
     async def test_shell_cmd_parallel_single_interface(self):
         self.driver_mock.async_run_cmd_on_shell = AsyncMock()
@@ -457,7 +453,7 @@ class InterfaceFlapStepTest(unittest.IsolatedAsyncioTestCase):
             ["eth1/1/1"], "--set_low_power", sequential=False
         )
         self.driver_mock.async_run_cmd_on_shell.assert_awaited_once_with(
-            "wedge_qsfp_util --set_low_power eth1/1/1"
+            f"{wedge_qsfp_util_cmd()} --set_low_power eth1/1/1"
         )
 
     async def test_shell_cmd_error_propagates(self):

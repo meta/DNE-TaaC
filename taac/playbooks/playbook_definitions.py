@@ -1720,6 +1720,7 @@ def _build_periodic_restart_stages(
     service_label: str,
     period_s: int = 300,
     total_duration_s: int = 14400,
+    clear_thrift_drain_exit: bool = False,
 ) -> list[Stage]:
     """Build N stages: each is [`SERVICE_INTERRUPTION_STEP`, `longevity(period_s)`].
 
@@ -1745,6 +1746,7 @@ def _build_periodic_restart_stages(
             period_s=period_s,
             iteration_index=i,
             total_iterations=n_iterations,
+            clear_thrift_drain_exit=clear_thrift_drain_exit,
         )
         for i in range(n_iterations)
     ]
@@ -1804,6 +1806,10 @@ def create_thft_restart_playbook(
                 service_label=service_label,
                 period_s=restart_period_s,
                 total_duration_s=test_duration_s,
+                # Under the thrift storm bgpd cannot drain its in-flight requests
+                # inside fbthrift's shutdown deadline and quick-exits 124; that is
+                # not a crash, so the agent restart's bgpd stop clears it.
+                clear_thrift_drain_exit=service == Service.AGENT,
             ),
             create_longevity_stage(duration=300),
         ],

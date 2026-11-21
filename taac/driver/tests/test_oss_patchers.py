@@ -9,6 +9,7 @@ import unittest
 from configerator.structs.neteng.fboss.bgp.bgp_config.thrift_types import (
     BgpConfig,
     BgpPeer,
+    BgpPeerTimers,
     OverloadProtectionMode,
     PeerGroup,
     RouteLimit,
@@ -164,6 +165,57 @@ class ConfigureBgpPeerGroupTest(unittest.TestCase):
     def test_unknown_field_raises(self) -> None:
         with self.assertRaises(PatcherError):
             self._update({"no_such_field": "1"})
+
+    def test_a_dict_replaces_a_struct_field_whole(self) -> None:
+        self.config = self.config(
+            peer_groups=[
+                none_throws(self.config.peer_groups)[0](
+                    bgp_peer_timers=BgpPeerTimers(
+                        hold_time_seconds=30, out_delay_seconds=2
+                    )
+                )
+            ]
+        )
+        group = self._update(
+            {"bgp_peer_timers": {"hold_time_seconds": 90, "keep_alive_seconds": "30"}}
+        )
+        self.assertEqual(
+            BgpPeerTimers(hold_time_seconds=90, keep_alive_seconds=30),
+            group.bgp_peer_timers,
+        )
+
+    def test_a_dict_sets_an_unset_struct_field(self) -> None:
+        group = self._update({"bgp_peer_timers": {"hold_time_seconds": 90}})
+        self.assertEqual(90, none_throws(group.bgp_peer_timers).hold_time_seconds)
+
+    def test_a_dict_with_an_unknown_key_names_it(self) -> None:
+        with self.assertRaisesRegex(
+            PatcherError, "BgpPeerTimers has no field 'hold_time'"
+        ):
+            self._update({"bgp_peer_timers": {"hold_time": 90}})
+
+    def test_a_dict_for_a_scalar_field_raises(self) -> None:
+        with self.assertRaisesRegex(PatcherError, "PeerGroup.description"):
+            self._update({"description": {"a": 1}})
+
+    def test_a_pre_filter_dict_with_route_limit_keys_raises_in_any_order(self) -> None:
+        for attrs in (
+            {"pre_filter": {"warning_only": True}, "max_routes": "100"},
+            {"max_routes": "100", "pre_filter": {"warning_only": True}},
+        ):
+            with self.subTest(order=list(attrs)):
+                with self.assertRaisesRegex(PatcherError, "pre_filter.*max_routes"):
+                    self._update(attrs)
+
+    def test_route_limit_keys_build_on_the_current_pre_filter(self) -> None:
+        group = self._update({"max_routes": "200", "warning_limit": "7"})
+        self.assertEqual(RouteLimit(max_routes=200, warning_limit=7), group.pre_filter)
+
+    def test_a_null_inside_a_struct_dict_names_the_field(self) -> None:
+        with self.assertRaisesRegex(
+            PatcherError, "BgpPeerTimers.hold_time_seconds cannot hold None"
+        ):
+            self._update({"bgp_peer_timers": {"hold_time_seconds": None}})
 
     def test_missing_group_is_left_alone(self) -> None:
         out = self.applier.configure_bgp_peer_group(

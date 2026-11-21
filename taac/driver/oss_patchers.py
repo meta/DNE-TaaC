@@ -28,6 +28,7 @@ import inspect
 import ipaddress
 import json
 import logging
+import sys
 import typing as t
 
 # @manual=//configerator/structs/neteng/fboss/bgp:bgp_config-python-types
@@ -58,6 +59,8 @@ from neteng.fboss.switch_config.thrift_types import (
     Vlan,
     VlanPort,
 )
+from thrift.python.metadata import gen_metadata, ThriftKind
+from thrift.python.types import Struct
 from taac.driver import oss_bgp_policy
 from taac.driver.config_modifiers import (
     POLICY_PROPAGATE_IN,
@@ -152,15 +155,36 @@ def _add_path(value: t.Any) -> AddPath:
         raise PatcherError(f"unknown add_path {value!r}") from exc
 
 
+def _struct_class(struct: t.Any, key: str) -> t.Any:
+    """The thrift struct class field ``key`` holds, or None for any other type."""
+    current = getattr(struct, key)
+    if isinstance(current, Struct):
+        return type(current)
+    field = next((f for f in gen_metadata(type(struct)).fields if f.name == key), None)
+    if field is None or field.type.kind != ThriftKind.STRUCT:
+        return None
+    name = field.type.as_struct().name.rsplit(".", 1)[-1]
+    return getattr(sys.modules[type(struct).__module__], name, None)
+
+
 def _with_field(struct: t.Any, key: str, raw: t.Any) -> t.Any:
     """Set one field from a string arg, converted to the type the field holds.
 
     COOP's ``_patch_object_attribute`` rule, except that an unset optional field
     is set (best-guess type, falling back to the string) rather than skipped,
     and an unknown field raises.
+    A dict replaces a struct field whole, so omitted fields take thrift defaults.
     """
     if not hasattr(struct, key):
         raise PatcherError(f"{type(struct).__name__} has no field {key!r}")
+    if isinstance(raw, dict):
+        cls = _struct_class(struct, key)
+        if cls is None:
+            raise PatcherError(f"{type(struct).__name__}.{key} cannot hold {raw!r}")
+        value = cls()
+        for name, item in raw.items():
+            value = _with_field(value, name, item)
+        return struct(**{key: value})
     current = getattr(struct, key)
     try:
         if isinstance(current, bool):
@@ -171,7 +195,7 @@ def _with_field(struct: t.Any, key: str, raw: t.Any) -> t.Any:
             candidates = [str(raw)]
         else:
             candidates = [_coerce(raw), str(raw)]
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         raise PatcherError(
             f"{type(struct).__name__}.{key} cannot hold {raw!r}"
         ) from exc
@@ -696,6 +720,12 @@ class OssPatchApplier:
         group = groups[index]
         updates = json.loads(my_args.get("attributes_to_update_json", "{}"))
         pre_filter = group.pre_filter or RouteLimit()
+        mixed = sorted(_ROUTE_LIMIT_FIELDS & updates.keys())
+        if "pre_filter" in updates and mixed:
+            # A pre_filter dict replaces the whole RouteLimit, so it undoes the others.
+            raise PatcherError(
+                f"peer group {name}: set pre_filter or {mixed}, not both"
+            )
         for key, value in updates.items():
             if key == "add_path":
                 group = group(add_path=_add_path(value))

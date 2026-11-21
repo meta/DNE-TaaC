@@ -74,6 +74,8 @@ VIEW_TO_IDENTIFIER: t.Dict[str, str] = {
 }
 
 TRAFFIC_ITEM_VIEW = "Traffic Item Statistics"
+# The chassis's answer to a select on a statistics view id that no longer exists.
+_STALE_STAT_VIEW_ERROR = "Args do not match signature"
 FLOW_STATISTICS_VIEW = "Flow Statistics"
 
 PTP_DRILL_DOWN_VIEW = "PTP Drill Down"
@@ -549,17 +551,14 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             else:
                 return packet_loss_stats["latest"]
 
-        traffic_item_view_assistant = self.traffic_item_view_assistant
-        if traffic_item_view_assistant is None:
+        if self.traffic_item_view_assistant is None:
             raise IxiaSetupError("IXIA traffic-item statistics view is not initialized")
         lock_timeout_sec = max(
             1, min(max_timeout_sec, _DIRECT_STATS_LOCK_TIMEOUT_MAX_S)
         )
         try:
             with self.stat_view_snapshot(timeout_seconds=lock_timeout_sec):
-                return self._get_packet_loss_statistics_unlocked(
-                    traffic_item_view_assistant
-                )
+                return self._read_traffic_item_stats()
         except IxiaOperationTimeoutError as error:
             if self.capturing:
                 raise
@@ -567,8 +566,28 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
                 "Timed out waiting for the IXIA snapshot lock; proceeding "
                 f"with the best-effort unlocked packet-loss read: {error}"
             )
+            # Unlocked, so a re-resolve can race the apply holding the lock;
+            # the view is then stale again and this read raises.
+            return self._read_traffic_item_stats()
+
+    def _read_traffic_item_stats(self) -> t.List:
+        """Read the traffic-item view, re-resolving it by caption once if its
+        cached id no longer exists (Traffic.Apply rebuilds the views)."""
+        try:
             return self._get_packet_loss_statistics_unlocked(
-                traffic_item_view_assistant
+                none_throws(self.traffic_item_view_assistant)
+            )
+        except Exception as error:
+            if _STALE_STAT_VIEW_ERROR not in str(error):
+                raise
+            self.logger.warning(
+                f"IXIA traffic-item statistics view handle is stale ({error}); "
+                "re-resolving it by caption"
+            )
+            self.invalidate_stat_view_cache(TRAFFIC_ITEM_VIEW)
+            self.traffic_item_view_assistant = self._get_traffic_item_view()
+            return self._get_packet_loss_statistics_unlocked(
+                none_throws(self.traffic_item_view_assistant)
             )
 
     def log_benchmark_rate_report(

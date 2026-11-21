@@ -5358,6 +5358,9 @@ def create_daemon_identity_step(
     unchanged_daemons: t.Sequence[str] = (),
     rss_summary_jq_vars: t.Mapping[str, str] | None = None,
     description: str | None = None,
+    observe_resources: bool = False,
+    resource_max_delta: int = 0,
+    resource_observe_seconds: float = 0,
 ) -> Step:
     """Record or verify EOS daemon PIDs and memory around a planned restart.
 
@@ -5366,6 +5369,10 @@ def create_daemon_identity_step(
     (after recovery) fails unless each restarted daemon has a new PID and each
     of ``unchanged_daemons`` kept its PID, then stores a before/after memory
     summary per restarted daemon in ``rss_summary_jq_vars`` for RSS_DELTA_CHECK.
+
+    ``observe_resources`` also records the NHG and hardware-table counters and,
+    on ``verify``, logs whether they come back within ``resource_max_delta``
+    in ``resource_observe_seconds``. It never fails the step.
     """
     if action not in ("record", "verify"):
         raise ValueError(f"action must be 'record' or 'verify', got {action!r}")
@@ -5382,6 +5389,11 @@ def create_daemon_identity_step(
     }
     if action == "verify":
         params["rss_summary_jq_vars"] = dict(rss_summary_jq_vars or {})
+    if observe_resources:
+        params["observe_resources"] = True
+        if action == "verify":
+            params["resource_max_delta"] = resource_max_delta
+            params["resource_observe_seconds"] = resource_observe_seconds
     if description is None:
         restarted = ", ".join(restarted_daemons)
         kept = (
@@ -5394,6 +5406,12 @@ def create_daemon_identity_step(
             if action == "record"
             else f"Verify {restarted} restarted{kept}; read {restarted} memory"
         )
+        if observe_resources:
+            description += (
+                "; record NHG/hardware counters"
+                if action == "record"
+                else "; observe NHG/hardware counters"
+            )
     return create_custom_step(params_dict=params, description=description)
 
 

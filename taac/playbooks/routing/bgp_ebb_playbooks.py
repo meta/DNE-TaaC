@@ -306,6 +306,11 @@ def _optional_pnh_route_starts(
 # in the matrix must accept both daemons, not only those restarted so far.
 _RESTART_MATRIX_EXPECTED_RESTARTS: tuple[str, ...] = ("Bgpcpp", "FibAgentBgp")
 _RESTART_MATRIX_MAX_RSS_GROWTH_PCT = 10.0
+# NHG and hardware-table counters are observed around every restart but not
+# gated yet: lab runs first show whether they return within this delta and
+# how long that takes.
+_RESTART_MATRIX_MAX_RESOURCE_DELTA = 2
+_RESTART_MATRIX_RESOURCE_OBSERVE_SECONDS = 180.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -398,7 +403,12 @@ def _verified_restart_block(
     summary_jq_vars = {d: f"{block_id}_{d.lower()}_rss_summary" for d in restarted}
     steps = [
         create_daemon_identity_step(
-            device_name, "record", record_jq_var, restarted, unchanged
+            device_name,
+            "record",
+            record_jq_var,
+            restarted,
+            unchanged,
+            observe_resources=True,
         ),
         *restart_steps,
         create_daemon_identity_step(
@@ -408,6 +418,9 @@ def _verified_restart_block(
             restarted,
             unchanged,
             rss_summary_jq_vars=summary_jq_vars,
+            observe_resources=True,
+            resource_max_delta=_RESTART_MATRIX_MAX_RESOURCE_DELTA,
+            resource_observe_seconds=_RESTART_MATRIX_RESOURCE_OBSERVE_SECONDS,
         ),
     ]
     memory_checks = [

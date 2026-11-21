@@ -1033,6 +1033,8 @@ class NexthopGroupSummary:
     num_unprogrammed_groups: int
     nexthop_group_sizes: t.Dict[int, int]
     nexthop_group_types: t.Dict[str, int]
+    # None when the EOS release does not print the "programmed as drop" line.
+    num_drop_groups: int | None = None
 
 
 def _parse_nexthop_group_rows(
@@ -1206,6 +1208,7 @@ async def get_nexthop_group_summary(driver: t.Any) -> NexthopGroupSummary:
 
         num_groups_configured = 0
         num_unprogrammed_groups = 0
+        num_drop_groups: int | None = None
         # Whether the counter lines were actually present. Without this, a
         # change to the EOS output wording leaves both counts at their 0
         # initialisers and the function returns a well-formed summary reporting
@@ -1244,6 +1247,12 @@ async def get_nexthop_group_summary(driver: t.Any) -> NexthopGroupSummary:
                     logger.debug(
                         f"[ARISTA_UTILS] Found num_unprogrammed_groups: {num_unprogrammed_groups}"
                     )
+                continue
+
+            if "Nexthop Groups programmed as drop:" in line:
+                match = re.search(r"programmed as drop:\s*(\d+)", line)
+                if match:
+                    num_drop_groups = int(match.group(1))
                 continue
 
             # Detect section headers
@@ -1290,6 +1299,7 @@ async def get_nexthop_group_summary(driver: t.Any) -> NexthopGroupSummary:
             num_unprogrammed_groups=num_unprogrammed_groups,
             nexthop_group_sizes=nexthop_group_sizes,
             nexthop_group_types=nexthop_group_types,
+            num_drop_groups=num_drop_groups,
         )
 
     except Exception as e:

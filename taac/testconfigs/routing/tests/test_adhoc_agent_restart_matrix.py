@@ -317,6 +317,16 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
                     dict(_jq_params(rss_checks[check_id])),
                 )
 
+    def test_every_restart_observes_resources(self) -> None:
+        for stage_id in _IDENTITY_BLOCKS:
+            identity = _identity_steps(self.stages[stage_id])
+            self.assertTrue(identity, stage_id)
+            for params in identity:
+                self.assertTrue(params["observe_resources"], stage_id)
+                if params["action"] == "verify":
+                    self.assertEqual(2, params["resource_max_delta"])
+                    self.assertEqual(180.0, params["resource_observe_seconds"])
+
     def test_log_checks_scan_only_their_stage(self) -> None:
         for index, stage_id in enumerate(_STAGE_IDS):
             start_var = (

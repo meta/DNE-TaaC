@@ -80,6 +80,7 @@ _OSS_READY_TEST_FILES = [
     "taac/health_checks/device_health_checks/test_bgp_rib_fib_consistency_health_check.py",
     "taac/health_checks/tests/test_common_utils.py",
     "taac/health_checks/tests/test_convergence_observer.py",
+    "taac/ixia/tests/test_custom_network_group_route_property.py",
     "taac/tasks/tests/test_oss_gating.py",
     "taac/health_checks/snapshot_health_checks/test_cpu_queue_failure_window.py",
     # Pure unit test: Ixia via __new__, config element mocked.

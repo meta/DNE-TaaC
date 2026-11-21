@@ -3799,6 +3799,7 @@ def create_fpf_set_interface_admin_step(
     best_effort: bool = False,
     record_event_time: bool = True,
     description: t.Optional[str] = None,
+    skip_missing: bool = False,
 ) -> Step:
     """Disable/enable interface(s) on the live agent via thrift (held).
 
@@ -3818,6 +3819,8 @@ def create_fpf_set_interface_admin_step(
         params["best_effort"] = True
     if not record_event_time:
         params["record_event_time"] = False
+    if skip_missing:
+        params["skip_missing"] = True
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description

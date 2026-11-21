@@ -504,3 +504,56 @@ class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
                     "fail_closed": True,
                 }
             )
+
+
+class TestFpfSetInterfaceAdmin(unittest.IsolatedAsyncioTestCase):
+    def _step(self):
+        step = _make_step()
+        step.driver.async_get_all_interfaces_admin_status.return_value = {
+            "eth1/17/1": True
+        }
+        return step
+
+    @staticmethod
+    def _params(interfaces, is_enable, **extra):
+        return {
+            "custom_step_name": "fpf_set_interface_admin",
+            "interfaces": interfaces,
+            "is_enable": is_enable,
+            **extra,
+        }
+
+    async def test_sets_present_ports_and_skips_a_removed_one(self):
+        step = self._step()
+        params = self._params(["eth1/17/1", "eth1/17/5"], False, skip_missing=True)
+        await step.run(MagicMock(), params)
+        step.driver.async_thrift_disable_enable_interfaces.assert_awaited_once_with(
+            interface_names=["eth1/17/1"], is_enable_port=False
+        )
+        self.assertIn("eth1/17/5", step.logger.warning.call_args.args[0])
+
+    async def test_missing_port_fails_unless_skip_missing(self):
+        step = self._step()
+        with self.assertRaisesRegex(TestCaseFailure, "eth1/17/5"):
+            await step.run(MagicMock(), self._params(["eth1/17/5"], False))
+        step.driver.async_thrift_disable_enable_interfaces.assert_not_awaited()
+
+    async def test_best_effort_failure_is_logged_not_raised(self):
+        step = self._step()
+        thrift = step.driver.async_thrift_disable_enable_interfaces
+        thrift.side_effect = RuntimeError("boom")
+        params = self._params(["eth1/17/1"], True, best_effort=True)
+        await step.run(MagicMock(), params)
+        self.assertIn("best_effort", step.logger.error.call_args.args[0])
+
+    async def test_failure_without_best_effort_raises(self):
+        step = self._step()
+        thrift = step.driver.async_thrift_disable_enable_interfaces
+        thrift.side_effect = RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            await step.run(MagicMock(), self._params(["eth1/17/1"], False))
+
+    async def test_enable_does_not_need_the_internal_fpf_registry(self):
+        step = self._step()
+        await step.run(MagicMock(), self._params(["eth1/17/1"], True))
+        step.driver.async_thrift_disable_enable_interfaces.assert_awaited_once()

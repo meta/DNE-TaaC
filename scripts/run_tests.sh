@@ -74,6 +74,11 @@ if [[ "$SKIP_SMOKE" -eq 0 ]]; then
         --dut fakedut123 \
         --device-info-csv /workspace/examples/topology/sample_device_info.csv \
         --circuit-info-csv /workspace/examples/topology/sample_circuit_info.csv \
-        --dry-run
+        --dry-run 2>&1 | tee /tmp/taac_smoke.log
+    # An image built without TAAC_GIT_SHA prints "Image commit: unknown".
+    if grep -q 'Image commit: unknown' /tmp/taac_smoke.log; then
+        echo "Smoke test failed: image has no git sha stamp" >&2
+        exit 1
+    fi
     echo "Smoke test passed"
 fi

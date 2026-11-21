@@ -8697,6 +8697,9 @@ def create_lag_baseline_playbook_1(
                         interfaces=phase2_interfaces,
                         interface_flap_method=taac_types.InterfaceFlapMethod.THRIFT_PORT_STATE_CHANGE,
                     ),
+                    # LACP must re-bundle the re-enabled members before the
+                    # LAG can come back UP, as in the teardown stage.
+                    create_longevity_step(duration=link_up_wait_s),
                     create_verify_port_operational_state_step(
                         interfaces=phase2_interfaces, operational_state=True
                     ),

@@ -49,6 +49,7 @@ from taac.utils.oss_taac_lib_utils import (
     ConsoleFileLogger,
     get_root_logger,
     none_throws,
+    oss_agent_restart_paths_enabled,
 )
 from taac.utils.upper_bound_gate import evaluate_upper_bound_gates
 
@@ -86,8 +87,18 @@ async def _resolve_fb303_port(host: str) -> int:
     (DNX) box exports them on :5931.
     """
     driver = await async_get_device_driver(host)
-    # pyre-fixme[16]: `AbstractSwitch` has no attribute `async_is_multi_switch`.
-    is_multi_switch = await driver.async_is_multi_switch()
+    try:
+        # pyre-fixme[16]: `AbstractSwitch` has no attribute `async_is_multi_switch`.
+        is_multi_switch = await driver.async_is_multi_switch()
+    except Exception as topology_error:
+        if not oss_agent_restart_paths_enabled():
+            raise
+        # A counter port choice cannot damage the DUT. Use the monolithic port.
+        LOGGER.warning(
+            f"{host}: agent topology unavailable ({topology_error}); reading "
+            f"fb303 counters on the monolithic port {FBOSS_FB303_PORT}"
+        )
+        is_multi_switch = False
     return FBOSS_MNPU_FB303_PORT if is_multi_switch else FBOSS_FB303_PORT
 
 

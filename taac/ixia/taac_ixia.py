@@ -3,6 +3,7 @@
 import ipaddress
 import logging
 import os
+import re
 import threading
 import time
 import typing as t
@@ -2336,6 +2337,25 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         self.apply_traffic()
         self.wait_for_view_assistants_ready()
 
+    def _generate_deferred_traffic_items(self) -> None:
+        # Generate does not build a disabled item's streams, so every item is
+        # enabled for it except retained ones about to be superseded.
+        self.enable_traffic(apply_changes=False)
+        superseded = [
+            rf"^{re.escape(name)}$"
+            for name, _ in getattr(self, "_deferred_traffic_item_replacements", ())
+        ]
+        if superseded:
+            self.enable_traffic(superseded, enable=False, apply_changes=False)
+        self.regenerate_traffic_items()
+
+    def _regenerate_enabled_traffic_items(self) -> None:
+        # Only the enabled ones: an item generated while disabled keeps its
+        # creation defaults (64 B, 10% line rate) once a later playbook enables it.
+        for traffic_item in self.get_traffic_items():
+            if traffic_item.Enabled:
+                traffic_item.Generate()
+
     def _complete_deferred_traffic_start(self) -> None:
         self._traffic_preparation_pending = False
         self._deferred_traffic_generation_complete = False
@@ -2364,7 +2384,7 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             # Generate temporary replacements before removing the retained,
             # generated items that they supersede.
             if not self._deferred_traffic_generation_complete:
-                self.regenerate_traffic_items()
+                self._generate_deferred_traffic_items()
                 self._deferred_traffic_generation_complete = True
             self.finalize_deferred_traffic_item_replacements()
             self.enable_traffic(
@@ -2373,7 +2393,7 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             )
             # Enabling deferred items modifies their compiled traffic state.
             # Regenerate after selection so Apply uses the selected flow groups.
-            self.regenerate_traffic_items()
+            self._regenerate_enabled_traffic_items()
             self._traffic_start_pending = True
         super().start_traffic(
             regenerate_traffic_items=(

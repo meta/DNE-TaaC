@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import tempfile
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from configerator.structs.neteng.fboss.bgp.bgp_config.thrift_types import (
     BgpConfig,
@@ -33,6 +33,7 @@ from neteng.fboss.switch_config.thrift_types import (
     VlanPort,
 )
 from neteng.test_infra.dne.taac.driver import oss_coop_patcher as ocp
+from taac.custom_test_handlers import patcher_cleanup_handler as cleanup
 from taac.driver.config_modifiers import (
     deserialize_config,
     PREDRAIN_CONFIG_PATH,
@@ -100,6 +101,7 @@ class _FakeSwitch:
         return "\n".join(out)
 
     async def async_read_file(self, path: str) -> str:
+        await asyncio.sleep(0)  # A real read yields. Concurrent callers interleave.
         self.reads.append(path)
         return self.files[path]
 
@@ -408,6 +410,26 @@ class OssCoopPatcherTest(TestCase):
         )
         self.assertEqual([], ocp.list_patchers(HOST, "bgpcpp_softdrain"))
         self.assertNotIn(SOFTDRAIN_BASELINE, self.switch.files)
+
+    async def test_cleanup_removes_two_patchers_of_one_config_in_turn(self) -> None:
+        # Two removals at once rebuild from the same list, so one patcher would stay.
+        await self._register(_peer_group("A"))
+        await self._register(_peer_group("B"))
+        driver = AsyncMock()
+
+        async def unregister(name: str, config: str) -> None:
+            await ocp.async_unregister(self.switch, config, name)
+
+        driver.async_coop_unregister_patchers.side_effect = unregister
+        helper = cleanup.PatcherCleanupHelper([HOST], logging.getLogger(__name__))
+        helper.initial_patchers = {HOST: {}}
+        helper.current_patchers = {HOST: {"bgpcpp": ocp.list_patchers(HOST, "bgpcpp")}}
+        with patch.object(
+            cleanup, "async_get_device_driver", AsyncMock(return_value=driver)
+        ), patch.object(cleanup, "oss_config_patcher_enabled", return_value=True):
+            await helper.initiate_cleanup()
+
+        self.assertEqual([], ocp.list_patchers(HOST, "bgpcpp"))
 
     async def test_patcher_sent_to_both_bgp_configs_patches_each(self) -> None:
         # What configure_parallel_bgp_peers does for a drainable host: one

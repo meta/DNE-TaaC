@@ -117,7 +117,8 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         self._traffic_start_pending = False
         self._traffic_view_readiness_pending = False
         self._pending_traffic_regexes = None
-        self.saved_configs = {}
+        # One slot: the runner exports before begin_test_case sets the test case uuid.
+        self.saved_config = None
 
         self.traffic_item_view_assistant = None
         self.ptp_drill_down_view_assistant = None
@@ -735,9 +736,10 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         return json_config
 
     def export_and_save_config(self) -> None:
-        self.logger.info(f"Saving ixia config for {self.test_case_uuid}")
-        json_config = self.export_json_config()
-        self.saved_configs[self.test_case_uuid] = json_config
+        self.logger.info("Saving ixia config for the next test case")
+        # A failed export must not leave the config of an earlier test case.
+        self.saved_config = None
+        self.saved_config = self.export_json_config()
 
     def import_json_config(
         self,
@@ -786,8 +788,12 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
         )
 
     def import_saved_config(self) -> None:
+        if self.saved_config is None:
+            raise RuntimeError(
+                "import_saved_config called before export_and_save_config"
+            )
         self.logger.info(f"Importing saved ixia config for {self.test_case_uuid}")
-        self.import_json_config(self.saved_configs[self.test_case_uuid])
+        self.import_json_config(self.saved_config)
 
     # =========================================================================
     # .ixncfg file-based caching methods (for chassis persistence)

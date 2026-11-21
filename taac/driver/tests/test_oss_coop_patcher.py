@@ -297,6 +297,52 @@ class OssCoopPatcherTest(TestCase):
         self.assertEqual(["BASE", "B"], _group_names(self._working_bgp()))
         self.assertEqual(["B"], [p.name for p in ocp.list_patchers(HOST, "bgpcpp")])
 
+    async def test_reregistering_with_different_args_warns(self) -> None:
+        await self._register(_peer_group("A", description="one"))
+
+        with self.assertLogs(self.switch.logger, logging.WARNING) as logs:
+            await self._register(_peer_group("A", description="two"))
+
+        self.assertIn("Changed keys: ['description']", logs.output[0])
+
+    async def test_a_field_the_bindings_do_not_know_refuses_to_patch(self) -> None:
+        doc = json.loads(serialize_config(_baseline_bgp()))
+        doc["zz_future_field"] = {"enabled": True}
+        doc["peer_groups"][0]["zz_future_field"] = 1
+        self.switch.files[BGP_LIVE] = json.dumps(doc)
+
+        with self.assertRaisesRegex(RuntimeError, "zz_future_field") as ctx:
+            await self._register(_peer_group("A"))
+
+        self.assertIn("peer_groups[0].zz_future_field", str(ctx.exception))
+        self.assertNotIn(BGP_BASELINE, self.switch.files)
+        self.assertEqual([], ocp.list_patchers(HOST, "bgpcpp"))
+
+    async def test_a_key_renamed_to_deprecated_is_dropped_with_a_warning(
+        self,
+    ) -> None:
+        # FBOSS renamed maxRouteCounterIDs to maxRouteCounterIDs_DEPRECATED; the
+        # agent already ignores the old key, so dropping it changes nothing.
+        doc = json.loads(serialize_config(_baseline_agent()))
+        doc["sw"].setdefault("switchSettings", {})["maxRouteCounterIDs"] = 13
+        self.switch.files[AGENT_LIVE] = json.dumps(doc)
+
+        with self.assertLogs(self.switch.logger, logging.WARNING) as logs:
+            await self._register(_vlan_patcher())
+
+        self.assertIn("sw.switchSettings.maxRouteCounterIDs", "\n".join(logs.output))
+        self.assertIn(AGENT_BASELINE, self.switch.files)
+        self.assertEqual(1, len(ocp.list_patchers(HOST, "agent")))
+
+    async def test_an_explicit_null_is_not_a_dropped_field(self) -> None:
+        doc = json.loads(serialize_config(_baseline_bgp()))
+        doc["zz_unset_field"] = None
+        self.switch.files[BGP_LIVE] = json.dumps(doc)
+
+        await self._register(_peer_group("A"))
+
+        self.assertEqual(["BASE", "A"], _group_names(self._working_bgp()))
+
     async def test_unregister_undoes_side_effects_on_unnamed_entries(self) -> None:
         # Moving a port rewrites its vlanPorts entry, which the patcher never
         # names; only a rebuild from the baseline gets the original back.

@@ -9,8 +9,11 @@ Uses fbthrift Python bindings (thrift.python.client) which are
 built from source via getdeps.py as part of the TAAC OSS build process.
 """
 
+import asyncio
+import functools
+import inspect
 from contextlib import asynccontextmanager, contextmanager
-from typing import AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Awaitable, Iterator
 
 from neteng.fboss.bgp_thrift.thrift_clients import TBgpService
 
@@ -30,6 +33,53 @@ from taac.driver.driver_constants import (
 
 # fbthrift Python client library (built from github.com/facebook/fbthrift)
 from thrift.python.client import get_client, get_sync_client
+from thrift.python.exceptions import (
+    TransportError,
+    TransportErrorType,
+    TransportOptions,
+)
+
+
+class _DeadlineClient:
+    """Async thrift client whose every RPC is bounded by ``timeout`` seconds.
+
+    fbthrift stops timing a request once its reply starts arriving, so a reply cut
+    off mid-stream (e.g. on a half-open connection) never completes. The deadline raises the same TIMED_OUT TransportError fbthrift
+    does, so existing ThriftError retries handle it unchanged.
+    """
+
+    def __init__(self, client: Any, timeout: float) -> None:
+        self._client = client
+        self._timeout = timeout
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        @functools.wraps(attr)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            result = attr(*args, **kwargs)
+            if not inspect.isawaitable(result):
+                return result
+            return self._bounded(name, result)
+
+        return call
+
+    async def _bounded(self, name: str, rpc: Awaitable[Any]) -> Any:
+        deadline = asyncio.timeout(self._timeout)
+        try:
+            async with deadline:
+                return await rpc
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            raise TransportError(
+                TransportErrorType.TIMED_OUT,
+                f"{name} did not complete within {self._timeout}s",
+                0,
+                TransportOptions.CHANNEL_IS_VALID,
+            ) from None
 
 
 class OSSClientFactory:
@@ -80,7 +130,7 @@ class OSSClientFactory:
         async with get_client(
             FbossCtrl, host=hostname, port=port, timeout=timeout
         ) as client:
-            yield client
+            yield _DeadlineClient(client, timeout)
 
     @asynccontextmanager
     async def get_hw_agent_client(
@@ -94,7 +144,7 @@ class OSSClientFactory:
         async with get_client(
             FbossHwCtrl, host=hostname, port=port, timeout=timeout
         ) as client:
-            yield client
+            yield _DeadlineClient(client, timeout)
 
     @asynccontextmanager
     async def get_qsfp_client(
@@ -107,7 +157,7 @@ class OSSClientFactory:
         async with get_client(
             QsfpService, host=hostname, port=port, timeout=timeout
         ) as client:
-            yield client
+            yield _DeadlineClient(client, timeout)
 
     @asynccontextmanager
     async def get_bgp_client(
@@ -120,7 +170,7 @@ class OSSClientFactory:
         async with get_client(
             TBgpService, host=hostname, port=port, timeout=timeout
         ) as client:
-            yield client
+            yield _DeadlineClient(client, timeout)
 
     @asynccontextmanager
     async def get_fsdb_client(
@@ -133,4 +183,4 @@ class OSSClientFactory:
         async with get_client(
             FsdbService, host=hostname, port=port, timeout=timeout
         ) as client:
-            yield client
+            yield _DeadlineClient(client, timeout)

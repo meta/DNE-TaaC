@@ -19,6 +19,9 @@ FB_OOMD_LOG_PATH: str = "/var/facebook/logs/fb-oomd.log"
 
 # FBOSS core dump configuration
 FBOSS_CORE_DUMP_PATH: str = "/var/tmp/cores/"
+# Some OSS FBOSS images pipe kernel.core_pattern to systemd-coredump, which
+# stores cores here instead of FBOSS_CORE_DUMP_PATH.
+FBOSS_SYSTEMD_CORE_DUMP_PATH: str = "/var/lib/systemd/coredump/"
 FBOSS_CRITICAL_CORE_DUMPS: t.List[str] = [
     "fboss",
     "openr",

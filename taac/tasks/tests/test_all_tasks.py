@@ -3,8 +3,10 @@
 import asyncio
 import base64
 import contextlib
+import importlib
 import json
 import math
+import os
 import typing as t
 import unittest
 from types import SimpleNamespace
@@ -17,7 +19,6 @@ from taac.task_definitions import (
     create_coop_unregister_patchers_task,
     create_enable_ixia_ports_patcher_task,
 )
-from neteng.test_infra.dne.taac.tasks import all as tasks_all
 from taac.tasks.all import (
     AristaCreateFileFromConfig,
     AristaDaemonControlTask,
@@ -33,6 +34,11 @@ from taac.tasks.all import (
     ValidateBgpcppUpdateGroupState,
 )
 from taac.utils import oss_taac_lib_utils
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+tasks_all = importlib.import_module(f"{_PACKAGE}.tasks.all")
 
 
 ALL_PATH = "neteng.test_infra.dne.taac.tasks.all"

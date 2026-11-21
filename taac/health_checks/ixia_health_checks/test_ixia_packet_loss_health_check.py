@@ -7,14 +7,19 @@ Tests the synchronous verify_packet_loss_threshold() method (pure logic)
 and the async _run() method (with mocked IXIA client).
 """
 
+import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from neteng.netcastle.logger import ConsoleFileLogger
+from taac.utils.oss_taac_lib_utils import ConsoleFileLogger
 from taac.health_checks.ixia_health_checks.ixia_packet_loss_health_check import (
     IxiaPacketLossHealthCheck,
 )
 from taac.health_check.health_check import types as hc_types
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
 
 
 def _make_stat(identifier, duration=0, frame_delta=0, percentage=0.0):
@@ -178,7 +183,7 @@ class TestIxiaPacketLossRun(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, hc_types.HealthCheckStatus.SKIP)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.ixia_health_checks"
+        f"{_PACKAGE}.health_checks.ixia_health_checks"
         ".ixia_packet_loss_health_check.async_everpaste_str",
         new_callable=AsyncMock,
         return_value="https://everpaste.test",
@@ -211,7 +216,7 @@ class TestIxiaPacketLossRun(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.ixia_health_checks"
+        f"{_PACKAGE}.health_checks.ixia_health_checks"
         ".ixia_packet_loss_health_check.async_everpaste_str",
         new_callable=AsyncMock,
         return_value="https://everpaste.test",
@@ -247,7 +252,7 @@ class TestIxiaPacketLossRun(unittest.IsolatedAsyncioTestCase):
         self.assertIn("missing from IXIA statistics", result.message)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.ixia_health_checks"
+        f"{_PACKAGE}.health_checks.ixia_health_checks"
         ".ixia_packet_loss_health_check.async_everpaste_str",
         new_callable=AsyncMock,
         return_value="https://everpaste.test",
@@ -294,7 +299,7 @@ class TestIxiaPacketLossRun(unittest.IsolatedAsyncioTestCase):
         self.assertIn("TRAFFIC_A", details)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.ixia_health_checks"
+        f"{_PACKAGE}.health_checks.ixia_health_checks"
         ".ixia_packet_loss_health_check.async_everpaste_str",
         new_callable=AsyncMock,
         return_value="https://everpaste.test",
@@ -316,7 +321,7 @@ class TestIxiaPacketLossRun(unittest.IsolatedAsyncioTestCase):
         mock_everpaste.assert_awaited_once()
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.ixia_health_checks"
+        f"{_PACKAGE}.health_checks.ixia_health_checks"
         ".ixia_packet_loss_health_check.async_everpaste_str",
         new_callable=AsyncMock,
         return_value="https://everpaste.test",
@@ -342,7 +347,7 @@ class TestIxiaPacketLossRun(unittest.IsolatedAsyncioTestCase):
         mock_everpaste.assert_awaited_once()
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.ixia_health_checks"
+        f"{_PACKAGE}.health_checks.ixia_health_checks"
         ".ixia_packet_loss_health_check.async_everpaste_str",
         new_callable=AsyncMock,
         return_value="https://everpaste.test",
@@ -373,7 +378,7 @@ class TestIxiaPacketLossRun(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<all traffic items>", result.message)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.ixia_health_checks"
+        f"{_PACKAGE}.health_checks.ixia_health_checks"
         ".ixia_packet_loss_health_check.async_everpaste_str",
         new_callable=AsyncMock,
         return_value="https://everpaste.test",
@@ -411,7 +416,7 @@ class TestIxiaPacketLossRun(unittest.IsolatedAsyncioTestCase):
         mock_everpaste.assert_not_awaited()
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.ixia_health_checks"
+        f"{_PACKAGE}.health_checks.ixia_health_checks"
         ".ixia_packet_loss_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
@@ -429,7 +434,7 @@ class TestIxiaPacketLossRun(unittest.IsolatedAsyncioTestCase):
         mock_sleep.assert_awaited_once_with(5)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.ixia_health_checks"
+        f"{_PACKAGE}.health_checks.ixia_health_checks"
         ".ixia_packet_loss_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )

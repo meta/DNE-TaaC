@@ -2,7 +2,9 @@
 
 # pyre-unsafe
 
+import importlib
 import json
+import os
 import typing as t
 import unittest
 
@@ -52,9 +54,15 @@ from taac.driver.config_modifiers import (
     POLICY_PROPAGATE_OUT,
     POLICY_PROPAGATE_OUT_DRAIN,
 )
-from neteng.test_infra.dne.taac.driver.oss_patchers import OssPatchApplier, PatcherError
 from pyre_extensions import none_throws
 
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+
+_oss_patchers = importlib.import_module(f"{_PACKAGE}.driver.oss_patchers")
+OssPatchApplier = _oss_patchers.OssPatchApplier
+PatcherError = _oss_patchers.PatcherError
 
 def _peer(peer_addr: str, peer_type: str | None = None) -> BgpPeer:
     return BgpPeer(local_addr="::1", peer_addr=peer_addr, type=peer_type)

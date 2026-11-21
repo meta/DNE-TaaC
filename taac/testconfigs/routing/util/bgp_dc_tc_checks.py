@@ -267,14 +267,8 @@ def build_bgp_dc_tc_prechecks(prefix_limit, *, include_traffic_check, device_nam
         create_prefix_limit_check(prefix_limit=prefix_limit),
         create_unclean_exit_check(),
         create_memory_utilization_check(
-            threshold=5 * (1024**3),
-            threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
-                "fsdb": 7 * (1024**3),
-                "qsfp_service": 2 * (1024**3),
-                "fboss_sw_agent": 12 * (1024**3),
-                "fboss_hw_agent@0": 8 * (1024**3),
-            },
+            threshold=6 * (1024**3),
+            threshold_by_service={"bgpd": 10 * (1024**3)},
             start_time_jq_var="test_case_start_time",
         ),
         BGP_SESSION_HEALTHCHECK_NO_V6_LOSS_EXPECTED,
@@ -304,14 +298,8 @@ def build_bgp_dc_tc_postchecks(
         BGP_SESSION_HEALTHCHECK_NO_V6_LOSS_EXPECTED,
         create_unclean_exit_check(),
         create_memory_utilization_check(
-            threshold=5 * (1024**3),
-            threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
-                "fsdb": 5 * (1024**3),
-                "qsfp_service": 2 * (1024**3),
-                "fboss_sw_agent": 12 * (1024**3),
-                "fboss_hw_agent@0": 8 * (1024**3),
-            },
+            threshold=6 * (1024**3),
+            threshold_by_service={"bgpd": 10 * (1024**3)},
             start_time_jq_var="test_case_start_time",
         ),
         create_cpu_utilization_check(

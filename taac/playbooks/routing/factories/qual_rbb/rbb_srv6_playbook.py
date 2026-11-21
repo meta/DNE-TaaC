@@ -45,7 +45,7 @@ from taac.steps.step_definitions import (
     create_stop_traffic_step,
     create_validation_step,
 )
-from neteng.test_infra.dne.taac.testconfigs.routing.util import bgp_rbb_constants as C
+from taac.testconfigs.routing.util import bgp_rbb_constants as C
 from taac.testconfigs.routing.util.bgp_rbb_scenario_profiles import (
     srv6_decap_counter_spec,
     srv6_encap_counter_spec,

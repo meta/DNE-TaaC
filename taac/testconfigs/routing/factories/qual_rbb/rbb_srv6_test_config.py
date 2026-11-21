@@ -30,7 +30,7 @@ from taac.playbooks.routing.factories.qual_rbb.rbb_srv6_playbook import (
     create_rbb_srv6_3_usids_playbook,
 )
 from taac.task_definitions import create_run_task
-from neteng.test_infra.dne.taac.testconfigs.routing.util import bgp_rbb_constants as C
+from taac.testconfigs.routing.util import bgp_rbb_constants as C
 from taac.testconfigs.routing.util.bgp_rbb_bootstrap_config import (
     validate_bootstrap_topology,
 )

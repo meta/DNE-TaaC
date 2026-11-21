@@ -777,6 +777,13 @@ class IxiaSetupError(Exception):
     pass
 
 
+# `verify_protocols` budget: the two sequential 300 s waits it replaces. Each
+# poll is a full CSV export of the Protocols Summary view, so polls are
+# deliberately infrequent.
+_PROTOCOLS_SUMMARY_TIMEOUT_SECONDS = 600
+_PROTOCOLS_SUMMARY_POLL_SECONDS = 15
+
+
 class IxiaOperationTimeoutError(TimeoutError):
     def __init__(self, message: str, *, deadline_expired: bool = False) -> None:
         super().__init__(message)
@@ -3448,6 +3455,90 @@ class Ixia:
             )
             time.sleep(poll_seconds)
 
+    # Which Protocols Summary rows a device group's stacks show up on. A group
+    # that is disabled may only excuse the rows it actually creates -- a v6-only
+    # group must not excuse notStarted sessions on the v4 rows.
+    _NOT_STARTED_ROW_BY_STACK: t.ClassVar[
+        t.Tuple[t.Tuple[str, str, str], ...]
+    ] = (
+        ("ip_addresses_config", "ipv4_addresses_config", "IPv4"),
+        ("ip_addresses_config", "ipv6_addresses_config", "IPv6"),
+        ("bgp_config", "bgp_v4_config", "BGP Peer"),
+        ("bgp_config", "bgp_v6_config", "BGP+ Peer"),
+    )
+
+    def _expected_not_started_by_protocol(self) -> t.Dict[str, int]:
+        """Sessions the CONFIG says never start, per Protocols Summary row.
+
+        A `DeviceGroupConfig(enable=False)` is created but not started, so its
+        `multiplier` sessions report as notStarted for the whole run.
+
+        Read from `self.ixia_config`, which is the same source the device groups
+        were built from -- no chassis query, so it costs nothing.
+
+        NOTE this is a SETUP-TIME expectation. `ixia_config` does not change
+        when a playbook enables a disabled group mid-test, so a call made after
+        that point would be too lenient by that group's multiplier. The only
+        caller is `start_and_verify_protocols`, which runs before any playbook.
+        """
+        expected: t.Dict[str, int] = {}
+        cfg = self.ixia_config
+        for port in cfg.port_configs if cfg else ():
+            for dg in port.device_group_configs:
+                if dg.enable:
+                    continue
+                # ASSUMES ONE SESSION PER DEVICE PER ROW. `multiplier` is the
+                # device count, and each device contributes one entry to each
+                # row its stacks create -- true for the singular
+                # `bgp_v{4,6}_config` / `ipv{4,6}_addresses_config` this type
+                # model allows. A group carrying more than one peer per device
+                # would UNDERCOUNT the allowance, and the check would then
+                # report a real-looking "N sessions not started" failure. If
+                # that becomes possible, count peers rather than devices.
+                sessions = dg.multiplier or 1
+                for parent, stack, protocol_type in self._NOT_STARTED_ROW_BY_STACK:
+                    container = getattr(dg, parent)
+                    if container is not None and getattr(container, stack) is not None:
+                        expected[protocol_type] = (
+                            expected.get(protocol_type, 0) + sessions
+                        )
+        return expected
+
+    @staticmethod
+    def _stat_int(value: t.Any) -> int:
+        """Stat-view cells arrive as CSV strings, and may be blank."""
+        try:
+            return int(str(value).strip() or 0)
+        except ValueError:
+            return 0
+
+    @classmethod
+    def _protocols_summary_failures(
+        cls,
+        rows: t.Iterable[t.Any],
+        expected_not_started: t.Mapping[str, int],
+    ) -> t.List[str]:
+        """Every way a Protocols Summary snapshot disagrees with the config.
+
+        Any protocol type the config does not name is expected fully up. Rows
+        are reported individually so a failure says WHICH protocol is wrong
+        rather than "condition not met".
+        """
+        failures: t.List[str] = []
+        for row in rows:
+            protocol_type = row["Protocol Type"]
+            allowed = expected_not_started.get(protocol_type, 0)
+            not_started = cls._stat_int(row["Sessions Not Started"])
+            down = cls._stat_int(row["Sessions Down"])
+            if not_started > allowed:
+                failures.append(
+                    f"{protocol_type}: {not_started} sessions not started, "
+                    f"config expects at most {allowed}"
+                )
+            if down:
+                failures.append(f"{protocol_type}: {down} sessions down, expected 0")
+        return failures
+
     def verify_protocols(self) -> None:
         """API to verify the status of the protocols in the topology"""
         if self.skip_ixia_protocol_verification:
@@ -3459,21 +3550,43 @@ class Ixia:
             UhdStatViewAssistant if self.is_uhd_chassis else IxnStatViewAssistant
         )
 
-        # `CheckCondition` polls `self.Rows` in a loop until the condition holds
-        # or `Timeout` expires, and every `.Rows` read is a chassis CSV snapshot.
-        # Two 300s conditions therefore make this the heaviest snapshot user in
-        # the class, so it has to hold the session snapshot lock like every other
-        # stat-view reader. Nesting is safe — `_snapshot_lock` is an `RLock`.
+        # `Rows` takes a full CSV export on EVERY access (slow at scale), so the
+        # snapshot count is the whole cost of this check.
+        # On a healthy setup the expectation holds on the first one. Deliberately
+        # not a `CheckCondition` loop: that snapshots per poll, and its Timeout
+        # bounds when polling stops STARTING, not the total duration.
+        #
+        # Holds the session snapshot lock like every other stat-view reader:
+        # every `.Rows` read is a chassis CSV snapshot, so this is one of the
+        # heaviest snapshot users in the class. Nesting is safe --
+        # `_snapshot_lock` is an RLock.
         with self.stat_view_snapshot():
             protocols_summary = StatViewAssistant(self.ixnetwork, "Protocols Summary")
-
-            protocols_summary.CheckCondition(
-                "Sessions Not Started", StatViewAssistant.EQUAL, 0, Timeout=300
+            expected_not_started = self._expected_not_started_by_protocol()
+            self.logger.info(
+                f"[GLOBAL] Verifying protocols; sessions the config expects "
+                f"never to start: {expected_not_started or 'none'}"
             )
 
-            protocols_summary.CheckCondition(
-                "Sessions Down", StatViewAssistant.EQUAL, 0, Timeout=300
-            )
+            # Also bounds how long the snapshot lock is held.
+            budget = _PROTOCOLS_SUMMARY_TIMEOUT_SECONDS
+            deadline = time.monotonic() + budget
+            while True:
+                failures = self._protocols_summary_failures(
+                    protocols_summary.Rows, expected_not_started
+                )
+                if not failures:
+                    break
+                if time.monotonic() >= deadline:
+                    raise IxiaOperationTimeoutError(
+                        "IXIA protocols did not reach the state the config "
+                        f"expects within {budget}s: " + "; ".join(failures),
+                        deadline_expired=True,
+                    )
+                self.logger.info(
+                    f"[GLOBAL] Waiting on protocols: {'; '.join(failures)}"
+                )
+                time.sleep(_PROTOCOLS_SUMMARY_POLL_SECONDS)
 
         self.logger.info(
             "[GLOBAL] Successfully verified the operational status of all "

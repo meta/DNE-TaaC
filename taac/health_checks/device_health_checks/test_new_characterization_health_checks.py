@@ -17,6 +17,7 @@ from taac.health_checks.device_health_checks.rss_delta_health_check import (
 )
 from taac.health_checks.healthcheck_definitions import (
     create_cpu_percentile_observe_check,
+    create_rss_delta_observe_check,
 )
 from taac.health_check.health_check import types as hc_types
 
@@ -139,6 +140,90 @@ class RssDeltaHealthCheckRunTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
         self.assertIn("exceeds threshold", result.message or "")
+
+    async def test_restarted_fails_with_daemon_name(self) -> None:
+        result = await self._run(
+            {"summary": _summary(restarted=True), "daemon_name": "FibAgentBgp"}
+        )
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("FibAgentBgp restarted mid-window", result.message or "")
+
+    async def test_expected_restart_is_gated_not_failed(self) -> None:
+        params = {
+            "summary": _summary(restarted=True),
+            "daemon_name": "FibAgentBgp",
+            "restart_expected": True,
+        }
+        within = await self._run({**params, "max_growth_pct": 15.0})
+        over = await self._run({**params, "max_growth_pct": 5.0})
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, within.status)
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, over.status)
+        self.assertEqual(
+            "FibAgentBgp: baseline=100MiB current=110MiB peak=112MiB growth=10.0% "
+            "exceeds threshold 5.0%",
+            over.message,
+        )
+
+    async def test_smaller_after_restart_passes(self) -> None:
+        summary = {
+            **_summary(restarted=True),
+            "current_bytes": 83 * _MIB,
+            "growth_pct": -17.0,
+        }
+        result = await self._run(
+            {"summary": summary, "restart_expected": True, "max_growth_pct": 10.0}
+        )
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+
+    async def test_summary_without_peak_omits_it(self) -> None:
+        summary = _summary()
+        del summary["peak_bytes"]
+        result = await self._run({"summary": summary})
+        self.assertEqual(
+            "baseline=100MiB current=110MiB growth=10.0% (observe-only)",
+            result.message,
+        )
+
+    async def test_unsettled_memory_is_noted(self) -> None:
+        result = await self._run(
+            {
+                "summary": {**_summary(), "settled": False},
+                "max_growth_pct": 15.0,
+            }
+        )
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn(
+            "[memory did not settle within the settle limit]", result.message or ""
+        )
+
+
+class RssDeltaFactoryTest(unittest.TestCase):
+    def test_restart_params_reach_the_check(self) -> None:
+        check = create_rss_delta_observe_check(
+            summary_jq_var="s1_restart1_fibagentbgp_rss_summary",
+            max_growth_pct=10.0,
+            daemon_name="FibAgentBgp",
+            restart_expected=True,
+        )
+        params = check.check_params
+        assert params is not None
+        self.assertEqual(
+            {
+                "max_growth_pct": 10.0,
+                "daemon_name": "FibAgentBgp",
+                "restart_expected": True,
+            },
+            json.loads(params.json_params or "{}"),
+        )
+        self.assertEqual(
+            {"summary": ".s1_restart1_fibagentbgp_rss_summary"},
+            dict(params.jq_params or {}),
+        )
+
+    def test_defaults_keep_the_payload_unchanged(self) -> None:
+        params = create_rss_delta_observe_check().check_params
+        assert params is not None
+        self.assertIsNone(params.json_params)
 
 
 class CpuPercentileHealthCheckRunTest(unittest.IsolatedAsyncioTestCase):

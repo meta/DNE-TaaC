@@ -5350,6 +5350,53 @@ def create_fibagent_bgp_ready_step(
     return create_custom_step(params_dict=params, description=description)
 
 
+def create_daemon_identity_step(
+    device_name: str,
+    action: str,
+    record_jq_var: str,
+    restarted_daemons: t.Sequence[str],
+    unchanged_daemons: t.Sequence[str] = (),
+    rss_summary_jq_vars: t.Mapping[str, str] | None = None,
+    description: str | None = None,
+) -> Step:
+    """Record or verify EOS daemon PIDs and memory around a planned restart.
+
+    ``record`` (before the restart) stores the PID of every daemon and the
+    settled memory of ``restarted_daemons`` in ``record_jq_var``. ``verify``
+    (after recovery) fails unless each restarted daemon has a new PID and each
+    of ``unchanged_daemons`` kept its PID, then stores a before/after memory
+    summary per restarted daemon in ``rss_summary_jq_vars`` for RSS_DELTA_CHECK.
+    """
+    if action not in ("record", "verify"):
+        raise ValueError(f"action must be 'record' or 'verify', got {action!r}")
+    summary_daemons = set(rss_summary_jq_vars or {})
+    if action == "verify" and summary_daemons != set(restarted_daemons):
+        raise ValueError("verify needs a summary jq var per restarted daemon")
+    params: t.Dict[str, t.Any] = {
+        "custom_step_name": "verify_daemon_identity",
+        "hostname": device_name,
+        "action": action,
+        "record_jq_var": record_jq_var,
+        "restarted_daemons": list(restarted_daemons),
+        "unchanged_daemons": list(unchanged_daemons),
+    }
+    if action == "verify":
+        params["rss_summary_jq_vars"] = dict(rss_summary_jq_vars or {})
+    if description is None:
+        restarted = ", ".join(restarted_daemons)
+        kept = (
+            f"; {', '.join(unchanged_daemons)} keeps its PID"
+            if unchanged_daemons
+            else ""
+        )
+        description = (
+            f"Record PIDs and {restarted} memory"
+            if action == "record"
+            else f"Verify {restarted} restarted{kept}; read {restarted} memory"
+        )
+    return create_custom_step(params_dict=params, description=description)
+
+
 def create_thread_cpu_monitoring_step(
     device_name: str,
     duration_minutes: int,

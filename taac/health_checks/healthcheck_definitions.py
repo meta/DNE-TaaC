@@ -2646,6 +2646,8 @@ def create_rss_delta_observe_check(
     summary_jq_var: str = RSS_SUMMARY_JQ_VAR,
     max_growth_pct: t.Optional[float] = None,
     check_scope: t.Optional["hc_types.Scope"] = None,
+    daemon_name: t.Optional[str] = None,
+    restart_expected: bool = False,
 ) -> PointInTimeHealthCheck:
     """RSS_DELTA_CHECK — report the bgpcpp RSS delta bracket into the results table.
 
@@ -2665,10 +2667,17 @@ def create_rss_delta_observe_check(
         summary_jq_var: jq var holding the RSS summary dict from STOP.
         max_growth_pct: growth gate threshold. None leaves growth ungated; it
             does not make the check unable to fail.
+        daemon_name: daemon named in the messages (default "bgpcpp").
+        restart_expected: compare a summary that spans a planned restart
+            instead of failing it.
     """
     json_payload: t.Dict[str, t.Any] = {}
     if max_growth_pct is not None:
         json_payload["max_growth_pct"] = max_growth_pct
+    if daemon_name is not None:
+        json_payload["daemon_name"] = daemon_name
+    if restart_expected:
+        json_payload["restart_expected"] = True
     return PointInTimeHealthCheck(
         name=hc_types.CheckName.RSS_DELTA_CHECK,
         check_params=Params(

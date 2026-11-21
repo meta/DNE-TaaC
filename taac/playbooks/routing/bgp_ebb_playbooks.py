@@ -69,6 +69,7 @@ from taac.constants import (
 )
 from taac.health_checks.healthcheck_definitions import (
     create_bgp_session_snapshot_check,
+    create_rss_delta_observe_check,
 )
 from taac.playbooks.playbook_definitions import (
     build_case2_playbook,
@@ -105,6 +106,7 @@ from taac.steps.step_definitions import (
     create_bgp_instability_setup_steps,
     create_bgp_restart_setup_steps,
     create_custom_step,
+    create_daemon_identity_step,
     create_fibagent_bgp_ready_step,
     create_igp_metric_churn_step,
     create_longevity_step,
@@ -303,6 +305,7 @@ def _optional_pnh_route_starts(
 # The playbook setup restarts BGP++ after test_case_start_time, so every check
 # in the matrix must accept both daemons, not only those restarted so far.
 _RESTART_MATRIX_EXPECTED_RESTARTS: tuple[str, ...] = ("Bgpcpp", "FibAgentBgp")
+_RESTART_MATRIX_MAX_RSS_GROWTH_PCT = 10.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -375,18 +378,66 @@ def _restart_matrix_scenarios(repeat_count: int) -> tuple[_RestartScenario, ...]
     )
 
 
+def _verified_restart_block(
+    *,
+    device_name: str,
+    stage_id: str,
+    block: int,
+    restarted: t.Sequence[str],
+    restart_steps: t.List[Step],
+) -> t.Tuple[t.List[Step], t.List[PointInTimeHealthCheck]]:
+    """Wrap restart steps with daemon PID/memory record and verify steps.
+
+    Returns the steps and one RSS_DELTA_CHECK per restarted daemon for the
+    stage-end validation, comparing its memory after recovery with before.
+    Check ids get the stage prefix when the stage-end validation is built.
+    """
+    unchanged = [d for d in _RESTART_MATRIX_EXPECTED_RESTARTS if d not in restarted]
+    block_id = f"{stage_id}_restart{block}"
+    record_jq_var = f"{block_id}_daemon_identity"
+    summary_jq_vars = {d: f"{block_id}_{d.lower()}_rss_summary" for d in restarted}
+    steps = [
+        create_daemon_identity_step(
+            device_name, "record", record_jq_var, restarted, unchanged
+        ),
+        *restart_steps,
+        create_daemon_identity_step(
+            device_name,
+            "verify",
+            record_jq_var,
+            restarted,
+            unchanged,
+            rss_summary_jq_vars=summary_jq_vars,
+        ),
+    ]
+    memory_checks = [
+        create_rss_delta_observe_check(
+            summary_jq_var=summary_jq_var,
+            max_growth_pct=_RESTART_MATRIX_MAX_RSS_GROWTH_PCT,
+            daemon_name=daemon,
+            restart_expected=True,
+        )(check_id=f"restart{block}_{daemon.lower()}_rss_delta_check")
+        for daemon, summary_jq_var in summary_jq_vars.items()
+    ]
+    return steps, memory_checks
+
+
 def _scenario_restart_steps(
     scenario: _RestartScenario,
     *,
     device_name: str,
     expected_established_sessions: int,
     parent_prefixes_to_ignore: t.List[str],
-) -> t.List[Step]:
-    last = len(scenario.daemons) - 1
-    steps: t.List[Step] = []
-    for index, daemon_name in enumerate(scenario.daemons):
-        wait_for_recovery = scenario.recover_between or index == last
-        steps.extend(
+) -> t.Tuple[t.List[Step], t.List[PointInTimeHealthCheck]]:
+    """Restart steps of one scenario and their stage-end memory checks.
+
+    With ``recover_between`` every restart is its own record/restart/verify
+    block. Without it the back-to-back restarts share one block, so nothing is
+    added between them.
+    """
+
+    def restart(daemon_name: str, wait_for_recovery: bool) -> t.List[Step]:
+        return list(
             create_bgp_restart_test_stage(
                 device_name=device_name,
                 daemon_name=daemon_name,
@@ -397,14 +448,35 @@ def _scenario_restart_steps(
                 parent_prefixes_to_ignore=parent_prefixes_to_ignore,
             ).steps
         )
+
+    if scenario.recover_between:
+        steps: t.List[Step] = []
+        memory_checks: t.List[PointInTimeHealthCheck] = []
+        for index, daemon_name in enumerate(scenario.daemons, start=1):
+            block_steps, block_checks = _verified_restart_block(
+                device_name=device_name,
+                stage_id=scenario.stage_id,
+                block=index,
+                restarted=[daemon_name],
+                restart_steps=restart(daemon_name, wait_for_recovery=True),
+            )
+            steps.extend(block_steps)
+            memory_checks.extend(block_checks)
+        return steps, memory_checks
+
+    last = len(scenario.daemons) - 1
+    restart_steps = [
+        step
+        for index, daemon_name in enumerate(scenario.daemons)
+        for step in restart(daemon_name, wait_for_recovery=index == last)
+    ]
     # The last restart's lifecycle convergence step already waits for BGP++;
     # a FibAgentBgp restarted earlier without a wait still needs its own.
     if (
-        not scenario.recover_between
-        and "FibAgentBgp" in scenario.daemons[:last]
+        "FibAgentBgp" in scenario.daemons[:last]
         and scenario.daemons[last] != "FibAgentBgp"
     ):
-        steps.append(
+        restart_steps.append(
             create_fibagent_bgp_ready_step(
                 device_name=device_name,
                 convergence_soft_threshold_seconds=600,
@@ -412,7 +484,13 @@ def _scenario_restart_steps(
                 convergence_poll_interval_seconds=5,
             )
         )
-    return steps
+    return _verified_restart_block(
+        device_name=device_name,
+        stage_id=scenario.stage_id,
+        block=1,
+        restarted=list(dict.fromkeys(scenario.daemons)),
+        restart_steps=restart_steps,
+    )
 
 
 def _restart_matrix_stages(
@@ -428,7 +506,10 @@ def _restart_matrix_stages(
     Each stage restarts its daemons, waiting for each to recover, then runs the
     EBB-01 postchecks. Its log checks scan only that stage (the first also
     covers setup and prechecks), and its snapshot checks compare the stage end
-    with the playbook start.
+    with the playbook start. Every restart must replace the daemon's process,
+    leave the other daemon's process alone, and bring the restarted daemon's
+    memory back within ``_RESTART_MATRIX_MAX_RSS_GROWTH_PCT`` of its memory
+    before the restart.
     """
     stages: t.List[Stage] = []
     snapshot_checks: t.List[SnapshotHealthCheck] = []
@@ -448,7 +529,7 @@ def _restart_matrix_stages(
                 rss_delta=None,
             ),
         )
-        restart_steps = _scenario_restart_steps(
+        restart_steps, memory_checks = _scenario_restart_steps(
             scenario,
             device_name=device_name,
             expected_established_sessions=expected_established_sessions,
@@ -471,7 +552,7 @@ def _restart_matrix_stages(
                                     f"{check.check_id or check.name.name.lower()}"
                                 )
                             )
-                            for check in stage_checks.postchecks
+                            for check in [*stage_checks.postchecks, *memory_checks]
                         ],
                         description=f"{stage_id}: post-restart checks",
                         start_traffic=False,

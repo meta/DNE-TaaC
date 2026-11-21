@@ -34,16 +34,29 @@ _STAGE_IDS = [
     "s6_bgpcpp_then_fibagent_bgp_restart",
 ]
 _FIBAGENT_BGP_RESTART = [
+    "identity:record",
     "FibAgentBgp:disable",
     "FibAgentBgp:enable",
     "test_bgp_lifecycle_convergence",
     "wait_for_fibagent_bgp_ready",
+    "identity:verify",
 ]
 _BGPCPP_RESTART = [
+    "identity:record",
     "Bgpcpp:disable",
     "Bgpcpp:enable",
     "test_bgp_lifecycle_convergence",
+    "identity:verify",
 ]
+# (restarted, kept) daemons of each record/verify block, in stage order.
+_IDENTITY_BLOCKS = {
+    "s1_fibagent_bgp_restart": [(["FibAgentBgp"], ["Bgpcpp"])],
+    "s2_fibagent_bgp_repeated_restart": [(["FibAgentBgp"], ["Bgpcpp"])] * 3,
+    "s3_bgpcpp_restart": [(["Bgpcpp"], ["FibAgentBgp"])],
+    "s4_bgpcpp_repeated_restart": [(["Bgpcpp"], ["FibAgentBgp"])] * 3,
+    "s5_fibagent_bgp_then_bgpcpp_restart": [(["FibAgentBgp", "Bgpcpp"], [])],
+    "s6_bgpcpp_then_fibagent_bgp_restart": [(["Bgpcpp", "FibAgentBgp"], [])],
+}
 
 
 def _playbook(config: TestConfig) -> Playbook:
@@ -70,17 +83,28 @@ def _daemon_actions(stage: Stage) -> list[tuple[str, str]]:
 
 
 def _restart_events(stage: Stage) -> list[str]:
-    """Daemon actions and recovery waits in step order."""
+    """Daemon actions, recovery waits and PID/memory checks in step order."""
     events = []
     for step in stage.steps:
         actions = _daemon_actions(Stage(steps=[step]))
         if actions:
             events.extend(f"{daemon}:{action}" for daemon, action in actions)
             continue
-        name = _json_params(step).get("custom_step_name")
+        params = _json_params(step)
+        name = params.get("custom_step_name")
         if name in ("test_bgp_lifecycle_convergence", "wait_for_fibagent_bgp_ready"):
             events.append(name)
+        elif name == "verify_daemon_identity":
+            events.append(f"identity:{params['action']}")
     return events
+
+
+def _identity_steps(stage: Stage) -> list[dict[str, t.Any]]:
+    return [
+        params
+        for params in map(_json_params, stage.steps)
+        if params.get("custom_step_name") == "verify_daemon_identity"
+    ]
 
 
 def _stage_checks(stage: Stage) -> list[PointInTimeHealthCheck]:
@@ -134,20 +158,24 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
                 "s3_bgpcpp_restart": _BGPCPP_RESTART,
                 "s4_bgpcpp_repeated_restart": _BGPCPP_RESTART * 3,
                 "s5_fibagent_bgp_then_bgpcpp_restart": [
+                    "identity:record",
                     "FibAgentBgp:disable",
                     "FibAgentBgp:enable",
                     "Bgpcpp:disable",
                     "Bgpcpp:enable",
                     "test_bgp_lifecycle_convergence",
                     "wait_for_fibagent_bgp_ready",
+                    "identity:verify",
                 ],
                 "s6_bgpcpp_then_fibagent_bgp_restart": [
+                    "identity:record",
                     "Bgpcpp:disable",
                     "Bgpcpp:enable",
                     "FibAgentBgp:disable",
                     "FibAgentBgp:enable",
                     "test_bgp_lifecycle_convergence",
                     "wait_for_fibagent_bgp_ready",
+                    "identity:verify",
                 ],
             },
             {
@@ -221,10 +249,16 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
         playbook_check_names = sorted(
             check.name for check in self.playbook.postchecks or []
         )
+        self.assertNotIn(hc_types.CheckName.RSS_DELTA_CHECK, playbook_check_names)
         for stage_id in _STAGE_IDS:
             checks = _stage_checks(self.stages[stage_id])
             self.assertEqual(
-                playbook_check_names, sorted(check.name for check in checks)
+                playbook_check_names,
+                sorted(
+                    check.name
+                    for check in checks
+                    if check.name != hc_types.CheckName.RSS_DELTA_CHECK
+                ),
             )
             self.assertIn(
                 hc_types.CheckName.BGP_RIB_FIB_CONSISTENCY_CHECK,
@@ -236,6 +270,52 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
                     for check in checks
                 )
             )
+
+    def test_each_restart_verifies_pids_then_gates_memory(self) -> None:
+        for stage_id, blocks in _IDENTITY_BLOCKS.items():
+            identity = _identity_steps(self.stages[stage_id])
+            self.assertEqual(
+                ["record", "verify"] * len(blocks),
+                [params["action"] for params in identity],
+                stage_id,
+            )
+            expected_checks = {}
+            for index, (restarted, kept) in enumerate(blocks):
+                record, verify = identity[2 * index : 2 * index + 2]
+                for params in (record, verify):
+                    self.assertEqual(restarted, params["restarted_daemons"])
+                    self.assertEqual(kept, params["unchanged_daemons"])
+                self.assertEqual(record["record_jq_var"], verify["record_jq_var"])
+                for daemon in restarted:
+                    check_id = (
+                        f"{stage_id}_restart{index + 1}_{daemon.lower()}"
+                        "_rss_delta_check"
+                    )
+                    expected_checks[check_id] = (
+                        daemon,
+                        verify["rss_summary_jq_vars"][daemon],
+                    )
+            rss_checks: dict[str, PointInTimeHealthCheck] = {}
+            for check in _stage_checks(self.stages[stage_id]):
+                if check.name == hc_types.CheckName.RSS_DELTA_CHECK:
+                    assert check.check_id is not None
+                    rss_checks[check.check_id] = check
+            self.assertEqual(sorted(expected_checks), sorted(rss_checks), stage_id)
+            for check_id, (daemon, summary_var) in expected_checks.items():
+                params = rss_checks[check_id].check_params
+                assert params is not None
+                self.assertEqual(
+                    {
+                        "max_growth_pct": 10.0,
+                        "daemon_name": daemon,
+                        "restart_expected": True,
+                    },
+                    json.loads(params.json_params or "{}"),
+                )
+                self.assertEqual(
+                    {"summary": f".{summary_var}"},
+                    dict(_jq_params(rss_checks[check_id])),
+                )
 
     def test_log_checks_scan_only_their_stage(self) -> None:
         for index, stage_id in enumerate(_STAGE_IDS):

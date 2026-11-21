@@ -14,6 +14,11 @@ Observe-only by default: with no ``max_growth_pct`` it always PASSes and puts th
 baseline/current/peak/growth in the message. Supply ``max_growth_pct`` to gate on
 steady-state growth over the in-run baseline. A restart mid-window (flagged by the
 STOP step) or a missing summary FAILs loudly -- never a silent pass.
+
+``daemon_name`` names the daemon in the messages. ``restart_expected`` reports a
+summary that spans a planned restart (before = old process, after = new one)
+instead of failing it. A summary with ``settled`` False is reported with a note
+that the memory never stopped moving within the settle limit.
 """
 
 import typing as t
@@ -38,6 +43,26 @@ class RssDeltaHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn])
     def _mib(self, summary: t.Dict[str, t.Any], key: str) -> float:
         return float(summary.get(key, 0)) / _BYTES_PER_MIB
 
+    def _detail(
+        self,
+        summary: t.Dict[str, t.Any],
+        growth_pct: float,
+        daemon_name: t.Optional[str],
+    ) -> str:
+        parts = [
+            f"baseline={self._mib(summary, 'baseline_bytes'):.0f}MiB",
+            f"current={self._mib(summary, 'current_bytes'):.0f}MiB",
+        ]
+        if "peak_bytes" in summary:
+            parts.append(f"peak={self._mib(summary, 'peak_bytes'):.0f}MiB")
+        parts.append(f"growth={growth_pct:.1f}%")
+        detail = " ".join(parts)
+        if daemon_name:
+            detail = f"{daemon_name}: {detail}"
+        if summary.get("settled") is False:
+            detail += " [memory did not settle within the settle limit]"
+        return detail
+
     async def _run(
         self,
         obj: TestDevice,
@@ -54,13 +79,14 @@ class RssDeltaHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn])
                 ),
             )
         self.add_data_to_log(summary)
+        daemon_name = check_params.get("daemon_name")
 
-        if summary.get("restarted"):
+        if summary.get("restarted") and not check_params.get("restart_expected"):
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.FAIL,
                 message=(
-                    f"RSS delta on {obj.name}: bgpcpp restarted mid-window; the "
-                    f"steady-state comparison is invalid."
+                    f"RSS delta on {obj.name}: {daemon_name or 'bgpcpp'} restarted "
+                    f"mid-window; the steady-state comparison is invalid."
                 ),
             )
 
@@ -70,12 +96,7 @@ class RssDeltaHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn])
             # precision, stashed in the summary) directly -- no threshold
             # evaluation, and no re-derivation from int-truncated byte counts.
             growth_pct = float(summary.get("growth_pct", 0.0))
-            detail = (
-                f"baseline={self._mib(summary, 'baseline_bytes'):.0f}MiB "
-                f"current={self._mib(summary, 'current_bytes'):.0f}MiB "
-                f"peak={self._mib(summary, 'peak_bytes'):.0f}MiB "
-                f"growth={growth_pct:.1f}%"
-            )
+            detail = self._detail(summary, growth_pct, daemon_name)
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.PASS,
                 message=f"{detail} (observe-only)",
@@ -86,12 +107,7 @@ class RssDeltaHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn])
             current_rss_bytes=int(summary["current_bytes"]),
             max_growth_pct=float(max_growth_pct),
         )
-        detail = (
-            f"baseline={self._mib(summary, 'baseline_bytes'):.0f}MiB "
-            f"current={self._mib(summary, 'current_bytes'):.0f}MiB "
-            f"peak={self._mib(summary, 'peak_bytes'):.0f}MiB "
-            f"growth={result.growth_pct:.1f}%"
-        )
+        detail = self._detail(summary, result.growth_pct, daemon_name)
         return hc_types.HealthCheckResult(
             status=(
                 hc_types.HealthCheckStatus.PASS

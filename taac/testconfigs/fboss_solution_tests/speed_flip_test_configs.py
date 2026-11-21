@@ -42,6 +42,7 @@ from taac.steps.step_definitions import (
     create_service_interruption_step,
     create_system_reboot_step,
 )
+from taac.utils.oss_taac_constants import TAAC_OSS
 from taac.task_definitions import (
     create_configure_parallel_bgp_peers_task,
     create_coop_apply_patchers_task,
@@ -307,6 +308,7 @@ def build_speed_flip_subsume_churn_playbook(
          (C,D,E,F -> 800G). Validate primaries at 800G.
       3. Churn x churn_iterations: remove p1, remove p2, reapply p1, reapply p2,
          remove p2 (each +warmboot, each followed by a primary-speed validation).
+         A primary expects target_speed_gbps only while a patcher covers its cage.
 
     Asserts: exactly 6 circuits; exactly 3 distinct a_end cages; exactly 3
     distinct z_end cages. The all-at-400G check is enforced at runtime (step 0).
@@ -314,6 +316,12 @@ def build_speed_flip_subsume_churn_playbook(
     NOTE (review): create_fpf_set_interface_admin_step downs F on the DUT (a_end)
     only; the z_end side of F is not admin-downed by this builder.
     """
+    if churn_iterations < 1:
+        # With 0 cycles, churn_patcher_2 stays registered at the end.
+        raise ValueError(
+            f"SPD_041 subsume churn requires churn_iterations >= 1; "
+            f"got {churn_iterations}."
+        )
     if len(circuit_info) != 6:
         raise ValueError(
             f"SPD_041 subsume churn requires exactly 6 circuits "
@@ -353,12 +361,34 @@ def build_speed_flip_subsume_churn_playbook(
         c for c in ordered_cages[2] if _subport(c.a_end_interface_name) == "5"
     )
 
-    primary_hc = _speed_flip_hc_params(
-        _circuit_endpoints(primary_circuits), target_speed_gbps
-    )
+    covered_cages = {
+        patcher1_name: {_cage_base(c.a_end_interface_name) for c in patcher1_circuits},
+        patcher2_name: {_cage_base(c.a_end_interface_name) for c in patcher2_circuits},
+    }
+
+    def _primary_hc(registered: t.FrozenSet[str]) -> t.Dict[str, t.Any]:
+        flipped = set().union(*(covered_cages[name] for name in registered))
+        params: t.Dict[str, t.Any] = {}
+        for c in primary_circuits:
+            speed = (
+                target_speed_gbps
+                if _cage_base(c.a_end_interface_name) in flipped
+                else baseline_speed_gbps
+            )
+            for device, port in (
+                (c.a_end_device_name, c.a_end_interface_name),
+                (c.z_end_device_name, c.z_end_interface_name),
+            ):
+                params.setdefault(device, {"interfaces": []})["interfaces"].append(
+                    {"interface_name": port, "expected_speed": speed}
+                )
+        return params
 
     def _patcher_step(
-        patcher_name: str, circuits: t.List[Circuit], register: bool
+        patcher_name: str,
+        circuits: t.List[Circuit],
+        register: bool,
+        registered: t.FrozenSet[str],
     ) -> Stage:
         # target_port_cage_count = number of a_end cages this patcher covers, so
         # the runtime cage gate passes for this intentionally-3/2-cage test.
@@ -373,7 +403,7 @@ def build_speed_flip_subsume_churn_playbook(
                     speed_in_gbps=target_speed_gbps,
                     target_port_cage_count=cage_count,
                 ),
-                get_validation_step(primary_hc),
+                get_validation_step(_primary_hc(registered)),
             ]
         )
 
@@ -392,28 +422,69 @@ def build_speed_flip_subsume_churn_playbook(
         )
     )
 
-    # 1. churn_patcher_1 (A-F) -> 800G; B,D subsumed (were up).
-    stages.append(_patcher_step(patcher1_name, patcher1_circuits, register=True))
+    patcher_circuits = {
+        patcher1_name: patcher1_circuits,
+        patcher2_name: patcher2_circuits,
+    }
+    churn = [
+        (patcher1_name, False),
+        (patcher2_name, False),
+        (patcher1_name, True),
+        (patcher2_name, True),
+        (patcher2_name, False),
+    ]
+    run_order = [(patcher1_name, True), (patcher2_name, True)]
+    run_order += churn * churn_iterations
+    registered: t.FrozenSet[str] = frozenset()
+    for index, (patcher_name, register) in enumerate(run_order):
+        if index == 1:
+            # 2. Force F down (DUT a_end), then churn_patcher_2 (C,D,E,F) -> 800G.
+            stages.append(
+                create_steps_stage(
+                    steps=[
+                        create_fpf_set_interface_admin_step(
+                            interfaces=[f_circuit.a_end_interface_name],
+                            enable=False,
+                            skip_missing=TAAC_OSS,
+                        ),
+                    ]
+                )
+            )
+        if register:
+            registered = registered | {patcher_name}
+        else:
+            registered = registered - {patcher_name}
+        stages.append(
+            _patcher_step(
+                patcher_name, patcher_circuits[patcher_name], register, registered
+            )
+        )
 
-    # 2. Force F down (DUT a_end), then churn_patcher_2 (C,D,E,F) -> 800G.
+    # Restore: remove p1 and bring F up, so the start-versus-end speed check passes.
     stages.append(
         create_steps_stage(
             steps=[
+                create_register_speed_flip_patcher_step(
+                    register_patcher=False,
+                    port_state_change=False,
+                    patcher_name=patcher1_name,
+                    endpoints=_circuit_endpoints(patcher1_circuits),
+                    speed_in_gbps=target_speed_gbps,
+                    target_port_cage_count=len(ordered_cages),
+                ),
                 create_fpf_set_interface_admin_step(
-                    interfaces=[f_circuit.a_end_interface_name], enable=False
+                    interfaces=[f_circuit.a_end_interface_name],
+                    enable=True,
+                    skip_missing=TAAC_OSS,
+                ),
+                get_validation_step(
+                    _speed_flip_hc_params(
+                        _circuit_endpoints(circuit_info), baseline_speed_gbps
+                    )
                 ),
             ]
         )
     )
-    stages.append(_patcher_step(patcher2_name, patcher2_circuits, register=True))
-
-    # 3. Churn: remove p1, remove p2, reapply p1, reapply p2, remove p2.
-    for _ in range(churn_iterations):
-        stages.append(_patcher_step(patcher1_name, patcher1_circuits, register=False))
-        stages.append(_patcher_step(patcher2_name, patcher2_circuits, register=False))
-        stages.append(_patcher_step(patcher1_name, patcher1_circuits, register=True))
-        stages.append(_patcher_step(patcher2_name, patcher2_circuits, register=True))
-        stages.append(_patcher_step(patcher2_name, patcher2_circuits, register=False))
 
     return create_speed_flip_playbook(
         name=playbook_name,

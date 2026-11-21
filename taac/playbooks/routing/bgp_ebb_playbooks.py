@@ -105,6 +105,7 @@ from taac.steps.step_definitions import (
     create_bgp_instability_setup_steps,
     create_bgp_restart_setup_steps,
     create_custom_step,
+    create_fibagent_bgp_ready_step,
     create_igp_metric_churn_step,
     create_longevity_step,
     create_openr_route_action_step,
@@ -159,6 +160,7 @@ from taac.test_as_a_config.types import (
     PointInTimeHealthCheck,
     SnapshotHealthCheck,
     Stage,
+    Step,
     ValidationStage,
 )
 
@@ -308,13 +310,16 @@ class _RestartScenario:
     """One CICD-EBB-01 restart-matrix stage.
 
     ``stage_id`` is fixed because the stage's snapshot checks close at
-    ``stage.<id>.end``. Each daemon in ``daemons`` is restarted in order, and
-    the next restart starts only after the previous daemon has recovered.
+    ``stage.<id>.end``. Each daemon in ``daemons`` is restarted in order. With
+    ``recover_between`` the next restart starts only after the previous daemon
+    has recovered; without it the next restart follows the previous enable
+    with no gap, and every restarted daemon is waited for at the end.
     """
 
     stage_id: str
     description: str
     daemons: tuple[str, ...]
+    recover_between: bool = True
 
 
 def _restart_matrix_scenarios(repeat_count: int) -> tuple[_RestartScenario, ...]:
@@ -349,7 +354,65 @@ def _restart_matrix_scenarios(repeat_count: int) -> tuple[_RestartScenario, ...]
             ),
             daemons=("Bgpcpp",) * repeat_count,
         ),
+        # TODO: add a mid-convergence gap for S5/S6, starting the second
+        # restart once BGP sessions are back up but before end-of-RIB.
+        _RestartScenario(
+            stage_id="s5_fibagent_bgp_then_bgpcpp_restart",
+            description=(
+                "S5: restart FibAgentBgp, then BGP++ with no gap, and verify recovery"
+            ),
+            daemons=("FibAgentBgp", "Bgpcpp"),
+            recover_between=False,
+        ),
+        _RestartScenario(
+            stage_id="s6_bgpcpp_then_fibagent_bgp_restart",
+            description=(
+                "S6: restart BGP++, then FibAgentBgp with no gap, and verify recovery"
+            ),
+            daemons=("Bgpcpp", "FibAgentBgp"),
+            recover_between=False,
+        ),
     )
+
+
+def _scenario_restart_steps(
+    scenario: _RestartScenario,
+    *,
+    device_name: str,
+    expected_established_sessions: int,
+    parent_prefixes_to_ignore: t.List[str],
+) -> t.List[Step]:
+    last = len(scenario.daemons) - 1
+    steps: t.List[Step] = []
+    for index, daemon_name in enumerate(scenario.daemons):
+        wait_for_recovery = scenario.recover_between or index == last
+        steps.extend(
+            create_bgp_restart_test_stage(
+                device_name=device_name,
+                daemon_name=daemon_name,
+                reactivate_device_groups=False,
+                adaptive_convergence=wait_for_recovery,
+                convergence_wait_seconds=0,
+                expected_established_sessions=expected_established_sessions,
+                parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+            ).steps
+        )
+    # The last restart's lifecycle convergence step already waits for BGP++;
+    # a FibAgentBgp restarted earlier without a wait still needs its own.
+    if (
+        not scenario.recover_between
+        and "FibAgentBgp" in scenario.daemons[:last]
+        and scenario.daemons[last] != "FibAgentBgp"
+    ):
+        steps.append(
+            create_fibagent_bgp_ready_step(
+                device_name=device_name,
+                convergence_soft_threshold_seconds=600,
+                convergence_hard_timeout_seconds=1200,
+                convergence_poll_interval_seconds=5,
+            )
+        )
+    return steps
 
 
 def _restart_matrix_stages(
@@ -385,18 +448,12 @@ def _restart_matrix_stages(
                 rss_delta=None,
             ),
         )
-        restart_steps = [
-            step
-            for daemon_name in scenario.daemons
-            for step in create_bgp_restart_test_stage(
-                device_name=device_name,
-                daemon_name=daemon_name,
-                reactivate_device_groups=False,
-                adaptive_convergence=True,
-                expected_established_sessions=expected_established_sessions,
-                parent_prefixes_to_ignore=parent_prefixes_to_ignore,
-            ).steps
-        ]
+        restart_steps = _scenario_restart_steps(
+            scenario,
+            device_name=device_name,
+            expected_established_sessions=expected_established_sessions,
+            parent_prefixes_to_ignore=parent_prefixes_to_ignore,
+        )
         stages.append(
             create_steps_stage(
                 steps=[

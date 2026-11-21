@@ -30,6 +30,8 @@ _STAGE_IDS = [
     "s2_fibagent_bgp_repeated_restart",
     "s3_bgpcpp_restart",
     "s4_bgpcpp_repeated_restart",
+    "s5_fibagent_bgp_then_bgpcpp_restart",
+    "s6_bgpcpp_then_fibagent_bgp_restart",
 ]
 _FIBAGENT_BGP_RESTART = [
     "FibAgentBgp:disable",
@@ -124,19 +126,59 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
     def test_one_stage_per_scenario_in_order(self) -> None:
         self.assertEqual(_STAGE_IDS, [stage.id for stage in self.playbook.stages])
 
-    def test_each_restart_waits_for_recovery_before_the_next(self) -> None:
+    def test_restart_sequences(self) -> None:
         self.assertEqual(
             {
                 "s1_fibagent_bgp_restart": _FIBAGENT_BGP_RESTART,
                 "s2_fibagent_bgp_repeated_restart": _FIBAGENT_BGP_RESTART * 3,
                 "s3_bgpcpp_restart": _BGPCPP_RESTART,
                 "s4_bgpcpp_repeated_restart": _BGPCPP_RESTART * 3,
+                "s5_fibagent_bgp_then_bgpcpp_restart": [
+                    "FibAgentBgp:disable",
+                    "FibAgentBgp:enable",
+                    "Bgpcpp:disable",
+                    "Bgpcpp:enable",
+                    "test_bgp_lifecycle_convergence",
+                    "wait_for_fibagent_bgp_ready",
+                ],
+                "s6_bgpcpp_then_fibagent_bgp_restart": [
+                    "Bgpcpp:disable",
+                    "Bgpcpp:enable",
+                    "FibAgentBgp:disable",
+                    "FibAgentBgp:enable",
+                    "test_bgp_lifecycle_convergence",
+                    "wait_for_fibagent_bgp_ready",
+                ],
             },
             {
                 stage_id: _restart_events(self.stages[stage_id])
                 for stage_id in _STAGE_IDS
             },
         )
+
+    def test_sequence_stages_start_the_second_restart_without_a_gap(self) -> None:
+        for stage_id in (
+            "s5_fibagent_bgp_then_bgpcpp_restart",
+            "s6_bgpcpp_then_fibagent_bgp_restart",
+        ):
+            steps = self.stages[stage_id].steps
+            actions = [_daemon_actions(Stage(steps=[step])) for step in steps]
+            first_enable = next(
+                index
+                for index, action in enumerate(actions)
+                if action and action[0][1] == "enable"
+            )
+            second_disable = next(
+                index
+                for index, action in enumerate(actions)
+                if index > first_enable and action and action[0][1] == "disable"
+            )
+            waits = [
+                _json_params(step)["duration"]
+                for step in steps[first_enable + 1 : second_disable]
+                if "duration" in _json_params(step)
+            ]
+            self.assertEqual([0], waits, stage_id)
 
     def test_repeat_count_sets_restarts_in_repeated_stages(self) -> None:
         playbook = get_bgp_ebb_daemon_restart_playbook(

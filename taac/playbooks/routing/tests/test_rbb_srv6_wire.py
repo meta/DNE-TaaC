@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 from taac.test_as_a_config.types import StepName
 from taac.tasks.rbb_srv6_capture_mirror_task import RbbSrv6CaptureMirrorTask
 from taac.tasks.rbb_srv6_pcap_verify_task import RbbSrv6PcapVerifyTask
+from taac.tasks.registry import TASK_NAME_TO_CLASS
 from taac.testconfigs.routing.factories.qual_rbb.rbb_srv6_wire_test_config import (
     create_rbb_srv6_wire_test_config,
 )
@@ -84,6 +85,20 @@ class RbbSrv6WireConfigTest(unittest.TestCase):
             [item.name for item in self.config.basic_traffic_item_configs or []],
             [C.TRAFFIC_ITEM_NAMED_NHG],
         )
+
+    def test_every_run_task_is_registered(self) -> None:
+        for playbook in self.config.playbooks or []:
+            task_names = [name for name, _ in _tasks(playbook)]
+            task_names.extend(
+                json.loads(step.input_json)["task"]["task_name"]
+                for step in playbook.cleanup_steps or []
+                if step.name == StepName.RUN_TASK_STEP
+            )
+            self.assertEqual(
+                sorted(set(task_names) - TASK_NAME_TO_CLASS.keys()),
+                [],
+                playbook.name,
+            )
 
     def test_each_case_programs_unique_nhg_and_decodes_actual_capture(self) -> None:
         packed = C.pack_usid_container(

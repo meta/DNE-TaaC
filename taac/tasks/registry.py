@@ -185,6 +185,7 @@ from taac.tasks.periodic_tasks import (
 # RBB SRv6 qualification tasks (see taac/testconfigs/routing/qual_rbb.py).
 from taac.tasks.rbb_dut_bootstrap_task import RbbDutBootstrapTask
 from taac.tasks.rbb_edge_ebgp_task import RbbEdgeEbgpTask
+from taac.tasks.rbb_ixia_capability_task import RbbIxiaCapabilityTask
 from taac.tasks.rbb_srv6_counter_delta_task import (
     RbbSrv6CounterDeltaTask,
 )
@@ -266,6 +267,7 @@ TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     SetupBaseConfigsTask,
     RbbDutBootstrapTask,
     RbbEdgeEbgpTask,
+    RbbIxiaCapabilityTask,
     RbbSrv6CounterDeltaTask,
     RbbSrv6CaptureMirrorTask,
     RbbSrv6DirectRouteTask,

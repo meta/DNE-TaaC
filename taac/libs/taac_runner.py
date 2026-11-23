@@ -33,6 +33,8 @@ from taac.constants import (
     TestCaseFailure,
     TestDevice,
     TestTopology,
+    THFT_QUIET_BGP_BASELINE_TAG,
+    THFT_QUIET_RECOVERY_STAGE_ID,
 )
 from taac.custom_test_handlers.base_custom_test_handler import (
     BaseCustomTestHandler,
@@ -1944,18 +1946,64 @@ class TaacRunner:
                         )
                     )
                     self._current_snapshot_checks = snapshot_check_objs
+                    quiet_bgp_checks = [
+                        check
+                        for check in snapshot_check_objs
+                        if self._uses_quiet_bgp_baseline()
+                        and check.CHECK_NAME == hc_types.CheckName.BGP_SESSION_CHECK
+                        and check._check_params.get("runtime_baseline")
+                        and check._pre_snapshot_checkpoint_id
+                        == DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID
+                        and not check._should_skip
+                    ]
+                    if self._uses_quiet_bgp_baseline() and not quiet_bgp_checks:
+                        raise TestbedError(
+                            "Quiet THFT requires a runtime BGP PRE snapshot"
+                        )
                     stages = self.inject_validation_stages(playbook)
                     async with self.run_monitor.step("Pre-snapshot checks"):
-                        await self.async_run_snapshot_checks(
-                            snapshot_check_objs,
-                            DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID,
-                            int(time.time()),
-                            test_case_results,
-                            playbook.name,
-                        )
+                        early_snapshot_checks = [
+                            check
+                            for check in snapshot_check_objs
+                            if check not in quiet_bgp_checks
+                        ]
+                        if early_snapshot_checks:
+                            await self.async_run_snapshot_checks(
+                                early_snapshot_checks,
+                                DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID,
+                                int(time.time()),
+                                test_case_results,
+                                playbook.name,
+                            )
                 _stage_exc: t.Optional[BaseException] = None
+                quiet_snapshot_errors: list[Exception] = []
+                quiet_workers_started = False
                 try:
                     for stage in stages:
+                        if self._uses_quiet_bgp_baseline():
+                            if stage.id == THFT_QUIET_RECOVERY_STAGE_ID:
+                                if not self._stop_quiet_periodic_tasks():
+                                    raise RuntimeError(
+                                        "Periodic workers did not join before quiet recovery"
+                                    )
+                            elif (
+                                stage.description != _PRECHECK_STAGE_DESCRIPTION
+                                and not quiet_workers_started
+                            ):
+                                # Package restart convergence can continue while
+                                # regular prechecks run. Capture the BGP baseline
+                                # at the final quiet boundary, not an earlier
+                                # temporary plateau. Core and legacy snapshots
+                                # retain their original checkpoint timing.
+                                await self.async_run_snapshot_checks(
+                                    quiet_bgp_checks,
+                                    DEFAULT_PRE_SNAPSHOT_CHECKPOINT_ID,
+                                    int(time.time()),
+                                    test_case_results,
+                                    playbook.name,
+                                )
+                                self._start_test_case_periodic_tasks(playbook)
+                                quiet_workers_started = True
                         self._current_stage = stage
                         if not stage.id:
                             stage = stage(id=uuid.uuid4().hex)
@@ -2044,6 +2092,13 @@ class TaacRunner:
                     # always run post-snapshot checks for observability, regardless of stage failures
                     with suppress_console_logs(self.logger):
                         try:
+                            if (
+                                self._uses_quiet_bgp_baseline()
+                                and not self._stop_quiet_periodic_tasks()
+                            ):
+                                raise RuntimeError(
+                                    "Skipping recovery snapshots: periodic workers did not join"
+                                )
                             async with self.run_monitor.step("Post-snapshot checks"):
                                 await self.async_run_snapshot_checks(
                                     snapshot_check_objs,
@@ -2056,6 +2111,8 @@ class TaacRunner:
                                 f"Post-snapshot checks completed for {test_case_name}"
                             )
                         except Exception as e:
+                            if self._uses_quiet_bgp_baseline():
+                                quiet_snapshot_errors.append(e)
                             self.logger.error(
                                 f"Failed to run post-snapshot checks for {test_case_name}: {e}"
                             )
@@ -2139,7 +2196,9 @@ class TaacRunner:
                     _cleanup_errors = (
                         [_teardown_exc] if _teardown_exc is not None else []
                     )
-                    self._raise_test_case_cleanup_errors(_stage_exc, _cleanup_errors)
+                    self._raise_test_case_cleanup_errors(
+                        _stage_exc, [*quiet_snapshot_errors, *_cleanup_errors]
+                    )
 
                 self._record_playbook_result(
                     playbook,
@@ -2594,6 +2653,24 @@ class TaacRunner:
                 check._pre_snapshot = await check._capture_pre_snapshot(
                     check._obj, check._input, check._check_params, current_timestamp
                 )
+                capture_result = check._pre_snapshot.capture_result
+                if capture_result is not None:
+                    test_case_results.append(
+                        await async_write_test_result(
+                            test_case_name,
+                            devices=[check._obj],
+                            test_status=capture_result.status,
+                            check_stage=taac_types.ValidationStage.PRE_TEST,
+                            start_time=check._pre_snapshot.timestamp,
+                            end_time=check._pre_snapshot.timestamp,
+                            check_name=check.__class__.CHECK_NAME.name,
+                            message=capture_result.message,
+                        )
+                    )
+                    if capture_result.status in FAILED_HC_STATUSES:
+                        raise TestbedError(
+                            capture_result.message or "Runtime PRE failed"
+                        )
             elif check._post_snapshot_checkpoint_id == id:
                 self.logger.info(
                     f"  [Snapshot] Capturing post-snapshot: {check.__class__.CHECK_NAME.name}"
@@ -3312,10 +3389,27 @@ class TaacRunner:
         for handler in self.custom_test_handlers:
             await handler._async_test_case_setUp()
             self._test_case_handlers_pending_cleanup.append(handler)
-        self._start_test_case_periodic_tasks(playbook)
+        self._quiet_periodic_stop_result = None
+        if self._uses_quiet_bgp_baseline():
+            if self.test_case_periodic_task_executor is not None:
+                raise RuntimeError("Quiet PRE cannot reuse an existing executor")
+        else:
+            self._start_test_case_periodic_tasks(playbook)
         if not self.skip_fboss_rsyslog:
             await self.async_create_fboss_ryslog_configuration()
             self._test_case_rsyslog_created = True
+
+    def _uses_quiet_bgp_baseline(self) -> bool:
+        return THFT_QUIET_BGP_BASELINE_TAG in (self.test_config.tags or [])
+
+    def _stop_quiet_periodic_tasks(self) -> bool:
+        if self._quiet_periodic_stop_result is None:
+            self._quiet_periodic_stop_result = (
+                self._stop_test_case_periodic_task_executor(
+                    self.test_case_periodic_task_executor
+                )
+            )
+        return self._quiet_periodic_stop_result[0] is not False
 
     def _start_test_case_periodic_tasks(self, playbook: taac_types.Playbook) -> None:
         if self.test_case_periodic_task_executor is not None:
@@ -3730,7 +3824,10 @@ class TaacRunner:
         # Executed at the end of each test
         test_case_name = playbook.name
         periodic_workers_stopped, periodic_stop_errors = (
-            self._stop_test_case_periodic_task_executor(
+            self._quiet_periodic_stop_result
+            if self._uses_quiet_bgp_baseline()
+            and self._quiet_periodic_stop_result is not None
+            else self._stop_test_case_periodic_task_executor(
                 self.test_case_periodic_task_executor
             )
         )

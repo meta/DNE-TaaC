@@ -2,10 +2,12 @@
 
 # pyre-unsafe
 
+import asyncio
 import ipaddress
 import time
 import typing as t
 from collections import namedtuple
+from dataclasses import dataclass
 
 from neteng.fboss.bgp_thrift.types import TBgpPeerState, TBgpSession
 from taac.constants import TestDevice
@@ -20,6 +22,20 @@ from taac.health_check.health_check import types as hc_types
 BgpSessionId = namedtuple(
     "BgpSessionId", ["my_addr", "peer_addr", "peer_session_state"], defaults=(None,)
 )
+
+
+class RuntimeBgpSessionDriver(t.Protocol):
+    async def async_get_bgp_sessions(self) -> list[TBgpSession]: ...
+
+
+class RuntimeBgpCaptureError(RuntimeError):
+    pass
+
+
+@dataclass
+class RuntimeBgpSnapshot:
+    established: dict[BgpSessionId, TBgpSession]
+    configured: frozenset[BgpSessionId]
 
 
 class BgpSessionHealthCheck(
@@ -39,6 +55,8 @@ class BgpSessionHealthCheck(
         check_params: t.Dict[str, t.Any],
         timestamp: int,
     ) -> Snapshot:
+        if check_params.get("runtime_baseline"):
+            return await self._capture_runtime_snapshot(check_params, recovery=False)
         parent_prefixes_to_ignore = check_params.get("parent_prefixes_to_ignore", [])
         bgp_sessions = await self.async_get_bgp_sessions(parent_prefixes_to_ignore)
         # Stamp the snapshot at the instant the device data is actually read, NOT
@@ -55,6 +73,8 @@ class BgpSessionHealthCheck(
         check_params: t.Dict[str, t.Any],
         timestamp: int,
     ) -> Snapshot:
+        if check_params.get("runtime_baseline"):
+            return await self._capture_runtime_snapshot(check_params, recovery=True)
         parent_prefixes_to_ignore = check_params.get("parent_prefixes_to_ignore", [])
         bgp_sessions = await self.async_get_bgp_sessions(parent_prefixes_to_ignore)
         # Stamp the snapshot at the instant the device data is actually read, NOT
@@ -72,6 +92,8 @@ class BgpSessionHealthCheck(
         pre_snapshot: Snapshot,
         post_snapshot: Snapshot,
     ) -> hc_types.HealthCheckResult:
+        if check_params.get("runtime_baseline"):
+            return self._compare_runtime_snapshots(pre_snapshot, post_snapshot)
         skip_flap_check = check_params.get("skip_flap_check")
         skip_uptime_check = check_params.get("skip_uptime_check")
         pre_snapshot_bgp_sessions = pre_snapshot.data
@@ -173,6 +195,142 @@ class BgpSessionHealthCheck(
 
         return hc_types.HealthCheckResult(
             status=hc_types.HealthCheckStatus.PASS,
+        )
+
+    async def _capture_runtime_snapshot(
+        self, check_params: dict[str, float | bool], *, recovery: bool
+    ) -> Snapshot:
+        timeout_key = "recovery_timeout_sec" if recovery else "baseline_timeout_sec"
+        timeout = float(check_params.get(timeout_key, 180 if recovery else 60))
+        stable_window = float(check_params.get("stable_window_sec", 10))
+        poll_interval = float(check_params.get("poll_interval_sec", 2))
+        if not 0 < poll_interval <= stable_window < timeout:
+            raise ValueError("Require 0 < poll interval <= stable window < timeout")
+        deadline = time.monotonic() + timeout
+        stable_since = None
+        previous = None
+        last = RuntimeBgpSnapshot({}, frozenset())
+        reason = "No nonempty stable runtime BGP baseline"
+        expected = None
+        if recovery:
+            pre = self._pre_snapshot
+            if not isinstance(pre, Snapshot) or not isinstance(
+                pre.data, RuntimeBgpSnapshot
+            ):
+                return self._runtime_snapshot_result(last, False, "Runtime PRE missing")
+            if (
+                pre.capture_result is None
+                or pre.capture_result.status != hc_types.HealthCheckStatus.PASS
+            ):
+                return self._runtime_snapshot_result(
+                    pre.data, False, "Runtime PRE was not qualified; recovery skipped"
+                )
+            expected = pre.data
+        while time.monotonic() < deadline:
+            try:
+                async with asyncio.timeout(deadline - time.monotonic()):
+                    last = await self._read_runtime_sessions()
+            except (TimeoutError, RuntimeBgpCaptureError) as error:
+                stable_since = None
+                previous = None
+                reason = f"Runtime BGP capture failed: {error}"
+                await asyncio.sleep(
+                    min(poll_interval, max(0, deadline - time.monotonic()))
+                )
+                continue
+            now = time.monotonic()
+            matches = bool(last.established) and (
+                expected is None or last.configured == expected.configured
+            )
+            if matches:
+                if last.configured != previous:
+                    stable_since = now
+                if stable_since is not None and now - stable_since >= stable_window:
+                    return self._runtime_snapshot_result(
+                        last, True, f"Runtime BGP stable for {stable_window:g}s"
+                    )
+            else:
+                stable_since = None
+                reason = "Runtime BGP is empty or differs from quiet PRE"
+            previous = last.configured
+            await asyncio.sleep(min(poll_interval, max(0, deadline - now)))
+        return self._runtime_snapshot_result(
+            last, False, f"{reason}; timed out after {timeout:g}s"
+        )
+
+    async def _read_runtime_sessions(self) -> RuntimeBgpSnapshot:
+        try:
+            driver = t.cast(RuntimeBgpSessionDriver, self.driver)
+            sessions = await driver.async_get_bgp_sessions()
+        except Exception as error:
+            raise RuntimeBgpCaptureError(f"BGP device query failed: {error}") from error
+        configured = {}
+        for session in sessions:
+            key = BgpSessionId(
+                session.my_addr, session.peer_addr, session.peer.peer_state
+            )
+            configured[key] = session
+        established = {
+            key: session
+            for key, session in configured.items()
+            if key.peer_session_state == TBgpPeerState.ESTABLISHED
+        }
+        return RuntimeBgpSnapshot(established, frozenset(configured))
+
+    def _runtime_snapshot_result(
+        self, data: RuntimeBgpSnapshot, passed: bool, reason: str
+    ) -> Snapshot:
+        audit = sorted(
+            f"{key.my_addr} -> {key.peer_addr}: {key.peer_session_state.name}"
+            for key in data.configured
+        )
+        message = (
+            f"{reason}; {len(data.established)}/{len(data.configured)} Established. "
+            f"Full configured-peer audit: {audit}. "
+            "Runtime recovery does not qualify the intended topology."
+        )
+        self.logger.info(message)
+        return Snapshot(
+            timestamp=int(time.time()),
+            data=data,
+            capture_result=hc_types.HealthCheckResult(
+                status=(
+                    hc_types.HealthCheckStatus.PASS
+                    if passed
+                    else hc_types.HealthCheckStatus.FAIL
+                ),
+                message=message,
+            ),
+        )
+
+    def _compare_runtime_snapshots(
+        self, pre_snapshot: Snapshot, post_snapshot: Snapshot
+    ) -> hc_types.HealthCheckResult:
+        if not isinstance(pre_snapshot, Snapshot):
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.FAIL,
+                message="Runtime PRE missing",
+            )
+        pre_result = pre_snapshot.capture_result
+        post_result = post_snapshot.capture_result
+        if pre_result is None or post_result is None:
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.FAIL,
+                message="Runtime BGP snapshot was not qualified",
+            )
+        for result in (pre_result, post_result):
+            if result.status != hc_types.HealthCheckStatus.PASS:
+                return result
+        pre = pre_snapshot.data
+        post = post_snapshot.data
+        if not pre.established or pre.configured != post.configured:
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.FAIL,
+                message=f"Runtime BGP identities/states changed: PRE={pre.configured}; POST={post.configured}",
+            )
+        return hc_types.HealthCheckResult(
+            status=hc_types.HealthCheckStatus.PASS,
+            message=f"Exact quiet runtime BGP recovery. PRE: {pre_result.message} POST: {post_result.message}",
         )
 
     def _detect_flapped_sessions(

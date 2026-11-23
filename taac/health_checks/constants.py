@@ -11,6 +11,7 @@ from taac.health_check.health_check import types as hc_types
 class Snapshot:
     timestamp: int
     data: t.Any = None
+    capture_result: hc_types.HealthCheckResult | None = None
 
 
 DAILY_TABLE_TRANSFORM_DESC: str = "table(daily)"

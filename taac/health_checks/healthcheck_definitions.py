@@ -2281,6 +2281,11 @@ def create_bgp_session_snapshot_check(
     max_convergence_sec: t.Optional[float] = None,
     convergence_service: t.Optional[str] = None,
     reconvergence_hosts: t.Optional[t.List[str]] = None,
+    runtime_baseline: bool | None = None,
+    baseline_timeout_sec: float | None = None,
+    recovery_timeout_sec: float | None = None,
+    stable_window_sec: float | None = None,
+    poll_interval_sec: float | None = None,
 ) -> SnapshotHealthCheck:
     """BGP_SESSION_CHECK — snapshot variant.
 
@@ -2289,6 +2294,11 @@ def create_bgp_session_snapshot_check(
     `skip_flap_check`/`skip_uptime_check` are tri-state — `None` omits the key,
     `True`/`False` sets it explicitly (some sites encode `False` to preserve
     historical byte-equivalence).
+
+    `runtime_baseline=True` requires a nonempty configured-peer set stable for
+    `stable_window_sec` (default 10s). Capture deadlines default to 60s PRE and
+    180s POST, polling every 2s. POST requires identical local/peer/state tuples,
+    including configured IDLE peers, and intentionally permits uptime resets.
 
     Reconvergence-timing assertion (for process-disruption tests — bgp/fsdb/
     wedge_agent restart, kill, GR-within/beyond, warm/coldboot, reboot):
@@ -2326,6 +2336,15 @@ def create_bgp_session_snapshot_check(
         json_payload["convergence_service"] = convergence_service
     if reconvergence_hosts is not None:
         json_payload["reconvergence_hosts"] = reconvergence_hosts
+    for key, value in (
+        ("runtime_baseline", runtime_baseline),
+        ("baseline_timeout_sec", baseline_timeout_sec),
+        ("recovery_timeout_sec", recovery_timeout_sec),
+        ("stable_window_sec", stable_window_sec),
+        ("poll_interval_sec", poll_interval_sec),
+    ):
+        if value is not None:
+            json_payload[key] = value
     return SnapshotHealthCheck(
         name=hc_types.CheckName.BGP_SESSION_CHECK,
         check_params=(

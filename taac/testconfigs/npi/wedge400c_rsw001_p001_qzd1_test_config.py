@@ -36,7 +36,7 @@ RSW001_P001_F01_QZD1_THRIFT_HARDENING_TEST_CONFIG = (
         requests_per_burst=NPI_CICD_THRIFT_REQUESTS_PER_BURST,
         include_kitchen_sink=True,
         basset_pool="dne.regression",
-        expected_established_bgp_sessions=6,
+        runtime_bgp_baseline=True,
         tags=[TESTBED_ISOLATION_BYPASS_TAG],
         service_restart_services=[
             "bgpd",

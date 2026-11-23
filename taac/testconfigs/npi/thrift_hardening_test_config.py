@@ -25,6 +25,13 @@ import asyncio
 import json
 
 from ixia.ixia import types as ixia_types
+from taac.constants import (
+    THFT_QUIET_BGP_BASELINE_TAG,
+    THFT_QUIET_RECOVERY_STAGE_ID,
+)
+from taac.health_checks.healthcheck_definitions import (
+    create_bgp_session_snapshot_check,
+)
 from taac.playbooks.playbook_definitions import (
     add_common_checks_to_thft_playbooks,
     create_thft_playbooks,
@@ -593,6 +600,7 @@ def create_npi_device_only_thrift_hardening_test_config(
     ignore_circuit_fbnet_status: bool = False,
     expected_restart_cascades: dict[str, list[str]] | None = None,
     agent_restart_service: taac_types.Service = taac_types.Service.AGENT,
+    runtime_bgp_baseline: bool = False,
 ) -> TestConfig:
     """Build THFT coverage that needs no IXIA protocol scaffolding.
 
@@ -605,7 +613,9 @@ def create_npi_device_only_thrift_hardening_test_config(
     device health checks remain scoped to the DUT.
     """
     _assert_fboss_platform(device_name)
-    return TestConfig(
+    if runtime_bgp_baseline and expected_established_bgp_sessions is not None:
+        raise ValueError("Runtime baseline cannot use a fixed BGP count")
+    config = TestConfig(
         name=test_config_name,
         basset_pool=basset_pool or "dne.test",
         tags=tags,
@@ -647,6 +657,24 @@ def create_npi_device_only_thrift_hardening_test_config(
             check_scope=hc_types.Scope.DEFAULT if neighbor_devices else None,
             expected_restart_cascades=expected_restart_cascades,
         ),
+    )
+    if not runtime_bgp_baseline:
+        return config
+    return config(
+        tags=[*(tags or []), THFT_QUIET_BGP_BASELINE_TAG],
+        playbooks=[
+            playbook(
+                stages=[
+                    *playbook.stages[:-1],
+                    playbook.stages[-1](id=THFT_QUIET_RECOVERY_STAGE_ID),
+                ],
+                snapshot_checks=[
+                    *(playbook.snapshot_checks or []),
+                    create_bgp_session_snapshot_check(runtime_baseline=True),
+                ],
+            )
+            for playbook in config.playbooks
+        ],
     )
 
 

@@ -4,6 +4,7 @@
 """CI/CD Thrift-hardening and reboot coverage for a NetOS Wedge400C RSW."""
 
 from ixia.ixia import types as ixia_types
+from taac.constants import TESTBED_ISOLATION_BYPASS_TAG
 from taac.testconfigs.npi.bgp_reboot_test_config import (
     create_npi_bgp_reboot_test_config,
 )
@@ -36,6 +37,7 @@ RSW001_P001_F01_QZD1_THRIFT_HARDENING_TEST_CONFIG = (
         include_kitchen_sink=True,
         basset_pool="dne.regression",
         expected_established_bgp_sessions=6,
+        tags=[TESTBED_ISOLATION_BYPASS_TAG],
         service_restart_services=[
             "bgpd",
             "fboss_hw_agent@0",

@@ -47,7 +47,6 @@ def create_rbb_srv6_wire_test_config(
         r2=r2,
         topology=topology,
         include_traffic=True,
-        traffic_route_prefix=C.TAIL_DEST_PREFIX,
         traffic_item_name=C.TRAFFIC_ITEM_NAMED_NHG,
         traffic_ibgp_next_hop=C.R2_LOOPBACK_V6,
     )

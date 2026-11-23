@@ -30,7 +30,7 @@ from taac.playbooks.routing.factories.qual_rbb.rbb_srv6_playbook import (
     create_rbb_srv6_3_usids_playbook,
 )
 from taac.task_definitions import create_run_task
-from neteng.test_infra.dne.taac.testconfigs.routing.util import bgp_rbb_constants as C
+from taac.testconfigs.routing.util import bgp_rbb_constants as C
 from taac.testconfigs.routing.util.bgp_rbb_bootstrap_config import (
     validate_bootstrap_topology,
 )
@@ -249,7 +249,10 @@ def _ixia_port_configs(
 
 
 def _ixia_traffic_items(
-    r1: PhysicalInventory, r2: PhysicalInventory, topology: RbbTopology
+    r1: PhysicalInventory,
+    r2: PhysicalInventory,
+    topology: RbbTopology,
+    traffic_item_name: str = C.TRAFFIC_ITEM_R1_TO_R2,
 ) -> list[BasicTrafficItemConfig]:
     """Selected R1 edge → SRv6 core → selected R2 edge."""
     r1_iface = topology.r1.primary_ixia_interface
@@ -261,7 +264,7 @@ def _ixia_traffic_items(
     )
     return [
         BasicTrafficItemConfig(
-            name=C.TRAFFIC_ITEM_R1_TO_R2,
+            name=traffic_item_name,
             src_endpoints=[
                 TrafficEndpoint(
                     name=f"{r1.device_name}:{r1_iface}", device_group_index=0
@@ -291,6 +294,7 @@ def _edge_ebgp_setup_tasks(
     r2: PhysicalInventory,
     topology: RbbTopology,
     include_traffic: bool,
+    traffic_ibgp_next_hop: str | None = None,
 ) -> list[taac_types.Task]:
     """OPT-IN DUT-side edge eBGP bring-up toward the IXIA edges (S14).
 
@@ -345,7 +349,7 @@ def _edge_ebgp_setup_tasks(
                 # the recursive next hop used by the head's TE_AGENT route.
                 "enable_ipv6_afi": True,
                 "ibgp_peer_addr": C.R1_ROUTER_ID,
-                "ibgp_srv6_nexthop": C.SRV6_DECAP_SID,
+                "ibgp_srv6_nexthop": traffic_ibgp_next_hop or C.SRV6_DECAP_SID,
                 # A retained device-only bootstrap locally originates the test
                 # tail route and disables next-hop-self to preserve its decap
                 # SID. Traffic mode instead learns the route from IXIA. Reconcile
@@ -449,6 +453,8 @@ def _build_rbb_test_config(
     r2: PhysicalInventory,
     topology: RbbTopology,
     include_traffic: bool,
+    traffic_item_name: str = C.TRAFFIC_ITEM_R1_TO_R2,
+    traffic_ibgp_next_hop: str | None = None,
 ) -> TestConfig:
     _validate_traffic_route_contract(profile, include_traffic)
     r1_ixia_ports = [dut_iface for dut_iface, _ in r1.ixia_ports]
@@ -460,7 +466,11 @@ def _build_rbb_test_config(
         _ixia_port_configs(r1, r2, topology) if include_traffic else None
     )
     basic_traffic_item_configs = (
-        _ixia_traffic_items(r1, r2, topology) if include_traffic else None
+        _ixia_traffic_items(
+            r1, r2, topology, traffic_item_name=traffic_item_name
+        )
+        if include_traffic
+        else None
     )
     return TestConfig(
         name=name,
@@ -503,7 +513,13 @@ def _build_rbb_test_config(
         startup_checks=[],
         setup_tasks=(
             _dut_bootstrap_setup_tasks(r1, r2, topology, include_traffic)
-            + _edge_ebgp_setup_tasks(r1, r2, topology, include_traffic)
+            + _edge_ebgp_setup_tasks(
+                r1,
+                r2,
+                topology,
+                include_traffic,
+                traffic_ibgp_next_hop=traffic_ibgp_next_hop,
+            )
         ),
         # Teardown runs in list order. Remove the edge overlay before restoring
         # the bootstrap's image baseline underneath it.

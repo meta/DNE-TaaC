@@ -116,7 +116,7 @@ def _reject_unknown(raw: t.Mapping[str, t.Any], allowed: set[str], label: str) -
 
 
 def _client_id(client_name: str) -> int:
-    """Resolve a generated ClientID lazily so the module stays OSS-importable."""
+    """Resolve a generated ClientID lazily so the module stays importable."""
     normalized = client_name.strip().upper()
     if not normalized:
         raise ValueError("route client must be non-empty")

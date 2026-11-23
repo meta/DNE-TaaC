@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the OSS RBB SRv6 qualification from adopter-owned local files.
+# Run the RBB SRv6 qualification from adopter-owned local files.
 
 set -euo pipefail
 
@@ -33,7 +33,7 @@ usage() {
 Usage: ./scripts/run-rbb-srv6.sh [OPTIONS] [-- RUNNER_ARGS...]
 
   no options          Validate the SRv6 device path without reserving IXIA.
-  --init              Create a local configuration from the OSS templates.
+  --init              Create a local configuration from the bundled templates.
   --check             Validate inputs in the built image without lab access.
   --config-dir PATH   Use PATH instead of the checkout-local .taac directory.
   --suite NAME        Select base (default), state-audit, or core-ecmp.
@@ -41,7 +41,7 @@ Usage: ./scripts/run-rbb-srv6.sh [OPTIONS] [-- RUNNER_ARGS...]
   --with-traffic      Run the complete SRv6 qualification with live IXIA traffic.
   --setup-dut-edges
                       Temporarily configure the DUT side of selected IXIA links.
-  --                  Pass remaining arguments to the OSS TAAC runner.
+  --                  Pass remaining arguments to the TAAC runner.
 
 Examples:
   ./scripts/run-rbb-srv6.sh --init

@@ -2,11 +2,12 @@
 # pyre-unsafe
 """Reversible Open/R core-path metric control for two-node RBB tests.
 
-The public FBOSS driver intentionally gates Open/R Thrift mutation in OSS
-mode.  This task uses the shipped ``breeze`` CLI instead, but accepts only a
-small structured contract: core RIF addresses, exact metric values, and route
-expectations.  Interface and peer names are discovered from JSON output and
-strictly validated before they can be interpolated into a command.
+The public FBOSS driver intentionally gates Open/R Thrift mutation in the
+standalone runner.  This task uses the shipped ``breeze`` CLI instead, but
+accepts only a small structured contract: core RIF addresses, exact metric
+values, and route expectations.  Interface and peer names are discovered from
+JSON output and strictly validated before they can be interpolated into a
+command.
 
 Every mutation is owned by one playbook-scoped snapshot.  A snapshot is
 accepted only when the node and all selected links are healthy and have no

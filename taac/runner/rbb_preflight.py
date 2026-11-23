@@ -1,9 +1,9 @@
 # pyre-unsafe
 
-"""Preflight checks for the OSS RBB SRv6 runner.
+"""Preflight checks for the standalone RBB SRv6 runner.
 
 This module intentionally uses only the Python standard library and TAAC's
-OSS-safe topology helpers. It runs inside the TAAC image before the test, so
+Topology helpers run inside the TAAC image before the test, so
 adopter mistakes are reported without reserving IXIA ports or contacting a DUT.
 """
 
@@ -368,7 +368,7 @@ def run_preflight(
 
 
 def _argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Validate an OSS RBB SRv6 lab profile")
+    parser = argparse.ArgumentParser(description="Validate an RBB SRv6 lab profile")
     parser.add_argument("--config-dir", required=True)
     parser.add_argument("--with-traffic", action="store_true")
     parser.add_argument("--setup-duts", action="store_true")

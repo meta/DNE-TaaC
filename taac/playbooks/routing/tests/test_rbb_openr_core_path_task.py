@@ -1,6 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # pyre-unsafe
-"""Safety and lifecycle tests for the OSS Open/R core-path task."""
+"""Safety and lifecycle tests for the standalone Open/R core-path task."""
 
 import json
 import unittest

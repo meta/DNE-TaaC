@@ -1,4 +1,4 @@
-"""OSS runner wrapper for the two-node RBB common state audits.
+"""Standalone runner wrapper for the two-node RBB common state audits.
 
 The default selection runs only fully covered test-plan profiles and does not
 reserve IXIA. Lab wiring comes from ``--circuit-info-csv``; credentials come

@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # pyre-unsafe
+import math
 import re
 import time
 import typing as t
@@ -103,6 +104,54 @@ def find_resource_accountant_rejections(
     return matching_lines
 
 
+def summarize_resource_accountant_read(
+    log_content: str,
+    start_time: int | None,
+    end_time: int,
+    in_window_count: int,
+    check_start_time: int | None,
+    read_returned_time: int,
+    utc_offset_seconds: int,
+) -> str:
+    """Describe one read of the rejection log: its bounds, coverage and drops.
+
+    check_start_time is the bound a pre-read window end would have used; lines
+    counted under after_check_start are the ones such a bound would drop.
+    """
+    rejections = find_resource_accountant_rejections(log_content)
+    stamps = [
+        match.group()
+        for line in rejections
+        if (match := _AGENT_LOG_TIMESTAMP_RE.search(line)) is not None
+    ]
+    after_window = (
+        len(
+            find_resource_accountant_rejections(
+                log_content, end_time + 1, end_time + 86400, utc_offset_seconds
+            )
+        )
+        if start_time is not None
+        else 0
+    )
+    parts = [
+        f"window={start_time}..{end_time}",
+        f"check_start={check_start_time}",
+        f"read_returned={read_returned_time}",
+        f"utc_offset={utc_offset_seconds}s",
+        f"lines_read={len(rejections)}",
+        f"stamps={stamps[0]}..{stamps[-1]}" if stamps else "stamps=none",
+        f"in_window={in_window_count}",
+        f"after_window={after_window}",
+        f"earlier_or_undated={len(rejections) - in_window_count - after_window}",
+    ]
+    if check_start_time is not None:
+        dropped_by_pre_read_end = find_resource_accountant_rejections(
+            log_content, check_start_time + 1, end_time, utc_offset_seconds
+        )
+        parts.append(f"after_check_start={len(dropped_by_pre_read_end)}")
+    return "[" + ", ".join(parts) + "]"
+
+
 class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn]):
     CHECK_NAME = hc_types.CheckName.LOG_PARSING_CHECK
     OPERATING_SYSTEMS = [
@@ -140,25 +189,42 @@ class LogParsingHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn
                 tail_lines=200,
                 utc_offset_seconds=utc_offset_seconds,
             )
+            read_returned_time = math.ceil(time.time())
+            explicit_end = bool(check_params.get("end_time"))
+            # Without an explicit end, the window ends when the read returns:
+            # under a rejection flood the newest 200 lines can all be stamped
+            # after a bound taken before the read.
+            window_end = end_time if explicit_end else read_returned_time
+            window_start = int(start_time) if start_time is not None else None
             matching_lines = find_resource_accountant_rejections(
+                log_content, window_start, window_end, utc_offset_seconds
+            )
+            read_summary = summarize_resource_accountant_read(
                 log_content,
-                int(start_time) if start_time is not None else None,
-                end_time,
-                utc_offset_seconds,
+                window_start,
+                window_end,
+                in_window_count=len(matching_lines),
+                check_start_time=None if explicit_end else end_time,
+                read_returned_time=read_returned_time,
+                utc_offset_seconds=utc_offset_seconds,
             )
             if not matching_lines:
+                self.logger.info(
+                    f"[LOG_PARSING] {obj.name} ResourceAccountant read "
+                    f"{read_summary}:\n{log_content}"
+                )
                 return hc_types.HealthCheckResult(
                     status=hc_types.HealthCheckStatus.FAIL,
                     message=(
                         "No ResourceAccountant rejection was logged in the "
-                        "requested validation window"
+                        f"requested validation window {read_summary}"
                     ),
                 )
             return hc_types.HealthCheckResult(
                 status=hc_types.HealthCheckStatus.PASS,
                 message=(
                     f"Found {len(matching_lines)} ResourceAccountant rejection "
-                    f"line(s): {matching_lines[:3]}"
+                    f"line(s) {read_summary}: {matching_lines[:3]}"
                 ),
             )
         include_regex = check_params.get("include_regex")

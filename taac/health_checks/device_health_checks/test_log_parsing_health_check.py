@@ -5,6 +5,7 @@
 
 import calendar
 import json
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -263,6 +264,147 @@ class LogParsingHealthCheckTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
         self.assertIn("No ResourceAccountant rejection", result.message)
+
+    def _flood_lines(self, first_second: int, count: int) -> str:
+        """Rejection lines stamped from first_second on, three per second."""
+        lines = []
+        for index in range(count):
+            stamp = time.gmtime(first_second + index // 3)
+            lines.append(
+                f"E{time.strftime('%m%d %H:%M:%S', stamp)}.{index % 3:06d} 51089 "
+                "ResourceAccountant.cpp:1041] Total ARP entries in new "
+                "switchState: 1281 exceeds the limit: 1280 for switchId: 0"
+            )
+        return "\n".join(lines) + "\n"
+
+    async def test_resource_accountant_mode_counts_flood_lines_logged_during_read(
+        self,
+    ):
+        # Regression: qoe/npi_qual R50-R52 ARP overload playbooks on
+        # fsw003.p003.f01.qzd1. Rejections flooded the log throughout the
+        # window, but the newest 200 lines were all stamped after the bound
+        # taken before the read, so the check found none.
+        now = calendar.timegm((time.gmtime().tm_year, 9, 20, 10, 0, 0, 0, 0, 0))
+        self.health_check.driver.async_read_log_file.return_value = self._flood_lines(
+            now + 1, 200
+        )
+        clock = iter([now])
+
+        with patch.object(
+            log_parsing_health_check_module.time,
+            "time",
+            side_effect=lambda: next(clock, now + 70),
+        ):
+            result = await self.health_check._run(
+                self.device,
+                self.input,
+                {
+                    "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+                    "resource_accountant_activation": True,
+                    "start_time": now - 300,
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn("Found 200 ResourceAccountant rejection", result.message)
+        # Every counted line is one a window ending at the check start drops.
+        self.assertIn(f"window={now - 300}..{now + 70}", result.message)
+        self.assertIn("after_window=0", result.message)
+        self.assertIn("after_check_start=200", result.message)
+        self.health_check.driver.async_read_log_file.assert_awaited_once_with(
+            "/var/facebook/logs/fboss/wedge_agent.log",
+            start_time=now - 300,
+            end_time=now,
+            grep_pattern=log_parsing_health_check_module._RESOURCE_ACCOUNTANT_GREP_PATTERN,
+            tail_lines=200,
+            utc_offset_seconds=0,
+        )
+
+    async def test_resource_accountant_mode_keeps_explicit_end_time(self):
+        end_time = calendar.timegm((time.gmtime().tm_year, 9, 20, 10, 0, 0, 0, 0, 0))
+        self.health_check.driver.async_read_log_file.return_value = self._flood_lines(
+            end_time + 1, 200
+        )
+
+        with patch.object(
+            log_parsing_health_check_module.time,
+            "time",
+            return_value=end_time + 70,
+        ):
+            result = await self.health_check._run(
+                self.device,
+                self.input,
+                {
+                    "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+                    "resource_accountant_activation": True,
+                    "start_time": end_time - 300,
+                    "end_time": end_time,
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.FAIL, result.status)
+        self.assertIn("No ResourceAccountant rejection", result.message)
+        for field in (
+            f"window={end_time - 300}..{end_time}",
+            "check_start=None",
+            f"read_returned={end_time + 70}",
+            "lines_read=200",
+            "in_window=0",
+            "after_window=200",
+            "earlier_or_undated=0",
+        ):
+            self.assertIn(field, result.message)
+        self.assertNotIn("after_check_start", result.message)
+        # The failed read's buffer is logged whole for later comparison.
+        logged = "\n".join(str(call) for call in self.logger.info.call_args_list)
+        self.assertIn("1281 exceeds the limit: 1280", logged)
+
+    async def test_resource_accountant_mode_device_local_minute_boundary(self):
+        # fsw003.p003.f01.qzd1 logs in PST (-0800). The window opens on a
+        # minute boundary, so 06:22:59 is just before it and 06:23:00 inside.
+        # 06:24:01 is after the check started but before the read returned.
+        year = time.gmtime().tm_year
+        start_time = calendar.timegm((year, 11, 21, 14, 23, 0, 0, 0, 0))
+        check_start = start_time + 60
+        self.health_check.driver.async_run_cmd_on_shell.return_value = "-0800\n"
+        self.health_check.driver.async_read_log_file.return_value = "".join(
+            f"E1121 {stamp}.500000 51089 ResourceAccountant.cpp:1041] Total ARP "
+            "entries in new switchState: 1281 exceeds the limit: 1280 for "
+            "switchId: 0\n"
+            for stamp in ("06:22:59", "06:23:00", "06:24:01")
+        )
+        clock = iter([check_start])
+
+        with patch.object(
+            log_parsing_health_check_module.time,
+            "time",
+            side_effect=lambda: next(clock, check_start + 1.2),
+        ):
+            result = await self.health_check._run(
+                self.device,
+                self.input,
+                {
+                    "log_file_path": "/var/facebook/logs/fboss/wedge_agent.log",
+                    "resource_accountant_activation": True,
+                    "start_time": start_time,
+                },
+            )
+
+        self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
+        self.assertIn("Found 2 ResourceAccountant rejection", result.message)
+        for field in (
+            f"window={start_time}..{check_start + 2}",
+            f"check_start={check_start}",
+            "utc_offset=-28800s",
+            "lines_read=3",
+            "stamps=E1121 06:22:59..E1121 06:24:01",
+            "in_window=2",
+            "after_window=0",
+            "earlier_or_undated=1",
+            "after_check_start=1",
+        ):
+            self.assertIn(field, result.message)
+        self.assertNotIn("06:22:59.500000", result.message)
 
     def test_resource_accountant_factory_uses_requested_time_anchor_and_retries(self):
         check = create_resource_accountant_activation_check(

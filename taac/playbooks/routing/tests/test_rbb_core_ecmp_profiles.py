@@ -42,7 +42,7 @@ def _topology(path_count=2):
 
 
 class RbbCoreEcmpProfilesTest(unittest.TestCase):
-    def test_catalog_maps_all_three_requirements_in_dependency_order(self) -> None:
+    def test_catalog_maps_two_requirements_in_dependency_order(self) -> None:
         profiles = build_rbb_core_ecmp_profiles(_topology())
 
         self.assertEqual(
@@ -54,7 +54,6 @@ class RbbCoreEcmpProfilesTest(unittest.TestCase):
             (
                 RbbCoreEcmpAction.OPENR_PATH_SELECTION,
                 RbbCoreEcmpAction.OPENR_ECMP,
-                RbbCoreEcmpAction.BGP_ECMP_TRAFFIC,
             ),
         )
         self.assertEqual(profiles[0].coverage, RbbCoreEcmpCoverage.ADAPTED)
@@ -67,11 +66,11 @@ class RbbCoreEcmpProfilesTest(unittest.TestCase):
     def test_selection_preserves_catalog_order_and_rejects_unknowns(self) -> None:
         profiles = build_rbb_core_ecmp_profiles(_topology())
         selected = select_rbb_core_ecmp_profiles(
-            profiles, ["phase1:TC-08", "phase1:TC-02"]
+            profiles, ["phase1:TC-03", "phase1:TC-02"]
         )
         self.assertEqual(
             [profile.testplan_id for profile in selected],
-            ["phase1:TC-02", "phase1:TC-08"],
+            ["phase1:TC-02", "phase1:TC-03"],
         )
         with self.assertRaisesRegex(ValueError, "unknown"):
             select_rbb_core_ecmp_profiles(profiles, ["phase1:TC-999"])

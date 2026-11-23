@@ -47,6 +47,7 @@ class TestRbbPreflight(TestCase):
     def _run_check(
         self,
         *,
+        suite: str = "base",
         with_traffic: bool = False,
         setup_duts: bool = False,
         setup_dut_edges: bool = False,
@@ -58,6 +59,8 @@ class TestRbbPreflight(TestCase):
             "taac.runner.rbb_preflight",
             "--config-dir",
             str(self.config_dir),
+            "--suite",
+            suite,
         ]
         if with_traffic:
             command.append("--with-traffic")
@@ -115,6 +118,15 @@ class TestRbbPreflight(TestCase):
             "rbb-r2.lab.local,eth1/1,FBOSS,port-channel1,3,\n"
             "rbb-r1.lab.local,eth1/2,FBOSS,,ixia,1/1,IXIA,,3,IXIA\n"
             "rbb-r2.lab.local,eth1/2,FBOSS,,ixia,1/2,IXIA,,3,IXIA\n",
+            encoding="utf-8",
+        )
+
+    def _add_second_core_path(self) -> None:
+        circuit_path = self.config_dir / "circuit_info.csv"
+        circuit_path.write_text(
+            circuit_path.read_text(encoding="utf-8")
+            + "rbb-r1.lab.local,eth1/3,FBOSS,port-channel2,"
+            "rbb-r2.lab.local,eth1/3,FBOSS,port-channel2,3,\n",
             encoding="utf-8",
         )
 
@@ -187,6 +199,36 @@ class TestRbbPreflight(TestCase):
         self.assertIn("Configuration check passed", result.stdout)
         self.assertIn("device path (no IXIA)", result.stdout)
         self.assertNotIn("dut-secret", result.stdout + result.stderr)
+
+    def test_state_audit_suite_accepts_device_only_configuration(self) -> None:
+        self._write_valid_config(ixia_credentials=False)
+        result = self._run_check(suite="state-audit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_core_ecmp_suite_accepts_two_core_paths_without_ixia(self) -> None:
+        self._write_valid_config(ixia_credentials=False)
+        self._add_second_core_path()
+        result = self._run_check(suite="core-ecmp")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_core_ecmp_suite_rejects_reversed_metric_order(self) -> None:
+        self._write_valid_config(ixia_credentials=False)
+        self._add_second_core_path()
+        result = self._run_check(
+            suite="core-ecmp",
+            environment={
+                "TAAC_RBB_OPENR_PREFERRED_METRIC": "100",
+                "TAAC_RBB_OPENR_STANDBY_METRIC": "10",
+            },
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must be greater", result.stderr)
+
+    def test_device_suite_rejects_traffic_mode(self) -> None:
+        self._write_valid_config()
+        result = self._run_check(suite="state-audit", with_traffic=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("device-only", result.stderr)
 
     def test_check_accepts_complete_traffic_configuration(self) -> None:
         self._write_valid_config()

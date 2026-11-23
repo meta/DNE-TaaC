@@ -36,6 +36,7 @@ Usage: ./scripts/run-rbb-srv6.sh [OPTIONS] [-- RUNNER_ARGS...]
   --init              Create a local configuration from the OSS templates.
   --check             Validate inputs in the built image without lab access.
   --config-dir PATH   Use PATH instead of the checkout-local .taac directory.
+  --image IMAGE       Use IMAGE instead of the Docker helper's default tag.
   --suite NAME        Select base (default) or srv6-wire.
   --setup-duts        Temporarily bootstrap core ports, OpenR, iBGP, and SRv6.
   --with-traffic      Run the complete SRv6 qualification with live IXIA traffic.
@@ -49,6 +50,8 @@ Examples:
   ./scripts/run-rbb-srv6.sh --setup-duts
   ./scripts/run-rbb-srv6.sh --with-traffic
   ./scripts/run-rbb-srv6.sh --suite srv6-wire --with-traffic
+  ./scripts/run-rbb-srv6.sh --image fboss-taac:srv6-wire \
+    --suite srv6-wire --with-traffic
   ./scripts/run-rbb-srv6.sh --setup-duts --with-traffic --setup-dut-edges
   ./scripts/run-rbb-srv6.sh --config-dir /secure/rbb-lab --with-traffic
 EOF
@@ -61,6 +64,8 @@ CONFIGURE_EDGES=0
 SETUP_DUTS=0
 SUITE="base"
 SUITE_SET=0
+IMAGE=""
+IMAGE_SET=0
 CONFIG_DIR="$DEFAULT_CONFIG_DIR"
 RUNNER_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -88,6 +93,15 @@ while [[ $# -gt 0 ]]; do
             fi
             SUITE="$2"
             SUITE_SET=1
+            shift 2
+            ;;
+        --image)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                echo "Error: --image requires a value" >&2
+                exit 2
+            fi
+            IMAGE="$2"
+            IMAGE_SET=1
             shift 2
             ;;
         --with-traffic)
@@ -159,7 +173,7 @@ fi
 if [[ "$INIT_ONLY" -eq 1 ]]; then
     if [[ "$CHECK_ONLY" -eq 1 || "$WITH_TRAFFIC" -eq 1 || \
         "$CONFIGURE_EDGES" -eq 1 || "$SETUP_DUTS" -eq 1 || \
-        "$SUITE_SET" -eq 1 || \
+        "$SUITE_SET" -eq 1 || "$IMAGE_SET" -eq 1 || \
         ${#RUNNER_ARGS[@]} -gt 0 ]]; then
         echo "Error: --init may be combined only with --config-dir" >&2
         exit 2
@@ -234,6 +248,9 @@ for optional_file in rbb.env secrets.json; do
 done
 
 DOCKER_INPUT_ARGS=(--volume "$LOCAL_DIR:/workspace/.taac:ro")
+if [[ -n "$IMAGE" ]]; then
+    DOCKER_INPUT_ARGS=(--image "$IMAGE" "${DOCKER_INPUT_ARGS[@]}")
+fi
 if [[ -f "$LOCAL_DIR/rbb.env" ]]; then
     DOCKER_INPUT_ARGS=(
         --env-file "$LOCAL_DIR/rbb.env"

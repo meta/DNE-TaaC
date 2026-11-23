@@ -223,6 +223,14 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             # of the precheck, after the baseline is taken.
             self.port_fault_baseline = {}
 
+    def supports_controller_traffic_stats_reset(self) -> bool:
+        """IxNetwork clears the underlying cumulative traffic counters."""
+        return True
+
+    def supports_variable_l4_flow_ranges(self) -> bool:
+        """RESTPy renders configured L4 start/step/count value lists."""
+        return True
+
     @retryable(sleep_time=2, num_tries=100, print_ex=True)
     def start_capturing(self, sample_time: int):
         """

@@ -109,6 +109,14 @@ class AbstractTrafficGenerator(ABC):
         """Clear captured stats between measurements."""
         ...
 
+    def supports_controller_traffic_stats_reset(self) -> bool:
+        """Whether clearing stats resets the traffic controller counters."""
+        return False
+
+    def supports_variable_l4_flow_ranges(self) -> bool:
+        """Whether declarative L4 start/step/count ranges reach the wire."""
+        return False
+
     @abstractmethod
     def get_traffic_start_time(self) -> float:
         """

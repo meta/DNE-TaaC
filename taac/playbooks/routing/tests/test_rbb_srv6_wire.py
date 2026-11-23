@@ -13,6 +13,7 @@ from taac.test_as_a_config.types import StepName
 from taac.tasks.rbb_srv6_capture_mirror_task import RbbSrv6CaptureMirrorTask
 from taac.tasks.rbb_srv6_pcap_verify_task import RbbSrv6PcapVerifyTask
 from taac.tasks.registry import TASK_NAME_TO_CLASS
+from taac.ixia.taac_ixia import TaacIxia
 from taac.testconfigs.routing.factories.qual_rbb.rbb_srv6_wire_test_config import (
     create_rbb_srv6_wire_test_config,
 )
@@ -99,6 +100,11 @@ class RbbSrv6WireConfigTest(unittest.TestCase):
                 [],
                 playbook.name,
             )
+
+    def test_restpy_backend_declares_variable_l4_flow_support(self) -> None:
+        self.assertTrue(
+            TaacIxia.supports_variable_l4_flow_ranges(MagicMock(spec=TaacIxia))
+        )
 
     def test_each_case_programs_unique_nhg_and_decodes_actual_capture(self) -> None:
         packed = C.pack_usid_container(

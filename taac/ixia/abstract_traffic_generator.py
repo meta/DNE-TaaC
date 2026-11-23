@@ -100,7 +100,9 @@ class AbstractTrafficGenerator(ABC):
         Return packet loss stats as list of dicts.
 
         Each dict has: identifier, packet_loss_duration, packet_loss_percentage,
-        frame_delta.
+        and frame_delta. Implementations may also expose cumulative tx_frames,
+        rx_frames, tx_bytes, and rx_bytes counters when the controller provides
+        them.
         """
         ...
 

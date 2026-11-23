@@ -402,6 +402,10 @@ class TaacIxia(Ixia, Thread, AbstractTrafficGenerator):
             "Packet Loss Duration (ms)": "packet_loss_duration",
             "Loss %": "packet_loss_percentage",
             "Frames Delta": "frame_delta",
+            "Tx Frames": "tx_frames",
+            "Rx Frames": "rx_frames",
+            "Tx Bytes": "tx_bytes",
+            "Rx Bytes": "rx_bytes",
         }
         for column, key in numeric_columns.items():
             if column in column_names:

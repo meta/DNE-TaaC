@@ -4440,7 +4440,8 @@ class FbossSwitch(AbstractSwitch):
         if start_time is None and grep_pattern is None and tail_lines is None:
             return await self.async_read_file(log_file_path)
 
-        command = f"cat {shlex.quote(log_file_path)}"
+        # zcat -f also reads the rotated .gz archives.
+        command = f"zcat -f {shlex.quote(log_file_path)}"
         if start_time is not None:
             stop_time = end_time if end_time is not None else int(time.time())
             formatted_times = []

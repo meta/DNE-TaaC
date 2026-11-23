@@ -1006,7 +1006,7 @@ class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
             }
         )
         driver.async_get_all_vlan_configured_addresses = AsyncMock(
-            return_value={2000: ["2401:db00:501c::a/64"]}
+            return_value={2000: ["2401:db00:501c::a/64", "fe80::face:b00c/64"]}
         )
         driver.async_register_python_patcher = AsyncMock()
         task = ConfigureParallelBgpPeers(logger=MagicMock())
@@ -1070,13 +1070,18 @@ class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
         # Only the OSS patcher needs telling; COOP replaces addresses anyway.
         self.assertNotIn("retain_existing_vlan_addresses", primary)
         self.assertEqual(primary["ports"], [129])
-        self.assertEqual(primary["ip_addresses"], ["2401:db00:501c::10/127"])
+        # The global address is replaced; the link-local that the base
+        # config's ndp.routerAddress names is kept.
+        self.assertCountEqual(
+            primary["ip_addresses"],
+            ["2401:db00:501c::10/127", "fe80::face:b00c/64"],
+        )
         self.assertEqual(secondary["ports"], [137])
         self.assertEqual(
             secondary["ip_addresses"],
             ["2401:db00:e50d:11:18::10/127"],
         )
-        driver.async_get_all_vlan_configured_addresses.assert_not_awaited()
+        driver.async_get_all_vlan_configured_addresses.assert_awaited_once_with()
 
         bgp_call = next(
             call
@@ -1096,6 +1101,7 @@ class ConfigureParallelBgpPeersTest(later.unittest.TestCase):
                 129: SimpleNamespace(name="eth1/17/1", portId=129, vlans=[2000]),
             }
         )
+        driver.async_get_all_vlan_configured_addresses = AsyncMock(return_value={})
         driver.async_register_python_patcher = AsyncMock()
         config = {
             "eth1/17/1": [

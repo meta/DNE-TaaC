@@ -426,11 +426,7 @@ class ConfigureParallelBgpPeers(BaseTask):
                 shared_vlan_id,
             )
         configured_vlan_addresses: t.Dict[int, t.List[str]] = {}
-        if any(
-            config.get("retain_existing_vlan_addresses", True)
-            for configs in config_json.values()
-            for config in configs
-        ):
+        if config_json:
             configured_vlan_addresses = (
                 await driver.async_get_all_vlan_configured_addresses()
             )
@@ -492,10 +488,18 @@ class ConfigureParallelBgpPeers(BaseTask):
                                 description,
                             )
                         )
+                configured_addresses = configured_vlan_addresses.get(vlan_id, [])
+                # Replacing a VLAN's addresses keeps its link-local ones: the
+                # interface's ndp.routerAddress names one, and the agent rejects
+                # a routerAddress that is not an interface address on cold boot.
                 existing_vlan_addresses = (
-                    configured_vlan_addresses.get(vlan_id, [])
+                    configured_addresses
                     if retain_existing_vlan_addresses
-                    else []
+                    else [
+                        address
+                        for address in configured_addresses
+                        if ipaddress.ip_interface(address).ip.is_link_local
+                    ]
                 )
                 vlan_ip_addresses = list(
                     set(

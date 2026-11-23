@@ -494,7 +494,15 @@ class RbbSrv6NamedNhgTask(BaseTask):
         )
 
     async def _read_group(self, agent: t.Any, group_name: str) -> t.Any | None:
-        groups = list(await agent.getNamedNextHopGroups([group_name]))
+        # Newer generated FBOSS clients do not apply the Thrift default at the
+        # Python call boundary, so the optional IDL argument must be supplied.
+        # Keep combined weighted next hops intact: the task compares their
+        # explicit weights and must not expand one weighted member into copies.
+        groups = list(
+            await agent.getNamedNextHopGroups(
+                [group_name], False  # replicateWeightedNexthops
+            )
+        )
         matching = [
             group for group in groups if getattr(group, "name", None) == group_name
         ]
@@ -1161,7 +1169,11 @@ class RbbSrv6NamedNhgTask(BaseTask):
                 self._data[members_key] = _serializable_members(programmed_members)
                 add_named = getattr(agent, "addNamedNextHopGroups", None)
                 if add_named is not None:
-                    await add_named([group])
+                    # Current fbthrift clients require the defaulted Thrift
+                    # argument to be passed explicitly. Keep duplicate NHEs
+                    # uncombined so the programmed group preserves the exact
+                    # member list supplied by the test case.
+                    await add_named([group], False)
                 else:
                     # Compatibility with FBOSS clients generated before the
                     # nondeprecated RPC was added. Never retry through the old
@@ -1172,7 +1184,7 @@ class RbbSrv6NamedNhgTask(BaseTask):
                             "FBOSS client exposes neither addNamedNextHopGroups "
                             "nor its deprecated compatibility predecessor"
                         )
-                    await fallback([group])
+                    await fallback([group], False)
                 programmed = await self._read_group(agent, group_name)
                 self._assert_group_matches(
                     hostname,

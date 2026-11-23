@@ -434,11 +434,24 @@ class RbbOpenrCorePathTask(BaseTask):
         for index, (current, expected_override) in enumerate(
             zip(observed["paths"], expected)
         ):
-            if current["metric_override"] != expected_override:
+            observed_override = current["metric_override"]
+            if (
+                observed_override is not None
+                and observed_override != expected_override
+            ):
                 raise TestCaseFailure(
                     f"[{gate}] path {index} override expected={expected_override!r} "
-                    f"observed={current['metric_override']!r}"
+                    f"observed={observed_override!r}"
                 )
+            # Some Open/R builds expose the override only through the effective
+            # Decision adjacency metric.  When Link Monitor reports a null
+            # metricOverride, use that effective metric for mutation checks.
+            if observed_override is None and expected_override is not None:
+                if current["metric"] != expected_override:
+                    raise TestCaseFailure(
+                        f"[{gate}] path {index} effective metric expected="
+                        f"{expected_override} observed={current['metric']}"
+                    )
             # A programmed override must project to the exact Decision metric.
             # With no override, however, the base metric may be computed from
             # live RTT and is not required to equal the one-time snapshot.
@@ -629,21 +642,50 @@ class RbbOpenrCorePathTask(BaseTask):
         observed = await self._inspect(driver, state["core_addresses"])
         self._assert_identity(observed, state, gate)
         expected_owned = state.get("expected_overrides")
+        attempted = state.get("attempted_overrides")
         for index, current in enumerate(observed["paths"]):
             allowed = {None}
             if isinstance(expected_owned, list):
                 allowed.add(expected_owned[index])
-            attempted = state.get("attempted_overrides")
             if isinstance(attempted, list):
                 allowed.add(attempted[index])
-            if current["metric_override"] not in allowed:
+            current_override = current["metric_override"]
+            if current_override is not None and current_override not in allowed:
                 raise TestCaseFailure(
                     f"[{gate}] refusing to clear unowned metric override on "
-                    f"{current['interface']}: {current['metric_override']!r}"
+                    f"{current['interface']}: {current_override!r}"
                 )
+            if current_override is None:
+                allowed_metrics = {state["paths"][index]["metric"]}
+                if (
+                    isinstance(expected_owned, list)
+                    and expected_owned[index] is not None
+                ):
+                    allowed_metrics.add(expected_owned[index])
+                if isinstance(attempted, list) and attempted[index] is not None:
+                    allowed_metrics.add(attempted[index])
+                if current["metric"] not in allowed_metrics:
+                    raise TestCaseFailure(
+                        f"[{gate}] refusing to clear unowned effective metric on "
+                        f"{current['interface']}: {current['metric']!r}"
+                    )
         failures: list[str] = []
-        for current in observed["paths"]:
-            if current["metric_override"] is None:
+        for index, current in enumerate(observed["paths"]):
+            expected = (
+                expected_owned[index]
+                if isinstance(expected_owned, list)
+                else None
+            )
+            attempted_metric = (
+                attempted[index] if isinstance(attempted, list) else None
+            )
+            baseline = state["paths"][index]["metric"]
+            should_clear = (
+                current["metric_override"] is not None or expected is not None
+            )
+            if attempted_metric is not None and current["metric"] != baseline:
+                should_clear = True
+            if not should_clear:
                 continue
             try:
                 await self._run_clear_command(
@@ -869,8 +911,6 @@ class RbbOpenrCorePathTask(BaseTask):
                     "mysids": [],
                     "active_services": [],
                     "interfaces_up": [],
-                    "timeout_seconds": timeout_seconds,
-                    "poll_interval_seconds": poll_interval_seconds,
                 }
             )
             return

@@ -18,6 +18,7 @@ class _OpenrDriver:
         self.interfaces = ("fboss2011", "fboss2012")
         self.addresses = ("2001:db8:c0::", "2001:db8:c1::")
         self.overrides = [None, None]
+        self.expose_metric_override = True
         self.base_metrics = [20, 20]
         self.node_overloaded = False
         self.node_increment = 0
@@ -47,7 +48,11 @@ class _OpenrDriver:
                         "isOverloaded": self.interface_overloaded[index],
                         "linkFlapBackOffMs": None,
                         "linkMetricIncrementVal": self.link_increments[index],
-                        "metricOverride": self.overrides[index],
+                        **(
+                            {"metricOverride": self.overrides[index]}
+                            if self.expose_metric_override
+                            else {}
+                        ),
                     }
                     for index, interface in enumerate(self.interfaces)
                 },
@@ -213,10 +218,13 @@ class RbbOpenrCorePathTaskTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(shared_data)
         self.assertTrue(all(value is None for value in shared_data.values()))
         route = audit.await_args.args[0]["routes"][0]
+        audit_params = audit.await_args.args[0]
         self.assertNotIn("interfaces", route)
         self.assertEqual(route["next_hop_count"], 1)
         self.assertEqual(route["next_hop_interface_count"], 1)
         self.assertEqual(route["next_hop_scope"], "link_local")
+        self.assertNotIn("timeout_seconds", audit_params)
+        self.assertNotIn("poll_interval_seconds", audit_params)
         self.assertIn(
             "breeze lm override-adj-metric --yes --quiet r2 fboss2011 10",
             driver.commands,
@@ -346,6 +354,27 @@ class RbbOpenrCorePathTaskTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(driver.overrides, [None, None])
         self.assertEqual(driver.base_metrics, [23, 27])
+        self.assertTrue(all(value is None for value in shared_data.values()))
+
+    async def test_lifecycle_uses_effective_metric_when_lm_hides_override(self) -> None:
+        driver = _OpenrDriver()
+        driver.expose_metric_override = False
+        shared_data = {}
+        task = self._task(shared_data)
+        with patch(_DRIVER_PATH, new_callable=AsyncMock, return_value=driver):
+            await task.run(
+                _base(
+                    "snapshot",
+                    core_rif_cidrs=[
+                        "2001:db8:c0::/127",
+                        "2001:db8:c1::/127",
+                    ],
+                )
+            )
+            await task.run(_base("set_metrics", metrics=[10, 1000]))
+            await task.run(_base("restore"))
+
+        self.assertEqual(driver.overrides, [None, None])
         self.assertTrue(all(value is None for value in shared_data.values()))
 
     async def test_decision_poll_rejects_non_equal_metric_selected_paths(self) -> None:

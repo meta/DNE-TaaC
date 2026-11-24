@@ -350,9 +350,6 @@ EBB_FY27_SCALE = EbbScaleProfile(
     routes_per_he_peer=1000,
     fa_routes_per_peer=1000,
     openr_injection_headroom=0,
-    # The sheet's 1.08M received plus 29.6M advertised paths exceed the
-    # 30,000,000 total-path limit the EBB BGP++ config deploys.
-    bgp_total_path_limit=32_000_000,
     device_state_guard_namespace="ebb_fy27_stage1",
     allows_bgp_monitor=False,
     allows_dense_unvetted_route_tail=True,

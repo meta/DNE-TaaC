@@ -131,12 +131,12 @@ class BgpUpdateGroupRecoveryStepDefinitionsTest(TestCase):
         bounded_params = json.loads(
             none_throws(none_throws(bounded.step_params).json_params)
         )
-        self.assertEqual(legacy_params, bounded_params)
-        self.assertFalse(none_throws(legacy.step_params).jq_params)
         self.assertEqual(
-            {"convergence_trigger_time_seconds": ".formation_t0"},
-            none_throws(bounded.step_params).jq_params,
+            {**legacy_params, "convergence_trigger_time_jq_var": "formation_t0"},
+            bounded_params,
         )
+        self.assertFalse(none_throws(legacy.step_params).jq_params)
+        self.assertFalse(none_throws(bounded.step_params).jq_params)
 
     def test_sent_route_prior_trigger_budget_is_opt_in(self) -> None:
         kwargs = {
@@ -161,12 +161,12 @@ class BgpUpdateGroupRecoveryStepDefinitionsTest(TestCase):
         bounded_params = json.loads(
             none_throws(none_throws(bounded.step_params).json_params)
         )
-        self.assertEqual(legacy_params, bounded_params)
-        self.assertFalse(none_throws(legacy.step_params).jq_params)
         self.assertEqual(
-            {"convergence_trigger_time_seconds": ".formation_t0"},
-            none_throws(bounded.step_params).jq_params,
+            {**legacy_params, "convergence_trigger_time_jq_var": "formation_t0"},
+            bounded_params,
         )
+        self.assertFalse(none_throws(legacy.step_params).jq_params)
+        self.assertFalse(none_throws(bounded.step_params).jq_params)
 
     def test_bgp_agent_log_artifact_serializes_owned_lifecycle(self) -> None:
         step = create_bgp_agent_log_artifact_step(

@@ -179,14 +179,12 @@ class ColdStartPlaybookTest(TestCase):
             (True, 18), (enable_args["enable"], enable_args["expected_match_count"])
         )
         self.assertEqual(
-            (1272, 600.0, 5.0, ".bgp_cold_start_formation_t0"),
+            (1272, 600.0, 5.0, "bgp_cold_start_formation_t0"),
             (
                 convergence["expected_established_sessions"],
                 convergence["convergence_hard_timeout_seconds"],
                 convergence["convergence_poll_interval_seconds"],
-                convergence_step.step_params.jq_params[
-                    "convergence_trigger_time_seconds"
-                ],
+                convergence["convergence_trigger_time_jq_var"],
             ),
         )
 
@@ -228,10 +226,8 @@ class ColdStartPlaybookTest(TestCase):
             ),
         )
         self.assertEqual(
-            ".bgp_cold_start_formation_t0",
-            playbook.stages[3]
-            .steps[1]
-            .step_params.jq_params["convergence_trigger_time_seconds"],
+            "bgp_cold_start_formation_t0",
+            all_peer_parity["convergence_trigger_time_jq_var"],
         )
         self.assertEqual(
             ("compare", 100, 100),

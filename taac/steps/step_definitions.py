@@ -2719,18 +2719,7 @@ def create_verify_bgp_sent_route_count_delta_step(
             )
         if not convergence_trigger_time_jq_var:
             raise ValueError("convergence_trigger_time_jq_var must be non-empty")
-        return Step(
-            name=StepName.CUSTOM_STEP,
-            step_params=Params(
-                json_params=json.dumps(params),
-                jq_params={
-                    "convergence_trigger_time_seconds": (
-                        f".{convergence_trigger_time_jq_var}"
-                    )
-                },
-            ),
-            description=description,
-        )
+        params["convergence_trigger_time_jq_var"] = convergence_trigger_time_jq_var
     return create_custom_step(params_dict=params, description=description)
 
 
@@ -5314,18 +5303,7 @@ def create_bgp_lifecycle_convergence_step(
     if convergence_trigger_time_jq_var is not None:
         if not convergence_trigger_time_jq_var:
             raise ValueError("convergence_trigger_time_jq_var must be non-empty")
-        return Step(
-            name=StepName.CUSTOM_STEP,
-            description=description,
-            step_params=Params(
-                json_params=json.dumps(params),
-                jq_params={
-                    "convergence_trigger_time_seconds": (
-                        f".{convergence_trigger_time_jq_var}"
-                    )
-                },
-            ),
-        )
+        params["convergence_trigger_time_jq_var"] = convergence_trigger_time_jq_var
     return create_custom_step(params_dict=params, description=description)
 
 

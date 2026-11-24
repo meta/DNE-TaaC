@@ -331,11 +331,11 @@ def run_preflight(
             require_ixia=with_traffic,
         )
         if suite == "srv6-wire":
-            from taac.testconfigs.routing.util.bgp_rbb_core_ecmp_profiles import (
-                validate_core_ecmp_topology,
+            from taac.testconfigs.routing.util.bgp_rbb_srv6_wire_profiles import (
+                validate_srv6_wire_distribution_topology,
             )
 
-            validate_core_ecmp_topology(topology)
+            validate_srv6_wire_distribution_topology(topology)
         if setup_duts or setup_dut_edges:
             from taac.testconfigs.routing.util import (
                 bgp_rbb_constants as C,

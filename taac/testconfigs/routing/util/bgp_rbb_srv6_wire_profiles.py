@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import dataclasses
+import math
+import os
 import re
 import typing as t
 from dataclasses import dataclass
@@ -19,6 +21,37 @@ from taac.testconfigs.routing.util.bgp_rbb_scenario_profiles import (
     SRV6_3_USIDS_PROFILE,
 )
 from taac.testconfigs.routing.util.bgp_rbb_topology import RbbTopology
+
+
+def _path_share(env_name: str, default: float) -> float:
+    value = float(os.environ.get(env_name, str(default)))
+    if not math.isfinite(value) or not 0 < value <= 100:
+        raise ValueError(f"{env_name} must be finite and in (0, 100]")
+    return value
+
+
+MIN_PATH_TRAFFIC_SHARE_PCT = _path_share(
+    "TAAC_RBB_SRV6_WIRE_MIN_PATH_SHARE_PCT", 1.0
+)
+
+
+def validate_srv6_wire_distribution_topology(topology: RbbTopology) -> int:
+    """Validate the symmetric physical paths required by TC-05 and TC-08."""
+    r1_paths = topology.r1.core_pcs
+    r2_paths = topology.r2.core_pcs
+    if len(r1_paths) < 2 or len(r2_paths) < 2:
+        raise ValueError("SRv6 wire distribution requires at least two core paths")
+    if len(r1_paths) != len(r2_paths):
+        raise ValueError("SRv6 wire distribution requires symmetric core-path counts")
+    for role, paths in (("r1", r1_paths), ("r2", r2_paths)):
+        if any(not path.members for path in paths):
+            raise ValueError(f"{role} core paths must have physical members")
+    if MIN_PATH_TRAFFIC_SHARE_PCT * len(r1_paths) > 100:
+        raise ValueError(
+            "TAAC_RBB_SRV6_WIRE_MIN_PATH_SHARE_PCT multiplied by the core-path "
+            "count must not exceed 100"
+        )
+    return len(r1_paths)
 
 
 @dataclass(frozen=True)
@@ -104,7 +137,9 @@ def select_rbb_srv6_wire_profiles(
 
 
 __all__ = [
+    "MIN_PATH_TRAFFIC_SHARE_PCT",
     "RbbSrv6WireProfile",
     "SRV6_WIRE_PROFILES",
     "select_rbb_srv6_wire_profiles",
+    "validate_srv6_wire_distribution_topology",
 ]

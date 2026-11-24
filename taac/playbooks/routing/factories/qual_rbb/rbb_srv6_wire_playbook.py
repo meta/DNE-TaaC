@@ -25,15 +25,13 @@ from taac.steps.step_definitions import (
 )
 from taac.test_as_a_config.types import Playbook, Step
 from taac.testconfigs.routing.util import bgp_rbb_constants as C
-from taac.testconfigs.routing.util.bgp_rbb_core_ecmp_profiles import (
-    MIN_PATH_TRAFFIC_SHARE_PCT,
-    validate_core_ecmp_topology,
-)
 from taac.testconfigs.routing.util.bgp_rbb_scenario_profiles import (
     SRV6_3_USIDS_PROFILE,
 )
 from taac.testconfigs.routing.util.bgp_rbb_srv6_wire_profiles import (
+    MIN_PATH_TRAFFIC_SHARE_PCT,
     RbbSrv6WireProfile,
+    validate_srv6_wire_distribution_topology,
 )
 from taac.testconfigs.routing.util.bgp_rbb_topology import RbbTopology
 
@@ -244,7 +242,7 @@ def create_rbb_srv6_wire_playbook(
     topology: RbbTopology,
 ) -> Playbook:
     if profile.require_distribution:
-        validate_core_ecmp_topology(topology)
+        validate_srv6_wire_distribution_topology(topology)
     provisioning = profile.provisioning_profile(topology)
     base = create_rbb_named_nhg_playbook(
         provisioning,

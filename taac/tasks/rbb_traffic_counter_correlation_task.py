@@ -20,13 +20,13 @@ part of this task's input contract.
 from __future__ import annotations
 
 import math
+import re
 import shlex
 import time
 import typing as t
 
 from taac.constants import TestCaseFailure
 from taac.tasks.base_task import BaseTask
-from taac.tasks.rbb_input_validation import validated_fboss_interface_names
 from taac.utils.driver_factory import async_get_device_driver
 from taac.utils.oss_taac_lib_utils import ConsoleFileLogger
 
@@ -38,6 +38,23 @@ _ASSERT_MIN_DELTA = "assert_min_delta"
 _IXIA_COUNTER_FIELDS = frozenset(("tx_frames", "rx_frames", "tx_bytes", "rx_bytes"))
 _COUNTER_DIRECTIONS = frozenset(("ingress", "egress"))
 _COUNTER_KINDS = frozenset(("packets", "bytes"))
+_FBOSS_INTERFACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
+
+
+def _validated_fboss_interface_names(value: object, field: str) -> list[str]:
+    """Validate the task-local list of exact FBOSS interface names."""
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field} must be a non-empty list")
+    interfaces: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _FBOSS_INTERFACE_NAME_RE.fullmatch(item):
+            raise ValueError(
+                f"{field} contains an invalid interface name: {item!r}"
+            )
+        if item in interfaces:
+            raise ValueError(f"{field} contains duplicate interface {item!r}")
+        interfaces.append(item)
+    return interfaces
 
 
 def _strict_nonnegative_number(value: t.Any, label: str) -> float:
@@ -114,7 +131,7 @@ class RbbTrafficCounterCorrelationTask(BaseTask):
 
     @staticmethod
     def _validated_interfaces(value: t.Any) -> list[str]:
-        return validated_fboss_interface_names(value, "counter_interfaces")
+        return _validated_fboss_interface_names(value, "counter_interfaces")
 
     @staticmethod
     def _ixia_counter(

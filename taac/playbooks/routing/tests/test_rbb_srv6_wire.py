@@ -12,6 +12,9 @@ from unittest.mock import MagicMock
 from taac.test_as_a_config.types import StepName
 from taac.tasks.rbb_srv6_capture_mirror_task import RbbSrv6CaptureMirrorTask
 from taac.tasks.rbb_srv6_pcap_verify_task import RbbSrv6PcapVerifyTask
+from taac.tasks.rbb_traffic_counter_correlation_task import (
+    RbbTrafficCounterCorrelationTask,
+)
 from taac.tasks.registry import TASK_NAME_TO_CLASS
 from taac.ixia.taac_ixia import TaacIxia
 from taac.testconfigs.routing.factories.qual_rbb.rbb_srv6_wire_test_config import (
@@ -20,6 +23,9 @@ from taac.testconfigs.routing.factories.qual_rbb.rbb_srv6_wire_test_config impor
 from taac.testconfigs.routing.util import bgp_rbb_constants as C
 from taac.testconfigs.routing.util.bgp_rbb_scenario_profiles import (
     SRV6_3_USIDS_PROFILE,
+)
+from taac.testconfigs.routing.util.bgp_rbb_srv6_wire_profiles import (
+    validate_srv6_wire_distribution_topology,
 )
 from taac.testconfigs.routing.util.bgp_rbb_topology import (
     CorePortChannel,
@@ -193,6 +199,33 @@ class RbbSrv6WireConfigTest(unittest.TestCase):
             self.assertTrue(
                 all(capture_index < index for index in snapshot_indices)
             )
+
+    def test_distribution_topology_requires_symmetric_physical_paths(self) -> None:
+        topology = _topology()
+        self.assertEqual(validate_srv6_wire_distribution_topology(topology), 2)
+        asymmetric = RbbTopology(
+            r1=topology.r1,
+            r2=NodeTopology(
+                role="r2",
+                hostname=topology.r2.hostname,
+                core_pcs=topology.r2.core_pcs[:1],
+                ixia_edges=topology.r2.ixia_edges,
+            ),
+            ixia_chassis=topology.ixia_chassis,
+        )
+        with self.assertRaisesRegex(ValueError, "at least two core paths"):
+            validate_srv6_wire_distribution_topology(asymmetric)
+
+    def test_counter_interface_validation_is_task_local_and_strict(self) -> None:
+        validate = RbbTrafficCounterCorrelationTask._validated_interfaces
+        self.assertEqual(
+            validate(["eth1/1/1", "port-channel1"]),
+            ["eth1/1/1", "port-channel1"],
+        )
+        with self.assertRaisesRegex(ValueError, "invalid interface name"):
+            validate(["eth1/1/1 "])
+        with self.assertRaisesRegex(ValueError, "duplicate interface"):
+            validate(["eth1/1/1", "eth1/1/1"])
 
 
 class RbbSrv6CaptureMirrorConfigTest(unittest.TestCase):

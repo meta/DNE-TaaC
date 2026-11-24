@@ -201,70 +201,128 @@ class BgpEbbFullScaleFactoryTest(unittest.TestCase):
             with self.subTest(config=config.name):
                 self.assertEqual("routing.qual", config.basset_pool)
 
-    def test_nrq_non_ug_canaries_select_fy27_without_changing_ug(self) -> None:
-        for non_ug, ug, expected_playbooks in (
-            (
-                cicd_ebb_int_tc.NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
-                cicd_ebb_int_tc.NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
-                [
-                    "bgp_ebb_route_registry_runtime_update_playbook",
-                    "bgp_ebb_daemon_restart_playbook",
-                ],
-            ),
-            (
-                cicd_ebb_int_tc.NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
-                cicd_ebb_int_tc.NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
-                [
-                    "bgp_ebb_attribute_churn_playbook",
-                    "bgp_ebb_fauu_drain_undrain_playbook",
-                ],
-            ),
-            (
-                cicd_ebb_int_tc.NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
-                cicd_ebb_int_tc.NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
-                [
-                    "bgp_ebb_ebgp_session_oscillation_playbook",
-                    "bgp_ebb_cold_start_playbook",
-                ],
-            ),
-            (
-                cicd_ebb_int_tc.NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG,
-                cicd_ebb_int_tc.NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG,
-                [
-                    "bgp_ebb_ebgp_route_oscillation_playbook",
-                    "bgp_ebb_igp_unresolvable_pnh_playbook",
-                ],
-            ),
-        ):
-            with self.subTest(config=non_ug.name):
-                (endpoint,) = non_ug.endpoints or []
+    def test_stage1_rollout_boundary_is_exactly_the_named_fy27_canaries(self) -> None:
+        """Only the Stage 1 bindings in `_FY27_CANARY_NAMES` run FY27 scale.
+
+        FY27 drops the BGP monitor, splits the Tornado planes over two iBGP
+        links, and forces the `ebb` BGP++ platform before the first Bgpcpp
+        enable; FY26 keeps the monitor on the spare lane and no platform task.
+        Asserting both directions over every Stage 1 binding, with each
+        binding's Playbook list pinned, is what keeps a later scale move from
+        carrying an unnamed node or a reordered case with it.
+        """
+        expected_playbooks = {
+            "NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG": [
+                "bgp_ebb_route_registry_runtime_update_playbook",
+                "bgp_ebb_daemon_restart_playbook",
+            ],
+            "NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG": [
+                "bgp_ebb_route_registry_runtime_update_playbook",
+                "bgp_ebb_daemon_restart_playbook",
+                "bgp_ebb_cold_start_playbook",
+                "bgp_ebb_longevity_playbook",
+            ],
+            "NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG": [
+                "bgp_ebb_attribute_churn_playbook",
+                "bgp_ebb_fauu_drain_undrain_playbook",
+            ],
+            "NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_UG": [
+                "bgp_ebb_attribute_churn_playbook",
+                "bgp_ebb_fauu_drain_undrain_playbook",
+                "bgp_ebb_plane_drain_undrain_playbook",
+                "bgp_ebb_ibgp_route_oscillation_playbook",
+            ],
+            "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG": [
+                "bgp_ebb_ebgp_session_oscillation_playbook",
+                "bgp_ebb_cold_start_playbook",
+            ],
+            "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_UG": [
+                "bgp_ebb_route_storm_playbook",
+                "bgp_ebb_multipath_group_oscillation_playbook",
+                "bgp_ebb_igp_pnh_metric_oscillation_playbook",
+                "bgp_ebb_ebgp_session_oscillation_playbook",
+            ],
+            "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG": [
+                "bgp_ebb_ebgp_route_oscillation_playbook",
+                "bgp_ebb_igp_unresolvable_pnh_playbook",
+            ],
+            "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_UG": [
+                "bgp_ebb_ebgp_route_oscillation_playbook",
+                "bgp_ebb_ibgp_plane_session_oscillation_playbook",
+                "bgp_ebb_igp_unresolvable_pnh_playbook",
+                "bgp_ebb_nexthop_group_count_threshold_playbook",
+            ],
+        }
+        stage1_names = {
+            name for name in cicd_ebb_int_tc.__all__ if "_STAGE1_FULL_SCALE_" in name
+        }
+
+        self.assertEqual(set(expected_playbooks), stage1_names)
+        self.assertLess(_FY27_CANARY_NAMES, stage1_names)
+
+        for name in sorted(stage1_names):
+            config = getattr(cicd_ebb_int_tc, name)
+            fy27 = name in _FY27_CANARY_NAMES
+            with self.subTest(config=name, fy27=fy27):
+                self.assertEqual(
+                    expected_playbooks[name],
+                    [playbook.name for playbook in config.playbooks or []],
+                )
+                (endpoint,) = config.endpoints or []
                 self.assertEqual(3, len(endpoint.ixia_ports or ()))
-                self.assertNotIn(
-                    "DEVICE_GROUP_BGP_MON", _enabled_device_group_names(non_ug)
+                platform_tasks = sum(
+                    task.task_name == "configure_bgpcpp_startup"
+                    and _json_params(task.params).get("flags") == {"platform": "ebb"}
+                    for task in config.setup_tasks or []
                 )
-                self.assertEqual(
-                    expected_playbooks,
-                    [playbook.name for playbook in non_ug.playbooks or []],
-                )
-                self.assertEqual(
-                    1,
-                    sum(
-                        task.task_name == "configure_bgpcpp_startup"
-                        and _json_params(task.params).get("flags")
-                        == {"platform": "ebb"}
-                        for task in non_ug.setup_tasks or []
-                    ),
-                )
-            with self.subTest(config=ug.name):
-                self.assertIn("DEVICE_GROUP_BGP_MON", _enabled_device_group_names(ug))
-                self.assertFalse(
-                    any(
-                        task.task_name == "configure_bgpcpp_startup"
-                        and _json_params(task.params).get("flags")
-                        == {"platform": "ebb"}
-                        for task in ug.setup_tasks or []
+                if fy27:
+                    self.assertNotIn(
+                        "DEVICE_GROUP_BGP_MON", _enabled_device_group_names(config)
                     )
-                )
+                    self.assertEqual(1, platform_tasks)
+                else:
+                    self.assertIn(
+                        "DEVICE_GROUP_BGP_MON", _enabled_device_group_names(config)
+                    )
+                    self.assertEqual(0, platform_tasks)
+
+    def test_nrqeb006_ug_canary_keeps_the_whole_node_contract(self) -> None:
+        """The NRQEB006 UG canary moves scale and nothing else.
+
+        CICD-EBB-15's four-hour soak and 300-second quiescence are scale
+        independent, so FY27 must not shorten either, and the four whole-node
+        cases must keep their order, Update Groups, and the FY27 1,880-session
+        fleet the checks are written against.
+        """
+        config = cicd_ebb_int_tc.NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG
+        playbooks = {playbook.name: playbook for playbook in config.playbooks or []}
+
+        longevity_durations = [
+            params["duration_seconds"]
+            for stage in playbooks["bgp_ebb_longevity_playbook"].stages or []
+            for step in stage.steps or []
+            if "duration_seconds" in (params := _json_params(step.step_params))
+        ]
+        self.assertEqual([factory._LONGEVITY_DURATION_SECONDS], longevity_durations)
+        self.assertEqual(14_400, factory._LONGEVITY_DURATION_SECONDS)
+
+        update_group_validations = [
+            _json_params(task.params).get("expect_enabled")
+            for task in config.setup_tasks or []
+            if task.task_name == "validate_bgpcpp_update_group_state"
+        ]
+        self.assertTrue(update_group_validations)
+        self.assertTrue(all(update_group_validations))
+
+        identities = [
+            params["expected_peer_identity"]
+            for playbook in config.playbooks or []
+            for check in playbook.snapshot_checks or []
+            if check.check_params is not None
+            and "expected_peer_identity" in (params := _json_params(check.check_params))
+        ]
+        self.assertTrue(identities)
+        self.assertTrue(all(len(identity) == 1_880 for identity in identities))
 
     def test_fy27_fauu_waits_for_stable_full_peer_baseline_only(self) -> None:
         def baseline_params(config: taac_types.TestConfig) -> dict[str, t.Any]:
@@ -1107,9 +1165,10 @@ def _bgp_peer_names(device_group: taac_types.DeviceGroupConfig) -> list[str]:
 
 
 _COLD_START_PLAYBOOK = "bgp_ebb_cold_start_playbook"
-_FY27_NON_UG_CANARY_NAMES = frozenset(
+_FY27_CANARY_NAMES = frozenset(
     {
         "NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
+        "NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG",
         "NRQEB007_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
         "NRQEB008_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
         "NRQEB009_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG",
@@ -1262,7 +1321,7 @@ class GatewayResolutionGateTest(unittest.TestCase):
                     and _json_params(tasks[index].params).get("daemon_name") == "Bgpcpp"
                     and _json_params(tasks[index].params).get("action") == "enable"
                 )
-                expected_gate_offset = 2 if name in _FY27_NON_UG_CANARY_NAMES else 1
+                expected_gate_offset = 2 if name in _FY27_CANARY_NAMES else 1
                 self.assertEqual(first_bgpcpp_enable - expected_gate_offset, gates[0])
                 self.assertLess(last_interface_ip, gates[0])
                 names = _gate_device_group_names(tasks[gates[0]].params)
@@ -1274,7 +1333,7 @@ class GatewayResolutionGateTest(unittest.TestCase):
                     }
                     <= set(names)
                 )
-                if name in _FY27_NON_UG_CANARY_NAMES:
+                if name in _FY27_CANARY_NAMES:
                     self.assertNotIn("DEVICE_GROUP_BGP_MON", names)
                 else:
                     self.assertIn("DEVICE_GROUP_BGP_MON", names)
@@ -1397,7 +1456,7 @@ class GatewayGateScopeTest(unittest.TestCase):
         for name, config in self.gated.items():
             with self.subTest(config=name):
                 self.assertEqual(
-                    name in _FY27_NON_UG_CANARY_NAMES,
+                    name in _FY27_CANARY_NAMES,
                     bool(_state_guard_tasks(config)),
                 )
 

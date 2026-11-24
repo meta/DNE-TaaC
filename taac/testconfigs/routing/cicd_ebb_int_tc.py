@@ -65,9 +65,10 @@ def _with_testbed_isolation_bypass(config: TestConfig) -> TestConfig:
 
 # Stage 1: retain only the reviewed Non-UG cases selected for daily execution.
 # Each config lists its playbooks inline so what a Conveyor node runs is
-# readable at the node, without resolving a shared constant. The promotion-
-# gating UG configs remain unchanged; a rebalanced Non-UG case can therefore
-# have its UG coverage on a different scheduled device.
+# readable at the node, without resolving a shared constant. A rebalanced
+# Non-UG case can have its UG coverage on a different scheduled device. Every
+# NRQEB006 binding runs EBB_FY27_SCALE; NRQEB007 through NRQEB009 keep their UG
+# bindings on EBB_FY26_SCALE.
 # CONVEYOR: dne_routing / nrqeb006_stage1_node
 NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG = create_bgp_ebb_full_scale_test_config(
     NRQEB006_ASH6,
@@ -97,6 +98,7 @@ NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_confi
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
     enable_daemon_restart_matrix=True,
+    scale=EBB_FY27_SCALE,
 )
 
 # CONVEYOR: dne_routing / nrqeb007_stage1_node

@@ -2541,3 +2541,68 @@ class EbbIgpPnhMetricOscillationDualScaleFactoryTest(unittest.TestCase):
             if value in _STALE_FY26_COUNTS
         ]
         self.assertEqual([], stale)
+
+
+class Ebb16Fy27ContractTest(unittest.TestCase):
+    """CICD-EBB-16 builds at FY27 with a scale-derived, unshortened contract."""
+
+    @staticmethod
+    def _storm_kwargs(scale: EbbScaleProfile | None) -> t.Mapping[str, t.Any]:
+        builder = factory.get_bgp_ebb_nexthop_group_count_threshold_playbook
+        kwargs: dict[str, t.Any] = {
+            "name": "EBB16_CONTRACT_TEST",
+            "playbooks_selected": [_C16_PLAYBOOK],
+            "profile": BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            "enable_update_group": False,
+            "parent_networks": EBB_PARENT_NETWORKS_IXIA03,
+            "next_hops": EBB_NEXT_HOPS_IXIA03,
+        }
+        if scale is not None:
+            kwargs["scale"] = scale
+        with mock.patch.object(factory, builder.__name__, wraps=builder) as wrapped:
+            factory.create_bgp_ebb_full_scale_test_config(NRQEB009_ASH6, **kwargs)
+        return wrapped.call_args.kwargs
+
+    def test_fy27_builds_the_nhg_storm_playbook(self) -> None:
+        config = factory.create_bgp_ebb_full_scale_test_config(
+            NRQEB009_ASH6,
+            name="EBB16_FY27_BUILDS",
+            playbooks_selected=[_C16_PLAYBOOK],
+            profile=BgpPlusPlusProfile.BGP_PLUS_PLUS_WITH_OPEN_R,
+            enable_update_group=False,
+            parent_networks=EBB_PARENT_NETWORKS_IXIA03,
+            next_hops=EBB_NEXT_HOPS_IXIA03,
+            scale=EBB_FY27_SCALE,
+        )
+        self.assertEqual([_C16_PLAYBOOK], [pb.name for pb in config.playbooks or []])
+
+    def test_fy27_storm_contract_is_scale_derived_and_unshortened(self) -> None:
+        kwargs = self._storm_kwargs(EBB_FY27_SCALE)
+        self.assertEqual(1880, kwargs["expected_established_sessions"])
+        self.assertEqual(1000, kwargs["minimum_distinct_memberships_per_afi"])
+        self.assertEqual(1000, kwargs["route_count_expected"])
+        self.assertEqual(48, kwargs["epoch_count"])
+        self.assertEqual(25, kwargs["epoch_interval_seconds"])
+        self.assertEqual(300, kwargs["soak_duration"])
+        self.assertEqual(25, kwargs["target_membership_width"])
+        self.assertEqual(1001, kwargs["minimum_observed_bgp_multiway_memberships"])
+        self.assertEqual(1000, kwargs["fibagent_nhg_watermark_high"])
+        self.assertEqual(1000, kwargs["fibagent_nhg_watermark_low"])
+        self.assertEqual(8192, kwargs["nexthop_group_threshold"])
+        self.assertEqual(150, kwargs["restoration_stage_prefix_count"])
+        self.assertEqual(180, kwargs["control_plane_read_timeout_seconds"])
+        self.assertEqual(3, kwargs["minimum_confirmed_pause_fap_samples"])
+        self.assertEqual(
+            {"ipv4": 1000, "ipv6": 1000},
+            {
+                afi: items["target_prefix_count"]
+                for afi, items in kwargs["ixia_items_by_afi"].items()
+            },
+        )
+
+    def test_fy26_membership_floor_and_sessions_are_unchanged(self) -> None:
+        kwargs = self._storm_kwargs(None)
+        self.assertEqual(750, kwargs["minimum_distinct_memberships_per_afi"])
+        self.assertEqual(750, kwargs["route_count_expected"])
+        self.assertEqual(1272, kwargs["expected_established_sessions"])
+        self.assertEqual(48, kwargs["epoch_count"])

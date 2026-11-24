@@ -179,9 +179,6 @@ _FY26_ONLY_PLAYBOOKS: t.Mapping[str, str] = {
         "62 peers, 750 routes, rows 0-61 and 21/21/20 shards"
     ),
     "bgp_ebb_plane_drain_undrain_playbook": _FY26_DRAIN_PNH_REASON,
-    "bgp_ebb_nexthop_group_count_threshold_playbook": (
-        "its NHG storm and restoration staging are calibrated to the FY26 FEC baseline"
-    ),
     **dict.fromkeys(
         _TC7_PLAYBOOK_NAMES,
         "the UG 2.7 runtime steps pin the FY26 two-port 1,272-session contract",
@@ -1783,6 +1780,7 @@ def _get_bgp_ebb_full_scale_playbooks(  # noqa: C901
             ixia_items_by_afi=_nhg_storm_ixia_items(
                 bound, automation, target_prefix_count=scale.fa_routes_per_peer
             ),
+            minimum_distinct_memberships_per_afi=scale.fa_routes_per_peer,
             prefix_pool_scope_regex=automation.exact_ebgp_route_regex(),
             nexthop_group_threshold=_NEXTHOP_GROUP_AGGREGATE_GUARDRAIL,
             epoch_count=nhg_storm_epoch_count,

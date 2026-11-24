@@ -96,6 +96,7 @@ NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG = create_bgp_ebb_full_scale_test_confi
     enable_update_group=True,
     parent_networks=EBB_PARENT_NETWORKS_IXIA03,
     next_hops=EBB_NEXT_HOPS_IXIA03,
+    enable_daemon_restart_matrix=True,
 )
 
 # CONVEYOR: dne_routing / nrqeb007_stage1_node

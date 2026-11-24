@@ -1973,7 +1973,7 @@ def create_bgp_ebb_full_scale_test_config(  # noqa: C901
             Open/R profile and name its playbooks, none of which may be one
             still pinned to FY26 geometry.
         enable_daemon_restart_matrix: Run CICD-EBB-01 as the FibAgentBgp/BGP++
-            restart matrix instead of the scheduled single BGP++ restart.
+            restart matrix instead of the single BGP++ restart.
     """
     if setup_only and playbooks_selected is not None:
         raise ValueError("setup_only requires playbooks_selected=None")

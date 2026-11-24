@@ -8,9 +8,6 @@ from taac.playbooks.routing.bgp_ebb_playbooks import (
     get_bgp_ebb_daemon_restart_playbook,
 )
 from taac.testconfigs.routing import cicd_ebb_int_tc
-from taac.testconfigs.routing.adhoc_agent_restart_matrix import (
-    NRQEB006_EBB01_RESTART_MATRIX_UG_ADHOC,
-)
 from taac.utils.json_thrift_utils import json_to_thrift
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config.types import (
@@ -25,6 +22,7 @@ from taac.test_as_a_config.types import (
 )
 
 _PLAYBOOK = "bgp_ebb_daemon_restart_playbook"
+_NIGHTLY_UG = cicd_ebb_int_tc.NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG
 _STAGE_IDS = [
     "s1_fibagent_bgp_restart",
     "s2_fibagent_bgp_repeated_restart",
@@ -133,15 +131,15 @@ def _expected_restarts(check: PointInTimeHealthCheck) -> list[str]:
     return json.loads(params.json_params).get("expected_restarted_services", [])
 
 
-class AdhocEbb01RestartMatrixTest(unittest.TestCase):
+class Ebb01RestartMatrixTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.playbook = _playbook(NRQEB006_EBB01_RESTART_MATRIX_UG_ADHOC)
+        self.playbook = _playbook(_NIGHTLY_UG)
         self.stages = {stage.id: stage for stage in self.playbook.stages}
 
-    def test_binding_runs_only_ebb01_on_nrqeb006(self) -> None:
-        config = NRQEB006_EBB01_RESTART_MATRIX_UG_ADHOC
-        self.assertEqual("NRQEB006_EBB01_RESTART_MATRIX_UG_ADHOC", config.name)
-        self.assertEqual([_PLAYBOOK], [playbook.name for playbook in config.playbooks])
+    def test_nightly_ug_config_runs_the_matrix_on_nrqeb006(self) -> None:
+        config = _NIGHTLY_UG
+        self.assertEqual("NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG", config.name)
+        self.assertIn(_PLAYBOOK, [playbook.name for playbook in config.playbooks])
         self.assertEqual(
             ["nrqeb006.ash6"],
             [endpoint.name for endpoint in config.endpoints if endpoint.dut],
@@ -393,8 +391,10 @@ class AdhocEbb01RestartMatrixTest(unittest.TestCase):
         for check in restart_checks:
             self.assertEqual(["Bgpcpp", "FibAgentBgp"], _expected_restarts(check))
 
-    def test_scheduled_ebb01_keeps_single_bgpcpp_restart(self) -> None:
-        playbook = _playbook(cicd_ebb_int_tc.NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_UG)
+    def test_nightly_non_ug_ebb01_keeps_single_bgpcpp_restart(self) -> None:
+        playbook = _playbook(
+            cicd_ebb_int_tc.NRQEB006_STAGE1_FULL_SCALE_TEST_CONFIG_NO_UG
+        )
         self.assertEqual(1, len(playbook.stages))
         self.assertEqual(
             [("Bgpcpp", "disable"), ("Bgpcpp", "enable")],

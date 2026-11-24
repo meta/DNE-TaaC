@@ -362,8 +362,6 @@ def _restart_matrix_scenarios(repeat_count: int) -> tuple[_RestartScenario, ...]
             ),
             daemons=("Bgpcpp",) * repeat_count,
         ),
-        # TODO: add a mid-convergence gap for S5/S6, starting the second
-        # restart once BGP sessions are back up but before end-of-RIB.
         _RestartScenario(
             stage_id="s5_fibagent_bgp_then_bgpcpp_restart",
             description=(
@@ -648,7 +646,7 @@ def get_bgp_ebb_daemon_restart_playbook(
         enable_restart_matrix: Replace the single BGP++ restart with the
             FibAgentBgp/BGP++ restart matrix, one stage per scenario, each
             ending with the EBB-01 postchecks. Default False keeps the
-            scheduled single restart.
+            single BGP++ restart.
         restart_matrix_repeat_count: Restarts in each repeated-restart stage
             of the matrix (S2 FibAgentBgp, S4 BGP++).
 

@@ -60,6 +60,8 @@ _UTP_PLAYBOOK_NAMES = [
     "SPEED_FLIP_51T_SPD_005_200G_TO_400G_AGENT_CRASH",
     "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
     "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
+    "SPEED_FLIP_51T_SPD_008_200G_TO_400G_COOP_CRASH_WARMBOOT",
+    "SPEED_FLIP_51T_SPD_009_100G_TO_400G_COOP_CRASH_WARMBOOT",
 ]
 
 
@@ -288,24 +290,26 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
                 "SPEED_FLIP_51T_SPD_004_100G_TO_200G_AGENT_CRASH",
                 "SPEED_FLIP_51T_SPD_005_200G_TO_400G_AGENT_CRASH",
                 "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
+                "SPEED_FLIP_51T_SPD_008_200G_TO_400G_COOP_CRASH_WARMBOOT",
                 "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
                 "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
+                "SPEED_FLIP_51T_SPD_009_100G_TO_400G_COOP_CRASH_WARMBOOT",
             ]
             + _REDUCED_TRANSITION_PLAYBOOK_NAMES,
         )
 
-        # SPDF_001/002 repeat their 4-stage flip cycle 3x inside ONE test case;
+        # Inside ONE test case, SPDF_001/002 repeat their 4-stage flip cycle 3x,
         # SPDF_004/005 run their 6-stage (flip + agent crash) cycle once and
-        # SPD_007 stays a single run.
+        # SPDF_007/008 their 6-stage (flip + Coop crash) cycle 3x.
         self.assertEqual(
-            [playbook.iteration for playbook in test_config.playbooks[:5]],
-            [1, 1, 1, 1, 1],
+            [playbook.iteration for playbook in test_config.playbooks[:6]],
+            [1] * 6,
         )
         self.assertEqual(
-            [len(playbook.stages) for playbook in test_config.playbooks[:5]],
-            [12, 12, 6, 6, 6],
+            [len(playbook.stages) for playbook in test_config.playbooks[:6]],
+            [12, 12, 6, 6, 18, 18],
         )
-        for playbook in test_config.playbooks[:5]:
+        for playbook in test_config.playbooks[:6]:
             self.assertEqual(len(playbook.cleanup_steps or []), 1)
             register_params = _step_params(playbook.stages[0].steps[0])
             self.assertEqual(register_params["endpoints"], _ENDPOINTS)
@@ -390,6 +394,26 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         )
         # One cycle: agent crash at 400G and again back at 100G.
         self.assertEqual(crashes, 2)
+
+    def test_spd_007_008_flip_crash_coop_and_warmboot_each_cycle(self) -> None:
+        for name, speed in (
+            ("SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT", 100),
+            ("SPEED_FLIP_51T_SPD_008_200G_TO_400G_COOP_CRASH_WARMBOOT", 400),
+        ):
+            operations, interruptions = self._patcher_ops_and_crash_count(name)
+            self.assertEqual(operations, [(speed, True), (speed, False)] * 3)
+            # Coop crash + agent warmboot after each flip and each revert.
+            self.assertEqual(interruptions, 2 * 2 * 3)
+
+    def test_spd_009_flips_100g_to_400g_with_coop_crash_warmboots(self) -> None:
+        operations, interruptions = self._patcher_ops_and_crash_count(
+            "SPEED_FLIP_51T_SPD_009_100G_TO_400G_COOP_CRASH_WARMBOOT"
+        )
+        self.assertEqual(
+            operations, [(100, True), (400, True), (400, False), (100, False)] * 3
+        )
+        # Coop crash + agent warmboot at 400G and again back at 100G.
+        self.assertEqual(interruptions, 2 * 2 * 3)
 
     def test_utp_cases_check_traffic_loss_once_after_the_last_cycle(self) -> None:
         playbooks_by_name = {p.name: p for p in self.test_config.playbooks}

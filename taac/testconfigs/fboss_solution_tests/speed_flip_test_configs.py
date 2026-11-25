@@ -1186,8 +1186,9 @@ def _build_reduced_transition_playbook(
 
 
 # UTP flip-cycle count for SPDF_001-006. One cycle = speed change +
-# warmboot + revert, each followed by a port up + speed check; SPDF_004-006
-# also crash the agent after each flip.
+# warmboot + revert, each followed by a port up + speed check; after each
+# flip SPDF_004-006 also crash the agent and SPDF_007-009 crash Coop and then
+# warmboot the agent.
 _SPEED_FLIP_51T_UTP_ITERATIONS = 3
 
 # SPDF_004-006 (speed flip + agent crash) run ONE flip cycle instead of
@@ -1290,7 +1291,14 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
             100,
             coop_crash_warmboot_stages(target_health_check_params),
             coop_crash_warmboot_stages(baseline_health_check_params),
-            1,
+            _SPEED_FLIP_51T_UTP_ITERATIONS,
+        ),
+        (
+            "SPEED_FLIP_51T_SPD_008_200G_TO_400G_COOP_CRASH_WARMBOOT",
+            400,
+            coop_crash_warmboot_stages(_single_cage_health_check_params(400)),
+            coop_crash_warmboot_stages(baseline_health_check_params),
+            _SPEED_FLIP_51T_UTP_ITERATIONS,
         ),
     ]
     playbooks = [
@@ -1362,6 +1370,28 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
                 ),
             ),
             _SPEED_FLIP_51T_AGENT_CRASH_ITERATIONS,
+        )
+    )
+    # SPDF_009: same path as SPDF_003, plus a Coop crash + agent warmboot at
+    # 400G and again after returning to 100G.
+    playbooks.append(
+        _repeat_flip_cycles(
+            _build_reduced_transition_playbook(
+                _ReducedSpeedFlipCase(
+                    "SPD_009",
+                    "SPEED_FLIP_51T_SPD_009_100G_TO_400G_COOP_CRASH_WARMBOOT",
+                    (100, 100),
+                    (400, 400),
+                ),
+                snapshot_checks,
+                target_trigger_stages=coop_crash_warmboot_stages(
+                    _single_cage_state_health_check_params((400, 400))
+                ),
+                initial_trigger_stages=coop_crash_warmboot_stages(
+                    _single_cage_state_health_check_params((100, 100))
+                ),
+            ),
+            _SPEED_FLIP_51T_UTP_ITERATIONS,
         )
     )
     playbooks.extend(

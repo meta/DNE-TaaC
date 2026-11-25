@@ -38,6 +38,7 @@ from taac.steps.step_definitions import (
     create_longevity_step,
     create_port_speed_validation_step as get_validation_step,
     create_register_speed_flip_patcher_step,
+    create_run_task_step,
     create_service_convergence_step,
     create_service_interruption_step,
     create_system_reboot_step,
@@ -940,6 +941,17 @@ def _speed_flip_prechecks() -> t.List[taac_types.PointInTimeHealthCheck]:
     ]
 
 
+def _speed_flip_utp_prechecks() -> t.List[taac_types.PointInTimeHealthCheck]:
+    # Same as _speed_flip_prechecks() minus IXIA packet loss: for the UTP
+    # multi-cycle runs traffic is only started up front and loss is judged
+    # once, by the postchecks after the last speed flip.
+    return [
+        check
+        for check in _speed_flip_prechecks()
+        if check.name != hc_types.CheckName.IXIA_PACKET_LOSS_CHECK
+    ]
+
+
 def _speed_flip_postchecks() -> t.List[taac_types.PointInTimeHealthCheck]:
     return [
         _speed_flip_bgp_converged_check(),
@@ -1164,9 +1176,64 @@ def _build_reduced_transition_playbook(
             prechecks=_speed_flip_prechecks(),
             postchecks=_speed_flip_postchecks(),
             traffic_items_to_start=[_SPEED_FLIP_51T_TRAFFIC_ITEM],
-            iteration=1,
         ),
         snapshot_checks=snapshot_checks,
+    )
+
+
+# UTP flip-cycle count for SPDF_001/002/003. One cycle = speed change +
+# warmboot + revert, each followed only by a port up + speed check.
+_SPEED_FLIP_51T_UTP_ITERATIONS = 3
+
+
+def _wait_for_bgp_convergence_stage() -> Stage:
+    """Wait until bgpd on both devices reports initialization converged.
+
+    Every speed-flip warmboot also restarts bgpd on both devices. Sessions come
+    back ESTABLISHED before the peers have re-sent their routes, so the IXIA
+    postcheck must not run until bgpd has finished its initial route exchange.
+    """
+    return create_steps_stage(
+        steps=[
+            create_run_task_step(
+                task_name="wait_for_bgp_convergence",
+                params_dict={
+                    "hostnames": [_SPEED_FLIP_51T_DUT, _SPEED_FLIP_51T_PEER],
+                    "timeout": 600,
+                    "interval": 10,
+                },
+                description="Wait for BGP convergence on both devices",
+            )
+        ]
+    )
+
+
+def _repeat_flip_cycles(
+    playbook: Playbook,
+    cycles: int,
+    final_stages: t.Optional[t.List[Stage]] = None,
+) -> Playbook:
+    """Run ``cycles`` flip cycles inside ONE test case (UTP SPDF_001/002/003).
+
+    Traffic is started once (prechecks have no IXIA loss check). Every flip is
+    judged only on ports up at the new speed. IXIA loss is checked once, after
+    the last cycle: the postchecks clear the counters, run traffic briefly and
+    apply the allowed-loss threshold, so loss caused by the flips themselves
+    does not fail the test. ``final_stages`` run once after the last cycle,
+    before the postchecks. ``cycles == 1`` returns the playbook unchanged.
+    """
+    if cycles == 1:
+        return playbook
+    return Playbook(
+        name=playbook.name,
+        prechecks=_speed_flip_utp_prechecks(),
+        postchecks=playbook.postchecks,
+        stages=list(playbook.stages) * cycles + list(final_stages or []),
+        iteration=1,
+        traffic_items_to_start=playbook.traffic_items_to_start,
+        snapshot_checks=playbook.snapshot_checks,
+        cleanup_steps=playbook.cleanup_steps,
+        enabled=playbook.enabled,
     )
 
 
@@ -1187,54 +1254,79 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
             100,
             [],
             [],
+            _SPEED_FLIP_51T_UTP_ITERATIONS,
         ),
         (
             "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT",
             400,
             [],
             [],
+            _SPEED_FLIP_51T_UTP_ITERATIONS,
         ),
         (
             "SPEED_FLIP_51T_SPD_004_100G_TO_200G_AGENT_CRASH",
             100,
             agent_crash_stages(target_health_check_params),
             agent_crash_stages(baseline_health_check_params),
+            1,
         ),
         (
             "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
             100,
             coop_crash_warmboot_stages(target_health_check_params),
             coop_crash_warmboot_stages(baseline_health_check_params),
+            1,
         ),
     ]
     playbooks = [
-        create_speed_flip_test_config_playbook(
-            built_playbook=create_bidirectional_speed_flip_playbook(
-                name=name,
-                endpoints=_SPEED_FLIP_51T_SINGLE_CAGE_ENDPOINTS,
-                target_speed_in_gbps=target_speed,
-                baseline_health_check_params=baseline_health_check_params,
-                target_health_check_params=_single_cage_health_check_params(
-                    target_speed
+        _repeat_flip_cycles(
+            create_speed_flip_test_config_playbook(
+                built_playbook=create_bidirectional_speed_flip_playbook(
+                    name=name,
+                    endpoints=_SPEED_FLIP_51T_SINGLE_CAGE_ENDPOINTS,
+                    target_speed_in_gbps=target_speed,
+                    baseline_health_check_params=baseline_health_check_params,
+                    target_health_check_params=_single_cage_health_check_params(
+                        target_speed
+                    ),
+                    patcher_name=f"change_speed_test_{target_speed}_{name.lower()}",
+                    target_port_cage_count=1,
+                    target_trigger_stages=target_trigger_stages,
+                    baseline_trigger_stages=baseline_trigger_stages,
+                    prechecks=_speed_flip_prechecks(),
+                    postchecks=_speed_flip_postchecks(),
+                    traffic_items_to_start=[_SPEED_FLIP_51T_TRAFFIC_ITEM],
                 ),
-                patcher_name=f"change_speed_test_{target_speed}_{name.lower()}",
-                target_port_cage_count=1,
-                target_trigger_stages=target_trigger_stages,
-                baseline_trigger_stages=baseline_trigger_stages,
-                prechecks=_speed_flip_prechecks(),
-                postchecks=_speed_flip_postchecks(),
-                traffic_items_to_start=[_SPEED_FLIP_51T_TRAFFIC_ITEM],
-                iteration=1,
+                snapshot_checks=snapshot_checks,
             ),
-            snapshot_checks=snapshot_checks,
+            cycles,
         )
         for (
             name,
             target_speed,
             target_trigger_stages,
             baseline_trigger_stages,
+            cycles,
         ) in case_specs
     ]
+    # SPDF_003: 100G <-> 400G on both ports, agent warmboot after each change.
+    # After the last cycle, wait for BGP to finish re-exchanging routes before
+    # the IXIA postcheck.
+    playbooks.append(
+        _repeat_flip_cycles(
+            _build_reduced_transition_playbook(
+                _ReducedSpeedFlipCase(
+                    "SPD_003",
+                    "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
+                    (100, 100),
+                    (400, 400),
+                ),
+                snapshot_checks,
+            ),
+            _SPEED_FLIP_51T_UTP_ITERATIONS,
+            final_stages=[_wait_for_bgp_convergence_stage()],
+        )
+    )
     playbooks.extend(
         _build_reduced_transition_playbook(case, snapshot_checks)
         for case in _REDUCED_SPEED_FLIP_CASES

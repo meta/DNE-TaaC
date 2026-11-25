@@ -52,6 +52,12 @@ _REDUCED_TRANSITION_PLAYBOOK_NAMES = [
     "SPEED_FLIP_51T_SPD_021_400G_200G_TO_800G_REDUCED",
 ]
 
+_UTP_PLAYBOOK_NAMES = [
+    "SPEED_FLIP_51T_SPD_001_100G_TO_200G_WARMBOOT",
+    "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT",
+    "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
+]
+
 
 def _health_check_params(speed: int) -> dict[str, object]:
     return {
@@ -277,12 +283,22 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
                 "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT",
                 "SPEED_FLIP_51T_SPD_004_100G_TO_200G_AGENT_CRASH",
                 "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
+                "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
             ]
             + _REDUCED_TRANSITION_PLAYBOOK_NAMES,
         )
 
+        # SPDF_001/002 repeat their 4-stage flip cycle 3x inside ONE test case;
+        # SPD_004/007 stay a single run.
+        self.assertEqual(
+            [playbook.iteration for playbook in test_config.playbooks[:4]],
+            [1, 1, 1, 1],
+        )
+        self.assertEqual(
+            [len(playbook.stages) for playbook in test_config.playbooks[:2]],
+            [12, 12],
+        )
         for playbook in test_config.playbooks[:4]:
-            self.assertEqual(playbook.iteration, 1)
             self.assertEqual(len(playbook.cleanup_steps or []), 1)
             register_params = _step_params(playbook.stages[0].steps[0])
             self.assertEqual(register_params["endpoints"], _ENDPOINTS)
@@ -294,6 +310,57 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
                     params = _step_params(step)
                     if "register_patcher" in params:
                         self.assertEqual(params["target_port_cage_count"], 1)
+
+    def test_spd_003_flips_100g_to_400g_and_back(self) -> None:
+        playbook = {p.name: p for p in self.test_config.playbooks}[
+            "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT"
+        ]
+        operations = [
+            (params["speed_in_gbps"], params["register_patcher"])
+            for stage in playbook.stages
+            for step in stage.steps
+            if "register_patcher" in (params := _step_params(step))
+        ]
+        self.assertEqual(
+            operations, [(100, True), (400, True), (400, False), (100, False)] * 3
+        )
+        self.assertEqual(playbook.iteration, 1)
+
+    def test_spd_003_waits_for_bgp_convergence_before_postchecks(self) -> None:
+        playbook = {p.name: p for p in self.test_config.playbooks}[
+            "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT"
+        ]
+        # Last stage (after the 3rd cycle): wait for bgpd on both devices.
+        last_steps = playbook.stages[-1].steps
+        self.assertEqual(len(last_steps), 1)
+        self.assertEqual(last_steps[0].name, taac_types.StepName.RUN_TASK_STEP)
+        task_json = last_steps[0].input_json or ""
+        self.assertIn("wait_for_bgp_convergence", task_json)
+        self.assertIn(_DUT, task_json)
+        self.assertIn(_PEER, task_json)
+        # The wait runs once, not per cycle.
+        wait_stages = [
+            stage
+            for stage in playbook.stages
+            if "wait_for_bgp_convergence" in str(stage)
+        ]
+        self.assertEqual(len(wait_stages), 1)
+
+    def test_utp_cases_check_traffic_loss_once_after_the_last_cycle(self) -> None:
+        playbooks_by_name = {p.name: p for p in self.test_config.playbooks}
+        for name in _UTP_PLAYBOOK_NAMES:
+            playbook = playbooks_by_name[name]
+            precheck_names = {check.name for check in playbook.prechecks or []}
+            postcheck_names = {check.name for check in playbook.postchecks or []}
+            # Traffic is only started up front; flips never judge traffic.
+            self.assertEqual(playbook.traffic_items_to_start, [_TRAFFIC_ITEM])
+            self.assertNotIn(hc_types.CheckName.IXIA_PACKET_LOSS_CHECK, precheck_names)
+            self.assertIn(hc_types.CheckName.PORT_STATE_CHECK, precheck_names)
+            # Loss is judged once, by the postchecks after the last cycle.
+            self.assertIn(hc_types.CheckName.IXIA_PACKET_LOSS_CHECK, postcheck_names)
+            for stage in playbook.stages:
+                for step in stage.steps:
+                    self.assertNotIn("IXIA_PACKET_LOSS_CHECK", str(step))
 
     def test_reduced_transition_cases_use_one_iteration(self) -> None:
         playbooks_by_name = {
@@ -549,6 +616,11 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         }
 
         for playbook in self.test_config.playbooks:
+            expected = (
+                expected_prechecks - {hc_types.CheckName.IXIA_PACKET_LOSS_CHECK}
+                if playbook.name in _UTP_PLAYBOOK_NAMES
+                else expected_prechecks
+            )
             self.assertEqual(playbook.traffic_items_to_start, [_TRAFFIC_ITEM])
             self.assertNotIn(
                 hc_types.CheckName.IXIA_TRAFFIC_RATE_CHECK,
@@ -559,9 +631,7 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
                 {check.name for check in playbook.postchecks or []},
             )
             self.assertTrue(
-                expected_prechecks.issubset(
-                    {check.name for check in playbook.prechecks or []}
-                )
+                expected.issubset({check.name for check in playbook.prechecks or []})
             )
             self.assertTrue(
                 expected_postchecks.issubset(
@@ -579,6 +649,7 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
             )
 
     def test_bgp_checks_are_scoped_to_the_two_ixia_peers(self) -> None:
+        # IXIA peers plus the cage-link peers seen from each end.
         expected_peers = [
             "2401:db00:e50d:11:9::11",
             "2401:db00:e50d:11:8::11",

@@ -1128,6 +1128,8 @@ def _single_cage_state_patchers(
 def _build_reduced_transition_playbook(
     case: _ReducedSpeedFlipCase,
     snapshot_checks: t.List[taac_types.SnapshotHealthCheck],
+    target_trigger_stages: t.Optional[t.List[Stage]] = None,
+    initial_trigger_stages: t.Optional[t.List[Stage]] = None,
 ) -> Playbook:
     state_variants = None
     target_down_endpoints = None
@@ -1173,6 +1175,8 @@ def _build_reduced_transition_playbook(
             restored_health_check_params=_single_cage_health_check_params(200),
             target_oper_down_endpoints=target_down_endpoints,
             state_variants=state_variants,
+            target_trigger_stages=target_trigger_stages,
+            initial_trigger_stages=initial_trigger_stages,
             prechecks=_speed_flip_prechecks(),
             postchecks=_speed_flip_postchecks(),
             traffic_items_to_start=[_SPEED_FLIP_51T_TRAFFIC_ITEM],
@@ -1181,9 +1185,14 @@ def _build_reduced_transition_playbook(
     )
 
 
-# UTP flip-cycle count for SPDF_001/002/003. One cycle = speed change +
-# warmboot + revert, each followed only by a port up + speed check.
+# UTP flip-cycle count for SPDF_001-006. One cycle = speed change +
+# warmboot + revert, each followed by a port up + speed check; SPDF_004-006
+# also crash the agent after each flip.
 _SPEED_FLIP_51T_UTP_ITERATIONS = 3
+
+# SPDF_004-006 (speed flip + agent crash) run ONE flip cycle instead of
+# _SPEED_FLIP_51T_UTP_ITERATIONS.
+_SPEED_FLIP_51T_AGENT_CRASH_ITERATIONS = 1
 
 
 def _wait_for_bgp_convergence_stage() -> Stage:
@@ -1213,17 +1222,16 @@ def _repeat_flip_cycles(
     cycles: int,
     final_stages: t.Optional[t.List[Stage]] = None,
 ) -> Playbook:
-    """Run ``cycles`` flip cycles inside ONE test case (UTP SPDF_001/002/003).
+    """Run ``cycles`` flip cycles inside ONE test case (UTP SPDF_001-006).
 
     Traffic is started once (prechecks have no IXIA loss check). Every flip is
     judged only on ports up at the new speed. IXIA loss is checked once, after
     the last cycle: the postchecks clear the counters, run traffic briefly and
     apply the allowed-loss threshold, so loss caused by the flips themselves
     does not fail the test. ``final_stages`` run once after the last cycle,
-    before the postchecks. ``cycles == 1`` returns the playbook unchanged.
+    before the postchecks. ``cycles == 1`` still gets this treatment (one
+    cycle, loss judged once, ``final_stages`` kept).
     """
-    if cycles == 1:
-        return playbook
     return Playbook(
         name=playbook.name,
         prechecks=_speed_flip_utp_prechecks(),
@@ -1268,7 +1276,14 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
             100,
             agent_crash_stages(target_health_check_params),
             agent_crash_stages(baseline_health_check_params),
-            1,
+            _SPEED_FLIP_51T_AGENT_CRASH_ITERATIONS,
+        ),
+        (
+            "SPEED_FLIP_51T_SPD_005_200G_TO_400G_AGENT_CRASH",
+            400,
+            agent_crash_stages(_single_cage_health_check_params(400)),
+            agent_crash_stages(baseline_health_check_params),
+            _SPEED_FLIP_51T_AGENT_CRASH_ITERATIONS,
         ),
         (
             "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
@@ -1325,6 +1340,28 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
             ),
             _SPEED_FLIP_51T_UTP_ITERATIONS,
             final_stages=[_wait_for_bgp_convergence_stage()],
+        )
+    )
+    # SPDF_006: same path as SPDF_003 (200 -> 100 -> 400 -> 100 -> 200), plus
+    # an agent crash at 400G and again after returning to 100G.
+    playbooks.append(
+        _repeat_flip_cycles(
+            _build_reduced_transition_playbook(
+                _ReducedSpeedFlipCase(
+                    "SPD_006",
+                    "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
+                    (100, 100),
+                    (400, 400),
+                ),
+                snapshot_checks,
+                target_trigger_stages=agent_crash_stages(
+                    _single_cage_state_health_check_params((400, 400))
+                ),
+                initial_trigger_stages=agent_crash_stages(
+                    _single_cage_state_health_check_params((100, 100))
+                ),
+            ),
+            _SPEED_FLIP_51T_AGENT_CRASH_ITERATIONS,
         )
     )
     playbooks.extend(

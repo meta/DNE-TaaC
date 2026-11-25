@@ -56,6 +56,10 @@ _UTP_PLAYBOOK_NAMES = [
     "SPEED_FLIP_51T_SPD_001_100G_TO_200G_WARMBOOT",
     "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT",
     "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
+    "SPEED_FLIP_51T_SPD_004_100G_TO_200G_AGENT_CRASH",
+    "SPEED_FLIP_51T_SPD_005_200G_TO_400G_AGENT_CRASH",
+    "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
+    "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
 ]
 
 
@@ -282,23 +286,26 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
                 "SPEED_FLIP_51T_SPD_001_100G_TO_200G_WARMBOOT",
                 "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT",
                 "SPEED_FLIP_51T_SPD_004_100G_TO_200G_AGENT_CRASH",
+                "SPEED_FLIP_51T_SPD_005_200G_TO_400G_AGENT_CRASH",
                 "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
                 "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
+                "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
             ]
             + _REDUCED_TRANSITION_PLAYBOOK_NAMES,
         )
 
         # SPDF_001/002 repeat their 4-stage flip cycle 3x inside ONE test case;
-        # SPD_004/007 stay a single run.
+        # SPDF_004/005 run their 6-stage (flip + agent crash) cycle once and
+        # SPD_007 stays a single run.
         self.assertEqual(
-            [playbook.iteration for playbook in test_config.playbooks[:4]],
-            [1, 1, 1, 1],
+            [playbook.iteration for playbook in test_config.playbooks[:5]],
+            [1, 1, 1, 1, 1],
         )
         self.assertEqual(
-            [len(playbook.stages) for playbook in test_config.playbooks[:2]],
-            [12, 12],
+            [len(playbook.stages) for playbook in test_config.playbooks[:5]],
+            [12, 12, 6, 6, 6],
         )
-        for playbook in test_config.playbooks[:4]:
+        for playbook in test_config.playbooks[:5]:
             self.assertEqual(len(playbook.cleanup_steps or []), 1)
             register_params = _step_params(playbook.stages[0].steps[0])
             self.assertEqual(register_params["endpoints"], _ENDPOINTS)
@@ -345,6 +352,44 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
             if "wait_for_bgp_convergence" in str(stage)
         ]
         self.assertEqual(len(wait_stages), 1)
+
+    def _patcher_ops_and_crash_count(
+        self, name: str
+    ) -> tuple[list[tuple[int, bool]], int]:
+        playbook = {p.name: p for p in self.test_config.playbooks}[name]
+        steps = [step for stage in playbook.stages for step in stage.steps]
+        operations = [
+            (
+                t.cast(int, params["speed_in_gbps"]),
+                t.cast(bool, params["register_patcher"]),
+            )
+            for step in steps
+            if "register_patcher" in (params := _step_params(step))
+        ]
+        crash_step = taac_types.StepName.SERVICE_INTERRUPTION_STEP
+        crashes = sum(step.name == crash_step for step in steps)
+        return operations, crashes
+
+    def test_spd_004_005_flip_and_crash_the_agent_each_cycle(self) -> None:
+        for name, speed in (
+            ("SPEED_FLIP_51T_SPD_004_100G_TO_200G_AGENT_CRASH", 100),
+            ("SPEED_FLIP_51T_SPD_005_200G_TO_400G_AGENT_CRASH", 400),
+        ):
+            operations, crashes = self._patcher_ops_and_crash_count(name)
+            # One flip cycle only (_SPEED_FLIP_51T_AGENT_CRASH_ITERATIONS).
+            self.assertEqual(operations, [(speed, True), (speed, False)])
+            # One agent crash after the flip and one after the revert.
+            self.assertEqual(crashes, 2)
+
+    def test_spd_006_flips_100g_to_400g_with_agent_crashes(self) -> None:
+        operations, crashes = self._patcher_ops_and_crash_count(
+            "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH"
+        )
+        self.assertEqual(
+            operations, [(100, True), (400, True), (400, False), (100, False)]
+        )
+        # One cycle: agent crash at 400G and again back at 100G.
+        self.assertEqual(crashes, 2)
 
     def test_utp_cases_check_traffic_loss_once_after_the_last_cycle(self) -> None:
         playbooks_by_name = {p.name: p for p in self.test_config.playbooks}

@@ -337,25 +337,33 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         )
         self.assertEqual(playbook.iteration, 1)
 
-    def test_spd_003_waits_for_bgp_convergence_before_postchecks(self) -> None:
-        playbook = {p.name: p for p in self.test_config.playbooks}[
-            "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT"
-        ]
-        # Last stage (after the 3rd cycle): wait for bgpd on both devices.
-        last_steps = playbook.stages[-1].steps
-        self.assertEqual(len(last_steps), 1)
-        self.assertEqual(last_steps[0].name, taac_types.StepName.RUN_TASK_STEP)
-        task_json = last_steps[0].input_json or ""
-        self.assertIn("wait_for_bgp_convergence", task_json)
-        self.assertIn(_DUT, task_json)
-        self.assertIn(_PEER, task_json)
-        # The wait runs once, not per cycle.
-        wait_stages = [
-            stage
-            for stage in playbook.stages
-            if "wait_for_bgp_convergence" in str(stage)
-        ]
-        self.assertEqual(len(wait_stages), 1)
+    def test_spd_003_006_009_wait_for_bgp_convergence_before_postchecks(
+        self,
+    ) -> None:
+        playbooks_by_name = {p.name: p for p in self.test_config.playbooks}
+        for name in (
+            "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
+            "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
+            "SPEED_FLIP_51T_SPD_009_100G_TO_400G_COOP_CRASH_WARMBOOT",
+        ):
+            playbook = playbooks_by_name[name]
+            # Last stage (after the 3rd cycle): wait for bgpd on both devices.
+            last_steps = playbook.stages[-1].steps
+            self.assertEqual(len(last_steps), 1, name)
+            self.assertEqual(
+                last_steps[0].name, taac_types.StepName.RUN_TASK_STEP, name
+            )
+            task_json = last_steps[0].input_json or ""
+            self.assertIn("wait_for_bgp_convergence", task_json, name)
+            self.assertIn(_DUT, task_json, name)
+            self.assertIn(_PEER, task_json, name)
+            # The wait runs once, not per cycle.
+            wait_stages = [
+                stage
+                for stage in playbook.stages
+                if "wait_for_bgp_convergence" in str(stage)
+            ]
+            self.assertEqual(len(wait_stages), 1, name)
 
     def _patcher_ops_and_crash_count(
         self, name: str

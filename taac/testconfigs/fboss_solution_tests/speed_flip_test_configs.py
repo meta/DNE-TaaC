@@ -1351,7 +1351,8 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
         )
     )
     # SPDF_006: same path as SPDF_003 (200 -> 100 -> 400 -> 100 -> 200), plus
-    # an agent crash at 400G and again after returning to 100G.
+    # an agent crash at 400G and again after returning to 100G. Like SPDF_003,
+    # waits for BGP convergence after the last cycle.
     playbooks.append(
         _repeat_flip_cycles(
             _build_reduced_transition_playbook(
@@ -1370,10 +1371,12 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
                 ),
             ),
             _SPEED_FLIP_51T_AGENT_CRASH_ITERATIONS,
+            final_stages=[_wait_for_bgp_convergence_stage()],
         )
     )
     # SPDF_009: same path as SPDF_003, plus a Coop crash + agent warmboot at
-    # 400G and again after returning to 100G.
+    # 400G and again after returning to 100G. Like SPDF_003, waits for BGP
+    # convergence after the last cycle.
     playbooks.append(
         _repeat_flip_cycles(
             _build_reduced_transition_playbook(
@@ -1392,6 +1395,7 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
                 ),
             ),
             _SPEED_FLIP_51T_UTP_ITERATIONS,
+            final_stages=[_wait_for_bgp_convergence_stage()],
         )
     )
     playbooks.extend(

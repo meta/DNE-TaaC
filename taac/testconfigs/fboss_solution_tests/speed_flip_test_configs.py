@@ -1184,16 +1184,25 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
     case_specs = [
         (
             "SPEED_FLIP_51T_SPD_001_100G_TO_200G_WARMBOOT",
+            100,
+            [],
+            [],
+        ),
+        (
+            "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT",
+            400,
             [],
             [],
         ),
         (
             "SPEED_FLIP_51T_SPD_004_100G_TO_200G_AGENT_CRASH",
+            100,
             agent_crash_stages(target_health_check_params),
             agent_crash_stages(baseline_health_check_params),
         ),
         (
             "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
+            100,
             coop_crash_warmboot_stages(target_health_check_params),
             coop_crash_warmboot_stages(baseline_health_check_params),
         ),
@@ -1203,10 +1212,12 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
             built_playbook=create_bidirectional_speed_flip_playbook(
                 name=name,
                 endpoints=_SPEED_FLIP_51T_SINGLE_CAGE_ENDPOINTS,
-                target_speed_in_gbps=100,
+                target_speed_in_gbps=target_speed,
                 baseline_health_check_params=baseline_health_check_params,
-                target_health_check_params=target_health_check_params,
-                patcher_name=f"change_speed_test_100_{name.lower()}",
+                target_health_check_params=_single_cage_health_check_params(
+                    target_speed
+                ),
+                patcher_name=f"change_speed_test_{target_speed}_{name.lower()}",
                 target_port_cage_count=1,
                 target_trigger_stages=target_trigger_stages,
                 baseline_trigger_stages=baseline_trigger_stages,
@@ -1217,7 +1228,12 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
             ),
             snapshot_checks=snapshot_checks,
         )
-        for name, target_trigger_stages, baseline_trigger_stages in case_specs
+        for (
+            name,
+            target_speed,
+            target_trigger_stages,
+            baseline_trigger_stages,
+        ) in case_specs
     ]
     playbooks.extend(
         _build_reduced_transition_playbook(case, snapshot_checks)

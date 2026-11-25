@@ -274,13 +274,14 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
             [playbook.name for playbook in test_config.playbooks],
             [
                 "SPEED_FLIP_51T_SPD_001_100G_TO_200G_WARMBOOT",
+                "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT",
                 "SPEED_FLIP_51T_SPD_004_100G_TO_200G_AGENT_CRASH",
                 "SPEED_FLIP_51T_SPD_007_100G_TO_200G_COOP_CRASH_WARMBOOT",
             ]
             + _REDUCED_TRANSITION_PLAYBOOK_NAMES,
         )
 
-        for playbook in test_config.playbooks[:3]:
+        for playbook in test_config.playbooks[:4]:
             self.assertEqual(playbook.iteration, 1)
             self.assertEqual(len(playbook.cleanup_steps or []), 1)
             register_params = _step_params(playbook.stages[0].steps[0])
@@ -451,6 +452,26 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
 
         self.assertIn("SPEED_FLIP_51T_SINGLE_CAGE_TWO_PORT_TEST_CONFIG", names)
         self.assertNotIn("SPEED_FLIP_51T_KO3_SSW_FSW_TEST_PORTS_UP", names)
+
+    def test_spd_002_flips_200g_to_400g_and_back(self) -> None:
+        playbook = {p.name: p for p in self.test_config.playbooks}[
+            "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT"
+        ]
+        register_params = _step_params(playbook.stages[0].steps[0])
+        self.assertTrue(register_params["register_patcher"])
+        self.assertEqual(register_params["speed_in_gbps"], 400)
+        self.assertEqual(
+            register_params["patcher_name"],
+            "change_speed_test_400_speed_flip_51t_spd_002_200g_to_400g_warmboot",
+        )
+        self.assertRegex(str(playbook.stages[1]), r"expected_speed\W+400")
+
+        unregister_params = _step_params(playbook.stages[2].steps[0])
+        self.assertFalse(unregister_params["register_patcher"])
+        self.assertEqual(
+            unregister_params["patcher_name"], register_params["patcher_name"]
+        )
+        self.assertRegex(str(playbook.stages[3]), r"expected_speed\W+200")
 
     def test_configures_two_ixia_endpoints_and_custom_imix_traffic(self) -> None:
         endpoint_ixia_ports = {

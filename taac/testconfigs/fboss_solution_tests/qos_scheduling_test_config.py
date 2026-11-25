@@ -281,9 +281,11 @@ def _make_qos_queue_desc_snapshot_check(
     )
 
 
-def _burst_packet_count(line_rate_percent: int) -> int:
+def _burst_packet_count(line_rate_percent: int, port_speed_bits_per_second: int) -> int:
+    if port_speed_bits_per_second <= 0:
+        raise ValueError("Port speed must be positive")
     return round(
-        PORT_SPEED_BITS_PER_SECOND
+        port_speed_bits_per_second
         * (line_rate_percent / 100)
         * (BURST_DURATION_MS / 1000)
         / (IMIX_MEAN_WIRE_BYTES * 8)
@@ -440,6 +442,8 @@ def _ixia_set_burst_step(
     traffic_item_regex: str,
     line_rate_percent: int,
     step_id: t.Optional[str] = None,
+    *,
+    port_speed_bits_per_second: int = PORT_SPEED_BITS_PER_SECOND,
 ) -> Step:
     return create_ixia_api_step(
         api_name="set_transmission_control",
@@ -447,7 +451,9 @@ def _ixia_set_burst_step(
             "traffic_item_regex": traffic_item_regex,
             "transmission_type": "burstFixedDuration",
             "duration": LONGEVITY_DURATION_S,
-            "burst_packet_count": _burst_packet_count(line_rate_percent),
+            "burst_packet_count": _burst_packet_count(
+                line_rate_percent, port_speed_bits_per_second
+            ),
             "inter_burst_gap_ms": BURST_INTER_GAP_MS,
             "repeat_burst_count": BURST_REPEAT_COUNT,
             "transmit_mode": "sequential",
@@ -569,6 +575,8 @@ def _create_qos_scheduling_playbook(
     ixia_downlink_interface: str,
     ixia_uplink_interface: str,
     frame_size: t.Optional[ixia_types.FrameSize] = None,
+    *,
+    port_speed_bits_per_second: int = PORT_SPEED_BITS_PER_SECOND,
 ) -> Playbook:
     """
     Creates a playbook that:
@@ -655,9 +663,24 @@ def _create_qos_scheduling_playbook(
         stage_id="qos_burst_longevity",
         steps=[
             _ixia_stop_traffic_step(step_id="stop_for_burst"),
-            _ixia_set_burst_step(v6_layer3_name, 33, "burst_v6_layer3"),
-            _ixia_set_burst_step(v6_directional_name, 33, "burst_v6_directional"),
-            _ixia_set_burst_step(v4_directional_name, 34, "burst_v4_directional"),
+            _ixia_set_burst_step(
+                v6_layer3_name,
+                33,
+                "burst_v6_layer3",
+                port_speed_bits_per_second=port_speed_bits_per_second,
+            ),
+            _ixia_set_burst_step(
+                v6_directional_name,
+                33,
+                "burst_v6_directional",
+                port_speed_bits_per_second=port_speed_bits_per_second,
+            ),
+            _ixia_set_burst_step(
+                v4_directional_name,
+                34,
+                "burst_v4_directional",
+                port_speed_bits_per_second=port_speed_bits_per_second,
+            ),
             _ixia_regenerate_and_apply_step(step_id="regenerate_burst_traffic"),
             _ixia_clear_traffic_stats_step(step_id="clear_stats_for_burst"),
             _ixia_start_traffic_step(step_id="start_burst_traffic"),
@@ -949,6 +972,8 @@ def _create_ncnf_scheduling_playbook(
     ixia_downlink_interface: str,
     ixia_uplink_interface: str,
     frame_size: t.Optional[ixia_types.FrameSize] = None,
+    *,
+    port_speed_bits_per_second: int = PORT_SPEED_BITS_PER_SECOND,
 ) -> Playbook:
     """
     Creates a scheduling playbook for the NCNF queue (queue0, DSCP 51).
@@ -1014,9 +1039,24 @@ def _create_ncnf_scheduling_playbook(
         stage_id="qos_burst_longevity",
         steps=[
             _ixia_stop_traffic_step(step_id="stop_for_burst"),
-            _ixia_set_burst_step(v6_layer3_name, 33, "burst_v6_layer3"),
-            _ixia_set_burst_step(v6_directional_name, 33, "burst_v6_directional"),
-            _ixia_set_burst_step(v4_directional_name, 34, "burst_v4_directional"),
+            _ixia_set_burst_step(
+                v6_layer3_name,
+                33,
+                "burst_v6_layer3",
+                port_speed_bits_per_second=port_speed_bits_per_second,
+            ),
+            _ixia_set_burst_step(
+                v6_directional_name,
+                33,
+                "burst_v6_directional",
+                port_speed_bits_per_second=port_speed_bits_per_second,
+            ),
+            _ixia_set_burst_step(
+                v4_directional_name,
+                34,
+                "burst_v4_directional",
+                port_speed_bits_per_second=port_speed_bits_per_second,
+            ),
             _ixia_regenerate_and_apply_step(step_id="regenerate_burst_traffic"),
             _ixia_clear_traffic_stats_step(step_id="clear_stats_for_burst"),
             _ixia_start_traffic_step(step_id="start_burst_traffic"),
@@ -1088,6 +1128,8 @@ def get_qos_scheduling_playbooks(
     ixia_downlink_interface: str,
     ixia_uplink_interface: str,
     frame_size: t.Optional[ixia_types.FrameSize] = None,
+    *,
+    port_speed_bits_per_second: int = PORT_SPEED_BITS_PER_SECOND,
 ) -> t.List[Playbook]:
     """
     Generates one playbook per ClassOfService that:
@@ -1123,6 +1165,7 @@ def get_qos_scheduling_playbooks(
                 ixia_downlink_interface=ixia_downlink_interface,
                 ixia_uplink_interface=ixia_uplink_interface,
                 frame_size=frame_size,
+                port_speed_bits_per_second=port_speed_bits_per_second,
             )
         )
 
@@ -1135,6 +1178,7 @@ def get_qos_scheduling_playbooks(
             ixia_downlink_interface=ixia_downlink_interface,
             ixia_uplink_interface=ixia_uplink_interface,
             frame_size=frame_size,
+            port_speed_bits_per_second=port_speed_bits_per_second,
         )
     )
     return playbooks
@@ -2321,6 +2365,7 @@ def test_config_qos_scheduling(
     direct_ixia_connections=None,
     precheck_packet_loss_clear_stats=False,
     stress_static_routes=True,
+    port_speed_bits_per_second=PORT_SPEED_BITS_PER_SECOND,
 ):
     """Build a QoS scheduling + congestion TestConfig for FBOSS BGP++ devices.
 
@@ -2447,6 +2492,7 @@ def test_config_qos_scheduling(
         device_name,
         ixia_downlink_interface,
         ixia_uplink_interface,
+        port_speed_bits_per_second=port_speed_bits_per_second,
     )
     # Add congestion playbooks if the congestion port is configured.
     has_congestion_port = (

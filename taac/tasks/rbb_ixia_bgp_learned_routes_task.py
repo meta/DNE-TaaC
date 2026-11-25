@@ -201,10 +201,50 @@ class RbbIxiaBgpLearnedRoutesTask(BaseTask):
                 "IPv6 BGP learned-route evidence; this check requires the "
                 "RESTPy/TaacIxia backend"
             )
-        peer = find_peer(port_identifier)
+        # BasicPortConfig names protocol stacks with the device-group
+        # identifier (``D<index>_<endpoint>``), while playbooks naturally
+        # identify the endpoint itself. Accept both forms so this task does
+        # not depend on another suite providing a topology-name adapter.
+        peer = None
+        peer_identifiers = list(
+            dict.fromkeys(
+                (
+                    port_identifier,
+                    f"D0_{port_identifier}",
+                    port_identifier.upper(),
+                    f"D0_{port_identifier.upper()}",
+                )
+            )
+        )
+        for peer_identifier in peer_identifiers:
+            peer = find_peer(peer_identifier)
+            if peer is not None:
+                break
+        observed_peer_names: list[str] = []
+        if peer is None:
+            # The legacy helper uses one identifier for both the topology and
+            # its device group, but BasicPortConfig intentionally names those
+            # objects ``<endpoint>`` and ``D0_<endpoint>`` respectively. Fall
+            # back to the public peer walk and select the exact generated peer
+            # name instead of relying on that incompatible shortcut.
+            find_peers = getattr(self.ixia, "find_bgp_peers", None)
+            if callable(find_peers):
+                peers = list(find_peers())
+                observed_peer_names = [
+                    str(getattr(item, "Name", "")) for item in peers
+                ]
+                expected_name = f"BGP_PEER_V6_D0_{port_identifier}".casefold()
+                matches = [
+                    item
+                    for item in peers
+                    if str(getattr(item, "Name", "")).casefold() == expected_name
+                ]
+                if len(matches) == 1:
+                    peer = matches[0]
         if peer is None:
             raise TestCaseFailure(
-                f"[{gate}] IXIA IPv6 BGP peer for {port_identifier!r} was not found"
+                f"[{gate}] IXIA IPv6 BGP peer for {port_identifier!r} was not found; "
+                f"observed peers={observed_peer_names}"
             )
 
         # IxNetwork does not populate the IPv6 learned-route view unless the

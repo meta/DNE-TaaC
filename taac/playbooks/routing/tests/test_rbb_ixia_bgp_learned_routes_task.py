@@ -74,6 +74,36 @@ class RbbIxiaBgpLearnedRoutesTaskTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(ixia.apply_changes.call_count, 2)
 
+    async def test_resolves_basic_port_generated_peer_name(self) -> None:
+        table = SimpleNamespace(
+            Columns=["IPv6 Prefix", "Communities"],
+            Values=[["2001:db8:1::/64", "65000:1"]],
+        )
+        peer = _peer(table, filter_value=True)
+        ixia = MagicMock()
+        peer.Name = "BGP_PEER_V6_D0_R2:ETH1/1/1"
+        ixia.find_bgp_ipv6_peer.return_value = None
+        ixia.find_bgp_peers.return_value = [peer]
+        task = RbbIxiaBgpLearnedRoutesTask(ixia=ixia, logger=MagicMock())
+
+        await task.run(
+            {
+                "port_identifier": "r2:eth1/1/1",
+                "expected_prefixes": ["2001:db8:1::/64"],
+            }
+        )
+
+        self.assertEqual(
+            ixia.find_bgp_ipv6_peer.call_args_list,
+            [
+                unittest.mock.call("r2:eth1/1/1"),
+                unittest.mock.call("D0_r2:eth1/1/1"),
+                unittest.mock.call("R2:ETH1/1/1"),
+                unittest.mock.call("D0_R2:ETH1/1/1"),
+            ],
+        )
+        ixia.find_bgp_peers.assert_called_once_with()
+
     async def test_forbidden_community_requires_attribute_view(self) -> None:
         peer = _peer(
             SimpleNamespace(

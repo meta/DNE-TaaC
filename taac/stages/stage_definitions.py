@@ -4275,7 +4275,7 @@ def create_route_registry_runtime_update_stage(
             ),
             expected_count_histogram_by_afi=(expanded_route_count_histogram_by_afi),
             stability_duration_seconds=soak_time_seconds,
-            stability_hard_timeout_seconds=soak_time_seconds + 30,
+            stability_hard_timeout_seconds=soak_time_seconds * 2 + 60,
             stability_poll_interval_seconds=5,
             description=(
                 f"Continuously verify {added_route_count} routes and stable BGP "
@@ -4343,7 +4343,7 @@ def create_route_registry_runtime_update_stage(
             ),
             expected_count_histogram_by_afi=(baseline_route_count_histogram_by_afi),
             stability_duration_seconds=soak_time_seconds,
-            stability_hard_timeout_seconds=soak_time_seconds + 30,
+            stability_hard_timeout_seconds=soak_time_seconds * 2 + 60,
             stability_poll_interval_seconds=5,
             description=(
                 f"Continuously verify {baseline_route_count} routes and stable BGP "

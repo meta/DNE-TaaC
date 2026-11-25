@@ -183,8 +183,12 @@ from taac.tasks.periodic_tasks import (
 )
 
 # RBB SRv6 qualification tasks (see taac/testconfigs/routing/qual_rbb.py).
+from taac.tasks.rbb_bgp_policy_lifecycle_task import RbbBgpPolicyLifecycleTask
 from taac.tasks.rbb_dut_bootstrap_task import RbbDutBootstrapTask
 from taac.tasks.rbb_edge_ebgp_task import RbbEdgeEbgpTask
+from taac.tasks.rbb_ixia_bgp_learned_routes_task import (
+    RbbIxiaBgpLearnedRoutesTask,
+)
 from taac.tasks.rbb_srv6_counter_delta_task import (
     RbbSrv6CounterDeltaTask,
 )
@@ -256,8 +260,10 @@ TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     VerifyBestPathChangesTask,
     SetPortChannelMinLinkPatcherTask,
     SetupBaseConfigsTask,
+    RbbBgpPolicyLifecycleTask,
     RbbDutBootstrapTask,
     RbbEdgeEbgpTask,
+    RbbIxiaBgpLearnedRoutesTask,
     RbbSrv6CounterDeltaTask,
     RbbSrv6DirectRouteTask,
     RbbSrv6VerifyTask,

@@ -3919,8 +3919,8 @@ class FbossSwitch(AbstractSwitch):
             oss_agent_restart_paths_enabled()
             and service.value == FbossSystemctlServiceName.AGENT.value
         ):
-            # Not gated on async_is_multi_switch(): it returns False whenever
-            # the agent is unreachable, which would fall through to a
+            # Not gated on async_is_multi_switch(): it falls back to the agent config
+            # when the agent is unreachable. The restart must not fall through to a
             # `systemctl restart wedge_agent` that cannot succeed here.
             #
             # Deliberately not wrapped in @async_retryable: a warm boot that
@@ -4136,7 +4136,22 @@ class FbossSwitch(AbstractSwitch):
         this reflects real hardware instead of a hardcoded/env-configured
         guess that silently drifts from the DUT it runs against.
         """
-        multi_switch_state = await self.async_get_multi_switch_run_state()
+        try:
+            multi_switch_state = await self.async_get_multi_switch_run_state()
+            async with self.async_agent_client as client:
+                switch_infos = await client.getSwitchIdToSwitchInfo()
+        except Exception as rpc_error:
+            if not oss_agent_restart_paths_enabled():
+                raise
+            # Fall back to the deployed config when the sw agent RPC fails.
+            is_multi_switch, indices = await self._async_get_recovery_agent_topology(
+                rpc_error
+            )
+            if not is_multi_switch:
+                raise RuntimeError(
+                    f"{self.hostname} is configured as monolithic; no HW agent indices"
+                ) from rpc_error
+            return indices
         # Keyed by SwitchID despite the thrift comment saying SwitchIndex
         # (MultiHwSwitchHandler::getHwSwitchRunStates). The cold-boot flags and
         # the fboss_hw_agent@<N> units are keyed by switch index, and the two
@@ -4147,8 +4162,6 @@ class FbossSwitch(AbstractSwitch):
                 f"{self.hostname} reports multi-switch enabled but "
                 "hwIndexToRunState is empty -- cannot determine NPU count"
             )
-        async with self.async_agent_client as client:
-            switch_infos = await client.getSwitchIdToSwitchInfo()
         missing = [sid for sid in switch_ids if sid not in switch_infos]
         if missing:
             raise Exception(
@@ -5881,8 +5894,45 @@ class FbossSwitch(AbstractSwitch):
             async with self.async_agent_client as client:
                 mpnu_state = await client.getMultiSwitchRunState()
             return mpnu_state.multiSwitchEnabled
-        except Exception:
-            return False
+        except Exception as rpc_error:
+            if not oss_agent_restart_paths_enabled():
+                return False
+            is_multi_switch, _ = await self._async_get_recovery_agent_topology(
+                rpc_error
+            )
+            return is_multi_switch
+
+    async def _async_get_recovery_agent_topology(
+        self, rpc_error: Exception
+    ) -> Tuple[bool, List[int]]:
+        """Read the topology from the agent config in pure OSS. Raise when unclear."""
+        try:
+            from taac.driver.config_modifiers import AGENT_CONFIG_PATH
+
+            config = json.loads(await self.async_read_file(AGENT_CONFIG_PATH))
+            # A missing flag means the gflag default, which is false.
+            flag = config["defaultCommandLineArgs"].get("multi_switch", "false")
+            if flag not in ("true", "false"):
+                raise ValueError("multi_switch must be true or false")
+            is_multi_switch = flag == "true"
+            indices = []
+            if is_multi_switch:
+                infos = config["sw"]["switchSettings"]["switchIdToSwitchInfo"]
+                indices = sorted(info["switchIndex"] for info in infos.values())
+                if not indices or any(
+                    index not in self.HW_AGENT_SERVICE_BY_INDEX for index in indices
+                ):
+                    raise ValueError("missing or unsupported HW switch indices")
+        except Exception as evidence_error:
+            raise RuntimeError(
+                f"Cannot find the agent topology on {self.hostname} after an RPC "
+                f"failure: {evidence_error}"
+            ) from rpc_error
+        self.logger.debug(
+            f"Agent RPC unavailable on {self.hostname}; the agent config says "
+            f"multi_switch={is_multi_switch}, hw_indices={indices}"
+        )
+        return is_multi_switch, indices
 
     async def async_wait_for_agent_configured(
         self, timeout: int = 300, interval: int = 5

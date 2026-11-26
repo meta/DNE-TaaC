@@ -835,6 +835,22 @@ class OssPatchApplier:
             name: _fit_profile(entries[name], profile, platform_mapping)
             for name in intfs
         }
+        # A requested port with no profile for this speed is dropped when another
+        # requested port's profile subsumes it. It skips the fit and 51T checks.
+        ids = {e.mapping.id: name for name, e in entries.items()}
+        subsumed: t.Set[str] = set()
+        for name, fit in fitted.items():
+            port_config = _profile_config(entries[name], fit) if fit else None
+            for pid in (port_config.subsumedPorts or []) if port_config else []:
+                mate = ids.get(pid)
+                if mate in intfs and mate != name and fitted[mate] is None:
+                    subsumed.add(mate)
+        if subsumed:
+            self.logger.info(
+                f"change_speed: {sorted(subsumed)} are subsumed in this request"
+            )
+            intfs = [name for name in intfs if name not in subsumed]
+            fitted = {name: fit for name, fit in fitted.items() if name not in subsumed}
         unsupported = [name for name, fit in fitted.items() if fit is None]
         if unsupported:
             raise PatcherError(
@@ -863,6 +879,13 @@ class OssPatchApplier:
         # A requested port another port's profile still subsumes is gone again;
         # registering that would report a speed change on a port that is absent.
         present = {p.name for p in sw.ports}
+        # A chained or hyper-port subsumer can leave the port in place. Raise.
+        kept = sorted(subsumed & present)
+        if kept:
+            raise PatcherError(
+                f"change_speed: {kept} were requested as subsumed but remain; "
+                "request the subsuming port alone"
+            )
         lost = [name for name in intfs if name not in present]
         if lost:
             raise PatcherError(

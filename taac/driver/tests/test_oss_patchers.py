@@ -42,6 +42,7 @@ from neteng.fboss.switch_config.thrift_types import (
     PortProfileID,
     PortSpeed,
     PortState,
+    PortType,
     SpanningTreeState,
     SwitchConfig,
     Vlan,
@@ -588,9 +589,10 @@ class ChangeSpeedTest(TestCase):
         self.assertNotIn(4094, [i.vlanID for i in out.sw.interfaces])
 
     async def test_unsupported_profile_and_unknown_port_raise(self) -> None:
+        # /5 alone: nothing else in the request subsumes it, so it must fit.
         with self.assertRaisesRegex(PatcherError, "not supported on ports: eth1/1/5"):
             await self._change(
-                _cage_config(), _speed_args("eth1/1/1,eth1/1/5", "EIGHTHUNDREDG", _P800)
+                _cage_config(), _speed_args("eth1/1/5", "EIGHTHUNDREDG", _P800)
             )
         with self.assertRaisesRegex(PatcherError, "not in the platform mapping"):
             await self._change(
@@ -613,6 +615,42 @@ class ChangeSpeedTest(TestCase):
         with self.assertRaisesRegex(PatcherError, "would be subsumed"):
             await self._change(
                 at_800g, _speed_args("eth1/1/5", "FOURHUNDREDG", _P400), None
+            )
+
+    async def test_mate_requested_with_its_subsuming_primary_is_taken_as_subsumed(
+        self,
+    ) -> None:
+        for hardware in (None, "MONTBLANC"):
+            with self.subTest(hardware=hardware):
+                out = await self._change(
+                    _cage_config(),
+                    _speed_args("eth1/1/1,eth1/1/5", "EIGHTHUNDREDG", _P800),
+                    hardware,
+                )
+                (port,) = out.sw.ports
+                self.assertEqual(("eth1/1/1", _P800), (port.name, port.profileID))
+
+    async def test_mate_with_its_own_profile_is_not_taken_as_subsumed(self) -> None:
+        with self.assertRaisesRegex(PatcherError, "would be subsumed by another"):
+            await OssPatchApplier(
+                inputs=_Inputs(hardware=None, adjacent_800g=True)
+            ).async_apply(
+                _cage_config(),
+                "agent",
+                "change_speed",
+                _speed_args("eth1/1/1,eth1/1/5", "EIGHTHUNDREDG", _P800),
+            )
+
+    async def test_mate_taken_as_subsumed_but_left_in_place_raises(self) -> None:
+        # A hyper port does not subsume its mate, so /5 stays in the config.
+        config = _cage_config()
+        hyper = config.sw.ports[0](portType=PortType.HYPER_PORT)
+        config = config(sw=config.sw(ports=[hyper, *config.sw.ports[1:]]))
+        with self.assertRaisesRegex(PatcherError, "requested as subsumed but remain"):
+            await self._change(
+                config,
+                _speed_args("eth1/1/1,eth1/1/5", "EIGHTHUNDREDG", _P800),
+                None,
             )
 
     async def test_subsumption_keeps_vlans_with_surviving_tagged_members(self) -> None:

@@ -27,7 +27,7 @@ import typing as t
 from taac.abstractions.physical_inventory.physical_inventory import (
     PhysicalInventory,
 )
-from neteng.test_infra.dne.taac.testconfigs.routing.util import bgp_rbb_constants as C
+from taac.testconfigs.routing.util import bgp_rbb_constants as C
 from taac.testconfigs.routing.util.bgp_rbb_topology import (
     NodeTopology,
     RbbTopology,

@@ -127,7 +127,11 @@ def build_testbed_topology(duts: List[str]) -> ConfigTopology:
     return ConfigTopology(links=tuple(links))
 
 
-def load_test_config(config_path: str, topology: Optional[ConfigTopology] = None):
+def load_test_config(
+    config_path: str,
+    topology: Optional[ConfigTopology] = None,
+    attr_name: Optional[str] = None,
+):
     """
     Load a test configuration from a Python file.
 
@@ -138,12 +142,19 @@ def load_test_config(config_path: str, topology: Optional[ConfigTopology] = None
     Args:
         config_path: Path to the Python test config file
         topology: Optional ConfigTopology to pass to callable configs
+        attr_name: If given, load only this named attribute from the
+            module (skipping the default 4-name fallback). Use for
+            modules that expose multiple named TestConfig constants.
+            When omitted,
+            the loader falls back to
+            ``test_config`` / ``TEST_CONFIG`` / ``config`` / ``CONFIG``.
 
     Returns:
         TestConfig object
 
     Raises:
-        OSSConfigError: If the config cannot be loaded
+        OSSConfigError: If the config cannot be loaded, or if
+            ``attr_name`` is given but not defined in the module.
     """
     try:
         # Convert to Path object
@@ -192,9 +203,19 @@ def load_test_config(config_path: str, topology: Optional[ConfigTopology] = None
         )
 
         _testconfig_classes = (_taac_thrift_types.TestConfig, _taac_types.TestConfig)
-        for attr_name in ["test_config", "TEST_CONFIG", "config", "CONFIG"]:
-            if hasattr(module, attr_name):
-                config = getattr(module, attr_name)
+        # A user-supplied ``--test-name`` skips the default fallback list
+        # entirely, so a typo doesn't silently fall through to a
+        # coincidentally-named ``test_config`` / ``CONFIG`` symbol from
+        # some other origin (a helper, an alias, an unrelated constant).
+        # The distinct error message below makes typos easy to spot.
+        if attr_name is not None:
+            candidate_attrs = [attr_name]
+        else:
+            candidate_attrs = ["test_config", "TEST_CONFIG", "config", "CONFIG"]
+
+        for candidate in candidate_attrs:
+            if hasattr(module, candidate):
+                config = getattr(module, candidate)
                 if callable(config) and not isinstance(config, _testconfig_classes):
                     if getattr(config, "_accepts_topology", False):
                         config = config(topology=topology)
@@ -202,10 +223,22 @@ def load_test_config(config_path: str, topology: Optional[ConfigTopology] = None
                         config = config()
                 return config
 
-        # If no config found, raise error
+        # If no config found, raise error. Different messages for the two
+        # cases: a bad ``--test-name`` should not be lumped in with "the
+        # module doesn't declare a test config at all" — the fix is
+        # different (rename the flag vs add a symbol).
+        if attr_name is not None:
+            raise OSSConfigError(
+                f"Test config attribute '{attr_name}' not found in "
+                f"{config_path}. Check --test-name spelling, or omit it to "
+                f"fall back to the default lookup order (test_config / "
+                f"TEST_CONFIG / config / CONFIG)."
+            )
         raise OSSConfigError(
             f"No test config found in {config_path}. "
-            f"Expected one of: test_config, TEST_CONFIG, config, CONFIG"
+            f"Expected one of: test_config, TEST_CONFIG, config, CONFIG. "
+            f"For modules with multiple named TestConfig constants, pass "
+            f"--test-name <NAME>."
         )
 
     except OSSConfigError:
@@ -320,7 +353,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         configs = []
         for config_path in args.test_configs:
             logger.info(f"Loading test config from: {config_path}")
-            config = load_test_config(config_path, topology=topology)
+            config = load_test_config(
+                config_path, topology=topology, attr_name=args.test_name
+            )
             configs.append((config_path, config))
 
         # Process each test config

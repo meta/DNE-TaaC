@@ -55,7 +55,10 @@ else:
 
 
 from neteng.fboss.ctrl.thrift_types import DsfSessionState
-from neteng.fboss.switch_config.thrift_mutable_types import PortSpeed
+from neteng.fboss.switch_config.thrift_mutable_types import (
+    PortProfileID,
+    PortSpeed,
+)
 from neteng.fboss.switch_config.thrift_types import SwitchDrainState
 
 if not TAAC_OSS:
@@ -152,6 +155,7 @@ else:
             )
 
 
+from taac.steps.speed_flip_profiles import default_profile_id
 from taac.steps.step import (  # oss-rewrite (force ShipIt re-export to taac.* root)
     Step as StepBase,
 )
@@ -13127,69 +13131,20 @@ _SUPPORTED_51T_SPEED_COMBINATIONS = {
     (200, 200),
     (400, 400),
 }
-_PLATFORM_SPEED_PROFILE_MAPPING = {
-    # Wedge800 (TH5-T, NextHop). Optical-family cage profiles per the on-box
-    # platform_mapping.json (nexthop/wedge800bnhp): 800G=39, 400G=38, 200G=25,
-    # 100G=23. Copper-family cages carry 22/24 at 100G/200G instead, so this
-    # one-id-per-speed table can satisfy only one end of a mixed-media link.
-    # 800G exists only on the /1 subport; flipping /1 to 800G subsumes its
-    # /5 mate.
-    "WEDGE800BNHP": {
-        PortSpeed.EIGHTHUNDREDG: "PROFILE_800G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-    },
-    "MONTBLANC": {
-        PortSpeed.EIGHTHUNDREDG: "PROFILE_800G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-    },
-    "MORGAN800CC": {
-        PortSpeed.EIGHTHUNDREDG: "PROFILE_800G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-    },
-    "WEDGE400C": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "WEDGE400": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "ELBERT": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "FUJI": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "DARWIN": {
-        PortSpeed.FOURHUNDREDG: "PROFILE_400G_8_PAM4_RS544X2N_OPTICAL",
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "YAMP": {
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-    "MINIPACK": {
-        PortSpeed.HUNDREDG: "PROFILE_100G_4_NRZ_RS528_OPTICAL",
-        PortSpeed.TWOHUNDREDG: "PROFILE_200G_4_PAM4_RS544X2N_OPTICAL",
-    },
-}
 
 
 class UnsupportedSpeedCombinationError(Exception):
     pass
+
+
+# The methods that activate an agent config change (BGP_RESTART does not).
+_AGENT_APPLY_PATCHER_METHODS = frozenset(
+    {
+        taac_types.ApplyPatcherMethod.AGENT_RELOAD,
+        taac_types.ApplyPatcherMethod.AGENT_WARMBOOT,
+        taac_types.ApplyPatcherMethod.AGENT_RELOAD_AND_WARMBOOT,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -13222,15 +13177,21 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
         device_infos = await self._gather_device_infos(endpoints)
         speed_in_gbps = params.get("speed_in_gbps", 0)
 
-        if port_state_change:
-            await self._disable_device_ports(device_infos)
-
         # AGENT_RELOAD when a config reload is enough and a restart is not.
         apply_patcher_method = taac_types.ApplyPatcherMethod(
             params.get(
                 "apply_patcher_method", taac_types.ApplyPatcherMethod.AGENT_WARMBOOT
             )
         )
+        if apply_patcher_method not in _AGENT_APPLY_PATCHER_METHODS:
+            raise ValueError(
+                f"{self.STEP_NAME} changes the agent config, but "
+                f"apply_patcher_method={apply_patcher_method.name} does not "
+                f"activate it: the ports would keep their old speed."
+            )
+
+        if port_state_change:
+            await self._disable_device_ports(device_infos)
 
         if register_patcher:
             await self._register_speed_flip_patchers(
@@ -13329,20 +13290,40 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
         speed_in_gbps: int,
         patcher_name: str,
     ) -> None:
+        """Queue the agent-config mutation a speed flip needs, one per device.
+
+        Registers COOP's ``change_speed`` agent patcher through
+        ``async_change_speed_patcher`` with each platform's default profile
+        from ``taac.steps.speed_flip_profiles``.
+
+        Why not ``fboss2-dev config interface ... profile``: the CLI commits a
+        subsuming profile change as a coldboot, which would wipe BGP and
+        counters mid-test.
+        The patcher removes the subsumed mate from the config too -- a merely
+        disabled mate still owns its lanes, so the 8-lane port is never created
+        in either boot mode. A stage whose config removes a port (entry into a
+        whole-cage profile) is cold-booted by ``async_apply_patchers``; every
+        other stage warm-boots.
+        """
         speed_in_mbps = speed_in_gbps * 1000
+        # Resolve every profile before building any coroutine: a raise halfway
+        # through would otherwise leave the earlier ones created and unawaited.
+        profiles = [
+            default_profile_id(device_info.hardware_type, speed_in_mbps)
+            for device_info in device_infos
+        ]
         coros = []
-        for device_info in device_infos:
-            profile_id = _PLATFORM_SPEED_PROFILE_MAPPING.get(
-                device_info.hardware_type,
-                {},
-                # pyrefly: ignore [bad-index]
-            )[speed_in_mbps]
+        for device_info, profile in zip(device_infos, profiles):
             coros.append(
                 device_info.driver.async_change_speed_patcher(
-                    device_info.ports,
+                    intf_names=list(device_info.ports),
                     desired_speed=PortSpeed(speed_in_mbps).name,
-                    profile_id=profile_id,
+                    profile_id=PortProfileID[profile].name,
                     patcher_name=patcher_name,
+                    patcher_desc=(
+                        f"speed flip: {len(device_info.ports)} port(s) to "
+                        f"{PortSpeed(speed_in_mbps).name}"
+                    ),
                 )
             )
         await asyncio.gather(*coros)
@@ -13354,7 +13335,9 @@ class RegisterSpeedFlipPatcherStep(StepBase[taac_types.BaseInput]):
     ) -> None:
         await asyncio.gather(
             *[
-                device_info.driver.async_coop_unregister_patchers(patcher_name)
+                device_info.driver.async_coop_unregister_patchers(
+                    patcher_name, config_name=AGENT_CONFIG
+                )
                 for device_info in device_infos
             ]
         )

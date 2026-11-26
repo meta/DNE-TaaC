@@ -67,6 +67,10 @@ class _FakeSwitch:
         self.reads = []
         self.events = []
         self.platform_mapping_reads = 0
+        # Whether an agent restart restarts bgpd too, as a BindsTo= unit does.
+        self.bgpd_restarts_with_agent = True
+        self.bgpd_start_time = 1000
+        self.bgpd_start_time_reads = 0
 
     async def async_get_platform_mapping(self) -> PlatformMapping:
         self.platform_mapping_reads += 1
@@ -112,6 +116,15 @@ class _FakeSwitch:
 
     async def async_restart_service(self, service) -> None:
         self.events.append(("restart", service))
+        if service == FbossSystemctlServiceName.BGP or (
+            service == FbossSystemctlServiceName.AGENT and self.bgpd_restarts_with_agent
+        ):
+            self.bgpd_start_time += 1
+
+    async def async_get_service_monotonic_start_time(self, service) -> int:
+        assert service == FbossSystemctlServiceName.BGP, service
+        self.bgpd_start_time_reads += 1
+        return self.bgpd_start_time
 
     async def async_wait_for_agent_configured(self) -> None:
         self.events.append(("wait_agent",))
@@ -520,6 +533,106 @@ class OssCoopPatcherTest(TestCase):
                 )
                 self.assertEqual(("wait_bgp",), self.switch.events[-1])
 
+    async def test_agent_restart_not_covering_bgpd_restarts_it(self) -> None:
+        """A split-agent bgpd unit is not bound to the agent's; restart it."""
+        self.switch.bgpd_restarts_with_agent = False
+        await self._register(_vlan_patcher())
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch)
+
+        self.assertEqual(
+            [
+                ("write", AGENT_LIVE),
+                ("write", BGP_LIVE),
+                ("restart", FbossSystemctlServiceName.AGENT),
+                ("wait_agent",),
+                ("restart", FbossSystemctlServiceName.BGP),
+                ("wait_bgp",),
+            ],
+            self.switch.events,
+        )
+
+    async def test_unbound_bgpd_is_restarted_for_warmboot_and_coldboot(self) -> None:
+        self.switch.bgpd_restarts_with_agent = False
+        for method, coldboot in (
+            (taac_types.ApplyPatcherMethod.AGENT_WARMBOOT, False),
+            (None, True),
+        ):
+            with self.subTest(method=method, coldboot=coldboot):
+                await self._register(_peer_group(f"A{coldboot}"))
+                self.switch.events.clear()
+                await ocp.async_apply(self.switch, method, coldboot=coldboot)
+                self.assertEqual(
+                    [
+                        ("restart", FbossSystemctlServiceName.AGENT),
+                        ("wait_agent",),
+                        ("restart", FbossSystemctlServiceName.BGP),
+                        ("wait_bgp",),
+                    ],
+                    self.switch.events[-4:],
+                )
+
+    async def test_restore_baselines_restarts_an_unbound_bgpd(self) -> None:
+        await self._register(_vlan_patcher())
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch)
+        self.switch.bgpd_restarts_with_agent = False
+        self.switch.events.clear()
+
+        await ocp.async_restore_baselines(self.switch)
+
+        self.assertEqual(_baseline_bgp(), self.switch.bgp())
+        self.assertEqual(
+            [
+                ("restart", FbossSystemctlServiceName.AGENT),
+                ("wait_agent",),
+                ("restart", FbossSystemctlServiceName.BGP),
+                ("wait_bgp",),
+            ],
+            self.switch.events,
+        )
+
+    async def test_unreadable_bgpd_start_time_restarts_bgpd(self) -> None:
+        async def _unreadable(service) -> int:
+            raise RuntimeError("systemctl show failed")
+
+        self.switch.async_get_service_monotonic_start_time = _unreadable
+        await self._register(_vlan_patcher())
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch)
+
+        self.assertIn(("restart", FbossSystemctlServiceName.BGP), self.switch.events)
+        self.assertEqual(("wait_bgp",), self.switch.events[-1])
+
+    async def test_bgpd_start_time_is_read_only_around_an_agent_restart(
+        self,
+    ) -> None:
+        """Paths that restart bgpd regardless need no start-time snapshot."""
+        await self._register(_vlan_patcher())
+        await self._register(_peer_group("A"))
+        await ocp.async_apply(self.switch, taac_types.ApplyPatcherMethod.AGENT_RELOAD)
+        self.assertEqual(0, self.switch.bgpd_start_time_reads)
+
+        await self._register(_peer_group("B"))
+        await ocp.async_apply(self.switch)  # bgp-only change
+        self.assertEqual(0, self.switch.bgpd_start_time_reads)
+
+        await self._register(
+            ocp.OssPatcher(
+                name="vlan21",
+                config_name="agent",
+                py_func_name="configure_vlans",
+                args={
+                    "vlan21": json.dumps(
+                        {"vlan_id": 21, "ip_addresses": ["10.0.1.1/31"]}
+                    )
+                },
+            )
+        )
+        await self._register(_peer_group("C"))
+        await ocp.async_apply(self.switch)  # agent + bgp: one agent restart
+        self.assertEqual(2, self.switch.bgpd_start_time_reads)
+
     async def test_agent_reload_still_restarts_bgp(self) -> None:
         await self._register(_vlan_patcher())
         await self._register(_peer_group("A"))
@@ -562,7 +675,7 @@ class OssCoopPatcherTest(TestCase):
         self.assertFalse(os.path.exists(self.working_bgp))
         self.assertEqual([], ocp.list_patchers(HOST, "agent"))
         self.assertEqual([], ocp.list_patchers(HOST, "bgpcpp"))
-        # The agent warmboot restarts bgpd too (BindsTo=wedge_agent.service).
+        # The agent warmboot restarts bgpd too where bgpd's unit is bound to it.
         self.assertEqual(
             [
                 ("restart", FbossSystemctlServiceName.AGENT),

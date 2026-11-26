@@ -26,6 +26,7 @@ Properties polled (matches all three checks' combined needs):
 * ``Id`` — required for the base class's block-to-unit matching.
 * ``LoadState`` / ``ActiveState`` / ``UnitFileState`` — is-active check.
 * ``Result`` — unclean-exit detection.
+* ``ConditionResult`` — tells a unit gated off on this box from an outage.
 * ``ActiveEnterTimestamp`` / ``NRestarts`` — service-restart detection.
 
 Usage (started by ``CollectorsTestHandler``, consumed by a postcheck):
@@ -80,6 +81,34 @@ class SystemdUnitState:
     unit_file_state: t.Optional[str] = None
     active_enter_ts: t.Optional[int] = None
     n_restarts: t.Optional[int] = None
+    condition_result: t.Optional[str] = None
+
+    def should_skip(
+        self,
+        skip_disabled: bool = True,
+        skip_not_loaded: bool = True,
+        skip_condition_unmet: bool = True,
+    ) -> bool:
+        """Whether this sample says the unit is not meant to run on this box,
+        so its state is neither an outage nor a restart. Each reason can be
+        turned off by a stricter caller:
+
+        * ``skip_disabled``: ``UnitFileState=disabled``.
+        * ``skip_not_loaded``: ``LoadState`` other than ``loaded`` (the unit is
+          not on this image).
+        * ``skip_condition_unmet``: inactive with ``ConditionResult=no``, i.e.
+          installed and enabled but gated off by a ``Condition*=`` that is false
+          here (e.g. a unit whose `ConditionPathExists=` file is absent).
+        """
+        if skip_disabled and self.unit_file_state == "disabled":
+            return True
+        if skip_not_loaded and self.load_state and self.load_state != "loaded":
+            return True
+        return (
+            skip_condition_unmet
+            and self.active_state == "inactive"
+            and self.condition_result == "no"
+        )
 
     @property
     def is_unclean(self) -> bool:
@@ -161,6 +190,7 @@ class SystemdStateCollector(ServicePollingCollector):
             "ActiveEnterTimestamp",
             "ActiveEnterTimestampMonotonic",
             "NRestarts",
+            "ConditionResult",
         ]
 
     def _extract_value(
@@ -192,6 +222,7 @@ class SystemdStateCollector(ServicePollingCollector):
             unit_file_state=unit_data.get("UnitFileState") or None,
             active_enter_ts=aet,
             n_restarts=n_restarts,
+            condition_result=unit_data.get("ConditionResult") or None,
         )
 
     def _format_value(self, value: t.Any) -> str:
@@ -257,6 +288,7 @@ class SystemdStateCollector(ServicePollingCollector):
         services: t.Optional[t.Sequence[str]] = None,
         skip_disabled: bool = True,
         skip_not_loaded: bool = True,
+        skip_condition_unmet: bool = True,
     ) -> t.Dict[str, str]:
         """Return ``{service: first_non_active_state}`` for services whose
         ``ActiveState`` was not ``active`` at any sample in the window.
@@ -269,6 +301,9 @@ class SystemdStateCollector(ServicePollingCollector):
         there's nothing to check. Both match the semantics
         ``SystemctlActiveStateHealthCheck``'s legacy per-service SSH path
         used; a caller wanting stricter checking can flip either flag off.
+        ``skip_condition_unmet=True`` (default): a sample that is inactive only
+        because the unit's start condition is false is omitted, like a
+        not-loaded one.
         """
         # The filters below decide sample-by-sample, not once-per-service:
         # a monitored unit can be disabled/not-loaded at one poll and
@@ -288,12 +323,10 @@ class SystemdStateCollector(ServicePollingCollector):
                     continue
                 if not isinstance(state, SystemdUnitState):
                     continue
-                if skip_disabled and state.unit_file_state == "disabled":
-                    continue
-                if (
-                    skip_not_loaded
-                    and state.load_state
-                    and state.load_state != "loaded"
+                if state.should_skip(
+                    skip_disabled=skip_disabled,
+                    skip_not_loaded=skip_not_loaded,
+                    skip_condition_unmet=skip_condition_unmet,
                 ):
                     continue
                 if state.active_state and state.active_state != "active":
@@ -315,8 +348,8 @@ class SystemdStateCollector(ServicePollingCollector):
         allow-list an intentional restart — the transient
         ``deactivating`` / ``activating`` states of the restarted service are
         expected and must not FAIL, but the check still needs to verify
-        recovery. A disabled / not-loaded final sample is skipped (nothing
-        to verify recovery to)."""
+        recovery. A final sample that ``SystemdUnitState.should_skip`` marks
+        is skipped: nothing to verify recovery to."""
         wanted = set(services) if services is not None else set(self.services)
         rows = self.get_rows_in_window(window_start, window_end)
         # Walk the samples once, keeping the last SystemdUnitState per
@@ -331,9 +364,7 @@ class SystemdStateCollector(ServicePollingCollector):
                 last_seen[service] = state
         result: t.Dict[str, str] = {}
         for service, state in last_seen.items():
-            if state.unit_file_state == "disabled":
-                continue
-            if state.load_state and state.load_state != "loaded":
+            if state.should_skip():
                 continue
             if state.active_state and state.active_state != "active":
                 result[service] = state.active_state
@@ -346,6 +377,7 @@ class SystemdStateCollector(ServicePollingCollector):
         services: t.Optional[t.Sequence[str]] = None,
         skip_disabled: bool = True,
         skip_not_loaded: bool = True,
+        skip_condition_unmet: bool = True,
     ) -> t.Dict[str, t.Tuple[int, int]]:
         """Return ``{service: (n_restarts_delta, active_enter_ts_changes)}``
         for services whose restart-indicating fields changed across the window.
@@ -361,8 +393,9 @@ class SystemdStateCollector(ServicePollingCollector):
         ``UnitFileState=disabled`` — a disabled unit can't be running to
         restart. ``skip_not_loaded=True`` (default): omit services that
         sampled as ``LoadState`` != ``loaded`` — the unit isn't present on
-        this DUT image. Both match the semantics ``ServiceRestartHealthCheck``
-        wants; a stricter caller can flip either off.
+        this DUT image. ``skip_condition_unmet=True`` (default): omit samples
+        gated off by a false start condition. All match the semantics
+        ``ServiceRestartHealthCheck`` wants; a stricter caller can flip any off.
         """
         # Filters decide per-sample, not per-service — mirrors the fix on
         # ``services_ever_inactive_in_window`` (see the comment there).
@@ -381,12 +414,10 @@ class SystemdStateCollector(ServicePollingCollector):
                     continue
                 if not isinstance(state, SystemdUnitState):
                     continue
-                if skip_disabled and state.unit_file_state == "disabled":
-                    continue
-                if (
-                    skip_not_loaded
-                    and state.load_state
-                    and state.load_state != "loaded"
+                if state.should_skip(
+                    skip_disabled=skip_disabled,
+                    skip_not_loaded=skip_not_loaded,
+                    skip_condition_unmet=skip_condition_unmet,
                 ):
                     continue
                 if service not in first_seen:

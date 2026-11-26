@@ -23,12 +23,20 @@ import asyncio
 import atexit
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from taac.utils.run_artifacts import declare_artifact
+
 
 logger = logging.getLogger(__name__)
+
+# Poll rows kept when the runner dumps a collector log inline. At the 5s
+# default interval this is ~2.8h of samples, so most runs are not truncated
+# at all; it exists to stop a multi-day longevity run from burying the log.
+DEFAULT_ARTIFACT_MAX_LINES: int = 2000
 
 
 def _now_str() -> str:
@@ -65,8 +73,22 @@ class BaseCollector:
 
     POLL_TIMEOUT_SEC: float = 120.0
 
-    def __init__(self, tmp_path: str, interval_sec: float = 2.0) -> None:
+    def __init__(
+        self,
+        tmp_path: str,
+        interval_sec: float = 2.0,
+        artifact_label: Optional[str] = None,
+    ) -> None:
         self.tmp_path = tmp_path
+        # Declare here rather than at collector-registry registration: the
+        # file is written whether or not anything registers this collector,
+        # and registration is a name-lookup concern.
+        self.artifact_label: str = artifact_label or self._default_artifact_label()
+        declare_artifact(
+            tmp_path,
+            label=self.artifact_label,
+            max_lines=DEFAULT_ARTIFACT_MAX_LINES,
+        )
         self.json_path = tmp_path.replace(".log", ".jsonl")
         self.interval_sec = interval_sec
         self._task: Optional[asyncio.Task] = None
@@ -85,6 +107,20 @@ class BaseCollector:
         # atexit has no deregister-by-default; guard so a restart doesn't
         # stack duplicate shutdown hooks.
         self._atexit_registered: bool = False
+
+    @classmethod
+    def _default_artifact_label(cls) -> str:
+        """``CpuUtilizationCollector`` -> ``cpu_utilization``.
+
+        Deriving keeps the label in step with the class without every
+        subclass restating it, and lands on the same names the collector
+        registry already uses (``cpu_utilization``, ``systemd_state``), so
+        there is one vocabulary rather than two.
+        """
+        name = cls.__name__
+        if name.endswith("Collector"):
+            name = name[: -len("Collector")]
+        return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
     def set_append_mode(self, enabled: bool = True) -> None:
         self._append_mode = enabled

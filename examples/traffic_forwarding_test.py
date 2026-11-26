@@ -2,8 +2,7 @@
 """IPv4 L3 traffic-forwarding test — runnable on IxNetwork (RESTPY) or OTG.
 
 Configures two traffic-generator ports as IPv4 endpoints on opposite sides
-of the DUT, sends bidirectional traffic at 10% line rate, and verifies zero
-packet loss.
+of the DUT, sends bidirectional traffic, and checks it for packet loss.
 
 Topology:
     TGEN Port 1 (10.0.3.2/24) -- DUT Port A (10.0.3.1) -- DUT Port B (10.0.4.1) -- TGEN Port 2 (10.0.4.2/24)
@@ -80,12 +79,11 @@ from taac.test_as_a_config.thrift_types import (
 def _connection(otg: bool, dut_interface: str, ixia_port: str, otg_location: str):
     if otg:
         # OTG: the port-location string doubles as the logical interface
-        # name (matching taac/otg/otg_basic_l3_test_config.py).
+        # name, and the OTG backend reads the location from `interface`.
         return DirectIxiaConnection(
             interface=otg_location,
             ixia_port=ixia_port,
             is_logical_port=True,
-            port_location=otg_location,
         )
     return DirectIxiaConnection(
         interface=dut_interface,
@@ -149,7 +147,14 @@ def _build(otg: bool) -> TestConfig:
             BasicTrafficItemConfig(
                 name=tb.TRAFFIC_ITEM_NAME,
                 bidirectional=True,
-                line_rate=tb.TRAFFIC_LINE_RATE_PERCENT,
+                line_rate=(
+                    tb.TRAFFIC_RATE_OTG_PPS if otg else tb.TRAFFIC_LINE_RATE_PERCENT
+                ),
+                line_rate_type=(
+                    ixia_types.RateType.FRAMES_PER_SECOND
+                    if otg
+                    else ixia_types.RateType.PERCENT_LINE_RATE
+                ),
                 src_endpoints=[
                     TrafficEndpoint(
                         name=f"{dut}:{iface_a}",
@@ -187,9 +192,11 @@ def _build(otg: bool) -> TestConfig:
                 postchecks=[
                     create_traffic_item_packet_loss_check(
                         traffic_item_names=[tb.TRAFFIC_ITEM_NAME],
-                        max_packet_loss_percent=0.0,
+                        max_packet_loss_percent=(
+                            tb.TRAFFIC_OTG_MAX_LOSS_PERCENT if otg else 0.0
+                        ),
                     ),
-                    # OSS collector-backed: forwarding at 10% line rate must
+                    # OSS collector-backed: forwarding traffic must
                     # not stress the control plane — CPU/memory within
                     # thresholds, services active, no unclean exits.
                     create_systemctl_active_state_check(

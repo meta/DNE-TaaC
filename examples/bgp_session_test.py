@@ -80,12 +80,11 @@ from taac.test_as_a_config.thrift_types import (
 def _build(otg: bool) -> TestConfig:
     if otg:
         # OTG: the port-location string doubles as the logical interface
-        # name (matching taac/otg/otg_basic_l3_test_config.py).
+        # name, and the OTG backend reads the location from `interface`.
         conn = DirectIxiaConnection(
             interface=tb.OTG_PORT_A_LOCATION,
             ixia_port="1/1",
             is_logical_port=True,
-            port_location=tb.OTG_PORT_A_LOCATION,
         )
     else:
         conn = DirectIxiaConnection(

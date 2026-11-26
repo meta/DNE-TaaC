@@ -213,6 +213,10 @@ class TestAbstractTrafficGeneratorABC(unittest.TestCase):
             # chassis IP — used for diagnostics collection (Manifold upload).
             # OTG deployments don't have a chassis IP in the same sense.
             "primary_chassis_ip",
+            # restpy-only REST-call tracer. OTG has no IxNetwork REST session to
+            # trace; the runner guards it with isinstance(candidate, TaacIxia)
+            # in _ixia_with_api_trace.
+            "api_tracer",
         }
 
         abc_attrs = {

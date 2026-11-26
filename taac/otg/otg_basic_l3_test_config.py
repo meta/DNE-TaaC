@@ -119,13 +119,21 @@ def get_test_config(
     for i, link in enumerate(links):
         endpoint_str = f"{device_name}:{link.traffic_gen_port}"
         location = port_location or link.traffic_gen_port
+        # Without a `port_location` field in the schema, OTG uses `interface`.
+        location_kwargs = {}
+        if hasattr(DirectIxiaConnection, "port_location"):
+            location_kwargs["port_location"] = location
+        elif location != link.traffic_gen_port:
+            raise ValueError(
+                "A port_location override needs DirectIxiaConnection.port_location"
+            )
 
         direct_ixia_connections.append(
             DirectIxiaConnection(
                 interface=link.traffic_gen_port,
                 ixia_port=f"1/{i + 1}",
                 is_logical_port=True,
-                port_location=location,
+                **location_kwargs,
             )
         )
 

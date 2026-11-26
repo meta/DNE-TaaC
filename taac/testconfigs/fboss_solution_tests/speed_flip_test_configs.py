@@ -1195,6 +1195,24 @@ _SPEED_FLIP_51T_UTP_ITERATIONS = 3
 # _SPEED_FLIP_51T_UTP_ITERATIONS.
 _SPEED_FLIP_51T_AGENT_CRASH_ITERATIONS = 1
 
+# Reduced cases (SPDF_010-016) that run as flip cycles followed by ONE wait for
+# BGP convergence after the last cycle, before the IXIA postcheck. Every speed
+# change warmboots the agent and restarts bgpd on both devices; the wait makes
+# sure traffic is never judged while bgpd is still re-exchanging routes (same
+# guard as SPDF_003/006/009). It returns immediately if bgpd has converged.
+_REDUCED_CASES_WITH_BGP_WAIT = {
+    "SPD_010",
+    "SPD_011",
+    "SPD_012",
+    "SPD_013",
+    "SPD_014",
+    "SPD_015",
+    "SPD_016",
+}
+
+# Flip cycles for the reduced cases in _REDUCED_CASES_WITH_BGP_WAIT.
+_SPEED_FLIP_51T_REDUCED_CYCLES = 3
+
 
 def _wait_for_bgp_convergence_stage() -> Stage:
     """Wait until bgpd on both devices reports initialization converged.
@@ -1399,7 +1417,15 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
         )
     )
     playbooks.extend(
-        _build_reduced_transition_playbook(case, snapshot_checks)
+        (
+            _repeat_flip_cycles(
+                _build_reduced_transition_playbook(case, snapshot_checks),
+                _SPEED_FLIP_51T_REDUCED_CYCLES,
+                final_stages=[_wait_for_bgp_convergence_stage()],
+            )
+            if case.utp_id in _REDUCED_CASES_WITH_BGP_WAIT
+            else _build_reduced_transition_playbook(case, snapshot_checks)
+        )
         for case in _REDUCED_SPEED_FLIP_CASES
     )
     return TestConfig(

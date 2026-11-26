@@ -52,6 +52,10 @@ _REDUCED_TRANSITION_PLAYBOOK_NAMES = [
     "SPEED_FLIP_51T_SPD_021_400G_200G_TO_800G_REDUCED",
 ]
 
+# Reduced cases (SPDF_010-016) that wait once for BGP convergence after the
+# last flip cycle.
+_BGP_WAIT_REDUCED_PLAYBOOK_NAMES = _REDUCED_TRANSITION_PLAYBOOK_NAMES[:7]
+
 _UTP_PLAYBOOK_NAMES = [
     "SPEED_FLIP_51T_SPD_001_100G_TO_200G_WARMBOOT",
     "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT",
@@ -337,17 +341,17 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         )
         self.assertEqual(playbook.iteration, 1)
 
-    def test_spd_003_006_009_wait_for_bgp_convergence_before_postchecks(
+    def test_spd_003_006_009_010_to_016_wait_for_bgp_convergence_before_postchecks(
         self,
     ) -> None:
         playbooks_by_name = {p.name: p for p in self.test_config.playbooks}
-        for name in (
+        for name in [
             "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
             "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
             "SPEED_FLIP_51T_SPD_009_100G_TO_400G_COOP_CRASH_WARMBOOT",
-        ):
+        ] + _BGP_WAIT_REDUCED_PLAYBOOK_NAMES:
             playbook = playbooks_by_name[name]
-            # Last stage (after the 3rd cycle): wait for bgpd on both devices.
+            # Last stage (after the last cycle): wait for bgpd on both devices.
             last_steps = playbook.stages[-1].steps
             self.assertEqual(len(last_steps), 1, name)
             self.assertEqual(
@@ -453,7 +457,12 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         }
 
         for name in _REDUCED_TRANSITION_PLAYBOOK_NAMES:
-            last_stage = playbooks_by_name[name].stages[-1]
+            stages = playbooks_by_name[name].stages
+            # Cases with the BGP wait end with it; the native-state check is
+            # the stage right before it.
+            last_stage = (
+                stages[-2] if name in _BGP_WAIT_REDUCED_PLAYBOOK_NAMES else stages[-1]
+            )
             self.assertEqual(
                 [step.name for step in last_stage.steps],
                 [
@@ -519,7 +528,8 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         for name, expected in zip(
             _REDUCED_TRANSITION_PLAYBOOK_NAMES[:7], expected_operations
         ):
-            self.assertEqual(speed_operations(name), expected)
+            # SPDF_010-016 repeat the flip cycle 3 times in one test case.
+            self.assertEqual(speed_operations(name), expected * 3)
 
     def test_spd_017_through_021_cover_subsumable_up_and_down_sequentially(
         self,
@@ -586,8 +596,10 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
                 if (params := _step_params(step)).get("register_patcher") is True
                 and params.get("speed_in_gbps") == 200
             ]
-            self.assertEqual(len(registered_200g), 1)
-            self.assertEqual(registered_200g[0]["endpoints"], _ENDPOINTS)
+            # Once per flip cycle (3 cycles).
+            self.assertEqual(len(registered_200g), 3)
+            for params in registered_200g:
+                self.assertEqual(params["endpoints"], _ENDPOINTS)
 
     def test_replaces_the_old_bundled_ko3_config(self) -> None:
         names = [
@@ -695,7 +707,8 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         for playbook in self.test_config.playbooks:
             expected = (
                 expected_prechecks - {hc_types.CheckName.IXIA_PACKET_LOSS_CHECK}
-                if playbook.name in _UTP_PLAYBOOK_NAMES
+                if playbook.name
+                in _UTP_PLAYBOOK_NAMES + _BGP_WAIT_REDUCED_PLAYBOOK_NAMES
                 else expected_prechecks
             )
             self.assertEqual(playbook.traffic_items_to_start, [_TRAFFIC_ITEM])

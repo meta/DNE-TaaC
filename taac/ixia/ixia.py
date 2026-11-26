@@ -56,6 +56,7 @@ from ixnetwork_restpy.assistants.sessions.sessionassistant import (
 from ixnetwork_restpy.assistants.statistics.statviewassistant import (
     StatViewAssistant as IxnStatViewAssistant,
 )
+from ixnetwork_restpy.errors import BadRequestError
 from ixnetwork_restpy.errors import IxNetworkError as IxnIxNetworkError
 from ixnetwork_restpy.files import Files
 from taac.abstractions.ixia_semantics import (
@@ -924,6 +925,13 @@ _PROTOCOL_STATE_SETTLE_TIMEOUT_SECONDS: int = 120
 _PROTOCOL_STATE_POLL_SECONDS: int = 2
 # ApplyOnTheFly failures are commonly transient while a large topology settles.
 _APPLY_CHANGES_MAX_ATTEMPTS: int = 3
+_TRAFFIC_APPLY_MAX_ATTEMPTS: int = 3
+_TRAFFIC_APPLY_RETRY_DELAY_SECONDS: float = 5.0
+# The error IxNetwork raises at Apply time when no stream could be built
+# because a destination MAC never resolved.
+_UNRESOLVED_DESTINATION_ERROR_MARKER: str = "no flow groups"
+# Time for neighbor discovery to complete after a resend, before regenerating.
+_DESTINATION_RESOLUTION_SETTLE_SECONDS: float = 10.0
 _APPLY_CHANGES_RETRY_DELAY_SECONDS: float = 10.0
 
 # A successful BGP peer Start can still leave some sessions `notStarted` (seen on
@@ -9855,7 +9863,73 @@ class Ixia:
                 "apply_traffic: no enabled traffic items — skipping Traffic.Apply()"
             )
             return
-        self.ixnetwork.Traffic.Apply()
+        self._apply_traffic_with_retry()
+
+    # IxNetwork occasionally rejects an Apply with a bare "Error in L2/L3
+    # Traffic Apply" and no AppErrors, on traffic items identical to ones it
+    # applied cleanly in the previous iteration.
+    # start_traffic already retries, but prepare_traffic and enable_traffic
+    # call Apply directly, so a single rejection there fails the playbook.
+    #
+    # A rejection whose AppErrors say a destination MAC did not resolve (a link
+    # flap can drop the gateway resolution and nothing redoes it) fails the same
+    # way on every identical retry, since the streams were generated without
+    # that destination. Those retries resend ARP/NS and regenerate first.
+    def _apply_traffic_with_retry(self) -> None:
+        for attempt in range(1, _TRAFFIC_APPLY_MAX_ATTEMPTS + 1):
+            try:
+                self.ixnetwork.Traffic.Apply()
+                return
+            except BadRequestError as error:
+                if attempt == _TRAFFIC_APPLY_MAX_ATTEMPTS:
+                    raise
+                try:
+                    traffic_running = self.is_traffic_running()
+                except Exception:
+                    traffic_running = True
+                if (
+                    not traffic_running
+                    and self._apply_failed_on_unresolved_destinations()
+                ):
+                    self.logger.warning(
+                        f"Traffic Apply attempt {attempt}/"
+                        f"{_TRAFFIC_APPLY_MAX_ATTEMPTS} rejected on unresolved "
+                        f"destination MACs ({error}); resending ARP/NS and "
+                        "regenerating traffic items"
+                    )
+                    # A failed recovery step only costs this attempt; the next
+                    # Apply surfaces the real rejection.
+                    try:
+                        self._send_arp_and_ns()
+                        time.sleep(_DESTINATION_RESOLUTION_SETTLE_SECONDS)
+                        self._generate_traffic_items()
+                    except Exception as recovery_error:
+                        self.logger.warning(
+                            "Resolving destinations before the next Traffic "
+                            f"Apply failed (non-fatal): {recovery_error}"
+                        )
+                else:
+                    self.logger.warning(
+                        f"Traffic Apply attempt {attempt}/"
+                        f"{_TRAFFIC_APPLY_MAX_ATTEMPTS} rejected ({error}); "
+                        "retrying"
+                    )
+                    time.sleep(_TRAFFIC_APPLY_RETRY_DELAY_SECONDS)
+
+    def _generate_traffic_items(self) -> None:
+        # Not regenerate_traffic_items: it stops and restarts running traffic,
+        # and its start_traffic re-enters apply_traffic from inside this retry.
+        # Enabled items only: generating a disabled item resets its settings.
+        for traffic_item in self.get_traffic_items():
+            if traffic_item.Enabled:
+                traffic_item.Generate()
+
+    def _apply_failed_on_unresolved_destinations(self) -> bool:
+        # Only the newest entry: older ones may be unrelated leftovers.
+        errors = self._recent_ixia_server_errors()
+        return (
+            bool(errors) and _UNRESOLVED_DESTINATION_ERROR_MARKER in errors[-1].lower()
+        )
 
     def has_traffic_items(self) -> bool:
         try:

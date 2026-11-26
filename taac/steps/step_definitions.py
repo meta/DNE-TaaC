@@ -111,6 +111,9 @@ from taac.health_checks.all_health_checks import (
     HEALTH_CHECK_NAME_TO_INPUT,
     NAME_TO_POINT_IN_TIME_HEALTH_CHECK,
 )
+from taac.health_checks.device_health_checks.bgp_session_health_check import (
+    BgpSessionEstablishedHealthCheck,
+)
 from taac.health_checks.healthcheck_definitions import (
     create_next_hop_count_check,
 )
@@ -11889,11 +11892,46 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
                 )
             await asyncio.sleep(2)
 
+    async def _async_wait_for_bgp_established(
+        self,
+        start_time: float,
+        timeout: int,
+        check_params: t.Dict[str, t.Any],
+        settle_until: float = 0.0,
+    ) -> None:
+        """Poll BgpSessionEstablishedHealthCheck until it passes or the timeout ends."""
+        # After a restart, sessions stay Established until their hold timers expire.
+        if settle_until > time.time():
+            await asyncio.sleep(settle_until - time.time())
+        check = BgpSessionEstablishedHealthCheck(self.logger)
+        check.driver = self.driver
+        params = {**check_params, "verbose": False}
+        deadline = start_time + timeout
+        while True:
+            # Thrift is not up just after a restart, so retry on read errors.
+            try:
+                result = await check._run(
+                    self.device, hc_types.BaseHealthCheckIn(), params
+                )
+                if result.status == hc_types.HealthCheckStatus.PASS:
+                    return
+                last = result.message or ""
+            except Exception as e:
+                self.logger.warning(f"BGP session read failed, will retry: {e!r}")
+                last = f"last error: {e!r}"
+            if time.time() >= deadline:
+                raise Exception(
+                    f"BGP sessions did not all establish within {timeout} seconds "
+                    f"({last[:500]})"
+                )
+            await asyncio.sleep(5)
+
     async def run(
         self,
         input: taac_types.ServiceConvergenceInput,
         params: t.Dict[str, t.Any],
     ) -> None:
+        run_start = time.time()
         if any(
             agent in [taac_types.Service.AGENT, taac_types.Service.FBOSS_SW_AGENT]
             for agent in input.services
@@ -11943,6 +11981,14 @@ class ServiceConvergenceStep(StepBase[taac_types.ServiceConvergenceInput]):
             )
             start_time = time.time()
             await self.driver.async_wait_for_bgp_convergence(timeout)
+            if params.get("wait_for_bgp_established"):
+                # initializationConverged() is already true when bgpd stays up.
+                await self._async_wait_for_bgp_established(
+                    start_time,
+                    timeout,
+                    params.get("bgp_session_check_params") or {},
+                    run_start + params.get("bgp_established_settle_s", 0),
+                )
             end_time = time.time()
             self.logger.info(f"Bgpd converged in {end_time - start_time} seconds")
         if taac_types.Service.QSFP_SERVICE in input.services and self.is_fboss:

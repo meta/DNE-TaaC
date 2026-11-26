@@ -13,6 +13,7 @@ from taac.health_checks.device_health_checks.lldp_health_check import (
 )
 from taac.health_check.health_check import types as hc_types
 from taac.test_as_a_config import types as taac_types
+from taac.utils import oss_taac_lib_utils
 
 
 def _make_test_interface(
@@ -28,6 +29,13 @@ def _make_test_interface(
         neighbor_interface_name=neighbor_interface_name,
         neighbor_display_name=f"{neighbor_switch_name}.tfbnw.net:{neighbor_interface_name}",
     )
+
+
+def _skip_retry_sleeps(test: unittest.TestCase) -> None:
+    # A failing LLDP read is retried for up to 16 s; don't spend that in tests.
+    sleep_patch = patch.object(oss_taac_lib_utils.asyncio, "sleep", AsyncMock())
+    sleep_patch.start()
+    test.addCleanup(sleep_patch.stop)
 
 
 def _make_device(
@@ -145,6 +153,7 @@ class TestLldpHealthCheckRun(unittest.IsolatedAsyncioTestCase):
         self.health_check = LldpHealthCheck(logger=self.logger)
         self.health_check.driver = AsyncMock()
         self.input = hc_types.BaseHealthCheckIn()
+        _skip_retry_sleeps(self)
 
         self.interfaces = [
             _make_test_interface(
@@ -279,6 +288,7 @@ class TestLldpHealthCheckRunArista(unittest.IsolatedAsyncioTestCase):
         self.health_check = LldpHealthCheck(logger=self.logger)
         self.health_check.driver = AsyncMock()
         self.input = hc_types.BaseHealthCheckIn()
+        _skip_retry_sleeps(self)
 
         self.interfaces = [
             _make_test_interface(
@@ -495,6 +505,7 @@ class TestLldpHealthCheckSkipsWhenNothingToValidate(unittest.IsolatedAsyncioTest
         self.health_check = LldpHealthCheck(logger=self.logger)
         self.health_check.driver = AsyncMock()
         self.input = hc_types.BaseHealthCheckIn()
+        _skip_retry_sleeps(self)
 
     async def test_skips_when_device_has_no_interfaces(self):
         device = _make_device("bag001.snc1", [])

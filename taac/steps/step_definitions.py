@@ -13481,7 +13481,25 @@ class SystemRebootStep(StepBase[taac_types.SystemRebootInput]):
             raise RuntimeError(f"{self.device.name} returned an empty boot_id")
         return boot_id
 
+    async def _async_sync_to_disk(self) -> None:
+        # A failed sync only warns. A hung host must still reset.
+        try:
+            out = await asyncio.wait_for(
+                self.driver.async_run_cmd_on_shell("sync && echo SYNCED", timeout=20),
+                30,
+            )
+            if "SYNCED" not in (out or ""):
+                self.logger.warning(
+                    f"sync on {self.device.name} did not confirm ({out!r}); "
+                    "resetting anyway"
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"sync on {self.device.name} raised {e!r}; resetting anyway"
+            )
+
     async def _async_run_bmc_reset(self, cmd: str) -> None:
+        await self._async_sync_to_disk()
         if lab_ssh_transport_enabled():
             # The lab-ssh daemon authenticates to the BMC with the caller's
             # certificate; the hwcontrol path needs a Rotor password instead.

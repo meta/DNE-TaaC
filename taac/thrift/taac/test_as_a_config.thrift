@@ -424,6 +424,9 @@ struct BgpConfig {
   # IXIA TCP receive window for every peer in this BGP object.
   # When absent, preserve the IXIA default.
   23: optional i32 tcp_window_size_bytes;
+  # Ordered, timed BGP UPDATEs sent once the session is established — an escape
+  # hatch from the declarative route_scales model.  See ixia.BgpUpdateSequence.
+  24: optional ixia.BgpUpdateSequence update_sequence;
 }
 
 struct DeviceGroupConfig {

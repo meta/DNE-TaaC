@@ -2,6 +2,7 @@
 # pyre-strict
 
 import json
+import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -20,6 +21,10 @@ from taac.steps.step_definitions import (
     create_validated_igp_unresolvable_pnh_step,
 )
 from taac.test_as_a_config import types as taac_types
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
 
 
 def _step_payload(step: taac_types.Step) -> dict:
@@ -137,7 +142,7 @@ class BgpIgpUnresolvablePnhPlaybookTest(unittest.TestCase):
         restore_ipv6 = list(EBB_OPENR_INJECTED_START_IPV6S_IXIA03)
 
         with mock.patch(
-            "neteng.test_infra.dne.taac.playbooks.routing."
+            f"{_PACKAGE}.playbooks.routing."
             "bgp_ebb_playbooks.get_profile_checks",
             return_value=SimpleNamespace(
                 prechecks=[], postchecks=[], snapshot_checks=[]

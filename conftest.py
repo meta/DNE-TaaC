@@ -77,6 +77,17 @@ _NON_OSS_TEST_FILES = [
 # after `run_tests.sh -- <path>` passes on its own.
 # ---------------------------------------------------------------------------
 _OSS_READY_TEST_FILES = [
+    "taac/health_checks/device_health_checks/test_new_characterization_health_checks.py",
+    "taac/health_checks/device_health_checks/tests/test_pfc_counter_health_checks.py",
+    "taac/health_checks/ixia_health_checks/test_ixia_port_stats_health_check.py",
+    "taac/health_checks/snapshot_health_checks/test_qos_queue_byte_counters.py",
+    "taac/health_checks/tests/test_healthcheck_definitions_systemctl.py",
+    # Pure unit test: the OSS custom step and its mocks, no taac.internal
+    # import, so it runs in the OSS image while the rest of
+    # taac/steps/tests does not.
+    "taac/steps/tests/test_oss_custom_step.py",
+    "taac/steps/tests/test_system_reboot_step.py",
+    "taac/ixia/tests/test_start_bgp_peers.py",
     "taac/health_checks/device_health_checks/test_bgp_rib_fib_consistency_health_check.py",
     "taac/health_checks/tests/test_common_utils.py",
     "taac/health_checks/tests/test_convergence_observer.py",

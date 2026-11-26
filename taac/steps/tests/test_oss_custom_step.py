@@ -10,7 +10,9 @@ here. Mirrors the contract locked by the internal
 patcher kwargs, same suffix fallback, same descriptive errors.
 """
 
+import importlib
 import json
+import os
 import time
 import typing as t
 import unittest
@@ -25,8 +27,14 @@ from taac.constants import (
 from taac.driver.driver_constants import SwitchLldpData
 from taac.libs.parameter_evaluator import ParameterEvaluator
 from taac.steps.all_steps import NAME_TO_STEP
-from neteng.test_infra.dne.taac.steps.oss_custom_step import _HANDLERS, OssCustomStep
 from taac.test_as_a_config import types as taac_types
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+_oss_custom_step = importlib.import_module(f"{_PACKAGE}.steps.oss_custom_step")
+_HANDLERS = _oss_custom_step._HANDLERS
+OssCustomStep = _oss_custom_step.OssCustomStep
 
 
 class _FakeIxiaClass:
@@ -422,7 +430,9 @@ class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
         step = _make_step({})
         step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
         # start=0.0, two checks under the 200s deadline, then one past it.
-        with patch("time.time", side_effect=[0.0, 1.0, 2.0, 500.0]):
+        with patch(
+            f"{_PACKAGE}.steps.oss_custom_step.time", **{"time.side_effect": [0.0, 1.0, 2.0, 500.0]}
+        ):
             await step.fpf_rapid_flap_lldp(
                 {
                     "neighbor_pattern": "nbr*",
@@ -449,7 +459,9 @@ class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
         """An exact host list narrows the scope a glob would widen."""
         step = _make_step({})
         step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
-        with patch("time.time", side_effect=[0.0, 1.0, 500.0]):
+        with patch(
+            f"{_PACKAGE}.steps.oss_custom_step.time", **{"time.side_effect": [0.0, 1.0, 500.0]}
+        ):
             await step.fpf_rapid_flap_lldp(
                 {
                     "neighbor_hosts": ["nbr001"],
@@ -464,7 +476,9 @@ class TestFpfRapidFlapLldp(unittest.IsolatedAsyncioTestCase):
     async def test_up_time_defaults_to_down_time(self):
         step = _make_step({})
         step.driver.async_get_lldp_neighbors.return_value = _lldp_table()
-        with patch("time.time", side_effect=[0.0, 1.0, 500.0]):
+        with patch(
+            f"{_PACKAGE}.steps.oss_custom_step.time", **{"time.side_effect": [0.0, 1.0, 500.0]}
+        ):
             await step.fpf_rapid_flap_lldp(
                 {
                     "neighbor_pattern": "nbr001*",

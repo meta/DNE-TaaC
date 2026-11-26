@@ -33,7 +33,12 @@ from taac.abstractions.eos_bgpcpp_setup_tasks import (
     POLICY_EVALUATION_SOURCE_CONFIG_PATH,
 )
 
-TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+# Imported rather than re-derived from the environment: two independently
+# patchable definitions of the same env var is a trap for the next person
+# writing a test.
+from taac.utils.oss_taac_constants import (  # noqa: E402
+    TAAC_OSS,
+)
 
 from taac.abstractions.churn.route import (  # oss-rewrite (force ShipIt re-export to taac.* root)
     RouteChurn,

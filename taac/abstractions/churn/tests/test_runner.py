@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import unittest
 from unittest.mock import patch
 
@@ -39,6 +40,10 @@ from taac.abstractions.churn.specs import (
     ChurnScenario,
     ChurnWorkload,
 )
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
 
 
 def _scenario() -> ChurnScenario:
@@ -218,7 +223,7 @@ class BoundedChurnRunnerTest(TestCase):
 class DeadlineTest(unittest.TestCase):
     def test_remaining_clamps_to_phase_budget(self) -> None:
         with patch(
-            "neteng.test_infra.dne.taac.abstractions.churn.context.time.monotonic",
+            f"{_PACKAGE}.abstractions.churn.context.time.monotonic",
             return_value=10.0,
         ):
             deadline = Deadline("phase", 15.0)
@@ -227,7 +232,7 @@ class DeadlineTest(unittest.TestCase):
 
     def test_remaining_fails_without_one_last_call(self) -> None:
         with patch(
-            "neteng.test_infra.dne.taac.abstractions.churn.context.time.monotonic",
+            f"{_PACKAGE}.abstractions.churn.context.time.monotonic",
             return_value=15.0,
         ):
             with self.assertRaisesRegex(DeadlineExceeded, "phase"):
@@ -235,7 +240,7 @@ class DeadlineTest(unittest.TestCase):
 
     def test_ensure_remaining_fails_after_deadline(self) -> None:
         with patch(
-            "neteng.test_infra.dne.taac.abstractions.churn.context.time.monotonic",
+            f"{_PACKAGE}.abstractions.churn.context.time.monotonic",
             return_value=15.0,
         ):
             with self.assertRaisesRegex(DeadlineExceeded, "phase"):

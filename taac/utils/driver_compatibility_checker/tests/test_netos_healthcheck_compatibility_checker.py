@@ -17,6 +17,15 @@ from taac.utils.driver_compatibility_checker.netos_healthcheck_compatibility_che
     run_device_checks,
 )
 
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_CHECKER_MODULE = (
+    "taac.utils.driver_compatibility_checker.netos_healthcheck_compatibility_checker"
+    if TAAC_OSS
+    else "neteng.test_infra.dne.taac.utils.driver_compatibility_checker."
+    "netos_healthcheck_compatibility_checker"
+)
+
 
 class _FakeDriver:
     def __init__(
@@ -78,15 +87,11 @@ class _FakeDriver:
 
 class NetosHealthcheckCompatibilityCheckerTest(unittest.IsolatedAsyncioTestCase):
     @patch(
-        "neteng.test_infra.dne.taac.utils.driver_compatibility_checker."
-        "netos_healthcheck_compatibility_checker."
-        "run_device_checks",
+        f"{_CHECKER_MODULE}.run_device_checks",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.utils.driver_compatibility_checker."
-        "netos_healthcheck_compatibility_checker."
-        "async_get_device_driver",
+        f"{_CHECKER_MODULE}.async_get_device_driver",
         new_callable=AsyncMock,
     )
     async def test_run_checks_forces_lab_ssh_before_creating_driver(

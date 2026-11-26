@@ -2,8 +2,10 @@
 
 # pyre-unsafe
 
+import importlib
 import json
 import logging
+import os
 import typing as t
 
 # IsolatedAsyncioTestCase, not later.unittest.TestCase: ShipIt exports
@@ -32,7 +34,6 @@ from configerator.structs.neteng.robotron.bgp_policy.thrift_types import (
     DrainState,
     FlowControlAction,
 )
-from neteng.test_infra.dne.taac.driver import config_modifiers as _config_modifiers
 from taac.driver.abstract_switch import AbstractSwitch
 from taac.driver.config_modifiers import (
     _async_resolve_bgpd_config_path,
@@ -65,6 +66,11 @@ from taac.driver.fboss_switch import FbossSwitch
 from taac.utils import oss_taac_lib_utils
 from thrift.python.serializer import deserialize, Protocol, serialize
 
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_PACKAGE = "taac" if TAAC_OSS else "neteng.test_infra.dne.taac"
+
+_config_modifiers = importlib.import_module(f"{_PACKAGE}.driver.config_modifiers")
 # ShipIt rewrites import statements but not string literals, so a hardcoded
 # dotted path is only correct in one of the two worlds; read the name off the
 # imported module instead.

@@ -23,6 +23,10 @@ from taac.utils.health_check_utils import (
 from taac.utils.oss_taac_lib_utils import ConsoleFileLogger
 from taac.health_check.health_check import types as hc_types
 
+# ShipIt rewrites import statements but not string literals; derive the
+# patch targets from the package the checks are imported from.
+_PKG = PfcWdHealthCheck.__module__.split(".health_checks.")[0]
+
 
 def _make_device(
     name: str = "gtsw001.example", os: str = "FBOSS", role: str = "GTSW"
@@ -77,7 +81,7 @@ class TestPfcCounterHealthChecks(TestCase):
         )
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.time.monotonic",
         return_value=100_000,
     )
@@ -117,7 +121,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual(hc_types.HealthCheckStatus.ERROR, result.status)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -153,7 +157,7 @@ class TestPfcCounterHealthChecks(TestCase):
         )
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -180,7 +184,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual((12, 11), PfcWdHealthCheck._snapshots[key])
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -210,7 +214,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual((3, 2), PfcWdHealthCheck._snapshots[key])
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -234,12 +238,12 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertNotIn(current_key, PfcWdHealthCheck._snapshots)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -269,12 +273,12 @@ class TestPfcCounterHealthChecks(TestCase):
         self.logger.warning.assert_not_called()
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -304,12 +308,12 @@ class TestPfcCounterHealthChecks(TestCase):
         mock_sleep.assert_awaited_once_with(0.2)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -339,7 +343,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual(4, mock_sleep.await_count)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -369,12 +373,12 @@ class TestPfcCounterHealthChecks(TestCase):
         )
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -413,12 +417,12 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertNotIn(self._wd_key(), PfcWdHealthCheck._snapshots)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -445,12 +449,12 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIn(key, PfcWdHealthCheck._snapshots)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.async_everpaste_str",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -477,7 +481,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIn("difference 3 exceeds configured maximum 2", result.message or "")
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -504,12 +508,12 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertNotIn(key, PfcWdHealthCheck._snapshots)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.async_everpaste_str",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -536,7 +540,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIn("Observed Deadlock: 2, Recovery: 2", result.message or "")
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -570,12 +574,12 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertNotIn(key, PfcWdHealthCheck._snapshots)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.async_everpaste_str",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -618,7 +622,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIn(second_key, PfcWdHealthCheck._snapshots)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -738,7 +742,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIn("requires FBOSS", result.message or "")
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -792,7 +796,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual((999, 999), DsfPfcHealthCheck._snapshots[stale_key])
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.time.monotonic",
         return_value=100_000,
     )
@@ -814,7 +818,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIn(live_key, DsfPfcHealthCheck._snapshots)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -855,7 +859,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual((10, 20), DsfPfcHealthCheck._snapshots[key])
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -887,12 +891,12 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual((100, 200), DsfPfcHealthCheck._snapshots[key])
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -928,12 +932,12 @@ class TestPfcCounterHealthChecks(TestCase):
         )
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -966,7 +970,7 @@ class TestPfcCounterHealthChecks(TestCase):
         mock_sleep.assert_awaited_once_with(0.2)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -994,7 +998,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIn("counters missing", result.message or "")
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -1054,7 +1058,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIn("expected 'device:interface'", result.message or "")
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -1072,7 +1076,7 @@ class TestPfcCounterHealthChecks(TestCase):
         mock_get_client.assert_not_awaited()
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "pfc_wd_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -1149,12 +1153,12 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertFalse(is_same_device("gtsw001.example", "gtsw002.example"))
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -1206,7 +1210,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIn("requires FBOSS", result.message or "")
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.dsf_health_checks."
+        f"{_PKG}.health_checks.dsf_health_checks."
         "dsf_pfc_health_check.get_fb303_client",
         new_callable=AsyncMock,
     )
@@ -1286,7 +1290,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual(hc_types.HealthCheckStatus.PASS, result.status)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "clear_counters_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
@@ -1310,7 +1314,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual(2, mock_sleep.await_count)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "clear_counters_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
@@ -1334,7 +1338,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertEqual(2, mock_sleep.await_count)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "port_counters_health_check.async_get_device_driver",
         new_callable=AsyncMock,
     )
@@ -1408,7 +1412,7 @@ class TestPfcCounterHealthChecks(TestCase):
         )
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "port_counters_health_check.async_get_device_driver",
         new_callable=AsyncMock,
     )
@@ -1447,7 +1451,7 @@ class TestPfcCounterHealthChecks(TestCase):
         self.assertIsNone(reason)
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "clear_counters_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )
@@ -1467,7 +1471,7 @@ class TestPfcCounterHealthChecks(TestCase):
         ixia.start_traffic.assert_called_once_with()
 
     @patch(
-        "neteng.test_infra.dne.taac.health_checks.device_health_checks."
+        f"{_PKG}.health_checks.device_health_checks."
         "clear_counters_health_check.asyncio.sleep",
         new_callable=AsyncMock,
     )

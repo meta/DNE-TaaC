@@ -3,6 +3,7 @@
 
 import contextlib
 import itertools
+import os
 import re
 import typing as t
 import unittest
@@ -15,6 +16,10 @@ from taac.ixia.ixia import (
     Ixia,
     IxiaOperationStateError,
 )
+
+TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
+
+_IXIA_MODULE = "taac.ixia.ixia" if TAAC_OSS else "neteng.test_infra.dne.taac.ixia.ixia"
 
 
 def _ixia() -> Ixia:
@@ -320,7 +325,7 @@ class _BgpSessionStatusTestBase(unittest.TestCase):
         self.ixia.find_bgp_peers = MagicMock(return_value=[self.peer])
         self.clock = _FakeClock()
         patcher = patch(
-            "neteng.test_infra.dne.taac.ixia.ixia.time",
+            f"{_IXIA_MODULE}.time",
             MagicMock(monotonic=self.clock.monotonic, sleep=self.clock.sleep),
         )
         patcher.start()

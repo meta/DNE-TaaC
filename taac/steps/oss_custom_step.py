@@ -24,8 +24,13 @@ import time
 import typing as t
 
 from taac.constants import TestCaseFailure
-from neteng.test_infra.dne.taac.steps.step import Step as StepBase
 from taac.test_as_a_config import types as taac_types
+from taac.utils.oss_taac_constants import TAAC_OSS
+
+if TAAC_OSS:
+    from taac.steps.step import Step as StepBase
+else:
+    from neteng.test_infra.dne.taac.steps.step import Step as StepBase
 
 
 class OssCustomStep(StepBase[taac_types.CustomStepInput]):

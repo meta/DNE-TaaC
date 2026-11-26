@@ -10,6 +10,7 @@ import asyncio
 import ipaddress
 import itertools
 import json
+import logging
 import math
 import os
 import re
@@ -188,7 +189,7 @@ from taac.utils.oss_taac_lib_utils import (
 from taac.utils.system_stress_utils import (
     async_get_memory_current_pct,
 )
-from taac.utils.taac_log_formatter import log_results_table
+from taac.utils.taac_log_formatter import log_results_table, suppress_console_logs
 
 if t.TYPE_CHECKING or not TAAC_OSS:
     from rfe.scubadata.scubadata_py3 import Sample, ScubaData
@@ -5680,6 +5681,8 @@ def create_run_ssh_command_step(
     step_id: t.Optional[str] = None,
     device_regexes: t.Optional[t.List[str]] = None,
     log_output: bool = False,
+    expect_in_output: t.Optional[str] = None,
+    timeout: t.Optional[int] = None,
 ) -> Step:
     """Run an arbitrary shell command on the DUT via SSH.
 
@@ -5699,6 +5702,10 @@ def create_run_ssh_command_step(
         log_output: When True the step logs the command's stdout/stderr at
             INFO level (useful for smoke/connectivity checks). Default False
             keeps the output out of the log.
+        expect_in_output: When set, the step fails unless this string appears
+            in the command's output. The exit status is not available to the
+            step, so a command that can fail should print a marker on success.
+        timeout: SSH command timeout in seconds; the driver default when None.
 
     Returns:
         A `Step` with `step_name=StepName.RUN_SSH_COMMAND_STEP`.
@@ -5706,6 +5713,10 @@ def create_run_ssh_command_step(
     params: t.Dict[str, t.Any] = {"cmd": cmd}
     if log_output:
         params["log_output"] = True
+    if expect_in_output is not None:
+        params["expect_in_output"] = expect_in_output
+    if timeout is not None:
+        params["timeout"] = timeout
     return Step(
         name=StepName.RUN_SSH_COMMAND_STEP,
         step_params=Params(json_params=json.dumps(params)),
@@ -11707,9 +11718,22 @@ class RunSSHCmdStep(StepBase[taac_types.BaseInput]):
     ) -> None:
         cmd = params["cmd"]
         log_output = params.get("log_output", False)
-        output = await self.driver.async_run_cmd_on_shell(cmd)
+        timeout = params.get("timeout")
+        output = await (
+            self.driver.async_run_cmd_on_shell(cmd, timeout=timeout)
+            if timeout is not None
+            else self.driver.async_run_cmd_on_shell(cmd)
+        )
         if log_output and output:
-            self.logger.info(f"Command output:\n{output}")
+            # run_step runs every step console-suppressed; log_output exists to
+            # be read, so lower the console to INFO for this line only.
+            with suppress_console_logs(self.logger, suppress_level=logging.INFO):
+                self.logger.info(f"Command output:\n{output}")
+        expected = params.get("expect_in_output")
+        if expected is not None and expected not in (output or ""):
+            raise RuntimeError(
+                f"expected {expected!r} in command output; got: {(output or '')[-500:]!r}"
+            )
 
 
 class DrainUndrainStep(StepBase[taac_types.DrainUndrainInput]):

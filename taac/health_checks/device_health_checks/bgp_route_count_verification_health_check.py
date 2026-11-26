@@ -234,6 +234,8 @@ class BgpRouteCountVerificationHealthCheck(
             )
 
             validation_errors: list[str] = []
+            # Stays empty on the histogram path, which counts per AFI instead.
+            peer_route_counts: t.Dict[str, int] = {}
             if expected_count_histogram_by_afi is not None:
                 try:
                     # The transport peer address is not the route AFI in
@@ -284,6 +286,8 @@ class BgpRouteCountVerificationHealthCheck(
                 for result in results:
                     validation_errors.extend(result.errors)
 
+            counts_summary = self._format_counts(peer_route_counts)
+
             # Build result message
             if not validation_errors:
                 # All peers passed validation
@@ -295,7 +299,10 @@ class BgpRouteCountVerificationHealthCheck(
                         f"({direction}, {policy_type})"
                     )
                 elif expected_count is None and min_count is None and max_count is None:
-                    message = f"BGP route count verification on {hostname} ({direction}, {policy_type})"
+                    message = (
+                        f"BGP route count verification on {hostname} "
+                        f"({direction}, {policy_type}): {counts_summary}"
+                    )
                 else:
                     criteria = []
                     if expected_count is not None:
@@ -307,7 +314,8 @@ class BgpRouteCountVerificationHealthCheck(
 
                     message = (
                         f"BGP route count verification PASSED on {hostname}: "
-                        f"all peers meet criteria ({', '.join(criteria)}) ({direction}, {policy_type})"
+                        f"all peers meet criteria ({', '.join(criteria)}) ({direction}, {policy_type}): "
+                        f"{counts_summary}"
                     )
 
                 return hc_types.HealthCheckResult(
@@ -324,7 +332,12 @@ class BgpRouteCountVerificationHealthCheck(
                         f"\n  ... and {len(validation_errors) - 10} more errors"
                     )
 
-                message = f"BGP route count verification FAILED on {hostname} ({direction}, {policy_type}):\n  {error_summary}"
+                message = (
+                    f"BGP route count verification FAILED on {hostname} "
+                    f"({direction}, {policy_type}):\n  {error_summary}"
+                )
+                if peer_route_counts:
+                    message += f"\n  {counts_summary}"
 
                 return hc_types.HealthCheckResult(
                     status=hc_types.HealthCheckStatus.FAIL,
@@ -337,6 +350,19 @@ class BgpRouteCountVerificationHealthCheck(
                 status=hc_types.HealthCheckStatus.FAIL,
                 message=f"Failed to verify BGP route counts on {hostname}: {str(e)}",
             )
+
+    # Enough for every IXIA mimic peer plus the fabric in a multi-DUT topology.
+    _MAX_PEERS_IN_MESSAGE = 32
+
+    @classmethod
+    def _format_counts(cls, peer_route_counts: t.Dict[str, int]) -> str:
+        total = sum(peer_route_counts.values())
+        shown = sorted(peer_route_counts.items())[: cls._MAX_PEERS_IN_MESSAGE]
+        per_peer = ", ".join(f"{peer}={count}" for peer, count in shown)
+        more = len(peer_route_counts) - len(shown)
+        if more > 0:
+            per_peer += f", ... and {more} more"
+        return f"{len(peer_route_counts)} peers, {total} routes; per peer: {per_peer}"
 
     async def _verify_rib_prefix_and_path_counts(
         self,

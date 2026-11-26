@@ -105,6 +105,21 @@ class BgpSessionEstablishedHealthCheck(
             return None
 
     @staticmethod
+    def _is_dynamic_peer_range(peer_addr: str) -> bool:
+        """A passive peer configured with a prefix, not a single address.
+
+        bgpd accepts connections from anywhere in the range. The range entry
+        itself never establishes; each session it accepts is reported under its
+        own address, so counting the range would fail the check forever.
+        """
+        try:
+            # strict=False: a range written with host bits set is still a range.
+            network = ipaddress.ip_network(peer_addr, strict=False)
+        except ValueError:
+            return False
+        return network.prefixlen < network.max_prefixlen
+
+    @staticmethod
     def _peer_in_scope(
         peer_addr: str,
         parent_prefixes_to_ignore: t.Optional[t.List[str]],
@@ -113,7 +128,8 @@ class BgpSessionEstablishedHealthCheck(
         """Whether a peer address survives the caller's scope filters.
 
         Single definition of "in scope" so the pass/fail loop and the peer
-        identity check cannot drift apart.
+        identity check cannot drift apart. Dynamic peer ranges are never in
+        scope.
 
         Args:
             peer_addr: the peer address to test.
@@ -123,6 +139,18 @@ class BgpSessionEstablishedHealthCheck(
         Returns:
             True when the peer should be considered by the caller.
         """
+        if BgpSessionEstablishedHealthCheck._is_dynamic_peer_range(peer_addr):
+            return False
+        return BgpSessionEstablishedHealthCheck._passes_peer_filters(
+            peer_addr, parent_prefixes_to_ignore, ignore_all_prefixes_except
+        )
+
+    @staticmethod
+    def _passes_peer_filters(
+        peer_addr: str,
+        parent_prefixes_to_ignore: t.Optional[t.List[str]],
+        ignore_all_prefixes_except: t.Optional[t.List[str]],
+    ) -> bool:
         if parent_prefixes_to_ignore and any(
             is_parent_prefix(peer_addr, prefix) for prefix in parent_prefixes_to_ignore
         ):
@@ -513,6 +541,7 @@ class BgpSessionEstablishedHealthCheck(
         non_established_sessions = []
         established_session_list = []
 
+        dynamic_ranges = 0
         for session in bgp_sessions:
             # parent_prefixes_to_ignore excludes by CIDR; ignore_all_prefixes_except
             # restricts to an exact peer-address allowlist.
@@ -521,6 +550,14 @@ class BgpSessionEstablishedHealthCheck(
                 parent_prefixes_to_ignore,
                 ignore_all_prefixes_except,
             ):
+                if self._is_dynamic_peer_range(
+                    session.peer_addr
+                ) and self._passes_peer_filters(
+                    session.peer_addr,
+                    parent_prefixes_to_ignore,
+                    ignore_all_prefixes_except,
+                ):
+                    dynamic_ranges += 1
                 continue
 
             session_states[session.peer.peer_state] += 1
@@ -575,6 +612,19 @@ class BgpSessionEstablishedHealthCheck(
         if (
             total_sessions == 0
             and expected_established_session_count is None
+            and dynamic_ranges
+        ):
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.FAIL,
+                message=(
+                    f"{hostname} has {dynamic_ranges} dynamic BGP peer range(s) "
+                    "and no session accepted from them"
+                ),
+            )
+
+        if (
+            total_sessions == 0
+            and expected_established_session_count is None
             and (
                 min_established_pct is not None
                 or max_established_session_count is not None
@@ -585,6 +635,23 @@ class BgpSessionEstablishedHealthCheck(
                 message=(
                     f"No in-scope BGP sessions found on {hostname}; verify the "
                     "peer filters before evaluating a percentage or maximum"
+                ),
+            )
+
+        # Without this, an allowlist naming peers the device does not have falls
+        # through to "All 0 BGP sessions are established" -- e.g. the default
+        # IXIA addressing applied to a DUT peered on other networks.
+        if (
+            total_sessions == 0
+            and expected_established_session_count is None
+            and ignore_all_prefixes_except
+        ):
+            return hc_types.HealthCheckResult(
+                status=hc_types.HealthCheckStatus.FAIL,
+                message=(
+                    f"None of the {len(ignore_all_prefixes_except)} allowlisted "
+                    f"BGP peers is configured on {hostname} "
+                    f"(e.g. {list(ignore_all_prefixes_except)[:3]})"
                 ),
             )
 

@@ -205,6 +205,45 @@ class TestBgpSessionEstablishedHealthCheck(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
 
+    async def test_dynamic_peer_ranges_are_not_sessions(self):
+        """A passive range entry is always IDLE and must not fail the check."""
+        self.health_check.driver.async_get_bgp_sessions = AsyncMock(
+            return_value=[
+                _make_bgp_session("2001:db8::1", TBgpPeerState.ESTABLISHED),
+                _make_bgp_session("2001:db8:1::/64", TBgpPeerState.IDLE),
+                _make_bgp_session("192.0.2.0/24", TBgpPeerState.IDLE),
+            ]
+        )
+        result = await self.health_check._run(self.device, self.input, {})
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
+
+    async def test_sessions_accepted_from_a_range_are_still_checked(self):
+        """Skipping the range entry must not skip the peers it accepted."""
+        self.health_check.driver.async_get_bgp_sessions = AsyncMock(
+            return_value=[
+                _make_bgp_session("2001:db8:1::/64", TBgpPeerState.IDLE),
+                _make_bgp_session("2001:db8:1::5", TBgpPeerState.ACTIVE),
+            ]
+        )
+        result = await self.health_check._run(self.device, self.input, {})
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+
+    async def test_only_dynamic_ranges_and_no_accepted_session_fails(self):
+        """Dropping every entry as a range must not leave a vacuous PASS."""
+        self.health_check.driver.async_get_bgp_sessions = AsyncMock(
+            return_value=[_make_bgp_session("2001:db8:1::/64", TBgpPeerState.IDLE)]
+        )
+        result = await self.health_check._run(self.device, self.input, {})
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+
+    def test_is_dynamic_peer_range(self):
+        check = BgpSessionEstablishedHealthCheck
+        self.assertTrue(check._is_dynamic_peer_range("2001:db8:1::/64"))
+        self.assertTrue(check._is_dynamic_peer_range("192.0.2.0/24"))
+        self.assertFalse(check._is_dynamic_peer_range("2001:db8::1"))
+        self.assertFalse(check._is_dynamic_peer_range("2001:db8::1/128"))
+        self.assertFalse(check._is_dynamic_peer_range("not-an-address"))
+
     async def test_expected_count_mismatch_returns_fail(self):
         """When expected_established_session_count doesn't match, should FAIL."""
         self.health_check.driver.async_get_bgp_sessions = AsyncMock(

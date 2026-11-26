@@ -3820,6 +3820,8 @@ def create_fpf_drain_interface_step(
     drain: bool,
     target_device: t.Optional[str] = None,
     mutation_token: t.Optional[str] = None,
+    best_effort: bool = False,
+    record_event_time: bool = True,
     description: t.Optional[str] = None,
 ) -> Step:
     """Soft-drain / undrain through the on-box LOCAL_DRAINER FPF custom task.
@@ -3845,6 +3847,10 @@ def create_fpf_drain_interface_step(
         params["target_device"] = target_device
     if mutation_token:
         params["mutation_token"] = mutation_token
+    if best_effort:
+        params["best_effort"] = True
+    if not record_event_time:
+        params["record_event_time"] = False
     return Step(
         name=StepName.CUSTOM_STEP,
         description=description or default_desc,

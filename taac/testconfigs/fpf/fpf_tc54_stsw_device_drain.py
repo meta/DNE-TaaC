@@ -44,6 +44,7 @@ from taac.playbooks.playbook_definitions import (
 from taac.steps.step_definitions import (
     create_fpf_stsw_drain_and_reinject_steps,
     create_longevity_step,
+    create_validation_step,
 )
 from taac.task_definitions import (
     create_fpf_inject_vf_groups_task,
@@ -93,6 +94,7 @@ RF_VF_GROUPS = fpf_rf_vf_groups(
 IB_TRAFFIC_CONFIG = fpf_ib_traffic_config()
 INJECT_SETTLE_SEC = 300
 LONGEVITY_SEC = 300
+CLEANUP_SETTLE_SEC = 180
 
 # STSW plane to drain (the first trigger STSW: stsw001.s001.l202.mwg2), which
 # serves lane 0 — the same plane tc19/tc34 monitor on GPU0 of the first GPU host.
@@ -140,12 +142,40 @@ def create_fpf_tc54_test_config() -> TestConfig:
         ),
     ]
 
-    # STRICT stable-state longevity: the GTSW BGP is untouched, so unlike tc34 we
-    # do NOT pass use_bgp_snapshot / skip_fsdb_session_precheck. Only lane 0's
-    # DATA plane is allowed to be drained (host-spray beth0 assertion); every
-    # control-plane signal stays strict. In particular, draining an STSW does
-    # not drain the host<->GTSW FSDB transport, so HRT plane status must remain
-    # UP rather than report DRAINED.
+    cleanup_steps = [
+        *create_fpf_stsw_drain_and_reinject_steps(
+            stsw=DRAIN_TARGET_STSW,
+            drained=False,
+            trigger_stsws=ALL_STSWS,
+            prefix_count=PREFIX_COUNT,
+            community_list=DEFAULT_COMMUNITY_LIST,
+            injection_groups=INJECTION_GROUPS,
+        ),
+        create_longevity_step(
+            duration=CLEANUP_SETTLE_SEC,
+            description="Settle after TC54 STSW undrain",
+        ),
+        create_validation_step(
+            point_in_time_checks=[
+                create_fpf_hrt_plane_status_check(
+                    mode="all_up",
+                    device_ids=HRT_DEVICE_IDS,
+                    expected_planes=INJECTED_LANES,
+                    stability_mode="last_sample",
+                    check_id="fpf_hrt_plane_status_cleanup_all_up",
+                )
+            ],
+            start_traffic=False,
+            fail_on_failure=True,
+            description="Verify all HRT planes UP after TC54 cleanup",
+        ),
+    ]
+
+    # STRICT drained-state longevity: the GTSW BGP is untouched, so unlike tc34
+    # we do NOT pass use_bgp_snapshot / skip_fsdb_session_precheck. The
+    # host<->GTSW FSDB transport remains connected, while the drain community
+    # deliberately drives the exact lane-0 HRT tuples to DRAINED. Every other
+    # plane and control-plane signal stays strict.
     longevity_playbook = create_fpf_hardening_playbook_v2(
         gtsws=OBSERVER_GTSWS,
         hosts=GPU_HOSTS,
@@ -164,17 +194,19 @@ def create_fpf_tc54_test_config() -> TestConfig:
         hrt_driver_hosts=HRT_MEMORY_HOSTS,
         spray_hosts=spray,
         ib_traffic_config=IB_TRAFFIC_CONFIG if spray else None,
-        # Lane 0's data plane drains, but HRT's host<->GTSW FSDB plane remains
-        # UP. Keep an explicit strict all-UP check so a real HRT-plane loss is
-        # not hidden by the data-plane drain allowance below.
-        plane_status_check=False,
-        additional_postchecks=[
+        additional_prechecks=[
             create_fpf_hrt_plane_status_check(
                 mode="all_up",
                 device_ids=HRT_DEVICE_IDS,
-                check_id="fpf_hrt_plane_status_stsw_control_up",
+                expected_planes=INJECTED_LANES,
+                lookback_sec=120,
+                check_id="fpf_hrt_plane_status_precheck_all_up",
             )
         ],
+        # The drain community is the HRT plane-state signal: exact lane-0 tuples
+        # must report DRAINED while every unimpacted tuple stays UP.
+        plane_status_check=True,
+        plane_status_expected_planes=INJECTED_LANES,
         prod_prefix_recovery=True,
         local_prod_prefixes=PROD_PREFIXES,
         impacted_planes_by_host=IMPACTED_PLANES_BY_HOST,
@@ -188,23 +220,16 @@ def create_fpf_tc54_test_config() -> TestConfig:
         prod_prefix_settle_sec=300,
         # Lane 0 (stsw001.s001 = plane 0 = beth0) STAYS drained for the whole
         # longevity. Host-spray asserts beth0~0, and rib/fsdb/bulk/remote-failure
-        # exempt lane 0; every other lane, the all-UP HRT plane-status check, and
-        # the HRT FSDB-session census stay STRICT (32/32). The STSW-side drain
-        # does not touch the GPU<->GTSW HRT subscription.
+        # exempt lane 0; every other lane and the HRT FSDB-session census stay
+        # STRICT (32/32). The exact impacted tuples must be DRAINED, not UP: raw
+        # plane status is route-drain intent, independent of session transport.
         impacted_lanes_drained=[0],
         # 8-plane: prefixes injected once by the setup task; check all 8 lanes.
         skip_injection=True,
         rf_vf_groups=RF_VF_GROUPS,
         lanes=INJECTED_LANES,
         hrt_device_ids=HRT_DEVICE_IDS,
-        cleanup_steps=create_fpf_stsw_drain_and_reinject_steps(
-            stsw=DRAIN_TARGET_STSW,
-            drained=False,
-            trigger_stsws=ALL_STSWS,
-            prefix_count=PREFIX_COUNT,
-            community_list=DEFAULT_COMMUNITY_LIST,
-            injection_groups=INJECTION_GROUPS,
-        ),
+        cleanup_steps=cleanup_steps,
     )
 
     return TestConfig(

@@ -51,6 +51,8 @@ from taac.testconfigs.fpf.fpf_tc38_persistent_ndp_clear import (
 from taac.testconfigs.fpf.fpf_tc54_stsw_device_drain import (
     DRAIN_TARGET_STSW,
     GPU_HOSTS as TC54_GPU_HOSTS,
+    HRT_DEVICE_IDS as TC54_HRT_DEVICE_IDS,
+    INJECTED_LANES as TC54_INJECTED_LANES,
     TEST_CONFIG as TC54,
 )
 from taac.health_check.health_check.types import CheckName
@@ -668,16 +670,57 @@ class TestTc54StswDeviceDrain(unittest.TestCase):
         )
         ids = _check_ids(playbook)
         self.assertIn("fpf_host_spray", ids)
-        self.assertNotIn("fpf_hrt_plane_status_drain", ids)
-        self.assertIn("fpf_hrt_plane_status_stsw_control_up", ids)
+        self.assertIn("fpf_hrt_plane_status_drain", ids)
+        self.assertNotIn("fpf_hrt_plane_status_stsw_control_up", ids)
         plane_check = next(
             check
             for check in playbook.postchecks or []
-            if check.check_id == "fpf_hrt_plane_status_stsw_control_up"
+            if check.check_id == "fpf_hrt_plane_status_drain"
         )
-        self.assertEqual(
-            json.loads(plane_check.check_params.json_params)["mode"], "all_up"
+        plane_params = json.loads(plane_check.check_params.json_params)
+        self.assertEqual(plane_params["mode"], "drain")
+        self.assertEqual(plane_params["impacted_planes"], [0])
+        expected_planes = (
+            [0, 1, 2, 3] if TC54_HRT_DEVICE_IDS != [0] else TC54_INJECTED_LANES
         )
+        self.assertEqual(plane_params["expected_planes"], expected_planes)
+        if TC54_HRT_DEVICE_IDS == [0]:
+            self.assertNotIn("impacted_tuples_by_host_device", plane_params)
+        else:
+            self.assertEqual(
+                plane_params["impacted_tuples_by_host_device"],
+                {
+                    host: {"0": [0], "2": [0], "4": [0], "6": [0]}
+                    for host in TC54_GPU_HOSTS
+                },
+            )
+
+        precheck = next(
+            check
+            for check in playbook.prechecks or []
+            if check.check_id == "fpf_hrt_plane_status_precheck_all_up"
+        )
+        precheck_params = json.loads(precheck.check_params.json_params)
+        self.assertEqual(precheck_params["mode"], "all_up")
+        self.assertEqual(precheck_params["lookback_sec"], 120)
+        self.assertEqual(precheck_params["expected_planes"], expected_planes)
+
+        cleanup = list(playbook.cleanup_steps or [])
+        self.assertEqual(cleanup[-2].name, StepName.LONGEVITY_STEP)
+        self.assertEqual(_params(cleanup[-2])["duration"], 180)
+        self.assertEqual(cleanup[-1].name, StepName.VALIDATION_STEP)
+        self.assertTrue(_params(cleanup[-1])["skip_start_traffic"])
+        self.assertTrue(_params(cleanup[-1])["fail_on_failure"])
+        cleanup_input = json.loads(cleanup[-1].input_json)
+        cleanup_checks = cleanup_input["point_in_time_checks"]
+        cleanup_plane = next(
+            check
+            for check in cleanup_checks
+            if check["check_id"] == "fpf_hrt_plane_status_cleanup_all_up"
+        )
+        cleanup_plane_params = json.loads(cleanup_plane["check_params"]["json_params"])
+        self.assertEqual(cleanup_plane_params["mode"], "all_up")
+        self.assertEqual(cleanup_plane_params["stability_mode"], "last_sample")
 
         # An STSW route drain does not drain the host-to-GTSW FSDB transport.
         # Keep sessions and every other product signal strict: only the old

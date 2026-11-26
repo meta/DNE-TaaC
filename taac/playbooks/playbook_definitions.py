@@ -29044,6 +29044,7 @@ def create_fpf_hardening_playbook_v2(
     community_list: str = "stsw",
     lanes: list[int] | None = None,
     services_to_check: list[str] | None = None,
+    additional_prechecks: list | None = None,
     additional_postchecks: list | None = None,
     ods_entities: list[str] | None = None,
     playbook_name: str = "fpf_hardening_v2",
@@ -29062,6 +29063,7 @@ def create_fpf_hardening_playbook_v2(
     host_spray_label: str = "",
     host_spray_excluded_lanes_by_host: dict[str, list[str]] | None = None,
     plane_status_check: bool = False,
+    plane_status_expected_planes: list[int] | None = None,
     prod_prefix_recovery: bool = False,
     local_prod_prefixes: list[str] | None = None,
     prod_prefixes_by_host: dict[str, list[str]] | None = None,
@@ -29419,6 +29421,7 @@ def create_fpf_hardening_playbook_v2(
             recovered_baseline_qualification_sec is not None
         ),
     )
+    prechecks = [*prechecks, *(additional_prechecks or [])]
 
     # Stage steps: inject → stabilize → disruption (or soak). When
     # skip_injection, prefixes are injected once by a setup task instead.
@@ -29786,6 +29789,7 @@ def create_fpf_hardening_playbook_v2(
                     impacted_planes=drained_lanes,
                     device_ids=resolved_hrt_device_ids,
                     impacted_tuples_by_host_device=drained_hrt_tuples or None,
+                    expected_planes=plane_status_expected_planes,
                     check_id="fpf_hrt_plane_status_drain",
                 )
             )
@@ -29794,6 +29798,7 @@ def create_fpf_hardening_playbook_v2(
                 create_fpf_hrt_plane_status_check(
                     mode="all_up",
                     device_ids=resolved_hrt_device_ids,
+                    expected_planes=plane_status_expected_planes,
                     settle_sec=convergence_settle_sec or None,
                     # Disruptive configs (convergence_blip_mode="last_sample") tolerate
                     # a mid-window plane UNKNOWN that recovers to UP (e.g. latched while
@@ -30823,6 +30828,8 @@ def create_fpf_disrupt_window_playbook(
     stage_id: str = "disruption",
     spray_hosts: list[str] | None = None,
     ib_traffic_config: t.Mapping[str, t.Any] | None = None,
+    prechecks: list | None = None,
+    cleanup_steps: list | None = None,
 ) -> Playbook:
     """FPF disruption playbook with disruption-window-scoped postchecks.
 
@@ -30885,13 +30892,16 @@ def create_fpf_disrupt_window_playbook(
         )
     )
     steps = ensure_traffic + list(disruption_steps)
-    return Playbook(
-        name=playbook_name,
-        prechecks=[],
-        postchecks=list(postchecks),
-        snapshot_checks=[],
-        stages=[create_steps_stage(stage_id=stage_id, steps=steps)],
-    )
+    playbook_kwargs: dict[str, t.Any] = {
+        "name": playbook_name,
+        "prechecks": list(prechecks or []),
+        "postchecks": list(postchecks),
+        "snapshot_checks": [],
+        "stages": [create_steps_stage(stage_id=stage_id, steps=steps)],
+    }
+    if cleanup_steps is not None:
+        playbook_kwargs["cleanup_steps"] = list(cleanup_steps)
+    return Playbook(**playbook_kwargs)
 
 
 def create_fpf_prod_prefix_drain_only_playbook(

@@ -1155,6 +1155,8 @@ class TestOwnedDrainCleanup(unittest.IsolatedAsyncioTestCase):
             drain=True,
             target_device="gtsw001.l1002.c087.mwg2",
             mutation_token="tc17",
+            best_effort=True,
+            record_event_time=False,
         )
         self.assertEqual(
             _params(drain),
@@ -1164,6 +1166,8 @@ class TestOwnedDrainCleanup(unittest.IsolatedAsyncioTestCase):
                 "is_drain": True,
                 "target_device": "gtsw001.l1002.c087.mwg2",
                 "mutation_token": "tc17",
+                "best_effort": True,
+                "record_event_time": False,
             },
         )
         cleanup = create_fpf_conditional_undrain_step(

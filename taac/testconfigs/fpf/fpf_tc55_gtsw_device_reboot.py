@@ -133,6 +133,14 @@ def create_fpf_tc55_test_config() -> TestConfig:
         skip_ssh, skip_ib, traffic_config=IB_TRAFFIC_CONFIG
     )
     spray = None if skip_ssh or skip_ib else SPRAY_HOSTS
+    cleanup_step = create_fpf_drain_interface_step(
+        interfaces=[],
+        drain=False,
+        target_device=OBSERVER_GTSWS[0],
+        best_effort=True,
+        record_event_time=False,
+        description="Safety cleanup: undrain rebooted GTSW",
+    )
 
     # Prefixes are injected once by the setup task (8-plane VF groups), so the
     # disrupt window only stabilizes/records/reboots/comes-up.
@@ -196,6 +204,14 @@ def create_fpf_tc55_test_config() -> TestConfig:
         spray_hosts=spray,
         ib_traffic_config=IB_TRAFFIC_CONFIG if spray else None,
         postchecks=disrupt_postchecks,
+        prechecks=[
+            create_drain_state_check(
+                expected_drained=False,
+                device_name=OBSERVER_GTSWS[0],
+                check_id="gtsw_reboot_precheck_undrained",
+            )
+        ],
+        cleanup_steps=[cleanup_step],
     )
 
     longevity_playbook = create_fpf_hardening_playbook_v2(
@@ -254,6 +270,7 @@ def create_fpf_tc55_test_config() -> TestConfig:
                 device_regexes=[OBSERVER_GTSWS[0]],
             ),
         ],
+        cleanup_steps=[cleanup_step],
     )
 
     return TestConfig(

@@ -279,6 +279,21 @@ class TestTwsharedCampaignConfigs(unittest.TestCase):
             },
             {"5000:dd::/64", "5000:ee::/64"},
         )
+        drain_check = next(
+            check
+            for check in tc54.playbooks[0].postchecks
+            if check.check_id == "fpf_hrt_plane_status_drain"
+        )
+        drain_params = json.loads(drain_check.check_params.json_params)
+        self.assertEqual(drain_params["mode"], "drain")
+        self.assertEqual(drain_params["expected_planes"], [0, 1, 2, 3])
+        self.assertEqual(
+            drain_params["impacted_tuples_by_host_device"],
+            {
+                host: {"0": [0], "2": [0], "4": [0], "6": [0]}
+                for host in (SERVER, CLIENT)
+            },
+        )
 
     def test_scale_cases_render_two_vf_operations_per_scale_transition(self):
         tc45_steps = [

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from neteng.test_infra.dne.taac.constants import TestDevice, TestTopology
+from taac.driver.drivers_common import OnboxDrainerOperationFailed
 from taac.internal.steps.custom_step import CustomStep
 from taac.libs.fpf.fpf_collector_registry import (
     clear_all,
@@ -146,6 +147,74 @@ class TestFpfRecoveryTimestamps(unittest.IsolatedAsyncioTestCase):
                 for call in t.cast(MagicMock, custom_step.logger.warning).call_args_list
             )
         )
+
+    async def test_device_undrain_cleanup_failure_is_best_effort(self) -> None:
+        custom_step = _make_custom_step()
+        driver = t.cast(AsyncMock, custom_step.driver)
+        driver.async_onbox_undrain_device.side_effect = OnboxDrainerOperationFailed(
+            "undrain failed"
+        )
+
+        await custom_step.fpf_drain_interface(
+            {
+                "interfaces": [],
+                "is_drain": False,
+                "best_effort": True,
+                "record_event_time": False,
+            }
+        )
+
+        self.assertEqual(get_recovery_start_time(), 0.0)
+        self.assertEqual(get_recovery_completion_time(), 0.0)
+        t.cast(MagicMock, custom_step.logger.error).assert_called_once()
+        self.assertIn(
+            "continuing cleanup",
+            t.cast(MagicMock, custom_step.logger.error).call_args.args[0],
+        )
+
+    async def test_best_effort_device_undrain_propagates_programming_errors(
+        self,
+    ) -> None:
+        for error in (
+            AttributeError("missing driver method"),
+            TypeError("bad driver call"),
+            RuntimeError("unexpected programming error"),
+        ):
+            with self.subTest(error=error):
+                custom_step = _make_custom_step()
+                driver = t.cast(AsyncMock, custom_step.driver)
+                driver.async_onbox_undrain_device.side_effect = error
+
+                with self.assertRaises(type(error)):
+                    await custom_step.fpf_drain_interface(
+                        {
+                            "interfaces": [],
+                            "is_drain": False,
+                            "best_effort": True,
+                            "record_event_time": False,
+                        }
+                    )
+
+    async def test_device_undrain_cleanup_preserves_recovery_timestamps(self) -> None:
+        custom_step = _make_custom_step()
+        driver = t.cast(AsyncMock, custom_step.driver)
+        driver.async_is_device_drained.return_value = False
+        set_recovery_start_time(100.0)
+        set_recovery_completion_time(110.0)
+
+        await custom_step.fpf_drain_interface(
+            {
+                "interfaces": [],
+                "is_drain": False,
+                "best_effort": True,
+                "record_event_time": False,
+            }
+        )
+
+        self.assertEqual(get_recovery_start_time(), 100.0)
+        self.assertEqual(get_recovery_completion_time(), 110.0)
+        driver.async_onbox_undrain_device.assert_awaited_once()
+        driver.async_is_device_drained.assert_awaited_once()
 
 
 if __name__ == "__main__":

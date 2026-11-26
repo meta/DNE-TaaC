@@ -648,6 +648,28 @@ class TestRapidFlapConfigs(unittest.TestCase):
             ],
         )
 
+        precheck_ids = {
+            check.check_id for check in disrupt.prechecks or [] if check.check_id
+        }
+        self.assertIn("gtsw_reboot_precheck_undrained", precheck_ids)
+        for cleanup_owner in (disrupt, recovery):
+            cleanup_params = [
+                _params(step) for step in cleanup_owner.cleanup_steps or []
+            ]
+            undrain = next(
+                params
+                for params in cleanup_params
+                if params.get("custom_step_name") == "fpf_drain_interface"
+            )
+            self.assertEqual(undrain["interfaces"], [])
+            self.assertFalse(undrain["is_drain"])
+            self.assertEqual(
+                undrain["target_device"],
+                fpf_tc55_gtsw_device_reboot.OBSERVER_GTSWS[0],
+            )
+            self.assertTrue(undrain["best_effort"])
+            self.assertFalse(undrain["record_event_time"])
+
     def test_tc32_and_tc33_target_different_neighbor_classes(self):
         """Downlinks use an exact GPU host; uplinks use the STSW glob."""
         tc32_params = _params(_steps(TC32.playbooks[0])[0])

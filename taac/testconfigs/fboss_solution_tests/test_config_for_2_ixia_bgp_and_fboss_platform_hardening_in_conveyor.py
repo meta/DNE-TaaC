@@ -1102,6 +1102,12 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         ),
         create_service_restart_check(),
     ]
+    # The collector polls every 5 s. It can still read `deactivating` after a restart.
+    _restart_check_retry = {
+        "retry_count": 3,
+        "retry_delay_seconds": 5,
+        "retry_delay_multiplier": 1.0,
+    }
     # Variant for playbooks that restart wedge_agent by design: the bare
     # TC-level SERVICE_RESTART_CHECK would flag the intentional restart and its
     # systemd cascade as a failure.
@@ -1109,6 +1115,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
         (
             create_service_restart_check(
                 expected_restarted_services=WEDGE_AGENT_BINDS_TO_CASCADE + ["openr"],
+                extra_json_params=_restart_check_retry,
             )
             if check.name == hc_types.CheckName.SERVICE_RESTART_CHECK
             else check
@@ -1117,6 +1124,13 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
     ]
     _tc_snapshot_checks = [
         create_core_dumps_snapshot_check(),
+    ]
+    # The :e and :f flap ranges churn by design, so they are never RIB==FIB stable.
+    rib_fib_ignore_prefixes = [
+        "103.0.0.0/8",
+        f"{v6_uplink_prefix}:1::/32",
+        f"{v6_prefix_flapping_prefix}:e::/32",
+        f"{v6_prefix_flapping_prefix}:f::/32",
     ]
 
     # UCMP-disabled uplink port-flap playbooks. The down-stage check records loss
@@ -2435,17 +2449,14 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": [
-                                "103.0.0.0/8",
-                                "6000:1::/32",
-                            ]
+                            "parent_prefixes_to_ignore": rib_fib_ignore_prefixes
                         },
                         # bgpd re-syncs the FIB for ~2-3 min after a restart.
                         retry_count=6,
                         retry_delay_seconds=30,
                     ),
                 ]
-                + _tc_postchecks,
+                + _tc_postchecks_agent_restart,
             ),
             build_2_ixia_hardening_playbook(
                 name="test_bgpd_restart",
@@ -2462,22 +2473,24 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    # The TC-level check would flag the restart this playbook performs.
-                    create_service_restart_check(expected_restarted_services=["bgpd"]),
                     bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": [
-                                "103.0.0.0/8",
-                                "6000:1::/32",
-                            ]
+                            "parent_prefixes_to_ignore": rib_fib_ignore_prefixes
                         },
                         # bgpd re-syncs the FIB for ~2-3 min after a restart.
                         retry_count=6,
                         retry_delay_seconds=30,
                     ),
                 ]
-                + _tc_postchecks,
+                + _tc_postchecks
+                # Last on purpose: the runner keeps the last check with the same name.
+                + [
+                    create_service_restart_check(
+                        expected_restarted_services=["bgpd"],
+                        extra_json_params=_restart_check_retry,
+                    )
+                ],
             ),
             build_2_ixia_hardening_playbook(
                 name="test_5_min_longevity",
@@ -2654,7 +2667,7 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                 iteration=1,
                 name="test_ecmp_member_overload_limit",
                 prechecks=_tc_prechecks,
-                postchecks=_tc_postchecks,
+                postchecks=_tc_postchecks_agent_restart,
                 snapshot_checks=_tc_snapshot_checks,
                 cleanup_steps=[
                     create_ixia_api_step(
@@ -2818,24 +2831,24 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    # The TC-level check would flag the restart this playbook performs.
-                    create_service_restart_check(
-                        expected_restarted_services=["qsfp_service"]
-                    ),
                     bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": [
-                                "103.0.0.0/8",
-                                "6000:1::/32",
-                            ]
+                            "parent_prefixes_to_ignore": rib_fib_ignore_prefixes
                         },
                         # bgpd re-syncs the FIB for ~2-3 min after a restart.
                         retry_count=6,
                         retry_delay_seconds=30,
                     ),
                 ]
-                + _tc_postchecks,
+                + _tc_postchecks
+                # Last on purpose: the runner keeps the last check with the same name.
+                + [
+                    create_service_restart_check(
+                        expected_restarted_services=["qsfp_service"],
+                        extra_json_params=_restart_check_retry,
+                    )
+                ],
             ),
             build_2_ixia_hardening_playbook(
                 name="test_fsdb_restart",
@@ -2852,22 +2865,24 @@ def test_config_for_2_ixia_bgp_and_fboss_platform_hardening_in_conveyor(
                     ),
                 ],
                 postchecks=[
-                    # The TC-level check would flag the restart this playbook performs.
-                    create_service_restart_check(expected_restarted_services=["fsdb"]),
                     bgp_convergence_check or create_bgp_convergence_check(),
                     create_bgp_rib_fib_consistency_check(
                         extra_json_params={
-                            "parent_prefixes_to_ignore": [
-                                "103.0.0.0/8",
-                                "6000:1::/32",
-                            ]
+                            "parent_prefixes_to_ignore": rib_fib_ignore_prefixes
                         },
                         # bgpd re-syncs the FIB for ~2-3 min after a restart.
                         retry_count=6,
                         retry_delay_seconds=30,
                     ),
                 ]
-                + _tc_postchecks,
+                + _tc_postchecks
+                # Last on purpose: the runner keeps the last check with the same name.
+                + [
+                    create_service_restart_check(
+                        expected_restarted_services=["fsdb"],
+                        extra_json_params=_restart_check_retry,
+                    )
+                ],
             ),
         ]
         + _uplink_flap_playbooks

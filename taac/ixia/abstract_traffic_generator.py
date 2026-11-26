@@ -100,7 +100,9 @@ class AbstractTrafficGenerator(ABC):
         Return packet loss stats as list of dicts.
 
         Each dict has: identifier, packet_loss_duration, packet_loss_percentage,
-        frame_delta.
+        and frame_delta. Implementations may also expose cumulative tx_frames,
+        rx_frames, tx_bytes, and rx_bytes counters when the controller provides
+        them.
         """
         ...
 
@@ -108,6 +110,14 @@ class AbstractTrafficGenerator(ABC):
     def clear_traffic_stats(self) -> None:
         """Clear captured stats between measurements."""
         ...
+
+    def supports_controller_traffic_stats_reset(self) -> bool:
+        """Whether clearing stats resets the traffic controller counters."""
+        return False
+
+    def supports_variable_l4_flow_ranges(self) -> bool:
+        """Whether declarative L4 start/step/count ranges reach the wire."""
+        return False
 
     @abstractmethod
     def get_traffic_start_time(self) -> float:

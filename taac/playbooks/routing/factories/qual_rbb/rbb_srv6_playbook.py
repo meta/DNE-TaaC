@@ -45,7 +45,7 @@ from taac.steps.step_definitions import (
     create_stop_traffic_step,
     create_validation_step,
 )
-from neteng.test_infra.dne.taac.testconfigs.routing.util import bgp_rbb_constants as C
+from taac.testconfigs.routing.util import bgp_rbb_constants as C
 from taac.testconfigs.routing.util.bgp_rbb_scenario_profiles import (
     srv6_decap_counter_spec,
     srv6_encap_counter_spec,
@@ -92,7 +92,13 @@ def _verify_step(hostname: str, spec: dict[str, t.Any]) -> Step:
     )
 
 
-def _counter_step(hostname: str, action: str, spec: dict[str, t.Any]) -> Step:
+def _counter_step(
+    hostname: str,
+    action: str,
+    spec: dict[str, t.Any],
+    *,
+    start_traffic: bool = True,
+) -> Step:
     """Wrap a counter spec into an ``rbb_srv6_counter_delta`` task step."""
     params = {"hostname": hostname, "action": action, **spec}
     return create_run_task_step(
@@ -103,6 +109,7 @@ def _counter_step(hostname: str, action: str, spec: dict[str, t.Any]) -> Step:
             f"{spec.get('direction', 'srv6')} path counter on {hostname}"
         ),
         ixia_needed=True,
+        start_traffic=start_traffic,
     )
 
 
@@ -119,14 +126,19 @@ def _bgp_peer_up_step(hostname: str, peer: str, gate: str) -> Step:
     )
 
 
-def _traffic_loss_validation_step(description: str) -> Step:
+def _traffic_loss_validation_step(
+    description: str,
+    traffic_items: t.Sequence[str] = C.ALL_TRAFFIC_ITEMS,
+    *,
+    start_traffic: bool = True,
+) -> Step:
     """Packet-loss assertion over the configured R1-to-R2 SRv6 path."""
     return create_validation_step(
         point_in_time_checks=[
             create_ixia_packet_loss_check(
                 thresholds=[
                     hc_types.PacketLossThreshold(
-                        names=list(C.ALL_TRAFFIC_ITEMS),
+                        names=list(traffic_items),
                         metric=hc_types.PacketLossMetric.PERCENTAGE,
                         str_value=C.PACKET_LOSS_THRESHOLD_PCT,
                         expect_packet_loss=False,
@@ -139,6 +151,7 @@ def _traffic_loss_validation_step(description: str) -> Step:
         # records the health failure for the final summary but prints a green
         # step/stage result, which can make 100% loss look successful.
         fail_fast=True,
+        start_traffic=start_traffic,
     )
 
 

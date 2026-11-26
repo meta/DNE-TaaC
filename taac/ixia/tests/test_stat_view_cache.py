@@ -306,6 +306,40 @@ class GetOrCreateStatViewTest(unittest.TestCase):
     def setUp(self):
         self.ixia = _create_taac_ixia()
 
+    def test_packet_loss_stats_include_cumulative_traffic_counters(self):
+        row = MagicMock()
+        row.Columns = [
+            "Loss %",
+            "Frames Delta",
+            "Tx Frames",
+            "Rx Frames",
+            "Tx Bytes",
+            "Rx Bytes",
+        ]
+        row.__getitem__.side_effect = {
+            "Traffic Item": "traffic",
+            "Loss %": "0",
+            "Frames Delta": "0",
+            "Tx Frames": "123",
+            "Rx Frames": "122",
+            "Tx Bytes": "12300",
+            "Rx Bytes": "12200",
+        }.__getitem__
+
+        self.assertEqual(
+            self.ixia._packet_loss_stat("Traffic Item Statistics", row),
+            {
+                "identifier": "traffic",
+                "view": "Traffic Item Statistics",
+                "packet_loss_percentage": 0.0,
+                "frame_delta": 0.0,
+                "tx_frames": 123.0,
+                "rx_frames": 122.0,
+                "tx_bytes": 12300.0,
+                "rx_bytes": 12200.0,
+            },
+        )
+
     def test_latest_stats_lock_timeout_preserves_best_effort_fallback(self):
         self.ixia.test_case_uuid = "test-case"
         self.ixia.captured_stats = {"test-case": {}}

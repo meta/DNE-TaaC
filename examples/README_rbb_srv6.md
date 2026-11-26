@@ -413,6 +413,24 @@ declared); their interface numbers are not fixed.
 direction in which R1 installs the SRv6 segment-list route and R2 decapsulates;
 ordinary reverse IPv6 traffic is intentionally outside this qualification.
 
+### Phase 2 SRv6 wire suite
+
+Run the traffic-backed TC-05, TC-08, and TC-113 qualification on an already
+configured lab with:
+
+```bash
+./scripts/run-rbb-srv6.sh --suite srv6-wire --with-traffic
+```
+
+The suite installs a uniquely named, recovery-safe SPAN on R1 and captures the
+core-egress packets through the selected IXIA edge. The downloaded PCAP must
+contain IPv6-in-IPv6 traffic with the configured SRv6 tunnel source, the exact
+ordered and zero-terminated packed uSID carrier, and the original IXIA payload.
+TC-05 and TC-08 also correlate IXIA transmit frames with every selected R1
+egress and R2 ingress path. TC-113 independently validates the carrier locator,
+ordered 16-bit functions, and zero termination. Existing mirror configuration
+is rejected, and the original AgentConfig is restored during teardown.
+
 ---
 
 ## Device configuration ownership

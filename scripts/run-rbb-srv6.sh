@@ -36,6 +36,8 @@ Usage: ./scripts/run-rbb-srv6.sh [OPTIONS] [-- RUNNER_ARGS...]
   --init              Create a local configuration from the OSS templates.
   --check             Validate inputs in the built image without lab access.
   --config-dir PATH   Use PATH instead of the checkout-local .taac directory.
+  --image IMAGE       Use IMAGE instead of the Docker helper's default tag.
+  --suite NAME        Select base (default) or srv6-wire.
   --setup-duts        Temporarily bootstrap core ports, OpenR, iBGP, and SRv6.
   --with-traffic      Run the complete SRv6 qualification with live IXIA traffic.
   --setup-dut-edges
@@ -47,6 +49,9 @@ Examples:
   ./scripts/run-rbb-srv6.sh --check
   ./scripts/run-rbb-srv6.sh --setup-duts
   ./scripts/run-rbb-srv6.sh --with-traffic
+  ./scripts/run-rbb-srv6.sh --suite srv6-wire --with-traffic
+  ./scripts/run-rbb-srv6.sh --image fboss-taac:srv6-wire \
+    --suite srv6-wire --with-traffic
   ./scripts/run-rbb-srv6.sh --setup-duts --with-traffic --setup-dut-edges
   ./scripts/run-rbb-srv6.sh --config-dir /secure/rbb-lab --with-traffic
 EOF
@@ -57,6 +62,10 @@ CHECK_ONLY=0
 WITH_TRAFFIC=0
 CONFIGURE_EDGES=0
 SETUP_DUTS=0
+SUITE="base"
+SUITE_SET=0
+IMAGE=""
+IMAGE_SET=0
 CONFIG_DIR="$DEFAULT_CONFIG_DIR"
 RUNNER_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -75,6 +84,24 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             CONFIG_DIR="$2"
+            shift 2
+            ;;
+        --suite)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                echo "Error: --suite requires a name" >&2
+                exit 2
+            fi
+            SUITE="$2"
+            SUITE_SET=1
+            shift 2
+            ;;
+        --image)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                echo "Error: --image requires a value" >&2
+                exit 2
+            fi
+            IMAGE="$2"
+            IMAGE_SET=1
             shift 2
             ;;
         --with-traffic)
@@ -106,6 +133,25 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$SUITE" in
+    base)
+        TEST_CONFIG="/workspace/examples/rbb_srv6_3_usids_config.py"
+        PLAYBOOK="bgp_rbb_srv6_3_usids"
+        ;;
+    srv6-wire)
+        TEST_CONFIG="/workspace/examples/rbb_srv6_wire_config.py"
+        PLAYBOOK=""
+        if [[ "$WITH_TRAFFIC" -ne 1 ]]; then
+            echo "Error: --suite srv6-wire requires --with-traffic" >&2
+            exit 2
+        fi
+        ;;
+    *)
+        echo "Error: unknown suite '$SUITE'; choose base or srv6-wire" >&2
+        exit 2
+        ;;
+esac
+
 if [[ "$CONFIGURE_EDGES" -eq 1 && "$WITH_TRAFFIC" -ne 1 ]]; then
     echo "Error: --setup-dut-edges requires --with-traffic" >&2
     exit 2
@@ -127,6 +173,7 @@ fi
 if [[ "$INIT_ONLY" -eq 1 ]]; then
     if [[ "$CHECK_ONLY" -eq 1 || "$WITH_TRAFFIC" -eq 1 || \
         "$CONFIGURE_EDGES" -eq 1 || "$SETUP_DUTS" -eq 1 || \
+        "$SUITE_SET" -eq 1 || "$IMAGE_SET" -eq 1 || \
         ${#RUNNER_ARGS[@]} -gt 0 ]]; then
         echo "Error: --init may be combined only with --config-dir" >&2
         exit 2
@@ -201,6 +248,9 @@ for optional_file in rbb.env secrets.json; do
 done
 
 DOCKER_INPUT_ARGS=(--volume "$LOCAL_DIR:/workspace/.taac:ro")
+if [[ -n "$IMAGE" ]]; then
+    DOCKER_INPUT_ARGS=(--image "$IMAGE" "${DOCKER_INPUT_ARGS[@]}")
+fi
 if [[ -f "$LOCAL_DIR/rbb.env" ]]; then
     DOCKER_INPUT_ARGS=(
         --env-file "$LOCAL_DIR/rbb.env"
@@ -219,6 +269,7 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
     CHECK_ARGS=(
         python3 -m taac.runner.rbb_preflight
         --config-dir /workspace/.taac
+        --suite "$SUITE"
     )
     if [[ "$WITH_TRAFFIC" -eq 1 ]]; then
         CHECK_ARGS+=(--with-traffic)
@@ -240,9 +291,14 @@ exec "$REPO_ROOT/docker/run_taac_docker.sh" \
     "${DOCKER_INPUT_ARGS[@]}" \
     run bash -c '
         set -euo pipefail
+        suite="$1"
+        test_config="$2"
+        playbook="$3"
+        shift 3
         preflight=(
             python3 -m taac.runner.rbb_preflight
             --config-dir /workspace/.taac
+            --suite "$suite"
         )
         if [[ "${TAAC_RBB_INCLUDE_TRAFFIC:-0}" == "1" ]]; then
             preflight+=(--with-traffic)
@@ -257,12 +313,14 @@ exec "$REPO_ROOT/docker/run_taac_docker.sh" \
 
         runner=(
             python3 -m taac.runner.oss_entry_point
-            --test-configs /workspace/examples/rbb_srv6_3_usids_config.py
+            --test-configs "$test_config"
             --device-info-csv /workspace/.taac/device_info.csv
             --circuit-info-csv /workspace/.taac/circuit_info.csv
             --dut "$TAAC_RBB_R1_HOST" "$TAAC_RBB_R2_HOST"
-            --playbook bgp_rbb_srv6_3_usids
         )
+        if [[ -n "$playbook" ]]; then
+            runner+=(--playbook "$playbook")
+        fi
         if [[ -f /workspace/.taac/secrets.json ]]; then
             runner+=(--secrets-file /workspace/.taac/secrets.json)
         fi
@@ -271,4 +329,4 @@ exec "$REPO_ROOT/docker/run_taac_docker.sh" \
             runner+=(--ixia-api-server "$TAAC_IXIA_API_SERVER")
         fi
         exec "${runner[@]}" "$@"
-    ' _ "${RUNNER_ARGS[@]}"
+    ' _ "$SUITE" "$TEST_CONFIG" "$PLAYBOOK" "${RUNNER_ARGS[@]}"

@@ -8741,7 +8741,10 @@ def create_ixia_packet_capture_step(
     mode: str,
     capture_filter: str = "tcp port 179",
     pcap_filename: t.Optional[str] = None,
+    local_pcap_path: t.Optional[str] = None,
     capture_id: t.Optional[str] = None,
+    control_plane: bool = True,
+    control_buffer_percent: int = 30,
     description: t.Optional[str] = None,
 ) -> Step:
     """
@@ -8753,10 +8756,14 @@ def create_ixia_packet_capture_step(
     Args:
         device_name: Name of the device under test (for port lookup)
         interface: Interface name on device (e.g., "Ethernet3/1/1")
-        mode: "start", "stop", or "save"
+        mode: "start", "stop", "save", or "download"
         capture_filter: BPF filter for capture (default: "tcp port 179" for BGP)
         pcap_filename: Filename for saved PCAP (required for save mode)
+        local_pcap_path: Client-side /tmp path (required for download mode)
         capture_id: Unique ID to track capture across steps (default: device:interface)
+        control_plane: Capture software/control traffic when true, hardware/data
+            traffic when false.
+        control_buffer_percent: IXIA control-plane buffer allocation.
         description: Custom description for the step
 
     Returns:
@@ -8795,10 +8802,15 @@ def create_ixia_packet_capture_step(
         "interface": interface,
         "mode": mode,
         "capture_filter": capture_filter,
+        "control_plane": control_plane,
+        "control_buffer_percent": control_buffer_percent,
     }
 
     if pcap_filename is not None:
         params_dict["pcap_filename"] = pcap_filename
+
+    if local_pcap_path is not None:
+        params_dict["local_pcap_path"] = local_pcap_path
 
     if capture_id is not None:
         params_dict["capture_id"] = capture_id

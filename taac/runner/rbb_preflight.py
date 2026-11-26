@@ -239,6 +239,7 @@ def run_preflight(
     with_traffic: bool,
     setup_duts: bool = False,
     setup_dut_edges: bool = False,
+    suite: str = "base",
 ) -> tuple[str, str]:
     """Validate local inputs and return the configured DUT names."""
 
@@ -281,6 +282,8 @@ def run_preflight(
             }
         )
     _require_values(required)
+    if suite == "srv6-wire" and not with_traffic:
+        raise OSSConfigError("--suite srv6-wire requires --with-traffic")
     if setup_dut_edges and not with_traffic:
         raise OSSConfigError("--setup-dut-edges requires --with-traffic")
     if setup_duts and with_traffic and not setup_dut_edges:
@@ -327,6 +330,12 @@ def run_preflight(
             allow_placeholder=False,
             require_ixia=with_traffic,
         )
+        if suite == "srv6-wire":
+            from taac.testconfigs.routing.util.bgp_rbb_srv6_wire_profiles import (
+                validate_srv6_wire_distribution_topology,
+            )
+
+            validate_srv6_wire_distribution_topology(topology)
         if setup_duts or setup_dut_edges:
             from taac.testconfigs.routing.util import (
                 bgp_rbb_constants as C,
@@ -360,6 +369,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--with-traffic", action="store_true")
     parser.add_argument("--setup-duts", action="store_true")
     parser.add_argument("--setup-dut-edges", action="store_true")
+    parser.add_argument("--suite", choices=("base", "srv6-wire"), default="base")
     return parser
 
 
@@ -371,6 +381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             with_traffic=args.with_traffic,
             setup_duts=args.setup_duts,
             setup_dut_edges=args.setup_dut_edges,
+            suite=args.suite,
         )
     except OSSConfigError as exc:
         print(f"Configuration check failed: {exc}", file=sys.stderr)

@@ -38,7 +38,7 @@ from taac.oss_topology_info.circuit_info_loader import (
     EndpointRecord,
     load_circuit_info,
 )
-from neteng.test_infra.dne.taac.testconfigs.routing.util import bgp_rbb_constants as C
+from taac.testconfigs.routing.util import bgp_rbb_constants as C
 
 # ─── Generic, documentation-only fallback wiring (NOT this lab's values) ────
 # Used only when no circuit_info CSV is supplied. Interface / port names are

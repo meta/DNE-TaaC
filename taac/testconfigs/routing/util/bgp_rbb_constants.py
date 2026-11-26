@@ -175,6 +175,18 @@ TAIL_DEST_PREFIX: str = os.environ.get(
     f"{_DEFAULT_IXIA_TAIL_PREFIX}/{_DEFAULT_IXIA_TAIL_PREFIX_LEN}",
 )
 
+# Isolated prefixes used while provisioning the named SRv6 next-hop group
+# reused by the srv6-wire qualification.
+NAMED_NHG_TEST_PREFIX: str = os.environ.get(
+    "TAAC_RBB_NAMED_NHG_TEST_PREFIX", "2001:db8:ff00::/64"
+)
+NAMED_NHG_UNDERLAY_ANCHOR_PREFIX: str = os.environ.get(
+    "TAAC_RBB_NAMED_NHG_UNDERLAY_ANCHOR_PREFIX", "2001:db8:ff00::1/128"
+)
+RECURSIVE_ROUTE_TEST_PREFIX: str = os.environ.get(
+    "TAAC_RBB_RECURSIVE_ROUTE_TEST_PREFIX", "2001:db8:ff01::/64"
+)
+
 # Optional platform-specific display token for the S10 core-RIF verify. When it
 # is empty, TAAC derives the expected IPv6 address from the topology-selected
 # CORE<n> setting. Most users should leave this unset.
@@ -190,6 +202,7 @@ ROUTE_OWNER_BGPD: str = "BGPD"
 # The qualification flow is intentionally one-way: ingress R1 to tail R2.
 # Reverse ordinary-IPv6 traffic does not add SRv6 coverage.
 TRAFFIC_ITEM_R1_TO_R2: str = "RBB_R1_TO_R2_SRV6"
+TRAFFIC_ITEM_NAMED_NHG: str = "RBB_R1_TO_R2_NAMED_NHG"
 ALL_TRAFFIC_ITEMS: tuple[str, ...] = (TRAFFIC_ITEM_R1_TO_R2,)
 
 # ─── Timing ───────────────────────────────────────────────────────────────

@@ -11812,7 +11812,20 @@ class DrainUndrainStep(StepBase[taac_types.DrainUndrainInput]):
                 try_json_to_thrift(interface, taac_types.TestInterface)
                 for interface in try_json_loads(interfaces)
             ]
-        if input.drain_handler == taac_types.DrainHandler.LOCAL_DRAINER:
+        # NDS is not available in OSS. Use the on-box drain for the whole device.
+        onbox_instead_of_nds = (
+            input.drain_handler == taac_types.DrainHandler.NDS
+            and oss_config_patcher_enabled()
+            and not interfaces
+        )
+        if onbox_instead_of_nds:
+            self.logger.warning(
+                f"NDS is not available in OSS; {self.device.name} uses the on-box "
+                f"{'drain' if input.drain else 'undrain'}, which restarts bgpd"
+            )
+        if input.drain_handler == taac_types.DrainHandler.LOCAL_DRAINER or (
+            onbox_instead_of_nds
+        ):
             # A local-drainer target need not be part of the testbed topology.
             # Preserve raw names so unrelated DUT uplinks remain valid targets.
             interface_names = [

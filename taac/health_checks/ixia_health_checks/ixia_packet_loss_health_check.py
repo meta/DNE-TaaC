@@ -63,7 +63,9 @@ class IxiaPacketLossHealthCheck(
             time.time() - max(window_start, obj.get_traffic_start_time())
             < input.sleep_time
         ):
-            time.sleep(0.1)
+            # await, not time.sleep: a blocking sleep stalls every other
+            # coroutine on the runner's event loop.
+            await asyncio.sleep(0.1)
         since_time = time.time()
         # this is necessary to allow in-flight traffic to arrive at the destination
         obj.stop_traffic()

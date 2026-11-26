@@ -13110,7 +13110,15 @@ class Ixia:
             bgp_ip_route_property_cls = getattr(
                 ip_prefix_pool_obj, bgp_route_property_attr
             )
-            bgp_ip_route_property = bgp_ip_route_property_cls.add()
+            # Find-or-create, as in `_create_custom_network_group`: newer
+            # IxNetwork builds auto-create the route property with the prefix
+            # pool and reject a second add(); older builds do not create it.
+            existing_route_props = bgp_ip_route_property_cls.find()
+            bgp_ip_route_property = (
+                existing_route_props[0]
+                if existing_route_props
+                else bgp_ip_route_property_cls.add()
+            )
             set_next_hop_type = (
                 import_bgp_routes_params.set_next_hop_type
                 or ixia_types.SetNextHopType.MANUALLY

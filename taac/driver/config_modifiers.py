@@ -391,11 +391,12 @@ async def _apply_drain_state(
     # place while adding SOFT_DRAINED would silently keep the device live. Removing
     # the opposite marker and setting the target in one invocation also avoids a
     # window where both or neither marker exists.
+    # /dev/shm is tmpfs: right after a reboot the drain directory may not exist.
     switch.logger.info(
         f"[{state_name}] {hostname}: clearing {opposite_marker}, setting {target_marker}"
     )
     await switch.async_run_cmd_on_shell(
-        f"rm -f {opposite_marker} && touch {target_marker}"
+        f"mkdir -p {FBOSS_DRAIN_DIR} && rm -f {opposite_marker} && touch {target_marker}"
     )
 
     # Symlink into a staging name, then rename over the real one. rename(2) is

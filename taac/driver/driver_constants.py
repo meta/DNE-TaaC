@@ -1419,3 +1419,12 @@ PROD_LIKE_MUTATING_OPTIONS: FrozenSet[ProdLikeEnvOption] = frozenset(
 
 
 FSDB_PORT: int = fboss_thrift_port(5908)
+
+
+# Some platforms abort with "invalid model name" without the descriptor root.
+PLATFORM_DESCRIPTOR_ROOT: str = "/opt/fboss/share/platform_descriptors"
+
+
+def wedge_qsfp_util_cmd(root: str = PLATFORM_DESCRIPTOR_ROOT) -> str:
+    flag = f"--platform_descriptor_config_path {root}"
+    return f"wedge_qsfp_util $(test -d {root} && echo {flag})"

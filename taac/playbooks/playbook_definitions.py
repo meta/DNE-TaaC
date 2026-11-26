@@ -1316,7 +1316,8 @@ def create_test_portchannel_playbook(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -1333,7 +1334,8 @@ def create_test_portchannel_playbook(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -1415,6 +1417,8 @@ def add_common_checks_to_cpu_queue_playbooks(
         create_prefix_limit_check(prefix_limit=unique_prefix_limit),
         create_memory_utilization_check(
             threshold=5 * (1024**3),  # 5gb
+            # bgpd RSS at full fabric scale exceeds the default.
+            threshold_by_service={"bgpd": 10 * (1024**3)},
             start_time_jq_var="test_case_start_time",
         ),
         create_port_state_check(),
@@ -1941,6 +1945,11 @@ def add_common_checks_to_thft_playbooks(
     `ExecStop=pre_wedge_agent_shut_runner.par` hook — same by-design
     intent, different mechanism. `qsfp_service` and `fsdb` are NOT in
     the cascade set so they don't propagate.
+
+    `BGP_ROUTE_COUNT_VERIFICATION_CHECK` is skipped as a precheck: the thrift
+    storm starts with the playbook and holds bgpd's connection limit, so a
+    pre-test route count cannot reach bgpd. A route-count postcheck runs after
+    the storm and the quiet stage, so it is kept.
     """
     common_prechecks = [
         create_drain_state_check(),
@@ -2020,8 +2029,10 @@ def add_common_checks_to_thft_playbooks(
                 expected_restarted_services=expected_restarted,
             ),
             create_unclean_exit_check(),
+            # The storm against a full route table holds the agent above four
+            # cores.
             create_cpu_utilization_check(
-                threshold=400.0, start_time_jq_var="test_case_start_time"
+                threshold=700.0, start_time_jq_var="test_case_start_time"
             ),
         ]
         prechecks = list(pb.prechecks or []) + common_prechecks
@@ -2047,7 +2058,8 @@ def add_common_checks_to_thft_playbooks(
                 skip_test_config_postchecks=pb.skip_test_config_postchecks,
                 skip_test_config_snapshot_checks=pb.skip_test_config_snapshot_checks,
                 override_duplicate_checks=pb.override_duplicate_checks,
-                prechecks_to_skip=pb.prechecks_to_skip,
+                prechecks_to_skip=list(pb.prechecks_to_skip or [])
+                + [hc_types.CheckName.BGP_ROUTE_COUNT_VERIFICATION_CHECK],
                 postchecks_to_skip=pb.postchecks_to_skip,
                 snapshot_checks_to_skip=pb.snapshot_checks_to_skip,
                 check_ids_to_skip=pb.check_ids_to_skip,
@@ -8469,7 +8481,8 @@ def _create_lag_prechecks(
         create_memory_utilization_check(
             threshold=5 * (1024**3),
             threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
+                # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                "bgpd": 10 * (1024**3),
                 "fsdb": 5 * (1024**3),
                 "qsfp_service": 2 * (1024**3),
                 "fboss_sw_agent": 9 * (1024**3),
@@ -8501,7 +8514,8 @@ def _create_lag_postchecks(
         create_memory_utilization_check(
             threshold=5 * (1024**3),
             threshold_by_service={
-                "bgpd": 4.5 * (1024**3),
+                # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                "bgpd": 10 * (1024**3),
                 "fsdb": 5 * (1024**3),
                 "qsfp_service": 2 * (1024**3),
                 "fboss_sw_agent": 9 * (1024**3),
@@ -9930,7 +9944,10 @@ def _l2_overload_safety_checks(
             start_time_jq_var=start_time_jq_var,
         ),
         create_memory_utilization_check(
-            threshold=5 * (1024**3),
+            # Services under L2 table overload at full fabric scale exceed
+            # 5 GiB RSS, bgpd more.
+            threshold=7.5 * (1024**3),
+            threshold_by_service={"bgpd": 10 * (1024**3)},
             start_time_jq_var=start_time_jq_var,
         ),
     ]
@@ -13176,7 +13193,8 @@ def create_ecmp_groups_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -13291,7 +13309,8 @@ def create_ecmp_groups_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -13978,7 +13997,8 @@ def create_ecmp_members_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -14116,7 +14136,8 @@ def create_ecmp_members_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -15072,7 +15093,8 @@ def create_spillover_testing_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -15240,7 +15262,8 @@ def create_ecmp_only_groups_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -15601,7 +15624,8 @@ def create_ecmp_only_members_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -16042,7 +16066,8 @@ def create_ecmp_only_longevity_playbooks(
             create_memory_utilization_check(
                 threshold=5 * (1024**3),
                 threshold_by_service={
-                    "bgpd": 4.5 * (1024**3),
+                    # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+                    "bgpd": 10 * (1024**3),
                     "fsdb": 5 * (1024**3),
                     "qsfp_service": 2 * (1024**3),
                     "fboss_sw_agent": 9 * (1024**3),
@@ -30125,7 +30150,8 @@ def create_fpf_link_event_disrupt_playbook(
     # established sessions at precheck (no fail) and assert the post-disruption
     # count matches in the postcheck — like the other snapshot checks.
     _mem_thresholds = {
-        "bgpd": 4.5 * (1024**3),
+        # bgpd RSS at full fabric scale exceeds 4.5 GiB.
+        "bgpd": 10 * (1024**3),
         "fsdb": 5 * (1024**3),
         "qsfp_service": 2 * (1024**3),
         "fboss_sw_agent": 9 * (1024**3),

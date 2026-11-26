@@ -94,37 +94,40 @@ def _run_periodic_task_loop(
     start_time = time.time()
     success_count = 0
 
-    while not stop_event.is_set():
-        if time.time() - start_time > max_runtime:
-            break
-        try:
-            dict_params = ParameterEvaluator().evaluate(
-                periodic_task.params_list[
-                    success_count % len(periodic_task.params_list)
-                ]
-                if periodic_task.params_list
-                else periodic_task.task.params
-            )
-            logger.info(
-                f"Running periodic task {periodic_task.name} with params {dict_params}"
-            )
-            asyncio.run(task_obj._run(dict_params))
-            success_count += 1
-            stop_event.wait(periodic_task.interval)
-        except Exception as error:
-            logger.exception(f"Exception occurred in periodic task: {error}")
-            if periodic_task.retryable:
-                logger.info(
-                    f"Sleeping {periodic_task.exception_sleep_time}s before "
-                    "retrying periodic task"
+    # One event loop for the worker's life: a call a task abandons (e.g. a
+    # cancelled thrift request) completes on a later run instead of leaking.
+    with asyncio.Runner() as runner:
+        while not stop_event.is_set():
+            if time.time() - start_time > max_runtime:
+                break
+            try:
+                dict_params = ParameterEvaluator().evaluate(
+                    periodic_task.params_list[
+                        success_count % len(periodic_task.params_list)
+                    ]
+                    if periodic_task.params_list
+                    else periodic_task.task.params
                 )
-                stop_event.wait(periodic_task.exception_sleep_time)
-                continue
+                logger.info(
+                    f"Running periodic task {periodic_task.name} with params {dict_params}"
+                )
+                runner.run(task_obj._run(dict_params))
+                success_count += 1
+                stop_event.wait(periodic_task.interval)
+            except Exception as error:
+                logger.exception(f"Exception occurred in periodic task: {error}")
+                if periodic_task.retryable:
+                    logger.info(
+                        f"Sleeping {periodic_task.exception_sleep_time}s before "
+                        "retrying periodic task"
+                    )
+                    stop_event.wait(periodic_task.exception_sleep_time)
+                    continue
 
-            has_error.value = True
-            if periodic_task.terminate_on_error:
-                stop_event.set()
-            break
+                has_error.value = True
+                if periodic_task.terminate_on_error:
+                    stop_event.set()
+                break
 
 
 def run_periodic_task_process(

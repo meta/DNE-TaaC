@@ -5786,6 +5786,7 @@ def create_service_interruption_step(
     step_id: t.Optional[str] = None,
     device_regexes: t.Optional[t.List[str]] = None,
     start_traffic: bool = True,
+    clear_thrift_drain_exit: bool = False,
 ) -> Step:
     """
     Create a step to interrupt a service (restart, crash, etc.).
@@ -5800,10 +5801,22 @@ def create_service_interruption_step(
         description: Custom description for the step
         step_id: Optional step ID
         start_traffic: Whether the generic step pre-hook should start IXIA.
+        clear_thrift_drain_exit: For a SYSTEMCTL_RESTART of Service.AGENT on a
+            split-agent FBOSS DUT, clear bgpd's failed state when its stop ends
+            in a thrift drain-deadline exit. Only for a caller that puts bgpd
+            under a thrift load it cannot drain.
 
     Returns:
         Step object for service interruption
     """
+    if clear_thrift_drain_exit and (
+        service != taac_types.Service.AGENT
+        or trigger != taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART
+    ):
+        raise ValueError(
+            "clear_thrift_drain_exit is valid only for a SYSTEMCTL_RESTART of "
+            "Service.AGENT"
+        )
     if (
         intentional_stop
         and trigger != taac_types.ServiceInterruptionTrigger.SYSTEMCTL_STOP
@@ -5818,6 +5831,8 @@ def create_service_interruption_step(
     step_params_dict: t.Dict[str, t.Any] = {}
     if intentional_stop:
         step_params_dict["intentional_stop"] = True
+    if clear_thrift_drain_exit:
+        step_params_dict["clear_thrift_drain_exit"] = True
     _add_skip_start_traffic_param(step_params_dict, start_traffic)
 
     return Step(
@@ -12060,7 +12075,17 @@ class ServiceInterruptionStep(StepBase[taac_types.ServiceInterruptionInput]):
             case taac_types.ServiceInterruptionTrigger.SYSTEMCTL_START:
                 await self.driver.async_start_service(service, agents)
             case taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART:
-                await self.driver.async_restart_service(service, agents)
+                if not params.get("clear_thrift_drain_exit", False):
+                    await self.driver.async_restart_service(service, agents)
+                else:
+                    if not self.is_fboss or not isinstance(self.driver, FbossSwitch):
+                        raise ValueError(
+                            "clear_thrift_drain_exit is supported only by the "
+                            "FBOSS driver"
+                        )
+                    await self.driver.async_restart_service(
+                        service, agents, clear_thrift_drain_exit=True
+                    )
             case taac_types.ServiceInterruptionTrigger.CRASH:
                 await self.driver.async_crash_service(service, agents)
 

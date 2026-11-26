@@ -136,6 +136,49 @@ class TestServiceInterruptionStep(_ServiceInterruptionStepFixture):
         with self.assertRaisesRegex(RuntimeError, "did not reach ACTIVE"):
             await self.si_step.run(input_data, {"intentional_stop": True})
 
+    async def test_restart_clearing_drain_exit_reaches_the_driver(self):
+        input_data = taac_types.ServiceInterruptionInput(
+            name=taac_types.Service.AGENT,
+            trigger=taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+        )
+        await self.si_step.run(input_data, {"clear_thrift_drain_exit": True})
+        self.driver_mock.async_restart_service.assert_awaited_once_with(
+            FbossSystemctlServiceName.AGENT, None, clear_thrift_drain_exit=True
+        )
+
+    async def test_restart_clearing_drain_exit_rejects_non_fboss_driver(self):
+        input_data = taac_types.ServiceInterruptionInput(
+            name=taac_types.Service.AGENT,
+            trigger=taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+        )
+        self.si_step.driver = AsyncMock()
+
+        with self.assertRaisesRegex(ValueError, "only by the FBOSS driver"):
+            await self.si_step.run(input_data, {"clear_thrift_drain_exit": True})
+
+    def test_factory_clears_drain_exit_only_for_an_agent_restart(self):
+        step = create_service_interruption_step(
+            service=taac_types.Service.AGENT, clear_thrift_drain_exit=True
+        )
+        self.assertIn('"clear_thrift_drain_exit": true', step.step_params.json_params)
+        for service, trigger in (
+            (
+                taac_types.Service.BGP,
+                taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+            ),
+            (
+                taac_types.Service.AGENT,
+                taac_types.ServiceInterruptionTrigger.CRASH,
+            ),
+        ):
+            with self.subTest(service=service, trigger=trigger):
+                with self.assertRaisesRegex(ValueError, "only for a SYSTEMCTL_RESTART"):
+                    create_service_interruption_step(
+                        service=service,
+                        trigger=trigger,
+                        clear_thrift_drain_exit=True,
+                    )
+
     def test_factory_rejects_intentional_stop_for_start(self):
         with self.assertRaisesRegex(ValueError, "only for SYSTEMCTL_STOP"):
             create_service_interruption_step(

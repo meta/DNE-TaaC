@@ -30956,7 +30956,7 @@ def create_fpf_prod_prefix_drain_only_playbook(
     )
 
 
-def create_fpf_service_restart_playbook(
+def create_fpf_service_restart_playbook(  # noqa: C901
     *,
     gtsws: list[str],
     hosts: list[str],
@@ -30991,6 +30991,9 @@ def create_fpf_service_restart_playbook(
     convergence_blip_mode: str = "strict",
     hrt_device_ids: list[int] | None = None,
     ib_traffic_config: t.Mapping[str, t.Any] | None = None,
+    prod_prefix_restart_recovery_sla_sec: float | None = None,
+    out_congestion_last_minute_max: bool = False,
+    host_spray_transform_desc: str | None = None,
 ) -> Playbook:
     """FPF service-restart / coldboot playbook (single playbook, self-recovering).
 
@@ -31012,6 +31015,15 @@ def create_fpf_service_restart_playbook(
     stage steps (prefixes injected once by the ``fpf_inject_bgp_prefixes`` setup
     task — 8-STSW split-per-VF injection). ``prefix_count`` then serves only as
     the EXPECTED converged count for the per-GTSW/per-lane checks.
+
+    ``prod_prefix_restart_recovery_sla_sec`` switches production-prefix
+    validation from no-churn stability to disruption-anchored restart recovery.
+    The stage records restart start/completion around the service interruption,
+    tolerates the expected outage rows, and requires a healthy final sample plus
+    full recovery within the supplied SLA. ``out_congestion_last_minute_max``
+    and ``host_spray_transform_desc`` restrict ODS validation to the recovered
+    tail so ingestion lag and expected coldboot transients do not fail the final
+    state contract.
 
     Injects prefixes, stabilizes, records the restart moment, restarts ``service``
     on ``restart_device_regexes`` (the DUT GTSW), waits ``settle_after_restart_sec``,
@@ -31054,6 +31066,8 @@ def create_fpf_service_restart_playbook(
         create_fpf_bgp_prefix_injection_step,
         create_fpf_ensure_traffic_step,
         create_fpf_record_disruption_time_step,
+        create_fpf_record_restart_completion_time_step,
+        create_fpf_record_restart_time_step,
         create_longevity_step,
         create_service_interruption_step,
     )
@@ -31096,6 +31110,8 @@ def create_fpf_service_restart_playbook(
         reconvergence_service=taac_types.SERVICE_NAME_MAP[service],
         reconvergence_sla_sec=reconvergence_sla_sec,
         reconvergence_hosts=restart_device_regexes,
+        out_congestion_last_minute_max=out_congestion_last_minute_max,
+        host_spray_transform_desc=host_spray_transform_desc,
         hrt_device_ids=resolved_hrt_device_ids,
     )
 
@@ -31171,24 +31187,31 @@ def create_fpf_service_restart_playbook(
                 ),
             ]
         )
-    stage_steps.extend(
-        [
-            # Stamp the restart moment so the affected-rib reconverge SLA measures
-            # from here, not test-case start.
-            create_fpf_record_disruption_time_step(),
-            create_service_interruption_step(
-                service=service,
-                trigger=trigger,
-                create_cold_boot_file=create_cold_boot_file,
-                device_regexes=restart_device_regexes,
-                description=f"{'Cold boot' if create_cold_boot_file else 'Restart'} "
-                f"service on {restart_device_regexes}",
+    # Stamp the disruption for existing restart-aware RIB checks. When the
+    # production-prefix recovery SLA is enabled, also preserve exact command
+    # start/completion boundaries for its restart_recovery evaluator.
+    stage_steps.append(create_fpf_record_disruption_time_step())
+    if prod_prefix_restart_recovery_sla_sec is not None:
+        stage_steps.append(create_fpf_record_restart_time_step())
+    stage_steps.append(
+        create_service_interruption_step(
+            service=service,
+            trigger=trigger,
+            create_cold_boot_file=create_cold_boot_file,
+            device_regexes=restart_device_regexes,
+            description=f"{'Cold boot' if create_cold_boot_file else 'Restart'} "
+            f"service on {restart_device_regexes}",
+        )
+    )
+    if prod_prefix_restart_recovery_sla_sec is not None:
+        stage_steps.append(create_fpf_record_restart_completion_time_step())
+    stage_steps.append(
+        create_longevity_step(
+            duration=settle_after_restart_sec,
+            description=(
+                f"Settle {settle_after_restart_sec}s after restart before assertion"
             ),
-            create_longevity_step(
-                duration=settle_after_restart_sec,
-                description=f"Settle {settle_after_restart_sec}s after restart before assertion",
-            ),
-        ]
+        )
     )
 
     postchecks = []
@@ -31330,7 +31353,16 @@ def create_fpf_service_restart_playbook(
                 check_id="fpf_hrt_remote_failure_stable",
             )
         )
-    if prod_prefixes:
+    if prod_prefixes and prod_prefix_restart_recovery_sla_sec is not None:
+        postchecks.append(
+            create_fpf_prod_hrt_prefix_stability_check(
+                mode="restart_recovery",
+                max_recovery_sec=prod_prefix_restart_recovery_sla_sec,
+                prefixes_by_host=resolved_prod_prefixes_by_host,
+                check_id="fpf_prod_hrt_prefix_restart_recovery",
+            )
+        )
+    elif prod_prefixes:
         postchecks.append(
             create_fpf_prod_hrt_prefix_stability_check(
                 settle_sec=settle,
@@ -31339,6 +31371,7 @@ def create_fpf_service_restart_playbook(
                 check_id="fpf_prod_hrt_prefix_stable",
             )
         )
+    if prod_prefixes:
         postchecks.append(
             create_fpf_hrt_plane_status_check(
                 mode="all_up",

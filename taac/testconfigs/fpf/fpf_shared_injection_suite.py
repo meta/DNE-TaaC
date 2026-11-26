@@ -765,6 +765,10 @@ def _service_restart_playbook(
     stable_settle_sec: int = 0,
     bgp_reconverge_sla_sec: float | None = None,
     skip_fsdb_session_postcheck: bool = False,
+    convergence_blip_mode: str = "strict",
+    prod_prefix_restart_recovery_sla_sec: float | None = None,
+    out_congestion_last_minute_max: bool = False,
+    host_spray_transform_desc: str | None = None,
 ) -> list:
     """tc04/23/24/25/27: service restart / warmboot / coldboot."""
     return [
@@ -796,6 +800,10 @@ def _service_restart_playbook(
             assert_bgp_reconvergence=True,
             reconvergence_sla_sec=reconvergence_sla_sec,
             skip_fsdb_session_postcheck=skip_fsdb_session_postcheck,
+            convergence_blip_mode=convergence_blip_mode,
+            prod_prefix_restart_recovery_sla_sec=(prod_prefix_restart_recovery_sla_sec),
+            out_congestion_last_minute_max=out_congestion_last_minute_max,
+            host_spray_transform_desc=host_spray_transform_desc,
             playbook_name=name,
         )
     ]
@@ -882,10 +890,14 @@ def _tc27(*, spray, skip_ssh) -> list:
         name="fpf_tc27_agent_coldboot",
         affected_rib="bgp",
         create_cold_boot_file=True,
-        settle_after_restart_sec=360,
+        settle_after_restart_sec=600,
         stable_settle_sec=300,
         bgp_reconverge_sla_sec=300.0,
         reconvergence_sla_sec=240.0,
+        convergence_blip_mode="last_sample",
+        prod_prefix_restart_recovery_sla_sec=360.0,
+        out_congestion_last_minute_max=True,
+        host_spray_transform_desc="formula(/ $1 125000000),latest(3),max",
     )
 
 

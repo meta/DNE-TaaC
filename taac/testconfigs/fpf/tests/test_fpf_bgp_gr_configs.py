@@ -96,6 +96,89 @@ class TestCampaignExecutionContracts(unittest.TestCase):
             params = _task_params(collector)
             self.assertEqual(params["fsdb_session_poll_interval_sec"], 2.0)
 
+    def test_tc27_coldboot_uses_bounded_recovery_contract(self) -> None:
+        config = (
+            fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
+        )
+        playbook = _playbook(config, "fpf_tc27_agent_coldboot")
+        steps = [step for stage in playbook.stages for step in stage.steps]
+        step_params = [
+            _step_params(step)
+            for step in steps
+            if step.step_params is not None and step.step_params.json_params is not None
+        ]
+
+        self.assertIn(
+            {"custom_step_name": "record_fpf_restart_time"},
+            step_params,
+        )
+        self.assertIn(
+            {"custom_step_name": "record_fpf_restart_completion_time"},
+            step_params,
+        )
+        self.assertIn(
+            {
+                "duration": 600,
+                "description": "Settle 600s after restart before assertion",
+            },
+            step_params,
+        )
+
+        by_id = {
+            check.check_id: _check_params(check)
+            for check in playbook.postchecks or []
+            if check.check_id
+        }
+        prod_prefix = by_id["fpf_prod_hrt_prefix_restart_recovery"]
+        self.assertEqual(prod_prefix["mode"], "restart_recovery")
+        self.assertEqual(prod_prefix["max_recovery_sec"], 360.0)
+
+        for check_id in (
+            "fpf_hrt_remote_failure_stable_vf1",
+            "fpf_hrt_remote_failure_stable_vf2",
+        ):
+            self.assertEqual(
+                by_id[check_id]["direction"],
+                "stable_last_sample",
+            )
+        self.assertEqual(
+            by_id["fpf_hrt_plane_status_all_up"]["stability_mode"],
+            "last_sample",
+        )
+
+        out_congestion = by_id["ods_out_congestion"]
+        self.assertEqual(out_congestion["aggregate"], "max")
+        self.assertFalse(out_congestion["use_test_case_start_time"])
+        self.assertEqual(out_congestion["min_ods_query_duration"], 60)
+        self.assertEqual(
+            by_id["fpf_host_spray"]["transform_desc"],
+            "formula(/ $1 125000000),latest(3),max",
+        )
+
+    def test_tc04_warmboot_retains_default_restart_contract(self) -> None:
+        config = (
+            fpf_shared_injection_suite.create_fpf_shared_injection_suite_test_config()
+        )
+        playbook = _playbook(config, "fpf_tc04_wedge_agent_warmboot")
+        custom_names = {
+            _step_params(step).get("custom_step_name")
+            for stage in playbook.stages
+            for step in stage.steps
+            if step.step_params is not None and step.step_params.json_params is not None
+        }
+        self.assertNotIn("record_fpf_restart_time", custom_names)
+        self.assertNotIn("record_fpf_restart_completion_time", custom_names)
+
+        by_id = {
+            check.check_id: _check_params(check)
+            for check in playbook.postchecks or []
+            if check.check_id
+        }
+        self.assertIn("fpf_prod_hrt_prefix_stable", by_id)
+        self.assertNotIn("fpf_prod_hrt_prefix_restart_recovery", by_id)
+        self.assertNotIn("aggregate", by_id["ods_out_congestion"])
+        self.assertNotIn("transform_desc", by_id["fpf_host_spray"])
+
     def test_shared_suite_contains_phase_correct_stsw_and_reboot_playbooks(
         self,
     ) -> None:

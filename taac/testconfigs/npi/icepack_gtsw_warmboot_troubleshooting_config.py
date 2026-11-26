@@ -24,6 +24,11 @@ and unregistered on teardown.
 import json
 
 from ixia.ixia import types as ixia_types
+from taac.constants import TESTBED_ISOLATION_BYPASS_TAG
+from taac.health_checks.healthcheck_definitions import (
+    create_bgp_session_establish_check,
+    create_systemctl_active_state_check,
+)
 from taac.packet_headers import DSF_RDMA_IB_PACKET_HEADERS
 from taac.playbooks.playbook_definitions import (
     create_icepack_gtsw_warmboot_troubleshooting_playbook,
@@ -50,6 +55,7 @@ from taac.test_as_a_config.types import (
 _HOSTNAME = "gtsw007.l1001.c085.ash6"
 _SRC_PORT = "eth1/1/1"
 _DST_PORT = "eth1/1/3"
+_IXIA_CHASSIS_IP = "2401:db00:2066:31fb::3023"  # ixia23.netcastle.ash6
 
 _TRAFFIC_ITEM_NAME = "ICEPACK_GTSW007_WARMBOOT_ROCE_TRAFFIC"
 
@@ -68,7 +74,18 @@ ICEPACK_GTSW007_WARMBOOT_ENDPOINTS = [
     Endpoint(
         name=_HOSTNAME,
         dut=True,
-        ixia_ports=[_SRC_PORT, _DST_PORT],
+        direct_ixia_connections=[
+            taac_types.DirectIxiaConnection(
+                interface=_SRC_PORT,
+                ixia_port="1/37",
+                ixia_chassis_ip=_IXIA_CHASSIS_IP,
+            ),
+            taac_types.DirectIxiaConnection(
+                interface=_DST_PORT,
+                ixia_port="1/39",
+                ixia_chassis_ip=_IXIA_CHASSIS_IP,
+            ),
+        ],
     ),
 ]
 
@@ -109,7 +126,9 @@ _PROVISION_ETH1_1_3_IP_SETUP_TASKS = [
 
 NPI_ICEPACK_GTSW007_WARMBOOT_TROUBLESHOOTING_TEST_CONFIG = TestConfig(
     name="NPI_ICEPACK_GTSW007_WARMBOOT_TROUBLESHOOTING_TEST_CONFIG",
-    basset_pool="networkai.test",
+    basset_pool="dne.test",
+    # Isolation would disable the fabric links checked by the BGP precheck.
+    tags=[TESTBED_ISOLATION_BYPASS_TAG],
     endpoints=ICEPACK_GTSW007_WARMBOOT_ENDPOINTS,
     # Explicit addressing changes the IXIA topology, so opt out of the
     # content-blind IXIA config cache to avoid a stale session overriding it.
@@ -188,6 +207,20 @@ NPI_ICEPACK_GTSW007_WARMBOOT_TROUBLESHOOTING_TEST_CONFIG = TestConfig(
         create_icepack_gtsw_warmboot_troubleshooting_playbook(
             name="test_icepack_gtsw007_warmboot_troubleshooting",
             traffic_item_name=_TRAFFIC_ITEM_NAME,
+            bgp_session_check=create_bgp_session_establish_check(
+                min_established_pct=0.8
+            ),
+            systemctl_active_check=create_systemctl_active_state_check(
+                services_json=[
+                    "wedge_agent",
+                    "fboss_sw_agent",
+                    "fboss_hw_agent@0",
+                    "bgpd",
+                    "fsdb",
+                    "qsfp_service",
+                    "coop",
+                ]
+            ),
         )
     ],
 )

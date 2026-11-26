@@ -158,6 +158,9 @@ from taac.health_checks.device_health_checks.system_cpu_load_average_health_chec
 from taac.health_checks.device_health_checks.systemctl_active_state_health_check import (
     SystemctlActiveStateHealthCheck,
 )
+from taac.health_checks.device_health_checks.unclean_exit_health_check import (
+    UncleanExitHealthCheck,
+)
 from taac.health_checks.device_health_checks.wedge_agent_configured_health_check import (
     WedgeAgentConfiguredHealthCheck,
 )
@@ -248,7 +251,7 @@ OSS_HEALTH_CHECKS: t.List[HealthCheck] = [
     IxiaTrafficRateHealthCheck,
     PfcWdHealthCheck,
     CpuQueueHealthCheck,
-    # UncleanExitHealthCheck,  # ODS-dependent (taac.internal), excluded in OSS
+    UncleanExitHealthCheck,
     CpuUtilizationHealthCheck,
     MemoryUtilizationHealthCheck,
     BgpSessionEstablishedHealthCheck,

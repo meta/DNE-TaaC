@@ -16,6 +16,10 @@ import typing as t
 # Environment variable to control OSS mode
 TAAC_OSS = os.environ.get("TAAC_OSS", "").lower() in ("1", "true", "yes")
 
+# The path differs from /opt/memory_pressure, so a push cannot overwrite it.
+OSS_MEMORY_PRESSURE_PATH = "/tmp/taac_oss_memory_pressure.py"
+OSS_MEMORY_PRESSURE_LOG = "/tmp/taac_oss_memory_pressure.log"
+
 
 class InsufficientInputError(Exception):
     """Raised when required inputs are missing or incomplete."""

@@ -56,7 +56,15 @@ _REDUCED_TRANSITION_PLAYBOOK_NAMES = [
 # last flip cycle.
 _BGP_WAIT_REDUCED_PLAYBOOK_NAMES = _REDUCED_TRANSITION_PLAYBOOK_NAMES[:7]
 
-_UTP_PLAYBOOK_NAMES = [
+# SPDF_037/039/040: 200G -> 100G -> 200G with a cold boot / microserver reboot
+# / BMC reboot after each speed change.
+_DISRUPTIVE_FLIP_PLAYBOOK_NAMES = [
+    "SPEED_FLIP_51T_SPD_037_100G_TO_200G_COLDBOOT",
+    "SPEED_FLIP_51T_SPD_039_100G_TO_200G_MICROSERVER_REBOOT",
+    "SPEED_FLIP_51T_SPD_040_100G_TO_200G_BMC_REBOOT",
+]
+
+_UTP_PLAYBOOK_NAMES = _DISRUPTIVE_FLIP_PLAYBOOK_NAMES + [
     "SPEED_FLIP_51T_SPD_001_100G_TO_200G_WARMBOOT",
     "SPEED_FLIP_51T_SPD_002_200G_TO_400G_WARMBOOT",
     "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
@@ -299,7 +307,8 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
                 "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
                 "SPEED_FLIP_51T_SPD_009_100G_TO_400G_COOP_CRASH_WARMBOOT",
             ]
-            + _REDUCED_TRANSITION_PLAYBOOK_NAMES,
+            + _REDUCED_TRANSITION_PLAYBOOK_NAMES
+            + _DISRUPTIVE_FLIP_PLAYBOOK_NAMES,
         )
 
         # Inside ONE test case, SPDF_001/002 repeat their 4-stage flip cycle 3x,
@@ -341,15 +350,19 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         )
         self.assertEqual(playbook.iteration, 1)
 
-    def test_spd_003_006_009_010_to_016_wait_for_bgp_convergence_before_postchecks(
+    def test_bgp_convergence_is_awaited_once_after_the_last_cycle(
         self,
     ) -> None:
         playbooks_by_name = {p.name: p for p in self.test_config.playbooks}
-        for name in [
-            "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
-            "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
-            "SPEED_FLIP_51T_SPD_009_100G_TO_400G_COOP_CRASH_WARMBOOT",
-        ] + _BGP_WAIT_REDUCED_PLAYBOOK_NAMES:
+        for name in (
+            [
+                "SPEED_FLIP_51T_SPD_003_100G_TO_400G_WARMBOOT",
+                "SPEED_FLIP_51T_SPD_006_100G_TO_400G_AGENT_CRASH",
+                "SPEED_FLIP_51T_SPD_009_100G_TO_400G_COOP_CRASH_WARMBOOT",
+            ]
+            + _BGP_WAIT_REDUCED_PLAYBOOK_NAMES
+            + _DISRUPTIVE_FLIP_PLAYBOOK_NAMES
+        ):
             playbook = playbooks_by_name[name]
             # Last stage (after the last cycle): wait for bgpd on both devices.
             last_steps = playbook.stages[-1].steps
@@ -426,6 +439,104 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
         )
         # Coop crash + agent warmboot at 400G and again back at 100G.
         self.assertEqual(interruptions, 2 * 2 * 3)
+
+    def test_spd_037_flips_100g_and_cold_boots_the_agent_each_change(self) -> None:
+        playbook = {p.name: p for p in self.test_config.playbooks}[
+            "SPEED_FLIP_51T_SPD_037_100G_TO_200G_COLDBOOT"
+        ]
+        steps = [step for stage in playbook.stages for step in stage.steps]
+        operations, interruptions = self._patcher_ops_and_crash_count(playbook.name)
+        # Three cycles (_SPEED_FLIP_51T_COLDBOOT_CYCLES): flip to 100G, revert.
+        self.assertEqual(operations, [(100, True), (100, False)] * 3)
+        # Agent cold boot after each flip and each revert.
+        self.assertEqual(interruptions, 2 * 3)
+        cold_boots = [
+            step
+            for step in steps
+            if step.name == taac_types.StepName.SERVICE_INTERRUPTION_STEP
+        ]
+        for step in cold_boots:
+            self.assertIn("cold_boot", str(step))
+
+    def test_spd_039_040_flip_100g_and_reboot_and_undrain_each_change(
+        self,
+    ) -> None:
+        playbooks_by_name = {p.name: p for p in self.test_config.playbooks}
+        for name, trigger in (
+            (
+                "SPEED_FLIP_51T_SPD_039_100G_TO_200G_MICROSERVER_REBOOT",
+                taac_types.SystemRebootTrigger.BMC_MICROSERVER_ONLY_RESET,
+            ),
+            (
+                "SPEED_FLIP_51T_SPD_040_100G_TO_200G_BMC_REBOOT",
+                taac_types.SystemRebootTrigger.BMC_POWER_RESET,
+            ),
+        ):
+            steps = [
+                step for stage in playbooks_by_name[name].stages for step in stage.steps
+            ]
+            operations, _ = self._patcher_ops_and_crash_count(name)
+            # One cycle (_SPEED_FLIP_51T_REBOOT_CYCLES): flip to 100G, revert.
+            self.assertEqual(operations, [(100, True), (100, False)], name)
+            reboots = [
+                step
+                for step in steps
+                if step.name == taac_types.StepName.SYSTEM_REBOOT_STEP
+            ]
+            # One reboot after the flip and one after the revert.
+            self.assertEqual(len(reboots), 2, name)
+            for step in reboots:
+                self.assertEqual(
+                    json.loads(step.input_json or "{}")["trigger"], int(trigger), name
+                )
+            # Each reboot leaves the device drained, so each is undrained.
+            undrains = [
+                step
+                for step in steps
+                if step.name == taac_types.StepName.DRAIN_UNDRAIN_STEP
+            ]
+            self.assertEqual(len(undrains), 2, name)
+            # Undrain on-box: the NDS path is rejected by the drainer service.
+            for step in undrains:
+                self.assertEqual(
+                    json.loads(step.input_json or "{}")["drain_handler"],
+                    int(taac_types.DrainHandler.LOCAL_DRAINER),
+                    name,
+                )
+            # The agent must be up before the on-box undrain (it needs
+            # /dev/shm/fboss), so every reboot is followed by agent
+            # convergence and then the undrain.
+            step_names = [step.name for step in steps]
+            for index, step_name in enumerate(step_names):
+                if step_name == taac_types.StepName.SYSTEM_REBOOT_STEP:
+                    self.assertEqual(
+                        step_names[index + 1 : index + 3],
+                        [
+                            taac_types.StepName.SERVICE_CONVERGENCE_STEP,
+                            taac_types.StepName.DRAIN_UNDRAIN_STEP,
+                        ],
+                        name,
+                    )
+                    self.assertEqual(
+                        json.loads(steps[index + 1].input_json or "{}")["timeout"],
+                        900,
+                        name,
+                    )
+
+    def test_disruptive_cases_skip_ixia_port_fault_postcheck(self) -> None:
+        # A cold boot or reboot takes the IXIA-facing port down, so IXIA
+        # always records faults; traffic is still judged by packet loss.
+        playbooks_by_name = {p.name: p for p in self.test_config.playbooks}
+        for name in _DISRUPTIVE_FLIP_PLAYBOOK_NAMES:
+            postcheck_names = {
+                check.name for check in playbooks_by_name[name].postchecks or []
+            }
+            self.assertNotIn(
+                hc_types.CheckName.IXIA_PORT_STATS_CHECK, postcheck_names, name
+            )
+            self.assertIn(
+                hc_types.CheckName.IXIA_PACKET_LOSS_CHECK, postcheck_names, name
+            )
 
     def test_utp_cases_check_traffic_loss_once_after_the_last_cycle(self) -> None:
         playbooks_by_name = {p.name: p for p in self.test_config.playbooks}
@@ -723,8 +834,13 @@ class SpeedFlip51TTestConfigTest(unittest.TestCase):
             self.assertTrue(
                 expected.issubset({check.name for check in playbook.prechecks or []})
             )
+            expected_post = (
+                expected_postchecks - {hc_types.CheckName.IXIA_PORT_STATS_CHECK}
+                if playbook.name in _DISRUPTIVE_FLIP_PLAYBOOK_NAMES
+                else expected_postchecks
+            )
             self.assertTrue(
-                expected_postchecks.issubset(
+                expected_post.issubset(
                     {check.name for check in playbook.postchecks or []}
                 )
             )

@@ -176,26 +176,64 @@ def coop_crash_warmboot_stages(
     ]
 
 
+def agent_coldboot_stages(
+    health_check_params: t.Dict[str, t.Any],
+) -> t.List[Stage]:
+    """Build the agent cold boot trigger and speed-validation stage.
+
+    Restarts the agent with the cold-boot marker (the hardware is
+    reprogrammed from scratch), waits for it to converge, settles and
+    validates the ports are still at the expected speed.
+    """
+    return [
+        create_steps_stage(
+            steps=[
+                create_service_interruption_step(
+                    service=taac_types.Service.AGENT,
+                    trigger=taac_types.ServiceInterruptionTrigger.SYSTEMCTL_RESTART,
+                    create_cold_boot_file=True,
+                ),
+                create_service_convergence_step(
+                    services=[taac_types.Service.AGENT],
+                ),
+                create_longevity_step(duration=180),
+                get_validation_step(health_check_params),
+            ]
+        )
+    ]
+
+
+_SPEED_FLIP_REBOOT_AGENT_CONVERGENCE_TIMEOUT_S = 900
+
+
 def _reboot_undrain_stages(
     health_check_params: t.Dict[str, t.Any],
     trigger: taac_types.SystemRebootTrigger,
 ) -> t.List[Stage]:
     """Trigger stages that validate a speed flip across a system reboot.
 
-    Reboots the device (microserver-only or full BMC power reset), then
-    undrains it (a reboot leaves the device drained), waits for agent
-    convergence, settles, and validates the flipped ports are at the target
-    speed. Used as a ``trigger_stage_builder`` override on SpeedFlipPlaybook in
-    place of the default agent-restart-based ``service_event_stages``.
+    Reboots the device (microserver-only or full BMC power reset), waits for
+    agent convergence, undrains it (a reboot leaves the device drained),
+    settles, and validates the flipped ports are at the target speed. Used as
+    a ``trigger_stage_builder`` override on SpeedFlipPlaybook in place of the
+    default agent-restart-based ``service_event_stages``.
     """
     return [
         create_steps_stage(
             steps=[
                 create_system_reboot_step(trigger=trigger),
-                # A reboot leaves the device drained; undrain before validating.
-                create_drain_undrain_step(drain=False),
+                # The local drainer needs the FBOSS services up (it writes
+                # /dev/shm/fboss), so wait for the agent before undraining.
                 create_service_convergence_step(
                     services=[taac_types.Service.AGENT],
+                    timeout=_SPEED_FLIP_REBOOT_AGENT_CONVERGENCE_TIMEOUT_S,
+                ),
+                # A reboot leaves the device drained; undrain before validating.
+                # Undrain on-box: the default NDS path sends force_undrain
+                # without a mode, which the drainer service now rejects.
+                create_drain_undrain_step(
+                    drain=False,
+                    drain_handler=taac_types.DrainHandler.LOCAL_DRAINER,
                 ),
                 # Settle: convergence can complete before traffic fully restores.
                 create_longevity_step(duration=300),
@@ -966,6 +1004,17 @@ def _speed_flip_postchecks() -> t.List[taac_types.PointInTimeHealthCheck]:
     ]
 
 
+def _speed_flip_disruptive_postchecks() -> t.List[taac_types.PointInTimeHealthCheck]:
+    # Same as _speed_flip_postchecks() minus IXIA port stats: a cold boot or
+    # reboot takes the IXIA-facing port down too, so IXIA always records
+    # local/remote faults. The packet loss check still validates traffic.
+    return [
+        check
+        for check in _speed_flip_postchecks()
+        if check.name != hc_types.CheckName.IXIA_PORT_STATS_CHECK
+    ]
+
+
 def _single_cage_health_check_params(speed_in_gbps: int) -> t.Dict[str, t.Any]:
     return {
         hostname: {
@@ -1213,6 +1262,12 @@ _REDUCED_CASES_WITH_BGP_WAIT = {
 # Flip cycles for the reduced cases in _REDUCED_CASES_WITH_BGP_WAIT.
 _SPEED_FLIP_51T_REDUCED_CYCLES = 3
 
+# Flip cycles for SPDF_037 (speed flip + agent cold boot). The UTP asks for 5.
+_SPEED_FLIP_51T_COLDBOOT_CYCLES = 3
+
+# Flip cycles for SPDF_039/040 (speed flip + microserver / BMC reboot).
+_SPEED_FLIP_51T_REBOOT_CYCLES = 1
+
 
 def _wait_for_bgp_convergence_stage() -> Stage:
     """Wait until bgpd on both devices reports initialization converged.
@@ -1428,6 +1483,56 @@ def _build_51t_single_cage_two_port_test_config() -> TestConfig:
         )
         for case in _REDUCED_SPEED_FLIP_CASES
     )
+    # SPDF_037/039/040: the SPDF_001 flip (200G -> 100G -> 200G on both
+    # ports), with a disruptive event after each speed change and after the
+    # revert: SPDF_037 agent cold boot, SPDF_039 microserver reboot, SPDF_040
+    # BMC power reset. The reboots undrain the device afterwards. Speed
+    # patchers are registered persistent, so the flipped speed must survive
+    # the event. BGP convergence is awaited once, after the last cycle.
+    for name, trigger_stages, cycles in [
+        (
+            "SPEED_FLIP_51T_SPD_037_100G_TO_200G_COLDBOOT",
+            agent_coldboot_stages,
+            _SPEED_FLIP_51T_COLDBOOT_CYCLES,
+        ),
+        (
+            "SPEED_FLIP_51T_SPD_039_100G_TO_200G_MICROSERVER_REBOOT",
+            microserver_reboot_undrain_stages,
+            _SPEED_FLIP_51T_REBOOT_CYCLES,
+        ),
+        (
+            "SPEED_FLIP_51T_SPD_040_100G_TO_200G_BMC_REBOOT",
+            bmc_reboot_undrain_stages,
+            _SPEED_FLIP_51T_REBOOT_CYCLES,
+        ),
+    ]:
+        playbooks.append(
+            _repeat_flip_cycles(
+                create_speed_flip_test_config_playbook(
+                    built_playbook=create_bidirectional_speed_flip_playbook(
+                        name=name,
+                        endpoints=_SPEED_FLIP_51T_SINGLE_CAGE_ENDPOINTS,
+                        target_speed_in_gbps=100,
+                        baseline_health_check_params=baseline_health_check_params,
+                        target_health_check_params=target_health_check_params,
+                        patcher_name=f"change_speed_test_100_{name.lower()}",
+                        target_port_cage_count=1,
+                        target_trigger_stages=trigger_stages(
+                            target_health_check_params
+                        ),
+                        baseline_trigger_stages=trigger_stages(
+                            baseline_health_check_params
+                        ),
+                        prechecks=_speed_flip_prechecks(),
+                        postchecks=_speed_flip_disruptive_postchecks(),
+                        traffic_items_to_start=[_SPEED_FLIP_51T_TRAFFIC_ITEM],
+                    ),
+                    snapshot_checks=snapshot_checks,
+                ),
+                cycles,
+                final_stages=[_wait_for_bgp_convergence_stage()],
+            )
+        )
     return TestConfig(
         name="SPEED_FLIP_51T_SINGLE_CAGE_TWO_PORT_TEST_CONFIG",
         basset_pool="dne.test",

@@ -362,6 +362,46 @@ class OssCustomStep(StepBase[taac_types.CustomStepInput]):
                 "unclassified from this run"
             )
 
+    async def fpf_set_interface_admin(self, params: t.Dict[str, t.Any]) -> None:
+        """Set the admin state of ports on the live agent (thrift setPortState)."""
+        interfaces = list(params["interfaces"])
+        enable = bool(params["is_enable"])
+        action = "enable" if enable else "disable"
+        try:
+            present = set(await self.driver.async_get_all_interfaces_admin_status())
+            missing = [i for i in interfaces if i not in present]
+            if missing and not params.get("skip_missing"):
+                raise TestCaseFailure(
+                    f"oss-custom-step: {self.hostname} has no port "
+                    f"{missing} to {action}"
+                )
+            if missing:
+                self.logger.warning(
+                    f"oss-custom-step: {self.hostname} has no port {missing}; "
+                    f"skipping its admin {action}"
+                )
+            targets = [i for i in interfaces if i in present]
+            if targets:
+                # pyre-fixme[16]
+                await self.driver.async_thrift_disable_enable_interfaces(
+                    interface_names=targets, is_enable_port=enable
+                )
+        except Exception as e:
+            if not params.get("best_effort"):
+                raise
+            self.logger.error(
+                f"oss-custom-step: admin {action} of {interfaces} failed ({e}); "
+                "continuing cleanup (best_effort)"
+            )
+            return
+        if targets and enable and params.get("record_event_time", True):
+            try:
+                from taac.libs.fpf.fpf_collector_registry import set_recovery_start_time
+            except ImportError:
+                # The FPF collectors need Meta-internal modules; OSS has none to anchor.
+                return
+            set_recovery_start_time(time.time())
+
 
 _HANDLERS: t.Dict[str, t.Callable[..., t.Awaitable[None]]] = {
     "register_cpu_queue_static_route_patcher": (
@@ -371,4 +411,5 @@ _HANDLERS: t.Dict[str, t.Callable[..., t.Awaitable[None]]] = {
     "verify_interface_mtu": OssCustomStep.verify_interface_mtu,
     "dump_traffic_item_stats": OssCustomStep.dump_traffic_item_stats,
     "fpf_rapid_flap_lldp": OssCustomStep.fpf_rapid_flap_lldp,
+    "fpf_set_interface_admin": OssCustomStep.fpf_set_interface_admin,
 }

@@ -2238,6 +2238,18 @@ class FbossSwitch(AbstractSwitch):
         sleep_time=2,
         exceptions=(Exception,),
     )
+    async def async_get_prefilter_received_networks(
+        self, peer: str
+    ) -> t.Mapping[TIpPrefix, TBgpPath]:
+        """Return routes received from a peer before ingress policy."""
+        async with await self._get_bgp_client() as bgp_client:
+            return await bgp_client.getPrefilterReceivedNetworks(peer)
+
+    @async_retryable(
+        retries=30,
+        sleep_time=2,
+        exceptions=(Exception,),
+    )
     async def async_get_postfilter_advertised_networks(
         self, peer: str
     ) -> t.Mapping[TIpPrefix, TBgpPath]:

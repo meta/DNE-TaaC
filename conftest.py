@@ -79,6 +79,8 @@ _NON_OSS_TEST_FILES = [
 _OSS_READY_TEST_FILES = [
     "taac/health_checks/device_health_checks/test_bgp_rib_fib_consistency_health_check.py",
     "taac/health_checks/tests/test_common_utils.py",
+    # Pure unit test: TaacIxia via a patched __init__, restpy objects mocked.
+    "taac/ixia/tests/test_port_stats_packet_loss.py",
     "taac/health_checks/tests/test_convergence_observer.py",
     "taac/tasks/tests/test_oss_gating.py",
     "taac/health_checks/snapshot_health_checks/test_cpu_queue_failure_window.py",

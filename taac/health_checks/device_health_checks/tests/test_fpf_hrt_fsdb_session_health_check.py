@@ -1,6 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-# pyre-unsafe
 """Unit tests for FpfHrtFsdbSessionHealthCheck."""
 
 import unittest
@@ -83,22 +82,22 @@ class TestFpfHrtFsdbSessionHealthCheck(unittest.IsolatedAsyncioTestCase):
         "neteng.test_infra.dne.taac.health_checks.device_health_checks"
         ".fpf_hrt_fsdb_session_health_check.get_hrt_client"
     )
-    async def test_connection_failure_returns_skip(self, mock_get_hrt_client):
-        """Failure to connect to HRT should return SKIP."""
+    async def test_connection_failure_returns_fail(self, mock_get_hrt_client):
+        """A required HRT host that cannot be reached must fail closed."""
         mock_get_hrt_client.side_effect = Exception("Connection refused")
 
         input_data = hc_types.BaseHealthCheckIn()
         result = await self.health_check._run(self.device, input_data, CHECK_PARAMS)
 
-        self.assertEqual(result.status, hc_types.HealthCheckStatus.SKIP)
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
         self.assertIn("Failed to connect to HRT", result.message)
 
     @patch(
         "neteng.test_infra.dne.taac.health_checks.device_health_checks"
         ".fpf_hrt_fsdb_session_health_check.get_hrt_client"
     )
-    async def test_get_sessions_failure_returns_skip(self, mock_get_hrt_client):
-        """Failure during getFsdbSessions should return SKIP."""
+    async def test_get_sessions_failure_returns_fail(self, mock_get_hrt_client):
+        """A required HRT host with an unreadable session table must fail closed."""
         mock_client = AsyncMock()
         mock_client.getFsdbSessions.side_effect = Exception("RPC timeout")
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -108,7 +107,7 @@ class TestFpfHrtFsdbSessionHealthCheck(unittest.IsolatedAsyncioTestCase):
         input_data = hc_types.BaseHealthCheckIn()
         result = await self.health_check._run(self.device, input_data, CHECK_PARAMS)
 
-        self.assertEqual(result.status, hc_types.HealthCheckStatus.SKIP)
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
         self.assertIn("Failed to get FSDB sessions", result.message)
 
     @patch(

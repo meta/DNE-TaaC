@@ -1,7 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-# pyre-unsafe
-
 import typing as t
 
 from taac.constants import TestDevice
@@ -268,7 +266,7 @@ class FpfHrtFsdbSessionHealthCheck(
             self.logger.warning(f"Failed to connect to HRT on {hostname}: {e}")
             return (
                 hc_types.HealthCheckResult(
-                    status=hc_types.HealthCheckStatus.SKIP,
+                    status=hc_types.HealthCheckStatus.FAIL,
                     message=f"Failed to connect to HRT on {hostname}: {e}",
                 ),
                 set(),
@@ -283,7 +281,7 @@ class FpfHrtFsdbSessionHealthCheck(
             )
             return (
                 hc_types.HealthCheckResult(
-                    status=hc_types.HealthCheckStatus.SKIP,
+                    status=hc_types.HealthCheckStatus.FAIL,
                     message=f"Failed to get FSDB sessions from HRT on {hostname}: {e}",
                 ),
                 set(),

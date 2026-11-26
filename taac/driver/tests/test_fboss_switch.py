@@ -296,9 +296,9 @@ class FbossSwitchTest(TestCase):
         ):
             await switch.async_crash_service(FbossSystemctlServiceName.AGENT)
 
-        run_cmd_mock.assert_awaited_once_with(
-            "pkill -9 -x fboss_sw_agent; pkill -9 -x fboss_hw_agent"
-        )
+        command = run_cmd_mock.await_args.args[0]
+        self.assertIn("pgrep -f '^/opt/fboss/bin/fboss_sw_agent( |$)'", command)
+        self.assertIn("pgrep -f '^/opt/fboss/bin/fboss_hw_agent[^ ]*( |$)'", command)
 
     async def test_wait_for_agent_configured_checks_deadline_boundary(self) -> None:
         self.switch.async_is_agent_configured = AsyncMock(side_effect=[False, True])

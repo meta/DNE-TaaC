@@ -39,6 +39,15 @@ class PortStateHealthCheck(AbstractDeviceHealthCheck[hc_types.BaseHealthCheckIn]
                 disabled_interface_names.add(disabled_interface.interface_name)
             if disabled_interface.neighbor_switch_name == obj.name:
                 disabled_interface_names.add(disabled_interface.neighbor_interface_name)
+        # An entry that names only one end: this device's end of that link, as the
+        # topology knows it, is down too.
+        for interface in obj.interfaces:
+            if any(
+                d.switch_name == interface.neighbor_switch_name
+                and d.interface_name == interface.neighbor_interface_name
+                for d in disabled_interfaces
+            ):
+                disabled_interface_names.add(interface.interface_name)
         enabled_interface_names = [
             interface.interface_name
             for interface in obj.interfaces

@@ -76,7 +76,7 @@ class PortSpeedHealtchCheck(
 
         for port, pre_speed in pre_snapshot_data.items():
             post_speed = post_snapshot_data.get(port, None)
-            if not post_speed:
+            if post_speed is None:
                 issues.append(f"Port {port} not found in post snapshot")
             elif pre_speed != post_speed:
                 issues.append(

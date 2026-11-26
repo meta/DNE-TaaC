@@ -1,10 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 # pyre-unsafe
+import gzip
+import subprocess
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from neteng.netcastle.logger import ConsoleFileLogger
+from taac.utils.oss_taac_lib_utils import ConsoleFileLogger
 from taac.constants import TestDevice
 from taac.health_checks.device_health_checks.route_convergence_time_health_check import (
     RouteConvergenceMetrics,
@@ -13,14 +18,22 @@ from taac.health_checks.device_health_checks.route_convergence_time_health_check
 from taac.health_check.health_check import types as hc_types
 
 
+# Internal and OSS trees import this module under different package roots.
+_MODULE = RouteConvergenceTimeHealthCheck.__module__
+
+
 class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.logger = MagicMock(spec=ConsoleFileLogger)
         self.mock_ixia = MagicMock()
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.return_value = [
+            ("2001:db8::b", "up")
+        ]
         self.health_check = RouteConvergenceTimeHealthCheck(
             logger=self.logger, ixia=self.mock_ixia
         )
+        self.health_check._SESSION_POLL_INTERVAL_S = 0
         self.health_check.driver = AsyncMock()
         self.health_check.driver.async_get_log_source_command = AsyncMock(
             side_effect=lambda path, **_kwargs: f"zcat -f {path}"
@@ -30,6 +43,318 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
         self.device.name = "rtsw002.l1003.c084.ash6"
 
         self.health_check_input = hc_types.BaseHealthCheckIn()
+
+    async def test_resolve_default_log_file_oss(self):
+        self.health_check.driver.async_run_cmd_on_shell.return_value = (
+            "/var/facebook/logs/fboss/fboss_sw_agent.log\n"
+        )
+        path = await self.health_check._resolve_log_file(None)
+        self.assertEqual(path, "/var/facebook/logs/fboss/fboss_sw_agent.log")
+        command = self.health_check.driver.async_run_cmd_on_shell.call_args.args[0]
+        self.assertIn("test -r", command)
+        self.assertIn("/var/facebook/logs/wedge_agent.log", command)
+        self.assertIn(path, command)
+
+    async def test_resolve_default_log_file_fboss_dir_legacy_name(self):
+        self.health_check.driver.async_run_cmd_on_shell.return_value = (
+            "/var/facebook/logs/fboss/wedge_agent.log\n"
+        )
+        path = await self.health_check._resolve_log_file(None)
+        self.assertEqual(path, "/var/facebook/logs/fboss/wedge_agent.log")
+        command = self.health_check.driver.async_run_cmd_on_shell.call_args.args[0]
+        self.assertIn(path, command)
+
+    async def test_resolve_explicit_log_file(self):
+        self.assertEqual(
+            await self.health_check._resolve_log_file("/custom/agent.log"),
+            "/custom/agent.log",
+        )
+        self.health_check.driver.async_run_cmd_on_shell.assert_not_called()
+
+    async def test_missing_default_log_fails_before_toggling(self):
+        self.health_check.driver.async_run_cmd_on_shell.return_value = ""
+        result = await self.health_check._run(
+            self.device,
+            self.health_check_input,
+            {"network_group_regex": ".*CONTIGUOUS.*"},
+        )
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.ERROR)
+        self.assertIn("readable agent log", result.message)
+        self.mock_ixia.activate_deactivate_bgp_prefix.assert_not_called()
+
+    async def test_find_oss_archive_logs(self):
+        archive = "/var/facebook/logs/fboss/archive/fboss_sw_agent.log-202609161235.gz"
+        self.health_check.driver.async_run_cmd_on_shell.return_value = archive
+        live = "/var/facebook/logs/fboss/fboss_sw_agent.log"
+        self.assertEqual(
+            await self.health_check._find_log_files("202609161234", live),
+            [archive, live],
+        )
+        command = self.health_check.driver.async_run_cmd_on_shell.call_args.args[0]
+        self.assertIn("fboss_sw_agent.log-* ", command)
+
+    async def test_find_oss_archive_logs_includes_zst(self):
+        archive_dir = "/var/facebook/logs/fboss/archive"
+        gz = f"{archive_dir}/fboss_sw_agent.log-202601021235.gz"
+        zst = f"{archive_dir}/fboss_sw_agent.log-202601021236.zst"
+        snapshot = f"{archive_dir}/fboss_sw_agent.log-202601021237.tmp"
+        self.health_check.driver.async_run_cmd_on_shell.return_value = (
+            f"{zst}\n{snapshot}\n{gz}"
+        )
+        live = "/var/facebook/logs/fboss/fboss_sw_agent.log"
+        self.assertEqual(
+            await self.health_check._find_log_files("202601021234", live),
+            [gz, zst, live],
+        )
+
+    async def test_real_log_parser_filters_operation_date_and_fraction(self):
+        cases = [
+            ("202609162359 23:59:58.500000", [
+                ("0915", "23:59:59.000000", 900),
+                ("0916", "23:59:58.400000", 900),
+                ("0916", "23:59:59.000000", 100),
+                ("0917", "00:00:01.000000", 200),
+            ]),
+            ("202609161430 14:30:00.500000", [
+                ("0915", "14:30:01.000000", 900),
+                ("0916", "14:30:00.400000", 900),
+                ("0916", "14:30:01.000000", 100),
+                ("0916", "14:30:03.000000", 200),
+            ]),
+            ("202612312359 23:59:58.500000", [
+                ("1230", "23:59:59.000000", 900),
+                ("1231", "23:59:58.400000", 900),
+                ("1231", "23:59:59.000000", 100),
+                ("0101", "00:00:01.000000", 200),
+            ]),
+        ]
+        for operation in ["ADD", "DELETE"]:
+            for captured_start, records in cases:
+                with (
+                    self.subTest(operation=operation, start=captured_start),
+                    tempfile.NamedTemporaryFile(mode="w") as log,
+                ):
+                    for day, clock, count in records:
+                        added, deleted = (count, 0) if operation == "ADD" else (0, count)
+                        log.write(
+                            f"V{day} {clock} 123 RouteUpdateWrapper.cpp:139] "
+                            f" Routes added: {added} Routes deleted: {deleted} "
+                            "Duration 0 us \n"
+                        )
+                    log.flush()
+
+                    async def run_command(command):
+                        if command.startswith("date "):
+                            return captured_start
+                        if command.startswith("ls "):
+                            return ""
+                        return subprocess.run(
+                            command, shell=True, check=True,
+                            capture_output=True, text=True,
+                        ).stdout
+
+                    self.health_check.driver.async_run_cmd_on_shell.side_effect = run_command
+                    result = await self.health_check._run_single_operation(
+                        operation_type=operation,
+                        network_group_regex=".*CONTIGUOUS.*",
+                        time_threshold=35,
+                        wait_time_seconds=0,
+                        log_file=log.name,
+                        start_time_file="/tmp/toggle_start_time",
+                        iteration=1,
+                    )
+                    self.assertTrue(result["passed"])
+                    self.assertEqual(result["routes"], 300)
+                    self.assertAlmostEqual(result["time"], 2.5)
+
+    async def test_midnight_rotation_preserves_threshold_failure(self):
+        for operation in ["ADD", "DELETE"]:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                live = Path(directory) / "fboss_sw_agent.log"
+                archive = Path(directory) / "fboss_sw_agent.log-202609170000.gz"
+                added, deleted = (100, 0) if operation == "ADD" else (0, 100)
+                message = (
+                    " 123 RouteUpdateWrapper.cpp:139] "
+                    f" Routes added: {added} Routes deleted: {deleted} Duration 0 us \n"
+                )
+                with gzip.open(archive, "wt") as log:
+                    log.write("V0916 23:59:50.000000" + message)
+                live.write_text("V0917 00:00:40.000000" + message)
+
+                async def run_command(command):
+                    if command.startswith("date "):
+                        return "202609162359 23:59:49.000000"
+                    if command.startswith("ls "):
+                        return str(archive)
+                    return subprocess.run(
+                        command, shell=True, check=True, capture_output=True, text=True
+                    ).stdout
+
+                self.health_check.driver.async_run_cmd_on_shell.side_effect = run_command
+                result = await self.health_check._run_single_operation(
+                    operation_type=operation,
+                    network_group_regex=".*CONTIGUOUS.*",
+                    time_threshold=35,
+                    wait_time_seconds=0,
+                    log_file=str(live),
+                    start_time_file="/tmp/toggle_start_time",
+                    iteration=1,
+                    archive_dir=directory,
+                )
+                self.assertFalse(result["passed"])
+                self.assertEqual(result["routes"], 200)
+                self.assertAlmostEqual(result["time"], 51.0)
+                self.assertIn("> 35s", result["message"])
+
+    async def test_programming_failures_prevent_partial_route_pass(self):
+        batch = (
+            "V0916 14:01:32.702458 270970 RouteUpdateWrapper.cpp:139] "
+            " Routes added: 45109 Routes deleted: 0 Duration 0 us \n"
+        )
+        failure = (
+            "V0916 14:01:33.341749 270970 ThriftHandler.cpp:900] "
+            '[0x7fae800045b0] addUnicastRoutes thrift request failed in 563ms. '
+            'params: clientName="BGPD",\n'
+        )
+        cases = [
+            ("captured_partial_add", batch, failure, True, "ADD", False),
+            ("sync_failure", batch, failure.replace("addUnicastRoutes", "syncFib"),
+             True, "ADD", False),
+            ("delete_failure_without_batches", "",
+             failure.replace("addUnicastRoutes", "deleteUnicastRoutes"),
+             True, "DELETE", False),
+            ("archive_failure", batch, failure, True, "ADD", True),
+            ("later_success_does_not_erase_failure", batch,
+             failure + failure.replace("failed", "succeeded"), True, "ADD", False),
+            ("other_client", batch, failure.replace('"BGPD"', '"OPENR"'),
+             False, "ADD", False),
+            ("unrelated_rpc", batch, failure.replace("addUnicastRoutes", "getRouteTable"),
+             False, "ADD", False),
+            ("nested_rpc_not_double_counted", batch,
+             failure.replace("addUnicastRoutes", "addUnicastRoutesInVrf"),
+             False, "ADD", False),
+            ("previous_day", batch, failure.replace("V0916", "V0915"),
+             False, "ADD", False),
+            ("before_capture_same_second", batch,
+             failure.replace("14:01:33.341749", "14:01:29.844286"),
+             False, "ADD", False),
+        ]
+        for name, batches, events, rejected, operation, archived in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                live = Path(directory) / "fboss_sw_agent.log"
+                archive = Path(directory) / "fboss_sw_agent.log-202609161402.gz"
+                live.write_text(batches + ("" if archived else events))
+                if archived:
+                    with gzip.open(archive, "wt") as log:
+                        log.write(events)
+
+                async def run_command(command):
+                    if command.startswith("date "):
+                        return "202609161401 14:01:29.844287"
+                    if command.startswith("ls "):
+                        return str(archive) if archived else ""
+                    return subprocess.run(
+                        command, shell=True, check=True, capture_output=True, text=True
+                    ).stdout
+
+                self.health_check.driver.async_run_cmd_on_shell.side_effect = run_command
+                result = await self.health_check._run_single_operation(
+                    operation_type=operation,
+                    network_group_regex=".*CONTIGUOUS.*",
+                    time_threshold=60,
+                    wait_time_seconds=0,
+                    log_file=str(live),
+                    start_time_file="/tmp/toggle_start_time",
+                    iteration=1,
+                    archive_dir=directory,
+                )
+                self.assertEqual(result["passed"], not rejected)
+                if rejected:
+                    self.assertIn("BGPD route programming failed", result["message"])
+                    self.assertIn("14:01:33.341749", result["message"])
+                else:
+                    self.assertEqual(result["routes"], 45109)
+
+    async def test_captured_rsw_route_batches(self):
+        # A short sample: it checks parsing, not a full toggle window.
+        captured = (
+            "V0916 09:00:11.993492 110473 RouteUpdateWrapper.cpp:139]"
+            "  Routes added: 500 Routes deleted: 0 Duration 0 us \n"
+            "V0916 09:00:13.110069 110473 RouteUpdateWrapper.cpp:139]"
+            "  Routes added: 1000 Routes deleted: 0 Duration 0 us \n"
+            "V0916 09:00:14.082492 110473 RouteUpdateWrapper.cpp:139]"
+            "  Routes added: 0 Routes deleted: 1000 Duration 0 us \n"
+            "V0916 09:00:26.948840 110473 RouteUpdateWrapper.cpp:139]"
+            "  Routes added: 500 Routes deleted: 0 Duration 0 us \n"
+            "V0916 09:00:27.985219 110473 RouteUpdateWrapper.cpp:139]"
+            "  Routes added: 500 Routes deleted: 0 Duration 0 us \n"
+            "V0916 09:00:29.121992 110473 RouteUpdateWrapper.cpp:139]"
+            "  Routes added: 1000 Routes deleted: 0 Duration 0 us \n"
+            "V0916 09:00:30.184435 110473 RouteUpdateWrapper.cpp:139]"
+            "  Routes added: 557 Routes deleted: 0 Duration 0 us \n"
+            "V0916 09:00:42.007332 110473 RouteUpdateWrapper.cpp:139]"
+            "  Routes added: 500 Routes deleted: 0 Duration 0 us \n"
+        )
+        with tempfile.NamedTemporaryFile(mode="w") as log:
+            log.write(captured)
+            log.flush()
+
+            async def run_command(command):
+                return subprocess.run(
+                    command, shell=True, check=True, capture_output=True, text=True
+                ).stdout
+
+            self.health_check.driver.async_run_cmd_on_shell.side_effect = run_command
+            metrics = await self.health_check._get_route_convergence_metrics(
+                log_files=[log.name],
+                operation_type="ADD",
+                start_time_str="09:00:00",
+                time_threshold=35,
+            )
+            self.assertIsNotNone(metrics)
+            self.assertEqual(metrics.total_routes_added, 4557)
+            self.assertEqual(metrics.total_routes_deleted, 1000)
+            self.assertEqual(metrics.num_batches, 7)
+            self.assertAlmostEqual(metrics.total_state_update_time_sec, 30.013840)
+
+    async def test_real_log_parser_preserves_threshold_failure(self):
+        # Uses the real printStats line format, with durations.
+        for operation, counts in [("ADD", (100, 0)), ("DELETE", (0, 100))]:
+            with (
+                self.subTest(operation=operation),
+                tempfile.NamedTemporaryFile(mode="w") as log,
+            ):
+                for ts in ["14:30:01.000000", "14:30:41.500000"]:
+                    log.write(
+                        f"I0916 {ts} 123 RouteUpdateWrapper.cpp:139] "
+                        f" Routes added: {counts[0]} Routes deleted: {counts[1]} "
+                        "Duration 1000 us \n"
+                    )
+                log.flush()
+
+                async def run_command(command):
+                    if command.startswith("date "):
+                        return "202609161430 14:30:00.000000"
+                    if command.startswith("ls "):
+                        return ""
+                    return subprocess.run(
+                        command, shell=True, check=True, capture_output=True, text=True
+                    ).stdout
+
+                self.health_check.driver.async_run_cmd_on_shell.side_effect = run_command
+                result = await self.health_check._run_single_operation(
+                    operation_type=operation,
+                    network_group_regex=".*CONTIGUOUS.*",
+                    time_threshold=35,
+                    wait_time_seconds=0,
+                    log_file=log.name,
+                    start_time_file="/tmp/toggle_start_time",
+                    iteration=1,
+                )
+                self.assertFalse(result["passed"])
+                self.assertEqual(result["routes"], 200)
+                self.assertAlmostEqual(result["time"], 41.5)
+                self.assertIn("> 35s", result["message"])
 
     # =========================================================================
     # Tests for _parse_start_time_to_hhmmss
@@ -146,6 +471,7 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
         # capture start time (stamp + HH:MM:SS.us) + list archives + awk output
         self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
             side_effect=[
+                "/var/facebook/logs/wedge_agent.log",
                 # Iter 1 DELETE - capture start time
                 "202601011430 14:30:00.000000",
                 # Iter 1 DELETE - list archives (none rotated)
@@ -175,10 +501,120 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
         self.assertIn("PASSED", result.message)
 
+    async def test_run_stops_when_the_ixia_session_is_not_established(self):
+        """A down peer fails once with diagnostics, not once per operation."""
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.return_value = [
+            ("2001:db8::b", "down")
+        ]
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            side_effect=["/var/facebook/logs/wedge_agent.log", "BGP state = Idle"]
+        )
+
+        result = await self.health_check._run(
+            self.device,
+            self.health_check_input,
+            {"network_group_regex": ".*CONTIGUOUS.*", "iterations": 5, "wait_time_seconds": 0},
+        )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("not Established", result.message)
+        self.assertIn("2001:db8::b (down)", result.message)
+        self.assertNotIn("No DELETE operations found", result.message)
+        self.mock_ixia.activate_deactivate_bgp_prefix.assert_not_called()
+        # Polled before giving up, so a session that is mid-flap is not failed.
+        self.assertEqual(
+            self.mock_ixia.get_bgp_session_statuses_for_network_groups.call_count,
+            self.health_check._SESSION_POLLS,
+        )
+        self.assertGreater(self.health_check._SESSION_POLLS, 1)
+        diag = self.health_check.driver.async_run_cmd_on_shell.await_args_list[1].args[0]
+        self.assertIn("timeout 20 fboss2 show bgp neighbors 2001:db8::b", diag)
+        self.assertIn("timeout 20 tail", diag)
+        self.assertIn("timeout 20 journalctl -u bgpd", diag)
+        self.assertTrue(
+            any("BGP state = Idle" in str(c) for c in self.logger.error.call_args_list)
+        )
+
+    async def test_session_reads_run_off_the_event_loop(self):
+        loop_thread = threading.get_ident()
+        threads = []
+
+        def _read(regex):
+            threads.append(threading.get_ident())
+            return [("2001:db8::b", "up")]
+
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.side_effect = _read
+        self.assertIsNone(await self.health_check._bgp_session_not_established(".*X.*"))
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], loop_thread)
+
+    async def test_message_and_diagnostics_name_the_same_peers(self):
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.return_value = [
+            ("2001:db8::c", "down"),
+            ("2001:db8::b", "notStarted"),
+            ("2001:db8::b", "down"),
+        ]
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(return_value="diag")
+
+        message = await self.health_check._bgp_session_not_established(".*X.*")
+
+        self.assertTrue(message.endswith("2001:db8::b (notStarted), 2001:db8::c (down)"), message)
+        diag = self.health_check.driver.async_run_cmd_on_shell.await_args.args[0]
+        self.assertLess(diag.index("neighbors 2001:db8::b"), diag.index("neighbors 2001:db8::c"))
+        self.assertEqual(diag.count("show bgp neighbors"), 2)
+
+    async def test_run_proceeds_when_the_session_comes_up_while_polling(self):
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.side_effect = [
+            [("2001:db8::b", "down")],
+            [("2001:db8::b", "up")],
+        ]
+        self.health_check._run_single_operation = AsyncMock(
+            return_value={"passed": True, "time": 1.0, "routes": 1}
+        )
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            return_value="/var/facebook/logs/wedge_agent.log"
+        )
+
+        result = await self.health_check._run(
+            self.device,
+            self.health_check_input,
+            {"network_group_regex": ".*CONTIGUOUS.*", "iterations": 1, "wait_time_seconds": 0},
+        )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.PASS)
+
+    async def test_session_check_never_leaves_the_groups_withdrawn(self):
+        """Checked before DELETE only, so a failure never lands between a
+        DELETE and its ADD."""
+        self.mock_ixia.get_bgp_session_statuses_for_network_groups.side_effect = [
+            [("2001:db8::b", "up")],
+        ] + [[("2001:db8::b", "down")]] * self.health_check._SESSION_POLLS
+        ops = []
+
+        async def _op(**kwargs):
+            ops.append(kwargs["operation_type"])
+            return {"passed": True, "time": 1.0, "routes": 1}
+
+        self.health_check._run_single_operation = _op
+        self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
+            side_effect=["/var/facebook/logs/wedge_agent.log", "diag"]
+        )
+
+        result = await self.health_check._run(
+            self.device,
+            self.health_check_input,
+            {"network_group_regex": ".*CONTIGUOUS.*", "iterations": 3, "wait_time_seconds": 0},
+        )
+
+        self.assertEqual(result.status, hc_types.HealthCheckStatus.FAIL)
+        self.assertIn("before Iter2-DELETE", result.message)
+        self.assertEqual(ops, ["DELETE", "ADD"])
+
     async def test_run_fails_when_threshold_exceeded(self):
         """Test _run returns FAIL when convergence time exceeds threshold."""
         self.health_check.driver.async_run_cmd_on_shell = AsyncMock(
             side_effect=[
+                "/var/facebook/logs/wedge_agent.log",
                 # Iter 1 DELETE - capture start time
                 "202601011430 14:30:00.000000",
                 # Iter 1 DELETE - list archives (none rotated)
@@ -359,13 +795,11 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "neteng.test_infra.dne.taac.health_checks.device_health_checks."
-                "route_convergence_time_health_check.asyncio.sleep",
+                f"{_MODULE}.asyncio.sleep",
                 new_callable=AsyncMock,
             ),
             patch(
-                "neteng.test_infra.dne.taac.health_checks.device_health_checks."
-                "route_convergence_time_health_check.time.monotonic",
+                f"{_MODULE}.time.monotonic",
                 return_value=0.0,
             ),
         ):
@@ -399,13 +833,11 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "neteng.test_infra.dne.taac.health_checks.device_health_checks."
-                "route_convergence_time_health_check.asyncio.sleep",
+                f"{_MODULE}.asyncio.sleep",
                 new_callable=AsyncMock,
             ),
             patch(
-                "neteng.test_infra.dne.taac.health_checks.device_health_checks."
-                "route_convergence_time_health_check.time.monotonic",
+                f"{_MODULE}.time.monotonic",
                 side_effect=[0.0, 0.0, 11.0],
             ),
         ):
@@ -467,6 +899,7 @@ class TestRouteConvergenceTimeHealthCheck(unittest.IsolatedAsyncioTestCase):
                 "network_group_regex": ".*CONTIGUOUS.*",
                 "iterations": 1,
                 "wait_time_seconds": 0,
+                "log_file": "/var/facebook/logs/wedge_agent.log",
             },
         )
 

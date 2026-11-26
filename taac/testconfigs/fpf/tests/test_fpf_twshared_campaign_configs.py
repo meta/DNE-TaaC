@@ -8,14 +8,19 @@ import importlib
 import json
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, PropertyMock
 
+from taac.libs.fpf import fpf_prod_prefix_map
+from taac.libs.fpf.fpf_host_profiles import (
+    MWG2_TWSHARED_1354_1379,
+)
 from taac.libs.fpf.fpf_stress_checks import (
     DEFAULT_SCALE_RECOVERY_POLL_DURATION_BUDGET_SEC,
 )
 from taac.testconfigs.fpf import (
     fpf_hardening_common,
     fpf_shared_injection_suite,
+    fpf_tc32_downlink_flaps,
     fpf_tc33_gtsw_stsw_links_down,
     fpf_tc35_stsw_undrain_reinject,
     fpf_tc36_stsw_all_connections_down,
@@ -573,6 +578,208 @@ class TestTwsharedCampaignConfigs(unittest.TestCase):
             list(reboot.device_regexes or []),
             [fpf_tc55_gtsw_device_reboot.OBSERVER_GTSWS[0]],
         )
+
+
+class TestNamedHostPairProfile(unittest.TestCase):
+    PROFILE = "mwg2_twshared_1354_1379"
+    SERVER = "twshared1354.03.mwg2"
+    CLIENT = "twshared1379.03.mwg2"
+    PROFILE_ENV = {
+        "TAAC_FPF_HOST_PROFILE": PROFILE,
+        # A selected profile supplies these host-derived values. Empty legacy
+        # overrides must not be required to instantiate the suite.
+        "FPF_GPU_HOSTS": "",
+        "FPF_HRT_DEVICE_IDS": "",
+        "FPF_HRT_LANES": "",
+        "FPF_HRT_VF1_DEVICE_IDS": "",
+        "FPF_HRT_VF2_DEVICE_IDS": "",
+        "TAAC_FPF_IB_DEVICE": "",
+        "TAAC_FPF_LINK_DRAIN_INTERFACE": "",
+    }
+
+    def tearDown(self) -> None:
+        # Leave module globals in their default state for tests that share this
+        # process, regardless of an assertion or import-time failure above.
+        os.environ.pop("TAAC_FPF_HOST_PROFILE", None)
+        for name in self.PROFILE_ENV:
+            if name != "TAAC_FPF_HOST_PROFILE" and os.environ.get(name) == "":
+                os.environ.pop(name, None)
+        importlib.reload(fpf_prod_prefix_map)
+        importlib.reload(fpf_hardening_common)
+        importlib.reload(fpf_shared_injection_suite)
+
+    def test_one_profile_instantiates_new_pair_and_all_host_artifacts(self) -> None:
+        with patch.dict(os.environ, self.PROFILE_ENV, clear=False):
+            importlib.reload(fpf_prod_prefix_map)
+            importlib.reload(fpf_hardening_common)
+            importlib.reload(fpf_tc32_downlink_flaps)
+            for module in MODULES:
+                importlib.reload(module)
+            importlib.reload(fpf_shared_injection_suite)
+
+            self.assertEqual(
+                fpf_hardening_common.HOST_PROFILE_NAME,
+                self.PROFILE,
+            )
+            self.assertEqual(
+                fpf_hardening_common.GPU_HOSTS,
+                [self.SERVER, self.CLIENT],
+            )
+            self.assertEqual(
+                fpf_hardening_common.fpf_link_drain_interface(),
+                "eth1/37/1",
+            )
+            self.assertEqual(
+                fpf_hardening_common.fpf_gpu_downlink_interfaces(),
+                ["eth1/37/1", "eth1/37/2", "eth1/37/3", "eth1/37/4"],
+            )
+            self.assertEqual(
+                fpf_hardening_common.fpf_hrt_device_ids(),
+                list(range(8)),
+            )
+            self.assertEqual(fpf_hardening_common.fpf_hrt_lanes(), [0, 1, 2, 3])
+            self.assertEqual(
+                fpf_hardening_common.fpf_hrt_vf_device_ids(list(range(8))),
+                ([0, 2, 4, 6], [1, 3, 5, 7]),
+            )
+            traffic = fpf_hardening_common.fpf_ib_traffic_config()
+            self.assertEqual(traffic["server"], self.SERVER)
+            self.assertEqual(traffic["clients"], [self.CLIENT])
+            self.assertEqual(traffic["device"], "mlx5_bveth0")
+            self.assertEqual(traffic["gid_iface"], "bveth0")
+            self.assertEqual(traffic["gid_prefix"], "2401")
+
+            self.assertEqual(
+                fpf_prod_prefix_map.get_hrt_device_prefixes(self.SERVER),
+                {
+                    0: "2401:db00:292a:a270::/64",
+                    1: "2401:db00:292a:a570::/64",
+                    2: "2401:db00:292a:a271::/64",
+                    3: "2401:db00:292a:a571::/64",
+                    4: "2401:db00:292a:a272::/64",
+                    5: "2401:db00:292a:a572::/64",
+                    6: "2401:db00:292a:a273::/64",
+                    7: "2401:db00:292a:a573::/64",
+                },
+            )
+            self.assertEqual(
+                fpf_prod_prefix_map.get_hrt_device_prefixes(self.CLIENT),
+                {
+                    0: "2401:db00:292a:a15c::/64",
+                    1: "2401:db00:292a:a45c::/64",
+                    2: "2401:db00:292a:a15d::/64",
+                    3: "2401:db00:292a:a45d::/64",
+                    4: "2401:db00:292a:a15e::/64",
+                    5: "2401:db00:292a:a45e::/64",
+                    6: "2401:db00:292a:a15f::/64",
+                    7: "2401:db00:292a:a45f::/64",
+                },
+            )
+
+            suite = fpf_shared_injection_suite.TEST_CONFIG
+            collector = next(
+                task
+                for task in suite.setup_tasks or []
+                if task.task_name == "fpf_start_collectors"
+            )
+            collector_params = _params(collector)
+            self.assertEqual(collector_params["hosts"], [self.SERVER, self.CLIENT])
+            self.assertEqual(
+                collector_params["hrt_device_ids"],
+                list(range(8)),
+            )
+            self.assertEqual(collector_params["hrt_plane_ids"], [0, 1, 2, 3])
+            self.assertEqual(
+                fpf_shared_injection_suite.PROD_TARGET_PREFIX,
+                "2401:db00:292a:a270::/64",
+            )
+            self.assertEqual(
+                fpf_shared_injection_suite._link_drain_circuits()[0].a_end_interface,
+                "eth1/37/1",
+            )
+
+            tc32_flap = next(
+                step
+                for step in _steps(fpf_tc32_downlink_flaps.TEST_CONFIG.playbooks[0])
+                if _step_params(step).get("custom_step_name") == "fpf_rapid_flap_lldp"
+            )
+            self.assertEqual(
+                _step_params(tc32_flap)["expected_interfaces"],
+                ["eth1/37/1", "eth1/37/2", "eth1/37/3", "eth1/37/4"],
+            )
+            self.assertEqual(_step_params(tc32_flap)["neighbor_hosts"], [self.SERVER])
+
+            tc37_circuit = fpf_tc37_nic_side_link_flap.CIRCUITS[0]
+            self.assertEqual(tc37_circuit.a_end_interface, "eth1/37/1")
+            self.assertEqual(tc37_circuit.z_end_device, self.SERVER)
+
+            tc40_flap = next(
+                step
+                for step in _steps(
+                    fpf_tc40_cont_interface_flaps.TEST_CONFIG.playbooks[0]
+                )
+                if _step_params(step).get("custom_step_name")
+                == "fpf_multi_gtsw_rapid_flap"
+            )
+            tc40_params = _step_params(tc40_flap)
+            self.assertEqual(tc40_params["neighbor_hosts"], [self.SERVER])
+            self.assertEqual(
+                tc40_params["expected_interfaces"],
+                ["eth1/37/1", "eth1/37/2", "eth1/37/3", "eth1/37/4"],
+            )
+            for gtsw in fpf_tc40_cont_interface_flaps.ALL_GTSWS:
+                self.assertEqual(
+                    tc40_params["nic_recovery_by_gtsw_interface"][gtsw]["eth1/37/1"],
+                    {
+                        "host": self.SERVER,
+                        "dev": 0,
+                        "lane": fpf_hardening_common.gtsw_to_lane(gtsw),
+                    },
+                )
+
+    def test_selected_profile_preserves_gpu_ids_and_separates_hrt_ids(self) -> None:
+        with patch.dict(os.environ, self.PROFILE_ENV, clear=False):
+            original = {
+                host: dict(prefixes)
+                for host, prefixes in fpf_prod_prefix_map.HOST_DEVICE_PREFIX.items()
+            }
+            importlib.reload(fpf_prod_prefix_map)
+            self.assertEqual(
+                fpf_prod_prefix_map.get_prefix(self.SERVER, 1),
+                "2401:db00:292a:a271::/64",
+            )
+            self.assertEqual(
+                fpf_prod_prefix_map.get_host_prefixes(self.SERVER),
+                original[self.SERVER],
+            )
+            self.assertEqual(
+                fpf_prod_prefix_map.get_hrt_device_prefixes(self.SERVER)[1],
+                "2401:db00:292a:a570::/64",
+            )
+            self.assertEqual(fpf_prod_prefix_map.HOST_DEVICE_PREFIX, original)
+
+    def test_selected_profile_rejects_conflicting_generated_vf1_prefix(self) -> None:
+        with patch.dict(os.environ, self.PROFILE_ENV, clear=False):
+            with patch.object(
+                type(MWG2_TWSHARED_1354_1379.server),
+                "prefixes_by_device",
+                new_callable=PropertyMock,
+                return_value={
+                    **MWG2_TWSHARED_1354_1379.server.prefixes_by_device,
+                    0: "2401:db00:292a:ffff::/64",
+                },
+            ):
+                with self.assertRaisesRegex(ValueError, "VF1 prefixes disagree"):
+                    fpf_prod_prefix_map.get_host_prefixes(self.SERVER)
+
+    def test_selected_profile_rejects_conflicting_legacy_host_override(self) -> None:
+        env = {
+            **self.PROFILE_ENV,
+            "FPF_GPU_HOSTS": "twshared1352.03.mwg2,twshared1388.03.mwg2",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with self.assertRaisesRegex(ValueError, "conflicts with host profile"):
+                importlib.reload(fpf_hardening_common)
 
 
 if __name__ == "__main__":

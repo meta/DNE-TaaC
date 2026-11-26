@@ -44,6 +44,10 @@ lookups raise a clear KeyError rather than silently returning a wrong value.
 
 import typing as t
 
+from taac.libs.fpf.fpf_host_profiles import (
+    selected_host_pair_profile,
+)
+
 # Default GPU device when a caller does not specify one.
 DEFAULT_DEVICE_ID: int = 0
 
@@ -102,6 +106,38 @@ HOST_DEVICE_PREFIX: t.Dict[str, t.Dict[int, str]] = {
 # === GENERATED:END host-device-prefix ===
 
 
+def _profile_prefixes(host: str) -> tuple[dict[int, str], dict[int, str]] | None:
+    profile = selected_host_pair_profile()
+    if profile is None:
+        return None
+    for profile_host in (profile.server, profile.client):
+        if profile_host.hostname != host:
+            continue
+        hrt_prefixes = profile_host.prefixes_by_device
+        gpu_prefixes = {
+            gpu_id: hrt_prefixes[device_id]
+            for gpu_id, device_id in enumerate(profile.vf1_device_ids)
+        }
+        if any(
+            gpu_prefixes.get(gpu_id) != prefix
+            for gpu_id, prefix in HOST_DEVICE_PREFIX.get(host, {}).items()
+        ):
+            raise ValueError(f"Generated and profiled VF1 prefixes disagree for {host}")
+        return gpu_prefixes, hrt_prefixes
+    return None
+
+
+def get_hrt_device_prefixes(host: str) -> dict[int, str]:
+    """Return paired HRT device prefixes for a host in the selected profile.
+
+    HRT device IDs include both VFs; GPU IDs in ``get_host_prefixes`` select VF1.
+    """
+    prefixes = _profile_prefixes(host)
+    if prefixes is None:
+        raise KeyError(f"No selected HRT host profile for {host!r}")
+    return prefixes[1]
+
+
 def known_hosts() -> t.List[str]:
     """All RTP test hosts present in the map."""
     return sorted(HOST_DEVICE_PREFIX)
@@ -109,6 +145,9 @@ def known_hosts() -> t.List[str]:
 
 def get_host_prefixes(host: str) -> t.Dict[int, str]:
     """Return the {device_id: prefix} mapping for a host (raises if unknown)."""
+    profiled = _profile_prefixes(host)
+    if profiled is not None:
+        return profiled[0]
     try:
         return HOST_DEVICE_PREFIX[host]
     except KeyError:

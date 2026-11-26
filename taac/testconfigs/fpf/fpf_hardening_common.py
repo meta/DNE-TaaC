@@ -13,7 +13,47 @@ import re
 import typing as t
 from dataclasses import dataclass
 
+from taac.libs.fpf.fpf_host_profiles import (
+    FpfHostPairProfile,
+    selected_host_pair_profile,
+)
 from taac.test_as_a_config.types import Endpoint
+
+
+HOST_PROFILE: FpfHostPairProfile | None = selected_host_pair_profile()
+HOST_PROFILE_NAME: str | None = HOST_PROFILE.name if HOST_PROFILE else None
+
+
+def _profile_default(
+    env_name: str,
+    profile_value: str,
+) -> str:
+    """Return a selected-profile value and reject a conflicting old override."""
+    configured = os.environ.get(env_name, "").strip()
+    if configured and configured != profile_value:
+        raise ValueError(
+            f"{env_name}={configured!r} conflicts with host profile "
+            f"{HOST_PROFILE_NAME!r} value {profile_value!r}"
+        )
+    return profile_value
+
+
+def _profile_csv_default(
+    env_name: str,
+    profile_values: t.Iterable[str | int],
+) -> list[str]:
+    expected = [str(value) for value in profile_values]
+    configured = [
+        value.strip()
+        for value in os.environ.get(env_name, "").split(",")
+        if value.strip()
+    ]
+    if configured and configured != expected:
+        raise ValueError(
+            f"{env_name}={configured!r} conflicts with host profile "
+            f"{HOST_PROFILE_NAME!r} value {expected!r}"
+        )
+    return expected
 
 
 def skip_ssh_dependencies() -> bool:
@@ -139,6 +179,8 @@ def fpf_ib_device() -> str:
     Set TAAC_FPF_IB_DEVICE for hosts whose live RDMA device naming differs,
     such as mlx5_bveth0 on the MWG2 twshared test hosts.
     """
+    if HOST_PROFILE is not None:
+        return _profile_default("TAAC_FPF_IB_DEVICE", HOST_PROFILE.ib_device)
     return (
         os.environ.get("TAAC_FPF_IB_DEVICE", DEFAULT_IB_DEVICE).strip()
         or DEFAULT_IB_DEVICE
@@ -181,6 +223,15 @@ def fpf_link_drain_interface(
     """
     hosts = list(GPU_HOSTS if gpu_hosts is None else gpu_hosts)
     configured = os.environ.get("TAAC_FPF_LINK_DRAIN_INTERFACE", "").strip()
+    if HOST_PROFILE is not None and hosts == list(HOST_PROFILE.hosts):
+        expected = HOST_PROFILE.server.gtsw_bundle_first_interface
+        if configured and configured != expected:
+            raise ValueError(
+                "TAAC_FPF_LINK_DRAIN_INTERFACE="
+                f"{configured!r} conflicts with host profile "
+                f"{HOST_PROFILE_NAME!r} value {expected!r}"
+            )
+        return expected
     if not configured:
         if hosts != DEFAULT_GPU_HOSTS:
             raise ValueError(
@@ -280,6 +331,9 @@ def fpf_hrt_lanes() -> list[int]:
     without changing the advertised STSW prefix scale.
     """
     configured = os.environ.get("FPF_HRT_LANES", "").strip()
+    if HOST_PROFILE is not None:
+        values = _profile_csv_default("FPF_HRT_LANES", HOST_PROFILE.hrt_local_planes)
+        return [int(value) for value in values]
     if not configured:
         return list(ALL_LANES)
 
@@ -307,6 +361,13 @@ def _parse_hrt_device_ids(env_name: str, default: list[int]) -> list[int]:
 
 def fpf_hrt_device_ids() -> list[int]:
     """Return HRT device IDs to collect; RTP remains dev0 by default."""
+    if HOST_PROFILE is not None:
+        return [
+            int(value)
+            for value in _profile_csv_default(
+                "FPF_HRT_DEVICE_IDS", HOST_PROFILE.hrt_device_ids
+            )
+        ]
     return _parse_hrt_device_ids("FPF_HRT_DEVICE_IDS", [0])
 
 
@@ -320,6 +381,25 @@ def fpf_hrt_vf_device_ids(hrt_device_ids: list[int]) -> tuple[list[int], list[in
     """
     vf1_configured = os.environ.get("FPF_HRT_VF1_DEVICE_IDS", "").strip()
     vf2_configured = os.environ.get("FPF_HRT_VF2_DEVICE_IDS", "").strip()
+    if HOST_PROFILE is not None:
+        vf1 = [
+            int(value)
+            for value in _profile_csv_default(
+                "FPF_HRT_VF1_DEVICE_IDS", HOST_PROFILE.vf1_device_ids
+            )
+        ]
+        vf2 = [
+            int(value)
+            for value in _profile_csv_default(
+                "FPF_HRT_VF2_DEVICE_IDS", HOST_PROFILE.vf2_device_ids
+            )
+        ]
+        if set(hrt_device_ids) != set(HOST_PROFILE.hrt_device_ids):
+            raise ValueError(
+                f"HRT device IDs {hrt_device_ids} conflict with host profile "
+                f"{HOST_PROFILE_NAME!r}"
+            )
+        return vf1, vf2
     if not vf1_configured and not vf2_configured:
         if hrt_device_ids == [0]:
             return [0], [0]
@@ -476,11 +556,16 @@ def fpf_device_drain_gtsw() -> str:
     return target
 
 
-GPU_HOSTS = [
-    host.strip()
-    for host in os.environ.get("FPF_GPU_HOSTS", ",".join(DEFAULT_GPU_HOSTS)).split(",")
-    if host.strip()
-]
+if HOST_PROFILE is not None:
+    GPU_HOSTS = _profile_csv_default("FPF_GPU_HOSTS", HOST_PROFILE.hosts)
+else:
+    GPU_HOSTS = [
+        host.strip()
+        for host in os.environ.get("FPF_GPU_HOSTS", ",".join(DEFAULT_GPU_HOSTS)).split(
+            ","
+        )
+        if host.strip()
+    ]
 if len(GPU_HOSTS) < 2:
     raise ValueError("FPF_GPU_HOSTS must contain at least two comma-separated hosts")
 if len(set(GPU_HOSTS)) != len(GPU_HOSTS):
@@ -510,8 +595,10 @@ def fpf_ib_traffic_config(*, ib_device: str | None = None) -> FpfIbTrafficConfig
         "clients": list(IB_TRAFFIC_CLIENTS),
         "binary_path": fpf_ib_binary(),
         "device": ib_device if ib_device is not None else fpf_ib_device(),
-        "gid_iface": DEFAULT_IB_GID_IFACE,
-        "gid_prefix": DEFAULT_IB_GID_PREFIX,
+        "gid_iface": (HOST_PROFILE.gid_iface if HOST_PROFILE else DEFAULT_IB_GID_IFACE),
+        "gid_prefix": (
+            HOST_PROFILE.gid_prefix if HOST_PROFILE else DEFAULT_IB_GID_PREFIX
+        ),
         "port": DEFAULT_IB_PORT,
         "msg_size": DEFAULT_IB_MSG_SIZE,
         "qp": DEFAULT_IB_QP,

@@ -344,6 +344,27 @@ fails. This mode still
 contacts both DUTs and requires the tail prefix to be present on R1 as a
 BGPD-owned route; it simply avoids reserving or configuring IXIA.
 
+### Additional device-only suites
+
+The state-audit suite runs reusable read-only Open/R and SRv6 state checks:
+
+```bash
+./scripts/run-rbb-srv6.sh --check --suite state-audit
+./scripts/run-rbb-srv6.sh --suite state-audit
+```
+
+The core-ECMP suite requires at least two declared core port-channels. It
+temporarily selects each path as the unique lowest-cost Open/R path, verifies
+equal-cost next-hop programming, and restores only the metric overrides owned
+by the test:
+
+```bash
+./scripts/run-rbb-srv6.sh --check --suite core-ecmp
+./scripts/run-rbb-srv6.sh --suite core-ecmp
+```
+
+Both suites are device-only and must be run without `--with-traffic`.
+
 ### With live IXIA traffic
 
 Set `TAAC_RBB_IXIA_CHASSIS` (the physical chassis IP) and

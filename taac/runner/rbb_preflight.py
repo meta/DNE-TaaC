@@ -1,9 +1,9 @@
 # pyre-unsafe
 
-"""Preflight checks for the OSS RBB SRv6 runner.
+"""Preflight checks for the standalone RBB SRv6 runner.
 
 This module intentionally uses only the Python standard library and TAAC's
-OSS-safe topology helpers. It runs inside the TAAC image before the test, so
+Topology helpers run inside the TAAC image before the test, so
 adopter mistakes are reported without reserving IXIA ports or contacting a DUT.
 """
 
@@ -41,6 +41,7 @@ _DOCUMENTATION_V4_NETWORKS = tuple(
     for prefix in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
 )
 _DOCUMENTATION_V6_NETWORK = ipaddress.ip_network("2001:db8::/32")
+_RBB_SUITES = frozenset(("base", "state-audit", "core-ecmp"))
 
 
 def _regular_file(path: Path, description: str) -> None:
@@ -239,8 +240,14 @@ def run_preflight(
     with_traffic: bool,
     setup_duts: bool = False,
     setup_dut_edges: bool = False,
+    suite: str = "base",
 ) -> tuple[str, str]:
     """Validate local inputs and return the configured DUT names."""
+
+    if suite not in _RBB_SUITES:
+        raise OSSConfigError(f"Unknown RBB suite {suite!r}")
+    if suite != "base" and with_traffic:
+        raise OSSConfigError(f"--suite {suite} is device-only")
 
     config_dir = config_dir.expanduser().resolve()
     if not config_dir.is_dir():
@@ -327,6 +334,12 @@ def run_preflight(
             allow_placeholder=False,
             require_ixia=with_traffic,
         )
+        if suite == "core-ecmp":
+            from taac.testconfigs.routing.util.bgp_rbb_core_ecmp_profiles import (
+                validate_core_ecmp_topology,
+            )
+
+            validate_core_ecmp_topology(topology)
         if setup_duts or setup_dut_edges:
             from taac.testconfigs.routing.util import (
                 bgp_rbb_constants as C,
@@ -355,11 +368,12 @@ def run_preflight(
 
 
 def _argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Validate an OSS RBB SRv6 lab profile")
+    parser = argparse.ArgumentParser(description="Validate an RBB SRv6 lab profile")
     parser.add_argument("--config-dir", required=True)
     parser.add_argument("--with-traffic", action="store_true")
     parser.add_argument("--setup-duts", action="store_true")
     parser.add_argument("--setup-dut-edges", action="store_true")
+    parser.add_argument("--suite", choices=sorted(_RBB_SUITES), default="base")
     return parser
 
 
@@ -371,6 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             with_traffic=args.with_traffic,
             setup_duts=args.setup_duts,
             setup_dut_edges=args.setup_dut_edges,
+            suite=args.suite,
         )
     except OSSConfigError as exc:
         print(f"Configuration check failed: {exc}", file=sys.stderr)

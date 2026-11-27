@@ -22,7 +22,7 @@ from taac.testconfigs.routing.factories.qual_rbb.rbb_srv6_test_config import (
     _validate_traffic_route_contract,
     create_rbb_srv6_3_usids_test_config,
 )
-from neteng.test_infra.dne.taac.testconfigs.routing.util import bgp_rbb_constants as C
+from taac.testconfigs.routing.util import bgp_rbb_constants as C
 from taac.testconfigs.routing.util.bgp_rbb_scenario_profiles import (
     SRV6_3_USIDS_PROFILE,
     srv6_decap_counter_spec,

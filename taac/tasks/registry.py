@@ -185,6 +185,7 @@ from taac.tasks.periodic_tasks import (
 # RBB SRv6 qualification tasks (see taac/testconfigs/routing/qual_rbb.py).
 from taac.tasks.rbb_dut_bootstrap_task import RbbDutBootstrapTask
 from taac.tasks.rbb_edge_ebgp_task import RbbEdgeEbgpTask
+from taac.tasks.rbb_openr_core_path_task import RbbOpenrCorePathTask
 from taac.tasks.rbb_srv6_counter_delta_task import (
     RbbSrv6CounterDeltaTask,
 )
@@ -197,6 +198,9 @@ from taac.tasks.setup_base_configs_task import (
 )
 from taac.tasks.verify_best_path_changes_task import (
     VerifyBestPathChangesTask,
+)
+from taac.tasks.rbb_state_audit_task import (
+    RbbStateAuditTask,
 )
 
 TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
@@ -258,9 +262,11 @@ TASK_REGISTRY: t.List[t.Type[BaseTask]] = [
     SetupBaseConfigsTask,
     RbbDutBootstrapTask,
     RbbEdgeEbgpTask,
+    RbbOpenrCorePathTask,
     RbbSrv6CounterDeltaTask,
     RbbSrv6DirectRouteTask,
     RbbSrv6VerifyTask,
+    RbbStateAuditTask,
 ]
 
 # Add internal tasks only when not in OSS mode

@@ -38,7 +38,7 @@ from taac.oss_topology_info.circuit_info_loader import (
     EndpointRecord,
     load_circuit_info,
 )
-from neteng.test_infra.dne.taac.testconfigs.routing.util import bgp_rbb_constants as C
+from taac.testconfigs.routing.util import bgp_rbb_constants as C
 
 # ─── Generic, documentation-only fallback wiring (NOT this lab's values) ────
 # Used only when no circuit_info CSV is supplied. Interface / port names are
@@ -424,7 +424,8 @@ def load_rbb_topology(
         circuit_info_path: circuit_info CSV; defaults to ``TAAC_CIRCUIT_INFO_PATH``.
         ixia_chassis: IXIA chassis handle; default ``TAAC_RBB_IXIA_CHASSIS``.
         allow_placeholder: permit documentation-only wiring when no CSV was
-            supplied. Live traffic callers must set this False.
+            supplied. Live traffic and DUT-bootstrap callers must set this
+            False.
         require_ixia: require at least one IXIA edge per DUT. If several are
             declared, ``TAAC_RBB_R{1,2}_IXIA_INTERFACE`` selects the one used.
     """
@@ -455,8 +456,8 @@ def load_rbb_topology(
     if not circuits:
         if not allow_placeholder:
             raise RbbTopologyError(
-                "TAAC_CIRCUIT_INFO_PATH is required for live RBB traffic; "
-                "placeholder wiring is documentation-only"
+                "TAAC_CIRCUIT_INFO_PATH is required for live RBB traffic or "
+                "DUT bootstrap; placeholder wiring is documentation-only"
             )
         topology = RbbTopology(
             r1=_default_node("r1", r1_host),

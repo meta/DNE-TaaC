@@ -41,7 +41,7 @@ from taac.tasks.rbb_edge_config_utils import (
     async_restore_backup,
     async_write_json_file,
 )
-from neteng.test_infra.dne.taac.testconfigs.routing.util import bgp_rbb_constants as C
+from taac.testconfigs.routing.util import bgp_rbb_constants as C
 from taac.testconfigs.routing.util.bgp_rbb_bootstrap_config import (
     build_bootstrap_documents,
     validate_bootstrap_device_paths,
